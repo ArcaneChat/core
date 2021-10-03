@@ -448,7 +448,7 @@ impl<'a> MimeFactory<'a> {
         );
 
         let mut to = Vec::new();
-        for (name, addr) in self.recipients.iter() {
+        for (_name, addr) in self.recipients.iter() {
 	    to.push(Address::new_mailbox(addr.clone()));
         }
 

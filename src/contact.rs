@@ -104,7 +104,7 @@ pub enum Origin {
     UnhandledQrScan = 0x80,
 
     /// Reply-To: of incoming message of known sender
-    /// Contacts with at least this origin value are shown in search results.
+    /// Contacts with at least this origin value are shown in the contact list.
     IncomingReplyTo = 0x100,
 
     /// Cc: of incoming message of known sender
@@ -114,7 +114,6 @@ pub enum Origin {
     IncomingTo = 0x400,
 
     /// a chat was manually created for this user, but no message yet sent
-    /// Contacts with at least this origin value are shown in the contact list.
     CreateChat = 0x800,
 
     /// message sent by us
@@ -607,7 +606,7 @@ impl Contact {
     pub async fn get_all(
         context: &Context,
         listflags: u32,
-        query: Option<&str>,
+        query: Option<impl AsRef<str>>,
     ) -> Result<Vec<u32>> {
         let self_addr = context
             .get_config(Config::ConfiguredAddr)
@@ -620,7 +619,7 @@ impl Contact {
         let flag_add_self = (listflags & DC_GCL_ADD_SELF) != 0;
 
         if flag_verified_only || query.is_some() {
-            let s3str_like_cmd = format!("%{}%", query.unwrap_or_default());
+            let s3str_like_cmd = format!("%{}%", query.as_ref().map(|s| s.as_ref()).unwrap_or(""));
             context
                 .sql
                 .query_map(
@@ -658,9 +657,9 @@ impl Contact {
             let self_name2 = stock_str::self_msg(context);
 
             if let Some(query) = query {
-                if self_addr.contains(query)
-                    || self_name.contains(query)
-                    || self_name2.await.contains(query)
+                if self_addr.contains(query.as_ref())
+                    || self_name.contains(query.as_ref())
+                    || self_name2.await.contains(query.as_ref())
                 {
                     add_self = true;
                 }
@@ -682,7 +681,7 @@ impl Contact {
                     paramsv![
                         self_addr,
                         DC_CONTACT_ID_LAST_SPECIAL as i32,
-                        Origin::CreateChat,
+                        Origin::IncomingReplyTo
                     ],
                     |row| row.get::<_, i32>(0),
                     |ids| {
@@ -1454,11 +1453,6 @@ mod tests {
         assert_eq!(contacts.len(), 1);
         assert_eq!(contacts.get(0), Some(&id));
 
-        // `Origin::IncomingReplyTo` is insufficient to show Bob in the contact list without
-        // searching.
-        let contacts = Contact::get_all(&context.ctx, 0, None).await?;
-        assert!(contacts.is_empty());
-
         // Search by address.
         let contacts = Contact::get_all(&context.ctx, 0, Some("user")).await?;
         assert_eq!(contacts.len(), 1);
@@ -1481,11 +1475,6 @@ mod tests {
         assert_eq!(contact.get_name(), "someone");
         assert_eq!(contact.get_authname(), "bob");
         assert_eq!(contact.get_display_name(), "someone");
-
-        // Manually created contacts show up in unfiltered contact list.
-        let contacts = Contact::get_all(&context.ctx, 0, None).await?;
-        assert_eq!(contacts.len(), 1);
-        assert_eq!(contacts.get(0), Some(&id));
 
         // Not searchable by authname, because it is not displayed.
         let contacts = Contact::get_all(&context.ctx, 0, Some("bob")).await?;
