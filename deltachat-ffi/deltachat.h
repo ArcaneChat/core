@@ -2249,21 +2249,12 @@ char*           dc_get_securejoin_qr         (dc_context_t* context, uint32_t ch
  * This function is typically called when dc_check_qr() returns
  * lot.state=DC_QR_ASK_VERIFYCONTACT or lot.state=DC_QR_ASK_VERIFYGROUP.
  *
- * Depending on the given QR code,
- * this function may takes some time and sends and receives several messages.
- * Therefore, you should call it always in a separate thread;
- * if you want to abort it, you should call dc_stop_ongoing_process().
+ * The function returns immediately and the handshake runs in background,
+ * sending and receiving several messages.
+ * During the handshake, info messages are added to the chat,
+ * showing progress, success or errors.
  *
- * - If the given QR code starts the Setup-Contact protocol,
- *   the function typically returns immediately
- *   and the handshake runs in background.
- *   Subsequent calls of dc_join_securejoin() will abort unfinished tasks.
- *   The returned chat is the one-to-one opportunistic chat.
- *   When the protocol has finished, an info-message is added to that chat.
- * - If the given QR code starts the Verified-Group-Invite protocol,
- *   the function waits until the protocol has finished.
- *   This is because the protected group is not opportunistic
- *   and can be created only when the contacts have verified each other.
+ * Subsequent calls of dc_join_securejoin() will abort previous, unfinished handshakes.
  *
  * See https://countermitm.readthedocs.io/en/latest/new.html
  * for details about both protocols.
@@ -2273,10 +2264,8 @@ char*           dc_get_securejoin_qr         (dc_context_t* context, uint32_t ch
  * @param qr The text of the scanned QR code. Typically, the same string as given
  *     to dc_check_qr().
  * @return Chat-id of the joined chat, the UI may redirect to the this chat.
- *     If the out-of-band verification failed or was aborted, 0 is returned.
+ *     On errors, 0 is returned, however, most errors will happen during handshake later on.
  *     A returned chat-id does not guarantee that the chat is protected or the belonging contact is verified.
- *     If needed, this be checked with dc_chat_is_protected() and dc_contact_is_verified(),
- *     however, in practise, the UI will just listen to #DC_EVENT_CONTACTS_CHANGED unconditionally.
  */
 uint32_t        dc_join_securejoin           (dc_context_t* context, const char* qr);
 
@@ -2423,6 +2412,22 @@ dc_array_t* dc_get_locations                (dc_context_t* context, uint32_t cha
  * @param context The context object.
  */
 void        dc_delete_all_locations         (dc_context_t* context);
+
+
+/**
+ * Get last error string.
+ *
+ * This is the same error string as logged via #DC_EVENT_ERROR,
+ * however, using this function avoids race conditions
+ * if the failing function is called in another thread than dc_get_next_event().
+ *
+ * @memberof dc_context_t
+ * @param context The context object.
+ * @return Last error or an empty string if there is no last error.
+ *     NULL is never returned.
+ *     The returned value must be released using dc_str_unref() after usage.
+ */
+char* dc_get_last_error (dc_context_t* context);
 
 
 /**
@@ -5959,6 +5964,21 @@ void dc_event_unref(dc_event_t* event);
 /// `%1$s` will be replaced by human-readable date and time.
 #define DC_STR_DOWNLOAD_AVAILABILITY      100
 
+/// "Multi Device Synchronization"
+///
+/// Used in subjects of outgoing sync messages.
+#define DC_STR_SYNC_MSG_SUBJECT           101
+
+/// "This message is used to synchronize data between your devices."
+///
+///
+/// Used as message text of outgoing sync messages.
+/// The text is visible in non-dc-muas or in outdated Delta Chat versions,
+/// the default text therefore adds the following hint:
+/// "If you see this message in Delta Chat,
+/// please update your Delta Chat apps on all devices."
+#define DC_STR_SYNC_MSG_BODY              102
+
 /// "Incoming Messages"
 ///
 /// Used as a headline in the connectivity view.
@@ -6032,6 +6052,26 @@ void dc_event_unref(dc_event_t* event);
 ///
 /// Used for describing resource usage, resulting string will be eg. "1.2 GiB of 3 GiB used".
 #define DC_STR_PART_OF_TOTAL_USED         116
+
+/// "%1$s invited you to join this group. Waiting for the device of %2$s to reply…"
+///
+/// Added as an info-message directly after scanning a QR code for joining a group.
+/// May be followed by the info-messages
+/// #DC_STR_SECURE_JOIN_REPLIES, #DC_STR_CONTACT_VERIFIED and #DC_STR_MSGADDMEMBER.
+///
+/// `%1$s` will be replaced by name and address of the inviter,
+/// `%2$s` will be replaced by the name of the inviter.
+#define DC_STR_SECURE_JOIN_STARTED        117
+
+/// "%1$s replied, waiting for being added to the group…"
+///
+/// Info-message on scanning a QR code for joining a group.
+/// Added after #DC_STR_SECURE_JOIN_STARTED.
+/// If the handshake allows to skip a step and go for #DC_STR_CONTACT_VERIFIED directly,
+/// this info-message is skipped.
+///
+/// `%1$s` will be replaced by the name of the inviter.
+#define DC_STR_SECURE_JOIN_REPLIES        118
 
 /**
  * @}

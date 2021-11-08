@@ -276,6 +276,15 @@ pub enum StockMessage {
     #[strum(props(fallback = "Download maximum available until %1$s"))]
     DownloadAvailability = 100,
 
+    #[strum(props(fallback = "Multi Device Synchronization"))]
+    SyncMsgSubject = 101,
+
+    #[strum(props(
+        fallback = "This message is used to synchronize data between your devices.\n\n\
+                    👉 If you see this message in Delta Chat, please update your Delta Chat apps on all devices."
+    ))]
+    SyncMsgBody = 102,
+
     #[strum(props(fallback = "Incoming Messages"))]
     IncomingMessages = 103,
 
@@ -317,6 +326,13 @@ pub enum StockMessage {
 
     #[strum(props(fallback = "%1$s of %2$s used"))]
     PartOfTotallUsed = 116,
+
+    #[strum(props(fallback = "%1$s invited you to join this group.\n\n\
+                             Waiting for the device of %2$s to reply…"))]
+    SecureJoinStarted = 117,
+
+    #[strum(props(fallback = "%1$s replied, waiting for being added to the group…"))]
+    SecureJoinReplies = 118,
 }
 
 impl StockMessage {
@@ -582,6 +598,32 @@ pub(crate) async fn e2e_preferred(context: &Context) -> String {
     translated(context, StockMessage::E2ePreferred).await
 }
 
+/// Stock string: `%1$s invited you to join this group. Waiting for the device of %2$s to reply…`.
+pub(crate) async fn secure_join_started(context: &Context, inviter_contact_id: u32) -> String {
+    if let Ok(contact) = Contact::get_by_id(context, inviter_contact_id).await {
+        translated(context, StockMessage::SecureJoinStarted)
+            .await
+            .replace1(contact.get_name_n_addr())
+            .replace2(contact.get_display_name())
+    } else {
+        format!(
+            "secure_join_started: unknown contact {}",
+            inviter_contact_id
+        )
+    }
+}
+
+/// Stock string: `%1$s replied, waiting for being added to the group…`.
+pub(crate) async fn secure_join_replies(context: &Context, contact_id: u32) -> String {
+    if let Ok(contact) = Contact::get_by_id(context, contact_id).await {
+        translated(context, StockMessage::SecureJoinReplies)
+            .await
+            .replace1(contact.get_display_name())
+    } else {
+        format!("secure_join_replies: unknown contact {}", contact_id)
+    }
+}
+
 /// Stock string: `%1$s verified.`.
 pub(crate) async fn contact_verified(context: &Context, contact_addr: impl AsRef<str>) -> String {
     translated(context, StockMessage::ContactVerified)
@@ -622,6 +664,16 @@ pub(crate) async fn ac_setup_msg_subject(context: &Context) -> String {
 /// Stock string: `This is the Autocrypt Setup Message used to transfer...`.
 pub(crate) async fn ac_setup_msg_body(context: &Context) -> String {
     translated(context, StockMessage::AcSetupMsgBody).await
+}
+
+/// Stock string: `Multi Device Synchronization`.
+pub(crate) async fn sync_msg_subject(context: &Context) -> String {
+    translated(context, StockMessage::SyncMsgSubject).await
+}
+
+/// Stock string: `This message is used to synchronize data betweeen your devices.`.
+pub(crate) async fn sync_msg_body(context: &Context) -> String {
+    translated(context, StockMessage::SyncMsgBody).await
 }
 
 /// Stock string: `Cannot login as \"%1$s\". Please check...`.

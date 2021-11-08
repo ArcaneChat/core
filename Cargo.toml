@@ -1,6 +1,6 @@
 [package]
 name = "deltachat"
-version = "1.61.0"
+version = "1.63.0"
 authors = ["Delta Chat Developers (ML) <delta@codespeak.net>"]
 edition = "2018"
 license = "MPL-2.0"
@@ -65,7 +65,7 @@ serde = { version = "1.0", features = ["derive"] }
 sha-1 = "0.9"
 sha2 = "0.9"
 smallvec = "1"
-stop-token = "0.5"
+stop-token = "0.6"
 strum = "0.22"
 strum_macros = "0.22"
 surf = { version = "2.3", default-features = false, features = ["h1-client"] }
