@@ -1,10 +1,10 @@
 //! Internet Message Format reception pipeline.
 
 use std::cmp::min;
+use std::collections::BTreeSet;
 use std::convert::TryFrom;
 
 use anyhow::{bail, ensure, Context as _, Result};
-use itertools::join;
 use mailparse::SingleInfo;
 use num_traits::FromPrimitive;
 use once_cell::sync::Lazy;
@@ -36,27 +36,42 @@ use crate::securejoin::{self, handle_securejoin_handshake, observe_securejoin_on
 use crate::stock_str;
 use crate::{contact, location};
 
-// IndexSet is like HashSet but maintains order of insertion.
-type ContactIds = indexmap::IndexSet<u32>;
-
 #[derive(Debug, PartialEq, Eq)]
 enum CreateEvent {
     MsgsChanged,
     IncomingMsg,
 }
 
+/// This is the struct that is returned after receiving one email (aka MIME message).
+///
+/// One email with multiple attachments can end up as multiple chat messages, but they
+/// all have the same chat_id, state and sort_timestamp.
+#[derive(Debug)]
+pub struct ReceivedMsg {
+    pub chat_id: ChatId,
+    pub state: MessageState,
+    pub sort_timestamp: i64,
+    // Feel free to add more fields here
+}
+
 /// Receive a message and add it to the database.
 ///
 /// Returns an error on recoverable errors, e.g. database errors. In this case,
-/// message parsing should be retried later. If message itself is wrong, logs
-/// the error and returns success.
+/// message parsing should be retried later.
+///
+/// If message itself is wrong, logs
+/// the error and returns success:
+/// - If possible, creates a database entry to prevent the message from being
+///   downloaded again, sets `chat_id=DC_CHAT_ID_TRASH` and returns `Ok(Some(…))`
+/// - If the message is so wrong that we didn't even create a database entry,
+///   returns `Ok(None)`
 pub async fn dc_receive_imf(
     context: &Context,
     imf_raw: &[u8],
     server_folder: &str,
     server_uid: u32,
     seen: bool,
-) -> Result<()> {
+) -> Result<Option<ReceivedMsg>> {
     dc_receive_imf_inner(
         context,
         imf_raw,
@@ -79,7 +94,7 @@ pub(crate) async fn dc_receive_imf_inner(
     seen: bool,
     is_partial_download: Option<u32>,
     fetching_existing_messages: bool,
-) -> Result<()> {
+) -> Result<Option<ReceivedMsg>> {
     info!(
         context,
         "Receiving message {}/{}, seen={}...", server_folder, server_uid, seen
@@ -94,7 +109,7 @@ pub(crate) async fn dc_receive_imf_inner(
         match MimeMessage::from_bytes_with_partial(context, imf_raw, is_partial_download).await {
             Err(err) => {
                 warn!(context, "dc_receive_imf: can't parse MIME: {}", err);
-                return Ok(());
+                return Ok(None);
             }
             Ok(mime_parser) => mime_parser,
         };
@@ -102,7 +117,7 @@ pub(crate) async fn dc_receive_imf_inner(
     // we can not add even an empty record if we have no info whatsoever
     if !mime_parser.has_headers() {
         warn!(context, "dc_receive_imf: no headers found");
-        return Ok(());
+        return Ok(None);
     }
 
     let rfc724_mid = mime_parser.get_rfc724_mid().unwrap_or_else(||
@@ -135,7 +150,7 @@ pub(crate) async fn dc_receive_imf_inner(
             if old_server_folder != server_folder || old_server_uid != server_uid {
                 message::update_server_uid(context, &rfc724_mid, server_folder, server_uid).await;
             }
-            return Ok(());
+            return Ok(None);
         }
     } else {
         false
@@ -163,23 +178,19 @@ pub(crate) async fn dc_receive_imf_inner(
 
     let incoming = from_id != DC_CONTACT_ID_SELF;
 
-    let mut to_ids = ContactIds::new();
-
-    to_ids.extend(
-        &dc_add_or_lookup_contacts_by_address_list(
-            context,
-            &mime_parser.recipients,
-            if !incoming {
-                Origin::OutgoingTo
-            } else if incoming_origin.is_known() {
-                Origin::IncomingTo
-            } else {
-                Origin::IncomingUnknownTo
-            },
-            prevent_rename,
-        )
-        .await?,
-    );
+    let to_ids = dc_add_or_lookup_contacts_by_address_list(
+        context,
+        &mime_parser.recipients,
+        if !incoming {
+            Origin::OutgoingTo
+        } else if incoming_origin.is_known() {
+            Origin::IncomingTo
+        } else {
+            Origin::IncomingUnknownTo
+        },
+        prevent_rename,
+    )
+    .await?;
 
     let rcvd_timestamp = dc_smeared_time(context).await;
     let sent_timestamp = mime_parser
@@ -193,7 +204,7 @@ pub(crate) async fn dc_receive_imf_inner(
     }
 
     // Add parts
-    let chat_id = add_parts(
+    let received_msg = add_parts(
         context,
         &mut mime_parser,
         imf_raw,
@@ -217,9 +228,14 @@ pub(crate) async fn dc_receive_imf_inner(
     .await
     .map_err(|err| err.context("add_parts error"))?;
 
+    if from_id > DC_CONTACT_ID_LAST_SPECIAL {
+        contact::update_last_seen(context, from_id, sent_timestamp).await?;
+    }
+
     // Update gossiped timestamp for the chat if someone else or our other device sent
     // Autocrypt-Gossip for all recipients in the chat to avoid sending Autocrypt-Gossip ourselves
     // and waste traffic.
+    let chat_id = received_msg.chat_id;
     if !chat_id.is_special()
         && mime_parser
             .recipients
@@ -369,7 +385,7 @@ pub(crate) async fn dc_receive_imf_inner(
         .handle_reports(context, from_id, sent_timestamp, &mime_parser.parts)
         .await;
 
-    Ok(())
+    Ok(Some(received_msg))
 }
 
 /// Converts "From" field to contact id.
@@ -399,7 +415,7 @@ pub async fn from_field_to_contact_id(
                 "mail has more than one From address, only using first: {:?}", from_address_list
             );
         }
-        let from_id = from_ids.get_index(0).cloned().unwrap_or_default();
+        let from_id = from_ids.get(0).cloned().unwrap_or_default();
 
         let mut from_id_blocked = false;
         let mut incoming_origin = Origin::Unknown;
@@ -427,7 +443,7 @@ async fn add_parts(
     incoming_origin: Origin,
     server_folder: &str,
     server_uid: u32,
-    to_ids: &ContactIds,
+    to_ids: &[u32],
     rfc724_mid: String,
     sent_timestamp: i64,
     rcvd_timestamp: i64,
@@ -439,7 +455,7 @@ async fn add_parts(
     create_event_to_send: &mut Option<CreateEvent>,
     fetching_existing_messages: bool,
     prevent_rename: bool,
-) -> Result<ChatId> {
+) -> Result<ReceivedMsg> {
     let mut chat_id = None;
     let mut chat_id_blocked = Blocked::Not;
     let mut incoming_origin = incoming_origin;
@@ -513,7 +529,8 @@ async fn add_parts(
                 }
                 Err(err) => {
                     warn!(context, "Error in Secure-Join message handling: {}", err);
-                    return Ok(DC_CHAT_ID_TRASH);
+                    chat_id = Some(DC_CHAT_ID_TRASH);
+                    securejoin_seen = true;
                 }
             }
         } else {
@@ -721,7 +738,7 @@ async fn add_parts(
         // the mail is on the IMAP server, probably it is also delivered.
         // We cannot recreate other states (read, error).
         state = MessageState::OutDelivered;
-        to_id = to_ids.get_index(0).cloned().unwrap_or_default();
+        to_id = to_ids.get(0).cloned().unwrap_or_default();
 
         let self_sent = from_id == DC_CONTACT_ID_SELF
             && to_ids.len() == 1
@@ -740,7 +757,7 @@ async fn add_parts(
                 }
                 Err(err) => {
                     warn!(context, "Error in Secure-Join watching: {}", err);
-                    return Ok(DC_CHAT_ID_TRASH);
+                    chat_id = Some(DC_CHAT_ID_TRASH);
                 }
             }
         } else if mime_parser.sync_items.is_some() && self_sent {
@@ -828,6 +845,18 @@ async fn add_parts(
             }
         }
 
+        if let Some(chat_id) = chat_id {
+            apply_group_changes(
+                context,
+                mime_parser,
+                sent_timestamp,
+                chat_id,
+                from_id,
+                to_ids,
+            )
+            .await?;
+        }
+
         if chat_id.is_none() && self_sent {
             // from_id==to_id==DC_CONTACT_ID_SELF - this is a self-sent messages,
             // maybe an Autocrypt Setup Message
@@ -864,9 +893,10 @@ async fn add_parts(
         DC_CHAT_ID_TRASH
     });
 
-    // Extract ephemeral timer from the message.
-    let mut ephemeral_timer = if let Some(value) = mime_parser.get_header(HeaderDef::EphemeralTimer)
-    {
+    // Extract ephemeral timer from the message or use the existing timer if the message is not fully downloaded.
+    let mut ephemeral_timer = if is_partial_download.is_some() {
+        chat_id.get_ephemeral_timer(context).await?
+    } else if let Some(value) = mime_parser.get_header(HeaderDef::EphemeralTimer) {
         match value.parse::<EphemeralTimer>() {
             Ok(timer) => timer,
             Err(err) => {
@@ -881,8 +911,6 @@ async fn add_parts(
         EphemeralTimer::Disabled
     };
 
-    // correct message_timestamp, it should not be used before,
-    // however, we cannot do this earlier as we need chat_id to be set
     let in_fresh = state == MessageState::InFresh;
     let sort_timestamp = calc_sort_timestamp(context, sent_timestamp, chat_id, in_fresh).await?;
 
@@ -1004,7 +1032,7 @@ async fn add_parts(
                                 sort_timestamp,
                             )
                             .await?;
-                            return Ok(chat_id); // do not return an error as this would result in retrying the message
+                            // do not return an error as this would result in retrying the message
                         }
                     }
                     set_better_msg(
@@ -1222,7 +1250,11 @@ INSERT INTO msgs
         }
     }
 
-    Ok(chat_id)
+    Ok(ReceivedMsg {
+        chat_id,
+        state,
+        sort_timestamp,
+    })
 }
 
 /// Saves attached locations to the database.
@@ -1312,7 +1344,7 @@ async fn lookup_chat_by_reply(
     mime_parser: &mut MimeMessage,
     parent: &Option<Message>,
     from_id: u32,
-    to_ids: &ContactIds,
+    to_ids: &[u32],
 ) -> Result<Option<(ChatId, Blocked)>> {
     // Try to assign message to the same chat as the parent message.
 
@@ -1352,7 +1384,7 @@ async fn lookup_chat_by_reply(
 /// If it returns false, it shall be assigned to the parent chat.
 async fn is_probably_private_reply(
     context: &Context,
-    to_ids: &indexmap::IndexSet<u32>,
+    to_ids: &[u32],
     mime_parser: &MimeMessage,
     parent_chat_id: ChatId,
     from_id: u32,
@@ -1364,7 +1396,7 @@ async fn is_probably_private_reply(
     // should be assigned to the group chat. We restrict this exception to classical emails, as chat-group-messages
     // contain a Chat-Group-Id header and can be sorted into the correct chat this way.
 
-    let private_message = to_ids == &[DC_CONTACT_ID_SELF].iter().copied().collect::<ContactIds>();
+    let private_message = to_ids == [DC_CONTACT_ID_SELF].iter().copied().collect::<Vec<u32>>();
     if !private_message {
         return Ok(false);
     }
@@ -1393,7 +1425,7 @@ async fn create_or_lookup_group(
     allow_creation: bool,
     create_blocked: Blocked,
     from_id: u32,
-    to_ids: &ContactIds,
+    to_ids: &[u32],
 ) -> Result<Option<(ChatId, Blocked)>> {
     let grpid = if let Some(grpid) = try_getting_grpid(mime_parser) {
         grpid
@@ -1537,7 +1569,7 @@ async fn apply_group_changes(
     sent_timestamp: i64,
     chat_id: ChatId,
     from_id: u32,
-    to_ids: &ContactIds,
+    to_ids: &[u32],
 ) -> Result<()> {
     let mut chat = Chat::load_from_db(context, chat_id).await?;
     if chat.typ != Chattype::Group {
@@ -1696,13 +1728,14 @@ async fn apply_group_changes(
             send_event_chat_modified = true;
         }
     } else if let Some(contact_id) = removed_id {
-        if chat_id
-            .update_timestamp(context, Param::MemberListTimestamp, sent_timestamp)
-            .await?
-        {
-            chat::remove_from_chat_contacts_table(context, chat_id, contact_id).await?;
-            send_event_chat_modified = true;
-        }
+        // in contrast to `Chat-Group-Member-Added` we do not reconstruct the whole state from To: on removing -
+        // otherwise out-of-order removals won't work as members are re-added quickly.
+        //
+        // therefore, we need to ignore `MemberListTimestamp`
+        // and execute `Chat-Group-Member-Removed` statements even when they arrive out of order.
+        // we do not set `MemberListTimestamp` as we do not reconstuct the memberlist.
+        chat::remove_from_chat_contacts_table(context, chat_id, contact_id).await?;
+        send_event_chat_modified = true;
     }
 
     if send_event_chat_modified {
@@ -1930,7 +1963,11 @@ async fn create_adhoc_group(
 /// are hidden in BCC. This group ID is sent by DC in the messages sent to this chat,
 /// so having the same ID prevents group split.
 async fn create_adhoc_grp_id(context: &Context, member_ids: &[u32]) -> Result<String> {
-    let member_ids_str = join(member_ids.iter().map(|x| x.to_string()), ",");
+    let member_ids_str = member_ids
+        .iter()
+        .map(|x| x.to_string())
+        .collect::<Vec<String>>()
+        .join(",");
     let member_cs = context
         .get_config(Config::ConfiguredAddr)
         .await?
@@ -1973,7 +2010,7 @@ async fn check_verified_properties(
     context: &Context,
     mimeparser: &MimeMessage,
     from_id: u32,
-    to_ids: &ContactIds,
+    to_ids: &[u32],
 ) -> Result<()> {
     let contact = Contact::load_from_db(context, from_id).await?;
 
@@ -2016,13 +2053,20 @@ async fn check_verified_properties(
     }
 
     // we do not need to check if we are verified with ourself
-    let mut to_ids = to_ids.clone();
-    to_ids.remove(&DC_CONTACT_ID_SELF);
+    let to_ids = to_ids
+        .iter()
+        .copied()
+        .filter(|id| *id != DC_CONTACT_ID_SELF)
+        .collect::<Vec<u32>>();
 
     if to_ids.is_empty() {
         return Ok(());
     }
-    let to_ids_str = join(to_ids.iter().map(|x| x.to_string()), ",");
+    let to_ids_str = to_ids
+        .iter()
+        .map(|x| x.to_string())
+        .collect::<Vec<String>>()
+        .join(",");
 
     let rows = context
         .sql
@@ -2104,6 +2148,8 @@ fn set_better_msg(mime_parser: &mut MimeMessage, better_msg: impl AsRef<str>) {
 /// Returns the last message referenced from `References` header if it is in the database.
 ///
 /// For Delta Chat messages it is the last message in the chat of the sender.
+///
+/// Note that the returned message may be trashed.
 async fn get_previous_message(
     context: &Context,
     mime_parser: &MimeMessage,
@@ -2119,6 +2165,8 @@ async fn get_previous_message(
 }
 
 /// Given a list of Message-IDs, returns the latest message found in the database.
+///
+/// Only messages that are not in the trash chat are considered.
 async fn get_rfc724_mid_in_list(context: &Context, mid_list: &str) -> Result<Option<Message>> {
     if mid_list.is_empty() {
         return Ok(None);
@@ -2126,7 +2174,10 @@ async fn get_rfc724_mid_in_list(context: &Context, mid_list: &str) -> Result<Opt
 
     for id in parse_message_ids(mid_list).iter().rev() {
         if let Some((_, _, msg_id)) = rfc724_mid_exists(context, id).await? {
-            return Ok(Some(Message::load_from_db(context, msg_id).await?));
+            let msg = Message::load_from_db(context, msg_id).await?;
+            if msg.chat_id != DC_CHAT_ID_TRASH {
+                return Ok(Some(msg));
+            }
         }
     }
 
@@ -2176,6 +2227,10 @@ pub(crate) async fn get_prefetch_parent_message(
     Ok(None)
 }
 
+/// Looks up contact IDs from the database given the list of recipients.
+///
+/// Returns vector of IDs guaranteed to be unique.
+///
 /// * param `prevent_rename`: if true, the display_name of this contact will not be changed. Useful for
 /// mailing lists: In some mailing lists, many users write from the same address but with different
 /// display names. We don't want the display name to change everytime the user gets a new email from
@@ -2185,8 +2240,8 @@ async fn dc_add_or_lookup_contacts_by_address_list(
     address_list: &[SingleInfo],
     origin: Origin,
     prevent_rename: bool,
-) -> Result<ContactIds> {
-    let mut contact_ids = ContactIds::new();
+) -> Result<Vec<u32>> {
+    let mut contact_ids = BTreeSet::new();
     for info in address_list.iter() {
         let display_name = if prevent_rename {
             Some("")
@@ -2198,7 +2253,7 @@ async fn dc_add_or_lookup_contacts_by_address_list(
         );
     }
 
-    Ok(contact_ids)
+    Ok(contact_ids.into_iter().collect::<Vec<u32>>())
 }
 
 /// Add contacts to database on receiving messages.
@@ -2303,7 +2358,7 @@ mod tests {
     #[async_std::test]
     async fn test_dc_create_incoming_rfc724_mid() {
         let context = TestContext::new().await;
-        let raw = b"From: Alice <alice@example.com>\n\
+        let raw = b"From: Alice <alice@example.org>\n\
                     To: Bob <bob@example.org>\n\
                     Subject: Some subject\n\
                     hello\n";
@@ -2313,14 +2368,14 @@ mod tests {
 
         assert_eq!(
             dc_create_incoming_rfc724_mid(&mimeparser),
-            "08d11318608d5191@stub"
+            "ca971a2eefd651f6@stub"
         );
     }
 
     static MSGRMSG: &[u8] =
         b"Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
                     From: Bob <bob@example.com>\n\
-                    To: alice@example.com\n\
+                    To: alice@example.org\n\
                     Chat-Version: 1.0\n\
                     Subject: Chat: hello\n\
                     Message-ID: <Mr.1111@example.com>\n\
@@ -2331,7 +2386,7 @@ mod tests {
     static ONETOONE_NOREPLY_MAIL: &[u8] =
         b"Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
                     From: Bob <bob@example.com>\n\
-                    To: alice@example.com\n\
+                    To: alice@example.org\n\
                     Subject: Chat: hello\n\
                     Message-ID: <2222@example.com>\n\
                     Date: Sun, 22 Mar 2020 22:37:56 +0000\n\
@@ -2341,7 +2396,7 @@ mod tests {
     static GRP_MAIL: &[u8] =
         b"Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
                     From: bob@example.com\n\
-                    To: alice@example.com, claire@example.com\n\
+                    To: alice@example.org, claire@example.com\n\
                     Subject: group with Alice, Bob and Claire\n\
                     Message-ID: <3333@example.com>\n\
                     Date: Sun, 22 Mar 2020 22:37:57 +0000\n\
@@ -2521,14 +2576,14 @@ mod tests {
             &t,
             format!(
                 "Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
-                 From: alice@example.com\n\
+                 From: alice@example.org\n\
                  To: bob@example.com\n\
                  Subject: foo\n\
                  Message-ID: <Gr.{}.12345678901@example.com>\n\
                  Chat-Version: 1.0\n\
                  Chat-Group-ID: {}\n\
                  Chat-Group-Name: foo\n\
-                 Chat-Disposition-Notification-To: alice@example.com\n\
+                 Chat-Disposition-Notification-To: alice@example.org\n\
                  Date: Sun, 22 Mar 2020 22:37:57 +0000\n\
                  \n\
                  hello\n",
@@ -2553,7 +2608,7 @@ mod tests {
             format!(
                 "Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
                  From: bob@example.com\n\
-                 To: alice@example.com\n\
+                 To: alice@example.org\n\
                  Subject: message opened\n\
                  Date: Sun, 22 Mar 2020 23:37:57 +0000\n\
                  Chat-Version: 1.0\n\
@@ -2646,7 +2701,7 @@ mod tests {
         dc_receive_imf(
             &t,
             b"From: =?UTF-8?B?0JjQvNGPLCDQpNCw0LzQuNC70LjRjw==?= <foobar@example.com>\n\
-                 To: alice@example.com\n\
+                 To: alice@example.org\n\
                  Subject: foo\n\
                  Message-ID: <asdklfjjaweofi@example.com>\n\
                  Chat-Version: 1.0\n\
@@ -2687,7 +2742,7 @@ mod tests {
         dc_receive_imf(
             &t,
             b"From: Foobar <foobar@example.com>\n\
-                 To: =?UTF-8?B?0JjQvNGPLCDQpNCw0LzQuNC70LjRjw==?= alice@example.com\n\
+                 To: =?UTF-8?B?0JjQvNGPLCDQpNCw0LzQuNC70LjRjw==?= alice@example.org\n\
                  Cc: =?utf-8?q?=3Ch2=3E?= <carl@host.tld>\n\
                  Subject: foo\n\
                  Message-ID: <asdklfjjaweofi@example.com>\n\
@@ -2732,7 +2787,7 @@ mod tests {
             &t,
             b"Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
                  From: Foobar <foobar@example.com>\n\
-                 To: alice@example.com\n\
+                 To: alice@example.org\n\
                  Cc: Carl <carl@host.tld>\n\
                  Subject: foo\n\
                  Message-ID: <asdklfjjaweofi@example.com>\n\
@@ -2908,7 +2963,7 @@ mod tests {
                  Chat-Version: 1.0\n\
                  Chat-Group-ID: abcde\n\
                  Chat-Group-Name: foo\n\
-                 Chat-Disposition-Notification-To: alice@example.com\n\
+                 Chat-Disposition-Notification-To: alice@example.org\n\
                  Date: Sun, 22 Mar 2020 22:37:57 +0000\n\
                  \n\
                  hello\n",
@@ -3526,7 +3581,7 @@ mod tests {
 To: {}
 References: <deltachat/deltachat-core-rust/pull/1625@github.com>
  <deltachat/deltachat-core-rust/pull/1625/c644661857@github.com>
-From: alice@example.com
+From: alice@example.org
 Message-ID: <d2717387-0ba7-7b60-9b09-fd89a76ea8a0@gmx.de>
 Date: Tue, 16 Jun 2020 12:04:20 +0200
 MIME-Version: 1.0
@@ -4044,7 +4099,7 @@ YEAAAAAA!.
         dc_receive_imf(
             &t,
             b"From: Nu Bar <nu@bar.org>\n\
-            To: alice@example.com, bob@example.org\n\
+            To: alice@example.org, bob@example.org\n\
             Subject: Hi\n\
             Message-ID: <4444@example.org>\n\
             \n\
@@ -4071,7 +4126,7 @@ YEAAAAAA!.
         dc_receive_imf(
             &t,
             b"From: Nu Bar <nu@bar.org>\n\
-            To: alice@example.com, bob@example.org\n\
+            To: alice@example.org, bob@example.org\n\
             Subject: Re: Hi\n\
             Message-ID: <5555@example.org>\n\
             In-Reply-To: <4444@example.org\n\
@@ -4179,13 +4234,13 @@ YEAAAAAA!.
 
         dc_receive_imf(
             &t,
-            b"Bcc: alice@example.com
+            b"Bcc: alice@example.org
 Received: from [127.0.0.1]
 Subject: s
 Chat-Version: 1.0
 Message-ID: <abcd@gmail.com>
 To: <me@other.maildomain.com>
-From: <alice@example.com>
+From: <alice@example.org>
 
 Message content",
             "Inbox",
@@ -4216,7 +4271,7 @@ Message content",
 Subject: Subj
 Message-ID: <abcd@example.com>
 To: <bob@example.org>
-From: <alice@example.com>
+From: <alice@example.org>
 
 Message content",
             "Sent",
@@ -4248,7 +4303,7 @@ Message content",
         let first_message = b"Received: from [127.0.0.1]
 Subject: First message
 Message-ID: <first@example.org>
-To: Alice <alice@example.com>
+To: Alice <alice@example.org>
 From: Bob1 <bob@example.org>
 Chat-Version: 1.0
 
@@ -4260,7 +4315,7 @@ First signature";
         let second_message = b"Received: from [127.0.0.1]
 Subject: Second message
 Message-ID: <second@example.org>
-To: Alice <alice@example.com>
+To: Alice <alice@example.org>
 From: Bob2 <bob@example.org>
 Chat-Version: 1.0
 
@@ -4304,7 +4359,7 @@ Subject: =?utf-8?q?single_reply-to?=
 {}
 Date: Fri, 28 May 2021 10:15:05 +0000
 To: Bob <bob@example.com>, <claire@example.com>
-From: Alice <alice@example.com>
+From: Alice <alice@example.org>
 Content-Type: text/plain; charset=utf-8; format=flowed; delsp=no
 Content-Transfer-Encoding: quoted-printable
 
@@ -4344,7 +4399,7 @@ Message-ID: <Gr.eJ_llQIXf0K.buxmrnMmG0Y@gmx.de>"
                 &t,
                 format!(
                     r#"Subject: Re: single reply-to
-To: "Alice" <alice@example.com>
+To: "Alice" <alice@example.org>
 References: <{0}>
  <{0}>
 From: Bob <bob@example.com>
@@ -4394,7 +4449,7 @@ Subject: =?utf-8?q?single_reply-to?=
 {}
 Date: Fri, 28 May 2021 10:15:05 +0000
 To: Bob <bob@example.com>{}
-From: Alice <alice@example.com>
+From: Alice <alice@example.org>
 Content-Type: text/plain; charset=utf-8; format=flowed; delsp=no
 Content-Transfer-Encoding: quoted-printable
 
@@ -4443,7 +4498,7 @@ In-Reply-To: <{0}>
 Date: Sat, 03 Jul 2021 20:00:26 +0000
 Chat-Version: 1.0
 Message-ID: <Mr.CJFwF5hwn8W.Pd-GGH5m32k@gmx.de>
-To: <alice@example.com>
+To: <alice@example.org>
 From: <bob@example.com>
 Content-Type: text/plain; charset=utf-8; format=flowed; delsp=no
 Content-Transfer-Encoding: quoted-printable
@@ -4491,7 +4546,7 @@ Sent with my Delta Chat Messenger: https://delta.chat
 Subject: =?utf-8?q?single_reply-to?=
 {}
 To: Bob <bob@example.com>, <claire@example.com>
-From: Alice <alice@example.com>
+From: Alice <alice@example.org>
 Content-Type: text/plain; charset=utf-8; format=flowed; delsp=no
 Content-Transfer-Encoding: quoted-printable
 
@@ -4534,7 +4589,7 @@ Message-ID: <Gr.eJ_llQIXf0K.buxmrnMmG0Y@gmx.de>"
                     r#"Received: from mout.gmx.net (mout.gmx.net [212.227.17.22])
 Subject: Out subj
 To: "Bob" <bob@example.com>, "Claire" <claire@example.com>
-From: Alice <alice@example.com>
+From: Alice <alice@example.org>
 Message-ID: <outgoing@testrun.org>
 MIME-Version: 1.0
 In-Reply-To: <{0}>
@@ -4566,7 +4621,7 @@ Outgoing reply to all"#,
                 br#"Received: from mout.gmx.net (mout.gmx.net [212.227.17.22])
 Subject: In subj
 To: "Bob" <bob@example.com>, "Claire" <claire@example.com>
-From: alice <alice@example.com>
+From: alice <alice@example.org>
 Message-ID: <xyz@testrun.org>
 MIME-Version: 1.0
 In-Reply-To: <outgoing@testrun.org>
@@ -4602,14 +4657,14 @@ Reply to all"#,
 
         let first_thread_mime = br#"Subject: First thread
 Message-ID: first@example.org
-To: Alice <alice@example.com>, Bob <bob@example.net>
+To: Alice <alice@example.org>, Bob <bob@example.net>
 From: Claire <claire@example.org>
 Content-Type: text/plain; charset=utf-8; format=flowed; delsp=no
 
 First thread."#;
         let second_thread_mime = br#"Subject: Second thread
 Message-ID: second@example.org
-To: Alice <alice@example.com>, Bob <bob@example.net>
+To: Alice <alice@example.org>, Bob <bob@example.net>
 From: Claire <claire@example.org>
 Content-Type: text/plain; charset=utf-8; format=flowed; delsp=no
 
@@ -4702,7 +4757,7 @@ Second thread."#;
 
         let msg = t.get_last_msg().await;
         assert!(msg.has_html());
-        assert_eq!(msg.id.get_html(&t).await?.unwrap().replace("\r\n", "\n"), "<html><head></head><body><div style=\"font-family: Verdana;font-size: 12.0px;\"><div>&nbsp;</div>\n\n<div>&nbsp;\n<div>&nbsp;\n<div data-darkreader-inline-border-left=\"\" name=\"quote\" style=\"margin: 10px 5px 5px 10px; padding: 10px 0px 10px 10px; border-left: 2px solid rgb(195, 217, 229); overflow-wrap: break-word; --darkreader-inline-border-left:#274759;\">\n<div style=\"margin:0 0 10px 0;\"><b>Gesendet:</b>&nbsp;Donnerstag, 12. August 2021 um 15:52 Uhr<br/>\n<b>Von:</b>&nbsp;&quot;Claire&quot; &lt;claire@example.org&gt;<br/>\n<b>An:</b>&nbsp;alice@example.com<br/>\n<b>Betreff:</b>&nbsp;subject</div>\n\n<div name=\"quoted-content\">bodytext</div>\n</div>\n</div>\n</div></div></body></html>\n\n");
+        assert_eq!(msg.id.get_html(&t).await?.unwrap().replace("\r\n", "\n"), "<html><head></head><body><div style=\"font-family: Verdana;font-size: 12.0px;\"><div>&nbsp;</div>\n\n<div>&nbsp;\n<div>&nbsp;\n<div data-darkreader-inline-border-left=\"\" name=\"quote\" style=\"margin: 10px 5px 5px 10px; padding: 10px 0px 10px 10px; border-left: 2px solid rgb(195, 217, 229); overflow-wrap: break-word; --darkreader-inline-border-left:#274759;\">\n<div style=\"margin:0 0 10px 0;\"><b>Gesendet:</b>&nbsp;Donnerstag, 12. August 2021 um 15:52 Uhr<br/>\n<b>Von:</b>&nbsp;&quot;Claire&quot; &lt;claire@example.org&gt;<br/>\n<b>An:</b>&nbsp;alice@example.org<br/>\n<b>Betreff:</b>&nbsp;subject</div>\n\n<div name=\"quoted-content\">bodytext</div>\n</div>\n</div>\n</div></div></body></html>\n\n");
 
         Ok(())
     }
@@ -4727,5 +4782,94 @@ Second thread."#;
                 return Ok(());
             }
         }
+    }
+
+    #[async_std::test]
+    async fn test_get_parent_message() -> Result<()> {
+        let t = TestContext::new_alice().await;
+        t.set_config(Config::ShowEmails, Some("2")).await?;
+
+        let mime = br#"Subject: First
+Message-ID: first@example.net
+To: Alice <alice@example.org>
+From: Bob <bob@example.net>
+Content-Type: text/plain; charset=utf-8; format=flowed; delsp=no
+
+First."#;
+        dc_receive_imf(&t, mime, "INBOX", 1, false).await?;
+        let first = t.get_last_msg().await;
+        let mime = br#"Subject: Second
+Message-ID: second@example.net
+To: Alice <alice@example.org>
+From: Bob <bob@example.net>
+Content-Type: text/plain; charset=utf-8; format=flowed; delsp=no
+
+First."#;
+        dc_receive_imf(&t, mime, "INBOX", 2, false).await?;
+        let second = t.get_last_msg().await;
+        let mime = br#"Subject: Third
+Message-ID: third@example.net
+To: Alice <alice@example.org>
+From: Bob <bob@example.net>
+Content-Type: text/plain; charset=utf-8; format=flowed; delsp=no
+
+First."#;
+        dc_receive_imf(&t, mime, "INBOX", 3, false).await?;
+        let third = t.get_last_msg().await;
+
+        let mime = br#"Subject: Message with references.
+Message-ID: second@example.net
+To: Alice <alice@example.org>
+From: Bob <bob@example.net>
+In-Reply-To: <third@example.net>
+References: <second@example.net> <nonexistent@example.net> <first@example.net>
+Content-Type: text/plain; charset=utf-8; format=flowed; delsp=no
+
+Message with references."#;
+        let mime_parser = MimeMessage::from_bytes(&t, &mime[..]).await?;
+
+        let parent = get_parent_message(&t, &mime_parser).await?.unwrap();
+        assert_eq!(parent.id, first.id);
+
+        message::delete_msgs(&t, &[first.id]).await?;
+        let parent = get_parent_message(&t, &mime_parser).await?.unwrap();
+        assert_eq!(parent.id, second.id);
+
+        message::delete_msgs(&t, &[second.id]).await?;
+        let parent = get_parent_message(&t, &mime_parser).await?.unwrap();
+        assert_eq!(parent.id, third.id);
+
+        message::delete_msgs(&t, &[third.id]).await?;
+        let parent = get_parent_message(&t, &mime_parser).await?;
+        assert!(parent.is_none());
+
+        Ok(())
+    }
+
+    /// Test a message with RFC 1847 encapsulation as created by Thunderbird.
+    #[async_std::test]
+    async fn test_rfc1847_encapsulation() -> Result<()> {
+        let alice = TestContext::new_alice().await;
+        let bob = TestContext::new_bob().await;
+        alice.configure_addr("alice@example.org").await;
+
+        // Alice sends an Autocrypt message to Bob so Bob gets Alice's key.
+        let chat_alice = alice.create_chat(&bob).await;
+        let first_msg = alice
+            .send_text(chat_alice.id, "Sending Alice key to Bob.")
+            .await;
+        bob.recv_msg(&first_msg).await;
+        message::delete_msgs(&bob, &[bob.get_last_msg().await.id]).await?;
+
+        bob.set_config(Config::ShowEmails, Some("2")).await?;
+
+        // Alice sends a message to Bob using Thunderbird.
+        let raw = include_bytes!("../test-data/message/rfc1847_encapsulation.eml");
+        dc_receive_imf(&bob, raw, "INBOX", 2, false).await?;
+
+        let msg = bob.get_last_msg().await;
+        assert!(msg.get_showpadlock());
+
+        Ok(())
     }
 }

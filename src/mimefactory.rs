@@ -462,13 +462,37 @@ impl<'a> MimeFactory<'a> {
             self.from_addr.clone(),
         );
 
-        let mut to = Vec::new();
-        for (_name, addr) in self.recipients.iter() {
-	    to.push(Address::new_mailbox(addr.clone()));
-        }
+        let undisclosed_recipients = match &self.loaded {
+            Loaded::Message { chat } => chat.typ == Chattype::Broadcast,
+            Loaded::Mdn { .. } => false,
+        };
 
-        if to.is_empty() {
-            to.push(from.clone());
+        let mut to = Vec::new();
+        if undisclosed_recipients {
+            to.push(Address::new_group(
+                "hidden-recipients".to_string(),
+                Vec::new(),
+            ));
+        } else {
+            let email_to_remove =
+                if self.msg.param.get_cmd() == SystemMessage::MemberRemovedFromGroup {
+                    self.msg.param.get(Param::Arg)
+                } else {
+                    None
+                };
+
+            for (_name, addr) in self.recipients.iter() {
+                if let Some(email_to_remove) = email_to_remove {
+                    if email_to_remove == addr {
+                        continue;
+                    }
+                }
+                to.push(Address::new_mailbox(addr.clone()));
+            }
+
+            if to.is_empty() {
+                to.push(from.clone());
+            }
         }
 
         headers
@@ -568,20 +592,9 @@ impl<'a> MimeFactory<'a> {
             render_rfc724_mid(&rfc724_mid),
         ));
 
-        let undisclosed_recipients = match &self.loaded {
-            Loaded::Message { chat } => chat.typ == Chattype::Broadcast,
-            Loaded::Mdn { .. } => false,
-        };
-
-        if undisclosed_recipients {
-            headers
-                .unprotected
-                .push(Header::new("To".into(), "hidden-recipients: ;".to_string()));
-        } else {
-            headers
-                .unprotected
-                .push(Header::new_with_value("To".into(), to).unwrap());
-        }
+        headers
+            .unprotected
+            .push(Header::new_with_value("To".into(), to).unwrap());
 
         headers
             .unprotected
@@ -1401,6 +1414,10 @@ mod tests {
     use async_std::prelude::*;
 
     use crate::chat::ChatId;
+    use crate::chat::{
+        add_contact_to_chat, create_group_chat, remove_contact_from_chat, send_text_msg,
+        ProtectionStatus,
+    };
     use crate::chatlist::Chatlist;
     use crate::contact::Origin;
     use crate::dc_receive_imf::dc_receive_imf;
@@ -1408,7 +1425,7 @@ mod tests {
     use crate::test_utils::{get_chat_msg, TestContext};
 
     use async_std::fs::File;
-    use pretty_assertions::assert_eq;
+    use mailparse::{addrparse_header, MailHeaderMap};
 
     #[test]
     fn test_render_email_address() {
@@ -1506,7 +1523,7 @@ mod tests {
             msg_to_subject_str(
                 b"Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
                 From: Bob <bob@example.com>\n\
-                To: alice@example.com\n\
+                To: alice@example.org\n\
                 Subject: Antw: Chat: hello\n\
                 Message-ID: <2222@example.com>\n\
                 Date: Sun, 22 Mar 2020 22:37:56 +0000\n\
@@ -1521,7 +1538,7 @@ mod tests {
             msg_to_subject_str(
                 b"Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
                 From: Bob <bob@example.com>\n\
-                To: alice@example.com\n\
+                To: alice@example.org\n\
                 Subject: Infos: 42\n\
                 Message-ID: <2222@example.com>\n\
                 Date: Sun, 22 Mar 2020 22:37:56 +0000\n\
@@ -1540,7 +1557,7 @@ mod tests {
             msg_to_subject_str(
                 b"Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
                 From: bob@example.com\n\
-                To: alice@example.com\n\
+                To: alice@example.org\n\
                 Subject: Chat: hello\n\
                 Chat-Version: 1.0\n\
                 Message-ID: <2223@example.com>\n\
@@ -1558,7 +1575,7 @@ mod tests {
         // 3. Send the first message to a new contact
         let t = TestContext::new_alice().await;
 
-        assert_eq!(first_subject_str(t).await, "Message from alice@example.com");
+        assert_eq!(first_subject_str(t).await, "Message from alice@example.org");
 
         let t = TestContext::new_alice().await;
         t.set_config(Config::Displayname, Some("Alice"))
@@ -1573,7 +1590,7 @@ mod tests {
         msg_to_subject_str(
             "Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
             From: bob@example.com\n\
-            To: alice@example.com\n\
+            To: alice@example.org\n\
             Subject: äääää\n\
             Chat-Version: 1.0\n\
             Message-ID: <2893@example.com>\n\
@@ -1587,7 +1604,7 @@ mod tests {
         msg_to_subject_str(
             "Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
             From: bob@example.com\n\
-            To: alice@example.com\n\
+            To: alice@example.org\n\
             Subject: aäääää\n\
             Chat-Version: 1.0\n\
             Message-ID: <2893@example.com>\n\
@@ -1606,7 +1623,7 @@ mod tests {
         dc_receive_imf(
             &t,
             b"Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
-            From: alice@example.com\n\
+            From: alice@example.org\n\
             To: bob@example.com\n\
             Subject: Hello, Bob\n\
             Chat-Version: 1.0\n\
@@ -1623,7 +1640,7 @@ mod tests {
         let new_msg = incoming_msg_to_reply_msg(
             b"Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
                  From: bob@example.com\n\
-                 To: alice@example.com\n\
+                 To: alice@example.org\n\
                  Subject: message opened\n\
                  Date: Sun, 22 Mar 2020 23:37:57 +0000\n\
                  Chat-Version: 1.0\n\
@@ -1698,7 +1715,7 @@ mod tests {
             format!(
                 "Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
                 From: bob@example.com\n\
-                To: alice@example.com\n\
+                To: alice@example.org\n\
                 Subject: Different subject\n\
                 In-Reply-To: {}\n\
                 Message-ID: <2893@example.com>\n\
@@ -1753,7 +1770,7 @@ mod tests {
         mf.subject_str(&t).await.unwrap()
     }
 
-    // In `imf_raw`, From has to be bob@example.com, To has to be alice@example.com
+    // In `imf_raw`, From has to be bob@example.com, To has to be alice@example.org
     async fn msg_to_subject_str(imf_raw: &[u8]) -> String {
         let subject_str = msg_to_subject_str_inner(imf_raw, false, false, false).await;
 
@@ -1814,7 +1831,7 @@ mod tests {
                 &t,
                 b"Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
                     From: Bob <bob@example.com>\n\
-                    To: alice@example.com\n\
+                    To: alice@example.org\n\
                     Subject: Some other, completely unrelated subject\n\
                     Message-ID: <3cl4@example.com>\n\
                     Date: Sun, 22 Mar 2020 22:37:56 +0000\n\
@@ -1874,7 +1891,7 @@ mod tests {
         let msg = incoming_msg_to_reply_msg(
             b"Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
                 From: Charlie <charlie@example.com>\n\
-                To: alice@example.com\n\
+                To: alice@example.org\n\
                 Subject: Chat: hello\n\
                 Chat-Version: 1.0\n\
                 Message-ID: <2223@example.com>\n\
@@ -2010,6 +2027,37 @@ mod tests {
         assert_eq!(body.match_indices("text/plain").count(), 0);
         assert_eq!(body.match_indices("Chat-User-Avatar:").count(), 0);
         assert_eq!(body.match_indices("Subject:").count(), 0);
+
+        Ok(())
+    }
+
+    /// Test that removed member address does not go into the `To:` field.
+    #[async_std::test]
+    async fn test_remove_member_bcc() -> Result<()> {
+        // Alice creates a group with Bob and Claire and then removes Bob.
+        let alice = TestContext::new_alice().await;
+
+        let bob_id = Contact::create(&alice, "Bob", "bob@example.net").await?;
+        let claire_id = Contact::create(&alice, "Claire", "claire@foo.de").await?;
+
+        let alice_chat_id = create_group_chat(&alice, ProtectionStatus::Unprotected, "foo").await?;
+        add_contact_to_chat(&alice, alice_chat_id, bob_id).await?;
+        add_contact_to_chat(&alice, alice_chat_id, claire_id).await?;
+        send_text_msg(&alice, alice_chat_id, "Creating a group".to_string()).await?;
+
+        remove_contact_from_chat(&alice, alice_chat_id, claire_id).await?;
+        let remove = alice.pop_sent_msg().await;
+        let remove_payload = remove.payload();
+        let parsed = mailparse::parse_mail(remove_payload.as_bytes())?;
+        let to = parsed
+            .headers
+            .get_first_header("To")
+            .ok_or_else(|| format_err!("No To: header parsed"))?;
+        let to = addrparse_header(to)?;
+        let mailbox = to
+            .extract_single_info()
+            .ok_or_else(|| format_err!("To: field does not contain exactly one address"))?;
+        assert_eq!(mailbox.addr, "bob@example.net");
 
         Ok(())
     }

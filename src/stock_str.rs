@@ -8,7 +8,7 @@ use strum::EnumProperty;
 use strum_macros::EnumProperty;
 
 use crate::blob::BlobObject;
-use crate::chat::{self, ChatId, ProtectionStatus};
+use crate::chat::{self, Chat, ChatId, ProtectionStatus};
 use crate::config::Config;
 use crate::constants::{Viewtype, DC_CONTACT_ID_SELF};
 use crate::contact::{Contact, Origin};
@@ -55,9 +55,6 @@ pub enum StockMessage {
 
     #[strum(props(fallback = "Sent with my Delta Chat Messenger: https://delta.chat"))]
     StatusLine = 13,
-
-    #[strum(props(fallback = "Hello, I\'ve just created the group \"%1$s\" for us."))]
-    NewGroupDraft = 14,
 
     #[strum(props(fallback = "Group name changed from \"%1$s\" to \"%2$s\"."))]
     MsgGrpName = 15,
@@ -333,6 +330,12 @@ pub enum StockMessage {
 
     #[strum(props(fallback = "%1$s replied, waiting for being added to the group…"))]
     SecureJoinReplies = 118,
+
+    #[strum(props(fallback = "Scan to chat with %1$s"))]
+    SetupContactQRDescription = 119,
+
+    #[strum(props(fallback = "Scan to join group %1$s"))]
+    SecureJoinGroupQRDescription = 120,
 }
 
 impl StockMessage {
@@ -455,13 +458,6 @@ pub(crate) async fn file(context: &Context) -> String {
 /// Stock string: `Sent with my Delta Chat Messenger: https://delta.chat`.
 pub(crate) async fn status_line(context: &Context) -> String {
     translated(context, StockMessage::StatusLine).await
-}
-
-/// Stock string: `Hello, I've just created the group "%1$s" for us.`.
-pub(crate) async fn new_group_draft(context: &Context, group_name: impl AsRef<str>) -> String {
-    translated(context, StockMessage::NewGroupDraft)
-        .await
-        .replace1(group_name)
 }
 
 /// Stock string: `Group name changed from "%1$s" to "%2$s".`.
@@ -622,6 +618,29 @@ pub(crate) async fn secure_join_replies(context: &Context, contact_id: u32) -> S
     } else {
         format!("secure_join_replies: unknown contact {}", contact_id)
     }
+}
+
+/// Stock string: `Scan to chat with %1$s`.
+pub(crate) async fn setup_contact_qr_description(
+    context: &Context,
+    display_name: &str,
+    addr: &str,
+) -> String {
+    let name = if display_name == addr {
+        addr.to_owned()
+    } else {
+        format!("{} ({})", display_name, addr)
+    };
+    translated(context, StockMessage::SetupContactQRDescription)
+        .await
+        .replace1(name)
+}
+
+/// Stock string: `Scan to join %1$s`.
+pub(crate) async fn secure_join_group_qr_description(context: &Context, chat: &Chat) -> String {
+    translated(context, StockMessage::SecureJoinGroupQRDescription)
+        .await
+        .replace1(chat.get_name())
 }
 
 /// Stock string: `%1$s verified.`.
@@ -1210,20 +1229,20 @@ mod tests {
     async fn test_stock_system_msg_add_member_by_me() {
         let t = TestContext::new().await;
         assert_eq!(
-            msg_add_member(&t, "alice@example.com", DC_CONTACT_ID_SELF).await,
-            "Member alice@example.com added by me."
+            msg_add_member(&t, "alice@example.org", DC_CONTACT_ID_SELF).await,
+            "Member alice@example.org added by me."
         )
     }
 
     #[async_std::test]
     async fn test_stock_system_msg_add_member_by_me_with_displayname() {
         let t = TestContext::new().await;
-        Contact::create(&t, "Alice", "alice@example.com")
+        Contact::create(&t, "Alice", "alice@example.org")
             .await
             .expect("failed to create contact");
         assert_eq!(
-            msg_add_member(&t, "alice@example.com", DC_CONTACT_ID_SELF).await,
-            "Member Alice (alice@example.com) added by me."
+            msg_add_member(&t, "alice@example.org", DC_CONTACT_ID_SELF).await,
+            "Member Alice (alice@example.org) added by me."
         );
     }
 
@@ -1231,7 +1250,7 @@ mod tests {
     async fn test_stock_system_msg_add_member_by_other_with_displayname() {
         let t = TestContext::new().await;
         let contact_id = {
-            Contact::create(&t, "Alice", "alice@example.com")
+            Contact::create(&t, "Alice", "alice@example.org")
                 .await
                 .expect("Failed to create contact Alice");
             Contact::create(&t, "Bob", "bob@example.com")
@@ -1239,8 +1258,8 @@ mod tests {
                 .expect("failed to create bob")
         };
         assert_eq!(
-            msg_add_member(&t, "alice@example.com", contact_id,).await,
-            "Member Alice (alice@example.com) added by Bob (bob@example.com)."
+            msg_add_member(&t, "alice@example.org", contact_id,).await,
+            "Member Alice (alice@example.org) added by Bob (bob@example.com)."
         );
     }
 

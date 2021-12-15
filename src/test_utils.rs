@@ -99,7 +99,7 @@ impl TestContext {
             let mut context_names = CONTEXT_NAMES.write().unwrap();
             context_names.insert(id, name);
         }
-        let ctx = Context::new("FakeOS".into(), dbfile.into(), id)
+        let ctx = Context::new(dbfile.into(), id)
             .await
             .expect("failed to create context");
 
@@ -195,7 +195,7 @@ impl TestContext {
         sinks.push(Box::new(move |evt| Box::pin(sink(evt))));
     }
 
-    /// Configure with alice@example.com.
+    /// Configure with alice@example.org.
     ///
     /// The context will be fake-configured as the alice user, with a pre-generated secret
     /// key.  The email address of the user is returned as a string.
@@ -544,19 +544,20 @@ impl SentMessage {
     }
 }
 
-/// Load a pre-generated keypair for alice@example.com from disk.
+/// Load a pre-generated keypair for alice@example.org from disk.
 ///
 /// This saves CPU cycles by avoiding having to generate a key.
 ///
 /// The keypair was created using the crate::key::tests::gen_key test.
 pub fn alice_keypair() -> key::KeyPair {
-    let addr = EmailAddress::new("alice@example.com").unwrap();
-    let public =
-        key::SignedPublicKey::from_base64(include_str!("../test-data/key/alice-public.asc"))
-            .unwrap();
-    let secret =
-        key::SignedSecretKey::from_base64(include_str!("../test-data/key/alice-secret.asc"))
-            .unwrap();
+    let addr = EmailAddress::new("alice@example.org").unwrap();
+
+    let public = key::SignedPublicKey::from_asc(include_str!("../test-data/key/alice-public.asc"))
+        .unwrap()
+        .0;
+    let secret = key::SignedSecretKey::from_asc(include_str!("../test-data/key/alice-secret.asc"))
+        .unwrap()
+        .0;
     key::KeyPair {
         addr,
         public,
@@ -569,10 +570,12 @@ pub fn alice_keypair() -> key::KeyPair {
 /// Like [alice_keypair] but a different key and identity.
 pub fn bob_keypair() -> key::KeyPair {
     let addr = EmailAddress::new("bob@example.net").unwrap();
-    let public =
-        key::SignedPublicKey::from_base64(include_str!("../test-data/key/bob-public.asc")).unwrap();
-    let secret =
-        key::SignedSecretKey::from_base64(include_str!("../test-data/key/bob-secret.asc")).unwrap();
+    let public = key::SignedPublicKey::from_asc(include_str!("../test-data/key/bob-public.asc"))
+        .unwrap()
+        .0;
+    let secret = key::SignedSecretKey::from_asc(include_str!("../test-data/key/bob-secret.asc"))
+        .unwrap()
+        .0;
     key::KeyPair {
         addr,
         public,

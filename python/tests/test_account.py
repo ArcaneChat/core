@@ -57,7 +57,7 @@ class TestOfflineAccountBasic:
         alice_public = data.read_path("key/alice-public.asc")
         alice_secret = data.read_path("key/alice-secret.asc")
         assert alice_public and alice_secret
-        ac._preconfigure_keypair("alice@example.com", alice_public, alice_secret)
+        ac._preconfigure_keypair("alice@example.org", alice_public, alice_secret)
 
     def test_getinfo(self, acfactory):
         ac1 = acfactory.get_unconfigured_account()
@@ -265,23 +265,23 @@ class TestOfflineChat:
         assert d["draft"] == "" if chat.get_draft() is None else chat.get_draft()
 
     def test_group_chat_creation_with_translation(self, ac1):
-        ac1.set_stock_translation(const.DC_STR_NEWGROUPDRAFT, "xyz %1$s")
+        ac1.set_stock_translation(const.DC_STR_MSGGRPNAME, "abc %1$s xyz %2$s")
         ac1._evtracker.consume_events()
         with pytest.raises(ValueError):
-            ac1.set_stock_translation(const.DC_STR_NEWGROUPDRAFT, "xyz %2$s")
+            ac1.set_stock_translation(const.DC_STR_FILE, "xyz %1$s")
+        ac1._evtracker.get_matching("DC_EVENT_WARNING")
+        with pytest.raises(ValueError):
+            ac1.set_stock_translation(const.DC_STR_CONTACT_NOT_VERIFIED, "xyz %2$s")
         ac1._evtracker.get_matching("DC_EVENT_WARNING")
         with pytest.raises(ValueError):
             ac1.set_stock_translation(500, "xyz %1$s")
         ac1._evtracker.get_matching("DC_EVENT_WARNING")
-        contact1 = ac1.create_contact("some1@example.org", name="some1")
-        contact2 = ac1.create_contact("some2@example.org", name="some2")
-        chat = ac1.create_group_chat(name="title1", contacts=[contact1, contact2])
-        assert chat.get_name() == "title1"
-        assert contact1 in chat.get_contacts()
-        assert contact2 in chat.get_contacts()
-        assert not chat.is_promoted()
-        msg = chat.get_draft()
-        assert msg.text == "xyz title1"
+        chat = ac1.create_group_chat(name="homework", contacts=[])
+        assert chat.get_name() == "homework"
+        chat.send_text("Now we have a group for homework")
+        assert chat.is_promoted()
+        chat.set_name("Homework")
+        assert chat.get_messages()[-1].text == "abc homework xyz Homework by me."
 
     @pytest.mark.parametrize("verified", [True, False])
     def test_group_chat_qr(self, acfactory, ac1, verified):
@@ -1359,7 +1359,7 @@ class TestOnlineAccount:
         If the draft email is sent out later (i.e. moved to "Sent"), it must be shown."""
         ac1 = acfactory.get_online_configuring_account()
         ac1.set_config("show_emails", "2")
-        ac1.create_contact("alice@example.com").create_chat()
+        ac1.create_contact("alice@example.org").create_chat()
 
         acfactory.wait_configure(ac1)
         ac1.direct_imap.create_folder("Drafts")
@@ -1373,7 +1373,7 @@ class TestOnlineAccount:
         ac1.direct_imap.append("Drafts", """
             From: ac1 <{}>
             Subject: subj
-            To: alice@example.com
+            To: alice@example.org
             Message-ID: <aepiors@example.org>
             Content-Type: text/plain; charset=utf-8
 
@@ -1382,7 +1382,7 @@ class TestOnlineAccount:
         ac1.direct_imap.append("Sent", """
             From: ac1 <{}>
             Subject: subj
-            To: alice@example.com
+            To: alice@example.org
             Message-ID: <hsabaeni@example.org>
             Content-Type: text/plain; charset=utf-8
 
@@ -1412,6 +1412,35 @@ class TestOnlineAccount:
 
         assert msg2.text == "subj – message in Drafts that is moved to Sent later"
         assert len(msg.chat.get_messages()) == 2
+
+    def test_no_old_msg_is_fresh(self, acfactory, lp):
+        ac1 = acfactory.get_online_configuring_account()
+        ac2 = acfactory.get_online_configuring_account()
+        ac1_clone = acfactory.clone_online_account(ac1)
+        acfactory.wait_configure_and_start_io()
+
+        ac1.set_config("e2ee_enabled", "0")
+        ac1_clone.set_config("e2ee_enabled", "0")
+        ac2.set_config("e2ee_enabled", "0")
+
+        ac1_clone.set_config("bcc_self", "1")
+
+        ac1.create_chat(ac2)
+        ac1_clone.create_chat(ac2)
+
+        lp.sec("Send a first message from ac2 to ac1 and check that it's 'fresh'")
+        first_msg_id = ac2.create_chat(ac1).send_text("Hi")
+        ac1._evtracker.wait_next_incoming_message()
+        assert ac1.create_chat(ac2).count_fresh_messages() == 1
+        assert len(list(ac1.get_fresh_messages())) == 1
+
+        lp.sec("Send a message from ac1_clone to ac2 and check that ac1 marks the first message as 'noticed'")
+        ac1_clone.create_chat(ac2).send_text("Hi back")
+        ev = ac1._evtracker.get_matching("DC_EVENT_MSGS_NOTICED")
+
+        assert ev.data1 == first_msg_id.id
+        assert ac1.create_chat(ac2).count_fresh_messages() == 0
+        assert len(list(ac1.get_fresh_messages())) == 0
 
     def test_prefer_encrypt(self, acfactory, lp):
         """Test quorum rule for encryption preference in 1:1 and group chat."""

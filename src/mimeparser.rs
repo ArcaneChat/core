@@ -1159,23 +1159,21 @@ impl MimeMessage {
 
         // must be present
         if let Some(_disposition) = report_fields.get_header_value(HeaderDef::Disposition) {
-            if let Some(original_message_id) = report_fields
+            let original_message_id = report_fields
                 .get_header_value(HeaderDef::OriginalMessageId)
-                .and_then(|v| parse_message_id(&v).ok())
-            {
-                let additional_message_ids = report_fields
-                    .get_header_value(HeaderDef::AdditionalMessageIds)
-                    .map_or_else(Vec::new, |v| {
-                        v.split(' ')
-                            .filter_map(|s| parse_message_id(s).ok())
-                            .collect()
-                    });
+                .and_then(|v| parse_message_id(&v).ok());
+            let additional_message_ids = report_fields
+                .get_header_value(HeaderDef::AdditionalMessageIds)
+                .map_or_else(Vec::new, |v| {
+                    v.split(' ')
+                        .filter_map(|s| parse_message_id(s).ok())
+                        .collect()
+                });
 
-                return Ok(Some(Report {
-                    original_message_id,
-                    additional_message_ids,
-                }));
-            }
+            return Ok(Some(Report {
+                original_message_id,
+                additional_message_ids,
+            }));
         }
         warn!(
             context,
@@ -1331,8 +1329,10 @@ impl MimeMessage {
         parts: &[Part],
     ) {
         for report in &self.mdn_reports {
-            for original_message_id in
-                std::iter::once(&report.original_message_id).chain(&report.additional_message_ids)
+            for original_message_id in report
+                .original_message_id
+                .iter()
+                .chain(&report.additional_message_ids)
             {
                 match message::handle_mdn(context, from_id, original_message_id, sent_timestamp)
                     .await
@@ -1437,7 +1437,10 @@ async fn update_gossip_peerstates(
 #[derive(Debug)]
 pub(crate) struct Report {
     /// Original-Message-ID header
-    original_message_id: String,
+    ///
+    /// It MUST be present if the original message has a Message-ID according to RFC 8098, but MS
+    /// Exchange does not add it nevertheless, in which case it is `None`.
+    original_message_id: Option<String>,
     /// Additional-Message-IDs
     additional_message_ids: Vec<String>,
 }
@@ -2346,7 +2349,7 @@ Additional-Message-IDs: <foo@example.com> <foo@example.net>\n\
         assert_eq!(message.mdn_reports.len(), 1);
         assert_eq!(
             message.mdn_reports[0].original_message_id,
-            "foo@example.org"
+            Some("foo@example.org".to_string())
         );
         assert_eq!(
             &message.mdn_reports[0].additional_message_ids,
@@ -3034,9 +3037,9 @@ Some reply
 Chat-Version: 1.0\n\
 Message-ID: <foobarbaz@example.org>
 To: Bob <bob@example.org>
-From: Alice <alice@example.com>
+From: Alice <alice@example.org>
 Subject: subject
-Chat-Disposition-Notification-To: alice@example.com
+Chat-Disposition-Notification-To: alice@example.org
 
 Message.
 "###;
@@ -3064,12 +3067,12 @@ Message.
         dc_receive_imf(
             &alice,
             "Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
-                 From: alice@example.com\n\
+                 From: alice@example.org\n\
                  To: bob@example.net\n\
                  Subject: foo\n\
                  Message-ID: first@example.com\n\
                  Chat-Version: 1.0\n\
-                 Chat-Disposition-Notification-To: alice@example.com\n\
+                 Chat-Disposition-Notification-To: alice@example.org\n\
                  Date: Sun, 22 Mar 2020 22:37:57 +0000\n\
                  \n\
                  hello\n"
@@ -3087,8 +3090,8 @@ Message.
         dc_receive_imf(
             &alice,
                 "Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
-                 From: alice@example.com\n\
-                 To: alice@example.com\n\
+                 From: alice@example.org\n\
+                 To: alice@example.org\n\
                  Subject: message opened\n\
                  Date: Sun, 22 Mar 2020 23:37:57 +0000\n\
                  Chat-Version: 1.0\n\
@@ -3123,6 +3126,20 @@ Message.
         let msg = Message::load_from_db(&alice, msg.id).await?;
         assert_eq!(msg.state, MessageState::OutDelivered);
 
+        Ok(())
+    }
+
+    /// Test parsing of MDN sent by MS Exchange.
+    ///
+    /// It does not have required Original-Message-ID field, so it is useless, but we want to
+    /// recognize it as MDN nevertheless to avoid displaying it in the chat as normal message.
+    #[async_std::test]
+    async fn test_ms_exchange_mdn() -> Result<()> {
+        let t = TestContext::new_alice().await;
+        let raw =
+            include_bytes!("../test-data/message/ms_exchange_report_disposition_notification.eml");
+        let mimeparser = MimeMessage::from_bytes(&t.ctx, raw).await?;
+        assert!(!mimeparser.mdn_reports.is_empty());
         Ok(())
     }
 }

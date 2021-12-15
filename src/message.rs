@@ -877,7 +877,7 @@ impl Message {
     }
 
     pub async fn quoted_message(&self, context: &Context) -> Result<Option<Message>> {
-        if self.param.get(Param::Quote).is_some() {
+        if self.param.get(Param::Quote).is_some() && !self.is_forwarded() {
             if let Some(in_reply_to) = &self.in_reply_to {
                 if let Some((_, _, msg_id)) = rfc724_mid_exists(context, in_reply_to).await? {
                     let msg = Message::load_from_db(context, msg_id).await?;
@@ -891,6 +891,11 @@ impl Message {
             }
         }
         Ok(None)
+    }
+
+    /// Force the message to be sent in plain text.
+    pub fn force_plaintext(&mut self) {
+        self.param.set_int(Param::ForcePlaintext, 1);
     }
 
     pub async fn update_param(&self, context: &Context) {
@@ -1972,9 +1977,9 @@ mod tests {
                     \n\
                     hello\n",
                     if outgoing {
-                        "From: alice@example.com\nTo: bob@example.net\n"
+                        "From: alice@example.org\nTo: bob@example.net\n"
                     } else {
-                        "From: bob@example.net\nTo: alice@example.com\n"
+                        "From: bob@example.net\nTo: alice@example.org\n"
                     },
                     if chat_msg { "Chat-Version: 1.0\n" } else { "" },
                 );
@@ -2187,7 +2192,7 @@ mod tests {
         dc_receive_imf(
             &alice,
             b"From: Bob <bob@example.com>\n\
-                    To: alice@example.com\n\
+                    To: alice@example.org\n\
                     Chat-Version: 1.0\n\
                     Message-ID: <123@example.com>\n\
                     Date: Fri, 29 Jan 2021 21:37:55 +0000\n\
@@ -2396,7 +2401,7 @@ mod tests {
         dc_receive_imf(
             &alice,
             b"From: Bob <bob@example.com>\n\
-                    To: alice@example.com\n\
+                    To: alice@example.org\n\
                     Chat-Version: 1.0\n\
                     Message-ID: <123@example.com>\n\
                     Auto-Submitted: auto-generated\n\
@@ -2416,7 +2421,7 @@ mod tests {
         dc_receive_imf(
             &alice,
             b"From: Bob <bob@example.com>\n\
-                    To: alice@example.com\n\
+                    To: alice@example.org\n\
                     Chat-Version: 1.0\n\
                     Message-ID: <456@example.com>\n\
                     Date: Fri, 29 Jan 2021 21:37:55 +0000\n\

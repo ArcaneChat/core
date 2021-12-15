@@ -1,5 +1,6 @@
 //! # Chat module.
 
+use std::collections::HashMap;
 use std::convert::{TryFrom, TryInto};
 use std::str::FromStr;
 use std::time::{Duration, SystemTime};
@@ -7,7 +8,6 @@ use std::time::{Duration, SystemTime};
 use anyhow::{bail, ensure, format_err, Context as _, Result};
 use async_std::path::{Path, PathBuf};
 use deltachat_derive::{FromSql, ToSql};
-use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
 use crate::aheader::EncryptPreference;
@@ -22,6 +22,7 @@ use crate::constants::{
 };
 use crate::contact::{addr_cmp, Contact, Origin, VerifiedStatus};
 use crate::context::Context;
+use crate::dc_receive_imf::ReceivedMsg;
 use crate::dc_tools::{
     dc_create_id, dc_create_outgoing_rfc724_mid, dc_create_smeared_timestamp,
     dc_create_smeared_timestamps, dc_get_abs_path, dc_gm2local_offset, improve_single_line_input,
@@ -571,7 +572,7 @@ impl ChatId {
 
         let changed = match &mut msg {
             None => self.maybe_delete_draft(context).await?,
-            Some(msg) => self.set_draft_raw(context, msg).await?,
+            Some(msg) => self.do_set_draft(context, msg).await?,
         };
 
         if changed {
@@ -589,15 +590,6 @@ impl ChatId {
         }
 
         Ok(())
-    }
-
-    /// Similar to as dc_set_draft() but does not emit an event
-    async fn set_draft_raw(self, context: &Context, msg: &mut Message) -> Result<bool> {
-        let deleted = self.maybe_delete_draft(context).await?;
-        let set = self.do_set_draft(context, msg).await.is_ok();
-
-        // Can't inline. Both functions above must be called, no shortcut!
-        Ok(deleted || set)
     }
 
     async fn get_draft_msg_id(self, context: &Context) -> Result<Option<MsgId>> {
@@ -635,9 +627,8 @@ impl ChatId {
     }
 
     /// Set provided message as draft message for specified chat.
-    ///
-    /// Return true on success, false on database error.
-    async fn do_set_draft(self, context: &Context, msg: &mut Message) -> Result<()> {
+    /// Returns true if the draft was added or updated in place.
+    async fn do_set_draft(self, context: &Context, msg: &mut Message) -> Result<bool> {
         match msg.viewtype {
             Viewtype::Unknown => bail!("Can not set draft of unknown type."),
             Viewtype::Text => {
@@ -660,9 +651,44 @@ impl ChatId {
             bail!("Can't set a draft: Can't send");
         }
 
-        context
+        // set back draft information to allow identifying the draft later on -
+        // no matter if message object is reused or reloaded from db
+        msg.state = MessageState::OutDraft;
+        msg.chat_id = self;
+
+        // if possible, replace existing draft and keep id
+        if !msg.id.is_special() {
+            if let Some(old_draft) = self.get_draft(context).await? {
+                if old_draft.id == msg.id
+                    && old_draft.chat_id == self
+                    && old_draft.state == MessageState::OutDraft
+                {
+                    context
+                        .sql
+                        .execute(
+                            "UPDATE msgs
+                            SET timestamp=?,type=?,txt=?, param=?,mime_in_reply_to=?
+                            WHERE id=?;",
+                            paramsv![
+                                time(),
+                                msg.viewtype,
+                                msg.text.as_deref().unwrap_or(""),
+                                msg.param.to_string(),
+                                msg.in_reply_to.as_deref().unwrap_or_default(),
+                                msg.id
+                            ],
+                        )
+                        .await?;
+                    return Ok(true);
+                }
+            }
+        }
+
+        // insert new draft
+        self.maybe_delete_draft(context).await?;
+        let row_id = context
             .sql
-            .execute(
+            .insert(
                 "INSERT INTO msgs (
                  chat_id,
                  from_id,
@@ -687,7 +713,8 @@ impl ChatId {
                 ],
             )
             .await?;
-        Ok(())
+        msg.id = MsgId::new(row_id.try_into()?);
+        Ok(true)
     }
 
     /// Returns number of messages in a chat.
@@ -1183,10 +1210,16 @@ impl Chat {
         }
     }
 
+    /// Adds missing values to the msg object,
+    /// writes the record to the database and returns its msg_id.
+    ///
+    /// If `update_msg_id` is set, that record is reused;
+    /// if `update_msg_id` is None, a new record is created.
     async fn prepare_msg_raw(
         &mut self,
         context: &Context,
         msg: &mut Message,
+        update_msg_id: Option<MsgId>,
         timestamp: i64,
     ) -> Result<MsgId> {
         let mut new_references = "".into();
@@ -1348,10 +1381,46 @@ impl Chat {
 
         // add message to the database
 
-        let msg_id = context
-            .sql
-            .insert(
-                "INSERT INTO msgs (
+        if let Some(update_msg_id) = update_msg_id {
+            context
+                .sql
+                .execute(
+                    "UPDATE msgs
+                     SET rfc724_mid=?, chat_id=?, from_id=?, to_id=?, timestamp=?, type=?,
+                         state=?, txt=?, subject=?, param=?,
+                         hidden=?, mime_in_reply_to=?, mime_references=?, mime_modified=?,
+                         mime_headers=?, location_id=?, ephemeral_timer=?, ephemeral_timestamp=?
+                     WHERE id=?;",
+                    paramsv![
+                        new_rfc724_mid,
+                        self.id,
+                        DC_CONTACT_ID_SELF,
+                        to_id as i32,
+                        timestamp,
+                        msg.viewtype,
+                        msg.state,
+                        msg.text.as_ref().cloned().unwrap_or_default(),
+                        &msg.subject,
+                        msg.param.to_string(),
+                        msg.hidden,
+                        msg.in_reply_to.as_deref().unwrap_or_default(),
+                        new_references,
+                        new_mime_headers.is_some(),
+                        new_mime_headers.unwrap_or_default(),
+                        location_id as i32,
+                        ephemeral_timer,
+                        ephemeral_timestamp,
+                        update_msg_id
+                    ],
+                )
+                .await?;
+            schedule_ephemeral_task(context).await;
+            msg.id = update_msg_id;
+        } else {
+            let raw_id = context
+                .sql
+                .insert(
+                    "INSERT INTO msgs (
                         rfc724_mid,
                         chat_id,
                         from_id,
@@ -1371,31 +1440,32 @@ impl Chat {
                         ephemeral_timer,
                         ephemeral_timestamp)
                         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);",
-                paramsv![
-                    new_rfc724_mid,
-                    self.id,
-                    DC_CONTACT_ID_SELF,
-                    to_id as i32,
-                    timestamp,
-                    msg.viewtype,
-                    msg.state,
-                    msg.text.as_ref().cloned().unwrap_or_default(),
-                    &msg.subject,
-                    msg.param.to_string(),
-                    msg.hidden,
-                    msg.in_reply_to.as_deref().unwrap_or_default(),
-                    new_references,
-                    new_mime_headers.is_some(),
-                    new_mime_headers.unwrap_or_default(),
-                    location_id as i32,
-                    ephemeral_timer,
-                    ephemeral_timestamp
-                ],
-            )
-            .await?;
+                    paramsv![
+                        new_rfc724_mid,
+                        self.id,
+                        DC_CONTACT_ID_SELF,
+                        to_id as i32,
+                        timestamp,
+                        msg.viewtype,
+                        msg.state,
+                        msg.text.as_ref().cloned().unwrap_or_default(),
+                        &msg.subject,
+                        msg.param.to_string(),
+                        msg.hidden,
+                        msg.in_reply_to.as_deref().unwrap_or_default(),
+                        new_references,
+                        new_mime_headers.is_some(),
+                        new_mime_headers.unwrap_or_default(),
+                        location_id as i32,
+                        ephemeral_timer,
+                        ephemeral_timestamp
+                    ],
+                )
+                .await?;
+            msg.id = MsgId::new(u32::try_from(raw_id)?);
+        }
         schedule_ephemeral_task(context).await;
-
-        Ok(MsgId::new(u32::try_from(msg_id)?))
+        Ok(msg.id)
     }
 }
 
@@ -1702,8 +1772,7 @@ pub async fn prepare_msg(context: &Context, chat_id: ChatId, msg: &mut Message) 
         "Cannot prepare message for special chat"
     );
 
-    msg.state = MessageState::OutPreparing;
-    let msg_id = prepare_msg_common(context, chat_id, msg).await?;
+    let msg_id = prepare_msg_common(context, chat_id, msg, MessageState::OutPreparing).await?;
     context.emit_event(EventType::MsgsChanged {
         chat_id: msg.chat_id,
         msg_id: msg.id,
@@ -1782,24 +1851,35 @@ async fn prepare_msg_common(
     context: &Context,
     chat_id: ChatId,
     msg: &mut Message,
+    change_state_to: MessageState,
 ) -> Result<MsgId> {
-    msg.id = MsgId::new_unset();
-    prepare_msg_blob(context, msg).await?;
-    chat_id.unarchive(context).await?;
-
     let mut chat = Chat::load_from_db(context, chat_id).await?;
     ensure!(chat.can_send(context).await?, "cannot send to {}", chat_id);
 
-    // The OutPreparing state is set by dc_prepare_msg() before it
-    // calls this function and the message is left in the OutPreparing
-    // state.  Otherwise we got called by send_msg() and we change the
-    // state to OutPending.
-    if msg.state != MessageState::OutPreparing {
-        msg.state = MessageState::OutPending;
-    }
+    // check current MessageState for drafts (to keep msg_id) ...
+    let update_msg_id = if msg.state == MessageState::OutDraft {
+        msg.hidden = false;
+        if !msg.id.is_special() && msg.chat_id == chat_id {
+            Some(msg.id)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
+    // ... then change the MessageState in the message object
+    msg.state = change_state_to;
+
+    prepare_msg_blob(context, msg).await?;
+    chat_id.unarchive(context).await?;
     msg.id = chat
-        .prepare_msg_raw(context, msg, dc_create_smeared_timestamp(context).await)
+        .prepare_msg_raw(
+            context,
+            msg,
+            update_msg_id,
+            dc_create_smeared_timestamp(context).await,
+        )
         .await?;
     msg.chat_id = chat_id;
 
@@ -1917,7 +1997,7 @@ async fn prepare_send_msg(
     // the state to OutPending.
     if msg.state != MessageState::OutPreparing {
         // automatically prepare normal messages
-        prepare_msg_common(context, chat_id, msg).await?;
+        prepare_msg_common(context, chat_id, msg, MessageState::OutPending).await?;
     } else {
         // update message state of separately prepared messages
         ensure!(
@@ -2146,6 +2226,75 @@ pub async fn marknoticed_chat(context: &Context, chat_id: ChatId) -> Result<()> 
     Ok(())
 }
 
+/// Marks messages preceding outgoing messages as noticed.
+///
+/// In a chat, if there is an outgoing message, it can be assumed that all previous
+/// messages were noticed. So, this function takes a Vec of messages that were
+/// just received, and for all the outgoing messages, it marks all
+/// previous messages as noticed.
+pub(crate) async fn mark_old_messages_as_noticed(
+    context: &Context,
+    mut msgs: Vec<ReceivedMsg>,
+) -> Result<()> {
+    msgs.retain(|m| m.state.is_outgoing());
+    if msgs.is_empty() {
+        return Ok(());
+    }
+
+    let mut msgs_by_chat: HashMap<ChatId, ReceivedMsg> = HashMap::new();
+    for msg in msgs {
+        let chat_id = msg.chat_id;
+        if let Some(existing_msg) = msgs_by_chat.get(&chat_id) {
+            if msg.sort_timestamp > existing_msg.sort_timestamp {
+                msgs_by_chat.insert(chat_id, msg);
+            }
+        } else {
+            msgs_by_chat.insert(chat_id, msg);
+        }
+    }
+
+    let changed_chats = context
+        .sql
+        .transaction(|transaction| {
+            let mut changed_chats = Vec::new();
+            for (_, msg) in msgs_by_chat {
+                let changed_rows = transaction.execute(
+                    "UPDATE msgs
+            SET state=?
+          WHERE state=?
+            AND hidden=0
+            AND chat_id=?
+            AND timestamp<=?;",
+                    paramsv![
+                        MessageState::InNoticed,
+                        MessageState::InFresh,
+                        msg.chat_id,
+                        msg.sort_timestamp
+                    ],
+                )?;
+                if changed_rows > 0 {
+                    changed_chats.push(msg.chat_id);
+                }
+            }
+            Ok(changed_chats)
+        })
+        .await?;
+
+    if !changed_chats.is_empty() {
+        info!(
+            context,
+            "Marking chats as noticed because there are newer outgoing messages: {:?}",
+            changed_chats
+        );
+    }
+
+    for c in changed_chats {
+        context.emit_event(EventType::MsgsNoticed(c));
+    }
+
+    Ok(())
+}
+
 pub async fn get_chat_media(
     context: &Context,
     chat_id: ChatId,
@@ -2267,7 +2416,6 @@ pub async fn create_group_chat(
     let chat_name = improve_single_line_input(chat_name);
     ensure!(!chat_name.is_empty(), "Invalid chat name");
 
-    let draft_txt = stock_str::new_group_draft(context, &chat_name).await;
     let grpid = dc_create_id();
 
     let row_id = context
@@ -2288,9 +2436,6 @@ pub async fn create_group_chat(
     let chat_id = ChatId::new(u32::try_from(row_id)?);
     if !is_contact_in_chat(context, chat_id, DC_CONTACT_ID_SELF).await? {
         add_to_chat_contacts_table(context, chat_id, DC_CONTACT_ID_SELF).await?;
-        let mut draft_msg = Message::new(Viewtype::Text);
-        draft_msg.set_text(Some(draft_txt));
-        chat_id.set_draft_raw(context, &mut draft_msg).await?;
     }
 
     context.emit_event(EventType::MsgsChanged {
@@ -2821,7 +2966,7 @@ pub async fn forward_msgs(context: &Context, msg_ids: &[MsgId], chat_id: ChatId)
             .query_map(
                 format!(
                     "SELECT id FROM msgs WHERE id IN({}) ORDER BY timestamp,id",
-                    msg_ids.iter().map(|_| "?").join(",")
+                    msg_ids.iter().map(|_| "?").collect::<Vec<&str>>().join(",")
                 ),
                 rusqlite::params_from_iter(msg_ids),
                 |row| row.get::<_, MsgId>(0),
@@ -2831,11 +2976,11 @@ pub async fn forward_msgs(context: &Context, msg_ids: &[MsgId], chat_id: ChatId)
 
         for id in ids {
             let src_msg_id: MsgId = id;
-            let msg = Message::load_from_db(context, src_msg_id).await;
-            if msg.is_err() {
-                break;
+            let mut msg = Message::load_from_db(context, src_msg_id).await?;
+            if msg.state == MessageState::OutDraft {
+                bail!("cannot forward drafts.");
             }
-            let mut msg = msg.unwrap();
+
             let original_param = msg.param.clone();
 
             // we tested a sort of broadcast
@@ -2851,15 +2996,17 @@ pub async fn forward_msgs(context: &Context, msg_ids: &[MsgId], chat_id: ChatId)
             msg.param.remove(Param::ForcePlaintext);
             msg.param.remove(Param::Cmd);
             msg.param.remove(Param::OverrideSenderDisplayname);
+            msg.in_reply_to = None;
 
             // do not leak data as group names; a default subject is generated by mimfactory
             msg.subject = "".to_string();
 
             let new_msg_id: MsgId;
             if msg.state == MessageState::OutPreparing {
-                let fresh9 = curr_timestamp;
+                new_msg_id = chat
+                    .prepare_msg_raw(context, &mut msg, None, curr_timestamp)
+                    .await?;
                 curr_timestamp += 1;
-                new_msg_id = chat.prepare_msg_raw(context, &mut msg, fresh9).await?;
                 let save_param = msg.param.clone();
                 msg.param = original_param;
                 msg.id = src_msg_id;
@@ -2876,9 +3023,10 @@ pub async fn forward_msgs(context: &Context, msg_ids: &[MsgId], chat_id: ChatId)
                 msg.param = save_param;
             } else {
                 msg.state = MessageState::OutPending;
-                let fresh10 = curr_timestamp;
+                new_msg_id = chat
+                    .prepare_msg_raw(context, &mut msg, None, curr_timestamp)
+                    .await?;
                 curr_timestamp += 1;
-                new_msg_id = chat.prepare_msg_raw(context, &mut msg, fresh10).await?;
                 if let Some(send_job) = job::send_msg_job(context, new_msg_id).await? {
                     job::add(context, send_job).await?;
                 }
@@ -3217,6 +3365,86 @@ mod tests {
     }
 
     #[async_std::test]
+    async fn test_delete_draft() -> Result<()> {
+        let t = TestContext::new_alice().await;
+        let chat_id = create_group_chat(&t, ProtectionStatus::Unprotected, "abc").await?;
+
+        let mut msg = Message::new(Viewtype::Text);
+        msg.set_text(Some("hi!".to_string()));
+        chat_id.set_draft(&t, Some(&mut msg)).await?;
+        assert!(chat_id.get_draft(&t).await?.is_some());
+
+        let mut msg = Message::new(Viewtype::Text);
+        msg.set_text(Some("another".to_string()));
+        chat_id.set_draft(&t, Some(&mut msg)).await?;
+        assert!(chat_id.get_draft(&t).await?.is_some());
+
+        chat_id.set_draft(&t, None).await?;
+        assert!(chat_id.get_draft(&t).await?.is_none());
+
+        Ok(())
+    }
+
+    #[async_std::test]
+    async fn test_forwarding_draft_failing() -> Result<()> {
+        let t = TestContext::new_alice().await;
+        let chat_id = &t.get_self_chat().await.id;
+        let mut msg = Message::new(Viewtype::Text);
+        msg.set_text(Some("hello".to_string()));
+        chat_id.set_draft(&t, Some(&mut msg)).await?;
+        assert_eq!(msg.id, chat_id.get_draft(&t).await?.unwrap().id);
+
+        let chat_id2 = create_group_chat(&t, ProtectionStatus::Unprotected, "foo").await?;
+        assert!(forward_msgs(&t, &[msg.id], chat_id2).await.is_err());
+        Ok(())
+    }
+
+    #[async_std::test]
+    async fn test_draft_stable_ids() -> Result<()> {
+        let t = TestContext::new_alice().await;
+        let chat_id = &t.get_self_chat().await.id;
+        let mut msg = Message::new(Viewtype::Text);
+        msg.set_text(Some("hello".to_string()));
+        assert_eq!(msg.id, MsgId::new_unset());
+        assert!(chat_id.get_draft_msg_id(&t).await?.is_none());
+
+        chat_id.set_draft(&t, Some(&mut msg)).await?;
+        let id_after_1st_set = msg.id;
+        assert_ne!(id_after_1st_set, MsgId::new_unset());
+        assert_eq!(
+            id_after_1st_set,
+            chat_id.get_draft_msg_id(&t).await?.unwrap()
+        );
+        assert_eq!(id_after_1st_set, chat_id.get_draft(&t).await?.unwrap().id);
+
+        msg.set_text(Some("hello2".to_string()));
+        chat_id.set_draft(&t, Some(&mut msg)).await?;
+        let id_after_2nd_set = msg.id;
+
+        assert_eq!(id_after_2nd_set, id_after_1st_set);
+        assert_eq!(
+            id_after_2nd_set,
+            chat_id.get_draft_msg_id(&t).await?.unwrap()
+        );
+        let test = chat_id.get_draft(&t).await?.unwrap();
+        assert_eq!(id_after_2nd_set, test.id);
+        assert_eq!(id_after_2nd_set, msg.id);
+        assert_eq!(test.text, Some("hello2".to_string()));
+        assert_eq!(test.state, MessageState::OutDraft);
+
+        let id_after_prepare = prepare_msg(&t, *chat_id, &mut msg).await?;
+        assert_eq!(id_after_prepare, id_after_1st_set);
+        let test = Message::load_from_db(&t, id_after_prepare).await?;
+        assert_eq!(test.state, MessageState::OutPreparing);
+        assert!(!test.hidden); // sent draft must no longer be hidden
+
+        let id_after_send = send_msg(&t, *chat_id, &mut msg).await?;
+        assert_eq!(id_after_send, id_after_1st_set);
+
+        Ok(())
+    }
+
+    #[async_std::test]
     async fn test_add_contact_to_chat_ex_add_self() {
         // Adding self to a contact should succeed, even though it's pointless.
         let t = TestContext::new().await;
@@ -3227,6 +3455,147 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(added, false);
+    }
+
+    #[async_std::test]
+    async fn test_modify_chat_multi_device() -> Result<()> {
+        let a1 = TestContext::new_alice().await;
+        let a2 = TestContext::new_alice().await;
+        a1.set_config_bool(Config::BccSelf, true).await?;
+
+        // create group and sync it to the second device
+        let a1_chat_id = create_group_chat(&a1, ProtectionStatus::Unprotected, "foo").await?;
+        send_text_msg(&a1, a1_chat_id, "ho!".to_string()).await?;
+        let a1_msg = a1.get_last_msg().await;
+        let a1_chat = Chat::load_from_db(&a1, a1_chat_id).await?;
+
+        a2.recv_msg(&a1.pop_sent_msg().await).await;
+        let a2_msg = a2.get_last_msg().await;
+        let a2_chat_id = a2_msg.chat_id;
+        let a2_chat = Chat::load_from_db(&a2, a2_chat_id).await?;
+
+        assert!(!a1_msg.is_system_message());
+        assert!(!a2_msg.is_system_message());
+        assert_eq!(a1_chat.grpid, a2_chat.grpid);
+        assert_eq!(a1_chat.name, "foo");
+        assert_eq!(a2_chat.name, "foo");
+        assert_eq!(a1_chat.get_profile_image(&a1).await?, None);
+        assert_eq!(a2_chat.get_profile_image(&a2).await?, None);
+        assert_eq!(get_chat_contacts(&a1, a1_chat_id).await?.len(), 1);
+        assert_eq!(get_chat_contacts(&a2, a2_chat_id).await?.len(), 1);
+
+        // add a member to the group
+        let bob = Contact::create(&a1, "", "bob@example.org").await?;
+        add_contact_to_chat(&a1, a1_chat_id, bob).await?;
+        let a1_msg = a1.get_last_msg().await;
+
+        a2.recv_msg(&a1.pop_sent_msg().await).await;
+        let a2_msg = a2.get_last_msg().await;
+
+        assert!(a1_msg.is_system_message());
+        assert!(a2_msg.is_system_message());
+        assert_eq!(a1_msg.get_info_type(), SystemMessage::MemberAddedToGroup);
+        assert_eq!(a2_msg.get_info_type(), SystemMessage::MemberAddedToGroup);
+        assert_eq!(get_chat_contacts(&a1, a1_chat_id).await?.len(), 2);
+        assert_eq!(get_chat_contacts(&a2, a2_chat_id).await?.len(), 2);
+
+        // rename the group
+        set_chat_name(&a1, a1_chat_id, "bar").await?;
+        let a1_msg = a1.get_last_msg().await;
+
+        a2.recv_msg(&a1.pop_sent_msg().await).await;
+        let a2_msg = a2.get_last_msg().await;
+
+        assert!(a1_msg.is_system_message());
+        assert!(a2_msg.is_system_message());
+        assert_eq!(a1_msg.get_info_type(), SystemMessage::GroupNameChanged);
+        assert_eq!(a2_msg.get_info_type(), SystemMessage::GroupNameChanged);
+        assert_eq!(Chat::load_from_db(&a1, a1_chat_id).await?.name, "bar");
+        assert_eq!(Chat::load_from_db(&a2, a2_chat_id).await?.name, "bar");
+
+        // remove member from group
+        remove_contact_from_chat(&a1, a1_chat_id, bob).await?;
+        let a1_msg = a1.get_last_msg().await;
+
+        a2.recv_msg(&a1.pop_sent_msg().await).await;
+        let a2_msg = a2.get_last_msg().await;
+
+        assert!(a1_msg.is_system_message());
+        assert!(a2_msg.is_system_message());
+        assert_eq!(
+            a1_msg.get_info_type(),
+            SystemMessage::MemberRemovedFromGroup
+        );
+        assert_eq!(
+            a2_msg.get_info_type(),
+            SystemMessage::MemberRemovedFromGroup
+        );
+        assert_eq!(get_chat_contacts(&a1, a1_chat_id).await?.len(), 1);
+        assert_eq!(get_chat_contacts(&a2, a2_chat_id).await?.len(), 1);
+
+        Ok(())
+    }
+
+    #[async_std::test]
+    async fn test_modify_chat_disordered() -> Result<()> {
+        // Alice creates a group with Bob, Claire and Daisy and then removes Claire and Daisy
+        // (sleep() is needed as otherwise smeared time from Alice looks to Bob like messages from the future which are all set to "now" then)
+        let alice = TestContext::new_alice().await;
+
+        let bob_id = Contact::create(&alice, "", "bob@example.net").await?;
+        let claire_id = Contact::create(&alice, "", "claire@foo.de").await?;
+        let daisy_id = Contact::create(&alice, "", "daisy@bar.de").await?;
+
+        let alice_chat_id = create_group_chat(&alice, ProtectionStatus::Unprotected, "foo").await?;
+        send_text_msg(&alice, alice_chat_id, "populate".to_string()).await?;
+
+        add_contact_to_chat(&alice, alice_chat_id, bob_id).await?;
+        async_std::task::sleep(std::time::Duration::from_millis(1100)).await;
+        let add1 = alice.pop_sent_msg().await;
+
+        add_contact_to_chat(&alice, alice_chat_id, claire_id).await?;
+        let add2 = alice.pop_sent_msg().await;
+        async_std::task::sleep(std::time::Duration::from_millis(1100)).await;
+
+        add_contact_to_chat(&alice, alice_chat_id, daisy_id).await?;
+        let add3 = alice.pop_sent_msg().await;
+        async_std::task::sleep(std::time::Duration::from_millis(1100)).await;
+
+        assert_eq!(get_chat_contacts(&alice, alice_chat_id).await?.len(), 4);
+
+        remove_contact_from_chat(&alice, alice_chat_id, claire_id).await?;
+        let remove1 = alice.pop_sent_msg().await;
+        async_std::task::sleep(std::time::Duration::from_millis(1100)).await;
+
+        remove_contact_from_chat(&alice, alice_chat_id, daisy_id).await?;
+        let remove2 = alice.pop_sent_msg().await;
+        async_std::task::sleep(std::time::Duration::from_millis(1100)).await;
+
+        assert_eq!(get_chat_contacts(&alice, alice_chat_id).await?.len(), 2);
+
+        // Bob receives the add and deletion messages out of order
+        let bob = TestContext::new_bob().await;
+        bob.recv_msg(&add1).await;
+        async_std::task::sleep(std::time::Duration::from_millis(1100)).await;
+
+        bob.recv_msg(&add3).await;
+        async_std::task::sleep(std::time::Duration::from_millis(1100)).await;
+
+        bob.recv_msg(&add2).await;
+        async_std::task::sleep(std::time::Duration::from_millis(1100)).await;
+
+        let bob_chat_id = bob.get_last_msg().await.chat_id;
+        assert_eq!(get_chat_contacts(&bob, bob_chat_id).await?.len(), 4);
+
+        bob.recv_msg(&remove2).await;
+        async_std::task::sleep(std::time::Duration::from_millis(1100)).await;
+
+        bob.recv_msg(&remove1).await;
+        async_std::task::sleep(std::time::Duration::from_millis(1100)).await;
+
+        assert_eq!(get_chat_contacts(&bob, bob_chat_id).await?.len(), 2);
+
+        Ok(())
     }
 
     #[async_std::test]
@@ -3998,7 +4367,7 @@ mod tests {
         dc_receive_imf(
             &t,
             b"From: bob@example.org\n\
-                 To: alice@example.com\n\
+                 To: alice@example.org\n\
                  Message-ID: <1@example.org>\n\
                  Chat-Version: 1.0\n\
                  Date: Fri, 23 Apr 2021 10:00:57 +0000\n\
@@ -4047,7 +4416,7 @@ mod tests {
         dc_receive_imf(
             &t,
             b"From: bob@example.org\n\
-                 To: alice@example.com\n\
+                 To: alice@example.org\n\
                  Message-ID: <1@example.org>\n\
                  Chat-Version: 1.0\n\
                  Date: Sun, 22 Mar 2021 19:37:57 +0000\n\
@@ -4096,7 +4465,7 @@ mod tests {
         dc_receive_imf(
             &t,
             b"From: bob@example.org\n\
-                 To: alice@example.com\n\
+                 To: alice@example.org\n\
                  Message-ID: <2@example.org>\n\
                  Chat-Version: 1.0\n\
                  Date: Sun, 22 Mar 2021 19:37:57 +0000\n\
@@ -4145,7 +4514,7 @@ mod tests {
         dc_receive_imf(
             &alice,
             b"From: bob@example.org\n\
-                 To: alice@example.com\n\
+                 To: alice@example.org\n\
                  Message-ID: <1@example.org>\n\
                  Date: Sun, 22 Mar 2021 19:37:57 +0000\n\
                  \n\
@@ -4293,6 +4662,98 @@ mod tests {
         let msg = alice.get_last_msg().await;
         assert!(msg.get_text().unwrap() == "Hi Bob");
         assert!(msg.is_forwarded());
+        Ok(())
+    }
+
+    #[async_std::test]
+    async fn test_forward_quote() -> Result<()> {
+        let alice = TestContext::new_alice().await;
+        let bob = TestContext::new_bob().await;
+        let alice_chat = alice.create_chat(&bob).await;
+        let bob_chat = bob.create_chat(&alice).await;
+
+        // Alice sends a message to Bob.
+        let sent_msg = alice.send_text(alice_chat.id, "Hi Bob").await;
+        bob.recv_msg(&sent_msg).await;
+        let received_msg = bob.get_last_msg().await;
+
+        // Bob quotes received message and sends a reply to Alice.
+        let mut reply = Message::new(Viewtype::Text);
+        reply.set_text(Some("Reply".to_owned()));
+        reply.set_quote(&bob, &received_msg).await?;
+        let sent_reply = bob.send_msg(bob_chat.id, &mut reply).await;
+        alice.recv_msg(&sent_reply).await;
+        let received_reply = alice.get_last_msg().await;
+
+        // Alice forwards a reply.
+        forward_msgs(&alice, &[received_reply.id], alice_chat.get_id()).await?;
+        let forwarded_msg = alice.pop_sent_msg().await;
+        bob.recv_msg(&forwarded_msg).await;
+
+        let alice_forwarded_msg = alice.get_last_msg().await;
+        assert!(alice_forwarded_msg.quoted_message(&alice).await?.is_none());
+        assert_eq!(
+            alice_forwarded_msg.quoted_text(),
+            Some("Hi Bob".to_string())
+        );
+
+        let bob_forwarded_msg = bob.get_last_msg().await;
+        assert!(bob_forwarded_msg.quoted_message(&bob).await?.is_none());
+        assert_eq!(bob_forwarded_msg.quoted_text(), Some("Hi Bob".to_string()));
+
+        Ok(())
+    }
+
+    #[async_std::test]
+    async fn test_forward_group() -> Result<()> {
+        let alice = TestContext::new_alice().await;
+        let bob = TestContext::new_bob().await;
+
+        let alice_chat = alice.create_chat(&bob).await;
+        let bob_chat = bob.create_chat(&alice).await;
+
+        // Alice creates a group with Bob.
+        let alice_group_chat_id =
+            create_group_chat(&alice, ProtectionStatus::Unprotected, "Group").await?;
+        let bob_id = Contact::create(&alice, "Bob", "bob@example.net").await?;
+        let claire_id = Contact::create(&alice, "Claire", "claire@example.net").await?;
+        add_contact_to_chat(&alice, alice_group_chat_id, bob_id).await?;
+        add_contact_to_chat(&alice, alice_group_chat_id, claire_id).await?;
+        let sent_group_msg = alice
+            .send_text(alice_group_chat_id, "Hi Bob and Claire")
+            .await;
+        bob.recv_msg(&sent_group_msg).await;
+        let bob_group_chat_id = bob.get_last_msg().await.chat_id;
+
+        // Alice deletes a message on her device.
+        // This is needed to make assignment of further messages received in this group
+        // based on `References:` header harder.
+        // Previously this exposed a bug, so this is a regression test.
+        message::delete_msgs(&alice, &[sent_group_msg.sender_msg_id]).await?;
+
+        // Alice sends a message to Bob.
+        let sent_msg = alice.send_text(alice_chat.id, "Hi Bob").await;
+        bob.recv_msg(&sent_msg).await;
+        let received_msg = bob.get_last_msg().await;
+        assert_eq!(received_msg.get_text(), Some("Hi Bob".to_string()));
+        assert_eq!(received_msg.chat_id, bob_chat.id);
+
+        // Alice sends another message to Bob, this has first message as a parent.
+        let sent_msg = alice.send_text(alice_chat.id, "Hello Bob").await;
+        bob.recv_msg(&sent_msg).await;
+        let received_msg = bob.get_last_msg().await;
+        assert_eq!(received_msg.get_text(), Some("Hello Bob".to_string()));
+        assert_eq!(received_msg.chat_id, bob_chat.id);
+
+        // Bob forwards message to a group chat with Alice.
+        forward_msgs(&bob, &[received_msg.id], bob_group_chat_id).await?;
+        let forwarded_msg = bob.pop_sent_msg().await;
+        alice.recv_msg(&forwarded_msg).await;
+
+        let received_forwarded_msg = alice.get_last_msg_in(alice_group_chat_id).await;
+        assert!(received_forwarded_msg.is_forwarded());
+        assert_eq!(received_forwarded_msg.chat_id, alice_group_chat_id);
+
         Ok(())
     }
 

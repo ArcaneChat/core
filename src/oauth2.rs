@@ -41,6 +41,7 @@ struct Oauth2 {
 
 /// OAuth 2 Access Token Response
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct Response {
     // Should always be there according to: <https://www.oauth.com/oauth2-servers/access-tokens/access-token-response/>
     // but previous code handled its abscense.
@@ -58,7 +59,7 @@ pub async fn dc_get_oauth2_url(
     redirect_uri: &str,
 ) -> Result<Option<String>> {
     let socks5_enabled = context.get_config_bool(Config::Socks5Enabled).await?;
-    if let Some(oauth2) = Oauth2::from_address(addr, socks5_enabled).await {
+    if let Some(oauth2) = Oauth2::from_address(context, addr, socks5_enabled).await {
         context
             .sql
             .set_raw_config("oauth2_pending_redirect_uri", Some(redirect_uri))
@@ -79,7 +80,7 @@ pub async fn dc_get_oauth2_access_token(
     regenerate: bool,
 ) -> Result<Option<String>> {
     let socks5_enabled = context.get_config_bool(Config::Socks5Enabled).await?;
-    if let Some(oauth2) = Oauth2::from_address(addr, socks5_enabled).await {
+    if let Some(oauth2) = Oauth2::from_address(context, addr, socks5_enabled).await {
         let lock = context.oauth2_mutex.lock().await;
 
         // read generated token
@@ -225,7 +226,7 @@ pub async fn dc_get_oauth2_addr(
     code: &str,
 ) -> Result<Option<String>> {
     let socks5_enabled = context.get_config_bool(Config::Socks5Enabled).await?;
-    let oauth2 = match Oauth2::from_address(addr, socks5_enabled).await {
+    let oauth2 = match Oauth2::from_address(context, addr, socks5_enabled).await {
         Some(o) => o,
         None => return Ok(None),
     };
@@ -253,13 +254,13 @@ pub async fn dc_get_oauth2_addr(
 }
 
 impl Oauth2 {
-    async fn from_address(addr: &str, skip_mx: bool) -> Option<Self> {
+    async fn from_address(context: &Context, addr: &str, skip_mx: bool) -> Option<Self> {
         let addr_normalized = normalize_addr(addr);
         if let Some(domain) = addr_normalized
             .find('@')
             .map(|index| addr_normalized.split_at(index + 1).1)
         {
-            if let Some(oauth2_authorizer) = provider::get_provider_info(domain, skip_mx)
+            if let Some(oauth2_authorizer) = provider::get_provider_info(context, domain, skip_mx)
                 .await
                 .and_then(|provider| provider.oauth2_authorizer.as_ref())
             {
@@ -356,31 +357,38 @@ mod tests {
 
     #[async_std::test]
     async fn test_oauth_from_address() {
+        let t = TestContext::new().await;
         assert_eq!(
-            Oauth2::from_address("hello@gmail.com", false).await,
+            Oauth2::from_address(&t, "hello@gmail.com", false).await,
             Some(OAUTH2_GMAIL)
         );
         assert_eq!(
-            Oauth2::from_address("hello@googlemail.com", false).await,
+            Oauth2::from_address(&t, "hello@googlemail.com", false).await,
             Some(OAUTH2_GMAIL)
         );
         assert_eq!(
-            Oauth2::from_address("hello@yandex.com", false).await,
+            Oauth2::from_address(&t, "hello@yandex.com", false).await,
             Some(OAUTH2_YANDEX)
         );
         assert_eq!(
-            Oauth2::from_address("hello@yandex.ru", false).await,
+            Oauth2::from_address(&t, "hello@yandex.ru", false).await,
             Some(OAUTH2_YANDEX)
         );
-
-        assert_eq!(Oauth2::from_address("hello@web.de", false).await, None);
+        assert_eq!(Oauth2::from_address(&t, "hello@web.de", false).await, None);
     }
 
     #[async_std::test]
     async fn test_oauth_from_mx() {
+        // youtube staff seems to use "google workspace with oauth2", figures this out by MX lookup
+        let t = TestContext::new().await;
         assert_eq!(
-            Oauth2::from_address("hello@google.com", false).await,
+            Oauth2::from_address(&t, "hello@youtube.com", false).await,
             Some(OAUTH2_GMAIL)
+        );
+        // without MX lookup, we would not know as youtube.com is not in our provider-db
+        assert_eq!(
+            Oauth2::from_address(&t, "hello@youtube.com", true).await,
+            None
         );
     }
 

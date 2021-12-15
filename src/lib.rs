@@ -12,7 +12,8 @@
 #![allow(
     clippy::match_bool,
     clippy::eval_order_dependence,
-    clippy::bool_assert_comparison
+    clippy::bool_assert_comparison,
+    clippy::manual_split_once
 )]
 
 #[macro_use]
@@ -77,6 +78,7 @@ pub mod peerstate;
 pub mod pgp;
 pub mod provider;
 pub mod qr;
+pub mod qr_code_generator;
 pub mod quota;
 pub mod securejoin;
 mod simplify;

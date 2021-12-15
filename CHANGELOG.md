@@ -1,5 +1,58 @@
 # Changelog
 
+## 1.70.0
+
+### Fixes
+- fix: do not abort Param parsing on unknown keys #2856
+- fix: execute `Chat-Group-Member-Removed:` even when arriving disordered #2857
+
+
+## 1.69.0
+
+### Fixes
+- fix group-related system messages in multi-device setups #2848
+- fix "Google Workspace" (former "G Suite") issues related to bad resolvers #2852
+
+
+## 1.68.0
+
+### Fixes
+- fix chat assignment when forwarding #2843
+- fix layout issues with the generated QR code svg #2842
+
+
+## 1.67.0
+
+### API changes
+- `dc_get_securejoin_qr_svg(chat_id)` added #2815
+- added stock-strings `DC_STR_SETUP_CONTACT_QR_DESC` and `DC_STR_SECURE_JOIN_GROUP_QR_DESC`
+
+
+## 1.66.0
+
+### API changes
+- `dc_contact_get_last_seen()` added #2823
+- python: `Contact.last_seen` added #2823
+- removed `DC_STR_NEWGROUPDRAFT`, we don't set draft after creating group anymore #2805
+
+### Changes
+- python: add cutil.from_optional_dc_charpointer() #2824
+- refactorings #2807 #2822 #2825
+
+
+## 1.65.0
+
+### Changes
+- python: add mypy support and some type hints #2809
+
+### Fixes
+- do not disable ephemeral timer when downloading a message partially #2811
+- apply existing ephemeral timer also to partially downloaded messages;
+  after full download, the ephemeral timer starts over #2811
+- replace user-visible error on verification failure with warning;
+  the error is logged to the corresponding chat anyway #2808
+
+
 ## 1.64.0
 
 ### Fixes
@@ -50,10 +103,10 @@
 ## 1.61.0
 
 ### API Changes
-- download-on-demand added: `dc_msg_get_download_status()`, `dc_download_full_msg()`
+- download-on-demand added: `dc_msg_get_download_state()`, `dc_download_full_msg()`
   and `download_limit` config option #2631 #2696
 - `dc_create_broadcast_list()` and chat type `DC_CHAT_TYPE_BROADCAST` added #2707 #2722
-- allow ui-specific configs: `dc_set_ui_config()` and `dc_get_ui_config()` #2672
+- allow ui-specific configs using `ui.`-prefix in key (`dc_set_config(context, "ui.*", value)`) #2672
 - new strings from `DC_STR_PARTIAL_DOWNLOAD_MSG_BODY`
   to `DC_STR_PART_OF_TOTAL_USED` #2631 #2694 #2707 #2723
 - emit warnings and errors from account manager with account-id 0 #2712

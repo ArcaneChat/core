@@ -25,6 +25,7 @@ use std::time::{Duration, SystemTime};
 use anyhow::Context as _;
 use async_std::sync::RwLock;
 use async_std::task::{block_on, spawn};
+use deltachat::qr_code_generator::get_securejoin_qr_svg;
 use num_traits::{FromPrimitive, ToPrimitive};
 
 use deltachat::chat::{ChatId, ChatVisibility, MuteDuration, ProtectionStatus};
@@ -62,7 +63,7 @@ pub type dc_context_t = Context;
 
 #[no_mangle]
 pub unsafe extern "C" fn dc_context_new(
-    os_name: *const libc::c_char,
+    _os_name: *const libc::c_char,
     dbfile: *const libc::c_char,
     blobdir: *const libc::c_char,
 ) -> *mut dc_context_t {
@@ -73,21 +74,11 @@ pub unsafe extern "C" fn dc_context_new(
         return ptr::null_mut();
     }
 
-    let os_name = if os_name.is_null() {
-        String::from("DcFFI")
-    } else {
-        to_string_lossy(os_name)
-    };
-
     let ctx = if blobdir.is_null() || *blobdir == 0 {
         use rand::Rng;
         // generate random ID as this functionality is not yet available on the C-api.
         let id = rand::thread_rng().gen();
-        block_on(Context::new(
-            os_name,
-            as_path(dbfile).to_path_buf().into(),
-            id,
-        ))
+        block_on(Context::new(as_path(dbfile).to_path_buf().into(), id))
     } else {
         eprintln!("blobdir can not be defined explicitly anymore");
         return ptr::null_mut();
@@ -641,8 +632,8 @@ pub unsafe extern "C" fn dc_preconfigure_keypair(
     let ctx = &*context;
     block_on(async move {
         let addr = dc_tools::EmailAddress::new(&to_string_lossy(addr))?;
-        let public = key::SignedPublicKey::from_base64(&to_string_lossy(public_data))?;
-        let secret = key::SignedSecretKey::from_base64(&to_string_lossy(secret_data))?;
+        let public = key::SignedPublicKey::from_asc(&to_string_lossy(public_data))?.0;
+        let secret = key::SignedSecretKey::from_asc(&to_string_lossy(secret_data))?.0;
         let keypair = key::KeyPair {
             addr,
             public,
@@ -2076,6 +2067,27 @@ pub unsafe extern "C" fn dc_get_securejoin_qr(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn dc_get_securejoin_qr_svg(
+    context: *mut dc_context_t,
+    chat_id: u32,
+) -> *mut libc::c_char {
+    if context.is_null() {
+        eprintln!("ignoring careless call to generate_verification_qr()");
+        return "".strdup();
+    }
+    let ctx = &*context;
+    let chat_id = if chat_id == 0 {
+        None
+    } else {
+        Some(ChatId::new(chat_id))
+    };
+
+    block_on(get_securejoin_qr_svg(ctx, chat_id))
+        .unwrap_or_else(|_| "".to_string())
+        .strdup()
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn dc_join_securejoin(
     context: *mut dc_context_t,
     qr: *const libc::c_char,
@@ -3413,6 +3425,16 @@ pub unsafe extern "C" fn dc_msg_get_quoted_msg(msg: *const dc_msg_t) -> *mut dc_
     }
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn dc_msg_force_plaintext(msg: *mut dc_msg_t) {
+    if msg.is_null() {
+        eprintln!("ignoring careless call to dc_msg_force_plaintext()");
+        return;
+    }
+    let ffi_msg = &mut *msg;
+    ffi_msg.message.force_plaintext();
+}
+
 // dc_contact_t
 
 /// FFI struct for [dc_contact_t]
@@ -3542,6 +3564,16 @@ pub unsafe extern "C" fn dc_contact_get_status(contact: *mut dc_contact_t) -> *m
     }
     let ffi_contact = &*contact;
     ffi_contact.contact.get_status().strdup()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_contact_get_last_seen(contact: *mut dc_contact_t) -> i64 {
+    if contact.is_null() {
+        eprintln!("ignoring careless call to dc_contact_get_last_seen()");
+        return 0;
+    }
+    let ffi_contact = &*contact;
+    ffi_contact.contact.last_seen()
 }
 
 #[no_mangle]
@@ -3721,7 +3753,11 @@ pub unsafe extern "C" fn dc_provider_new_from_email(
 
     match socks5_enabled {
         Ok(socks5_enabled) => {
-            match block_on(provider::get_provider_info(addr.as_str(), socks5_enabled)) {
+            match block_on(provider::get_provider_info(
+                ctx,
+                addr.as_str(),
+                socks5_enabled,
+            )) {
                 Some(provider) => provider,
                 None => ptr::null_mut(),
             }
@@ -3803,7 +3839,7 @@ pub type dc_accounts_t = AccountsWrapper;
 
 #[no_mangle]
 pub unsafe extern "C" fn dc_accounts_new(
-    os_name: *const libc::c_char,
+    _os_name: *const libc::c_char,
     dbfile: *const libc::c_char,
 ) -> *mut dc_accounts_t {
     setup_panic!();
@@ -3813,13 +3849,7 @@ pub unsafe extern "C" fn dc_accounts_new(
         return ptr::null_mut();
     }
 
-    let os_name = if os_name.is_null() {
-        String::from("DcFFI")
-    } else {
-        to_string_lossy(os_name)
-    };
-
-    let accs = block_on(Accounts::new(os_name, as_path(dbfile).to_path_buf().into()));
+    let accs = block_on(Accounts::new(as_path(dbfile).to_path_buf().into()));
 
     match accs {
         Ok(accs) => Box::into_raw(Box::new(AccountsWrapper::new(accs))),
