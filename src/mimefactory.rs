@@ -348,15 +348,13 @@ impl<'a> MimeFactory<'a> {
         }
     }
 
-    async fn should_skip_autocrypt(&self, context: &Context) -> bool {
+    fn should_skip_autocrypt(&self) -> bool {
         match &self.loaded {
             Loaded::Message { .. } => self
                 .msg
                 .param
                 .get_bool(Param::SkipAutocrypt)
-                .unwrap_or_default()
-		|| (!context.get_config_bool(Config::E2eeEnabled).await.unwrap_or_default()
-		    && !self.msg.param.get_bool(Param::GuaranteeE2ee).unwrap_or_default()),
+                .unwrap_or_default(),
             Loaded::Mdn { .. } => true,
         }
     }
@@ -547,21 +545,9 @@ impl<'a> MimeFactory<'a> {
         let min_verified = self.min_verified();
         let grpimage = self.grpimage();
         let force_plaintext = self.should_force_plaintext(context).await;
-        let skip_autocrypt = self.should_skip_autocrypt(context).await;
-        let subject_str = self.subject_str(context).await?;
+        let skip_autocrypt = self.should_skip_autocrypt();
         let e2ee_guaranteed = self.is_e2ee_guaranteed();
         let encrypt_helper = EncryptHelper::new(context).await?;
-
-        let encoded_subject = if subject_str
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == ' ')
-        // We do not use needs_encoding() here because needs_encoding() returns true if the string contains a space
-        // but we do not want to encode all subjects just because they contain a space.
-        {
-            subject_str.clone()
-        } else {
-            encode_words(&subject_str)
-        };
 
         if !skip_autocrypt {
             // unless determined otherwise we add the Autocrypt header
@@ -569,9 +555,6 @@ impl<'a> MimeFactory<'a> {
             headers
                 .unprotected
                 .push(Header::new("Autocrypt".into(), aheader));
-            headers
-                .protected
-                .push(Header::new("Subject".into(), encoded_subject));
         }
 
         let rfc724_mid = match self.loaded {
