@@ -546,6 +546,7 @@ impl<'a> MimeFactory<'a> {
         let grpimage = self.grpimage();
         let force_plaintext = self.should_force_plaintext(context).await;
         let skip_autocrypt = self.should_skip_autocrypt();
+        let subject_str = self.subject_str(context).await?;
         let e2ee_guaranteed = self.is_e2ee_guaranteed();
         let encrypt_helper = EncryptHelper::new(context).await?;
 
