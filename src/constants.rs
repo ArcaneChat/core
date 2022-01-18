@@ -295,6 +295,9 @@ pub enum Viewtype {
 
     /// Message is an invitation to a videochat.
     VideochatInvitation = 70,
+
+    /// Message is an webxdc instance.
+    Webxdc = 80,
 }
 
 impl Default for Viewtype {
@@ -339,6 +342,7 @@ mod tests {
             Viewtype::VideochatInvitation,
             Viewtype::from_i32(70).unwrap()
         );
+        assert_eq!(Viewtype::Webxdc, Viewtype::from_i32(80).unwrap());
     }
 
     #[test]

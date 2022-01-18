@@ -15,7 +15,7 @@ use crate::blob::BlobObject;
 use crate::constants::{Viewtype, DC_DESIRED_TEXT_LEN, DC_ELLIPSIS};
 use crate::contact::addr_normalize;
 use crate::context::Context;
-use crate::dc_tools::{dc_get_filemeta, dc_truncate};
+use crate::dc_tools::{dc_get_filemeta, dc_truncate, parse_receive_headers};
 use crate::dehtml::dehtml;
 use crate::e2ee;
 use crate::events::EventType;
@@ -47,6 +47,7 @@ pub struct MimeMessage {
     /// Addresses are normalized and lowercased:
     pub recipients: Vec<SingleInfo>,
     pub from: Vec<SingleInfo>,
+    pub list_post: Option<String>,
     pub chat_disposition_notification_to: Option<SingleInfo>,
     pub decrypting_failed: bool,
 
@@ -65,6 +66,7 @@ pub struct MimeMessage {
     pub location_kml: Option<location::Kml>,
     pub message_kml: Option<location::Kml>,
     pub(crate) sync_items: Option<SyncItems>,
+    pub(crate) webxdc_status_update: Option<String>,
     pub(crate) user_avatar: Option<AvatarAction>,
     pub(crate) group_avatar: Option<AvatarAction>,
     pub(crate) mdn_reports: Vec<Report>,
@@ -82,6 +84,8 @@ pub struct MimeMessage {
     /// This is non-empty only if the message was actually encrypted.  It is used
     /// for e.g. late-parsing HTML.
     pub decoded_data: Vec<u8>,
+
+    pub(crate) hop_info: String,
 }
 
 #[derive(Debug, PartialEq)]
@@ -132,6 +136,10 @@ pub enum SystemMessage {
     /// Self-sent-message that contains only json used for multi-device-sync;
     /// if possible, we attach that to other messages as for locations.
     MultiDeviceSync = 20,
+
+    // Sync message that contains a json payload
+    // sent to the other webxdc instances
+    WebxdcStatusUpdate = 30,
 }
 
 impl Default for SystemMessage {
@@ -163,10 +171,12 @@ impl MimeMessage {
             .get_header_value(HeaderDef::Date)
             .and_then(|v| mailparse::dateparse(&v).ok())
             .unwrap_or_default();
+        let hop_info = parse_receive_headers(&mail.get_headers());
 
         let mut headers = Default::default();
         let mut recipients = Default::default();
         let mut from = Default::default();
+        let mut list_post = Default::default();
         let mut chat_disposition_notification_to = None;
 
         // Parse IMF headers.
@@ -175,6 +185,7 @@ impl MimeMessage {
             &mut headers,
             &mut recipients,
             &mut from,
+            &mut list_post,
             &mut chat_disposition_notification_to,
             &mail.headers,
         );
@@ -248,6 +259,7 @@ impl MimeMessage {
                             &mut headers,
                             &mut recipients,
                             &mut throwaway_from,
+                            &mut list_post,
                             &mut chat_disposition_notification_to,
                             &decrypted_mail.headers,
                         );
@@ -275,6 +287,7 @@ impl MimeMessage {
             parts: Vec::new(),
             header: headers,
             recipients,
+            list_post,
             from,
             chat_disposition_notification_to,
             decrypting_failed: false,
@@ -288,12 +301,14 @@ impl MimeMessage {
             location_kml: None,
             message_kml: None,
             sync_items: None,
+            webxdc_status_update: None,
             user_avatar: None,
             group_avatar: None,
             failure_report: None,
             footer: None,
             is_mime_modified: false,
             decoded_data: Vec::new(),
+            hop_info,
         };
 
         match partial {
@@ -529,7 +544,7 @@ impl MimeMessage {
             };
 
             if let Some(ref subject) = self.get_subject() {
-                if !self.has_chat_version() {
+                if !self.has_chat_version() && self.webxdc_status_update.is_none() {
                     part.msg = subject.to_string();
                 }
             }
@@ -828,6 +843,12 @@ impl MimeMessage {
                                     .await?;
                             }
                         }
+                        Some("status-update") => {
+                            if let Some(second) = mail.subparts.get(1) {
+                                self.add_single_part_if_known(context, second, is_related)
+                                    .await?;
+                            }
+                        }
                         Some(_) => {
                             if let Some(first) = mail.subparts.get(0) {
                                 any_part_added = self
@@ -997,8 +1018,13 @@ impl MimeMessage {
         if decoded_data.is_empty() {
             return;
         }
-        // treat location/message kml file attachments specially
-        if filename.ends_with(".kml") {
+        let msg_type = if context
+            .is_webxdc_file(filename, decoded_data)
+            .await
+            .unwrap_or(false)
+        {
+            Viewtype::Webxdc
+        } else if filename.ends_with(".kml") {
             // XXX what if somebody sends eg an "location-highlights.kml"
             // attachment unrelated to location streaming?
             if filename.starts_with("location") || filename.starts_with("message") {
@@ -1014,6 +1040,7 @@ impl MimeMessage {
                 }
                 return;
             }
+            msg_type
         } else if filename == "multi-device-sync.json" {
             let serialized = String::from_utf8_lossy(decoded_data)
                 .parse()
@@ -1026,7 +1053,15 @@ impl MimeMessage {
                 })
                 .ok();
             return;
-        }
+        } else if filename == "status-update.json" {
+            let serialized = String::from_utf8_lossy(decoded_data)
+                .parse()
+                .unwrap_or_default();
+            self.webxdc_status_update = Some(serialized);
+            return;
+        } else {
+            msg_type
+        };
 
         /* we have a regular file attachment,
         write decoded data to new blob object */
@@ -1092,11 +1127,11 @@ impl MimeMessage {
         }
     }
 
-    pub fn repl_msg_by_error(&mut self, error_msg: impl AsRef<str>) {
+    pub fn repl_msg_by_error(&mut self, error_msg: &str) {
         self.is_system_message = SystemMessage::Unknown;
         if let Some(part) = self.parts.first_mut() {
             part.typ = Viewtype::Text;
-            part.msg = format!("[{}]", error_msg.as_ref());
+            part.msg = format!("[{}]", error_msg);
             self.parts.truncate(1);
         }
     }
@@ -1112,6 +1147,7 @@ impl MimeMessage {
         headers: &mut HashMap<String, String>,
         recipients: &mut Vec<SingleInfo>,
         from: &mut Vec<SingleInfo>,
+        list_post: &mut Option<String>,
         chat_disposition_notification_to: &mut Option<SingleInfo>,
         fields: &[mailparse::MailHeader<'_>],
     ) {
@@ -1141,6 +1177,10 @@ impl MimeMessage {
         let from_new = get_from(fields);
         if !from_new.is_empty() {
             *from = from_new;
+        }
+        let list_post_new = get_list_post(fields);
+        if list_post_new.is_some() {
+            *list_post = list_post_new;
         }
     }
 
@@ -1628,6 +1668,14 @@ pub(crate) fn get_recipients(headers: &[MailHeader]) -> Vec<SingleInfo> {
 /// Returned addresses are normalized and lowercased.
 pub(crate) fn get_from(headers: &[MailHeader]) -> Vec<SingleInfo> {
     get_all_addresses_from_header(headers, |header_key| header_key == "from")
+}
+
+/// Returned addresses are normalized and lowercased.
+pub(crate) fn get_list_post(headers: &[MailHeader]) -> Option<String> {
+    get_all_addresses_from_header(headers, |header_key| header_key == "list-post")
+        .into_iter()
+        .next()
+        .map(|s| s.addr)
 }
 
 fn get_all_addresses_from_header<F>(headers: &[MailHeader], pred: F) -> Vec<SingleInfo>
@@ -2851,7 +2899,6 @@ On 2020-10-25, Bob wrote:
             &t.ctx,
             include_bytes!("../test-data/message/subj_with_multimedia_msg.eml"),
             "INBOX",
-            1,
             false,
         )
         .await
@@ -3000,7 +3047,7 @@ Subject: ...
 
 Some quote.
 "###;
-        dc_receive_imf(&t, raw, "INBOX", 1, false).await?;
+        dc_receive_imf(&t, raw, "INBOX", false).await?;
 
         // Delta Chat generates In-Reply-To with a starting tab when Message-ID is too long.
         let raw = br###"In-Reply-To:
@@ -3017,7 +3064,7 @@ Subject: ...
 Some reply
 "###;
 
-        dc_receive_imf(&t, raw, "INBOX", 2, false).await?;
+        dc_receive_imf(&t, raw, "INBOX", false).await?;
 
         let msg = t.get_last_msg().await;
         assert_eq!(msg.get_text().unwrap(), "Some reply");
@@ -3045,13 +3092,13 @@ Message.
 "###;
 
         // Bob receives message.
-        dc_receive_imf(&bob, raw, "INBOX", 1, false).await?;
+        dc_receive_imf(&bob, raw, "INBOX", false).await?;
         let msg = bob.get_last_msg().await;
         // Message is incoming.
         assert!(msg.param.get_bool(Param::WantsMdn).unwrap());
 
         // Alice receives copy-to-self.
-        dc_receive_imf(&alice, raw, "INBOX", 1, false).await?;
+        dc_receive_imf(&alice, raw, "INBOX", false).await?;
         let msg = alice.get_last_msg().await;
         // Message is outgoing, don't send read receipt to self.
         assert!(msg.param.get_bool(Param::WantsMdn).is_none());
@@ -3078,7 +3125,6 @@ Message.
                  hello\n"
                 .as_bytes(),
             "INBOX",
-            1,
             false,
         )
         .await?;
@@ -3117,7 +3163,6 @@ Message.
                  --SNIPP--"
             .as_bytes(),
             "INBOX",
-            2,
             false,
         )
         .await?;

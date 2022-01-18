@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use anyhow::{bail, format_err, Result};
+use anyhow::{bail, format_err, Context as _, Result};
 use mailparse::ParsedMail;
 use num_traits::FromPrimitive;
 
@@ -121,9 +121,9 @@ impl EncryptHelper {
             .into_iter()
             .filter_map(|(state, addr)| state.map(|s| (s, addr)))
         {
-            let key = peerstate.take_key(min_verified).ok_or_else(|| {
-                format_err!("proper enc-key for {} missing, cannot encrypt", addr)
-            })?;
+            let key = peerstate
+                .take_key(min_verified)
+                .with_context(|| format!("proper enc-key for {} missing, cannot encrypt", addr))?;
             keyring.add(key);
         }
         keyring.add(self.public_key.clone());
@@ -390,12 +390,10 @@ pub async fn ensure_secret_key_exists(context: &Context) -> Result<String> {
     let self_addr = context
         .get_config(Config::ConfiguredAddr)
         .await?
-        .ok_or_else(|| {
-            format_err!(concat!(
-                "Failed to get self address, ",
-                "cannot ensure secret key if not configured."
-            ))
-        })?;
+        .context(concat!(
+            "Failed to get self address, ",
+            "cannot ensure secret key if not configured."
+        ))?;
     SignedPublicKey::load_self(context).await?;
     Ok(self_addr)
 }
@@ -416,9 +414,11 @@ mod tests {
 
         #[async_std::test]
         async fn test_prexisting() {
-            let t = TestContext::new().await;
-            let test_addr = t.configure_alice().await;
-            assert_eq!(ensure_secret_key_exists(&t).await.unwrap(), test_addr);
+            let t = TestContext::new_alice().await;
+            assert_eq!(
+                ensure_secret_key_exists(&t).await.unwrap(),
+                "alice@example.org"
+            );
         }
 
         #[async_std::test]

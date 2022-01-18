@@ -110,8 +110,8 @@ pub enum Param {
     /// For Jobs
     AlsoMove = b'M',
 
-    /// For Jobs: space-separated list of message recipients
-    Recipients = b'R',
+    /// For MDN-sending job
+    MsgId = b'I',
 
     /// For Groups
     ///
@@ -136,8 +136,17 @@ pub enum Param {
     /// For Chats
     Devicetalk = b'D',
 
-    /// For MDN-sending job
-    MsgId = b'I',
+    /// For Chats: If this is a mailing list chat, contains the List-Post address.
+    /// None if there simply is no `List-Post` header in the mailing list.
+    /// Some("") if the mailing list is using multiple different List-Post headers.
+    ///
+    /// The List-Post address is the email address where the user can write to in order to
+    /// post something to the mailing list.
+    ListPost = b'p',
+
+    /// For Contacts: If this is the List-Post address of a mailing list, contains
+    /// the List-Id of the mailing list (which is also used as the group id of the chat).
+    ListId = b's',
 
     /// For Contacts: timestamp of status (aka signature or footer) update.
     StatusTimestamp = b'j',
@@ -159,6 +168,12 @@ pub enum Param {
 
     /// For Chats: timestamp of protection settings update.
     ProtectionSettingsTimestamp = b'L',
+
+    /// For Webxdc Message Instances: Current summary
+    WebxdcSummary = b'N',
+
+    /// For Webxdc Message Instances: timestamp of summary update.
+    WebxdcSummaryTimestamp = b'Q',
 }
 
 /// An object for handling key=value parameter lists.

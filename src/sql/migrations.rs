@@ -1,6 +1,6 @@
 //! Migrations module.
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 
 use crate::config::Config;
 use crate::constants::ShowEmails;
@@ -19,7 +19,11 @@ pub async fn run(context: &Context, sql: &Sql) -> Result<(bool, bool, bool, bool
     let mut exists_before_update = false;
     let mut dbversion_before_update = DBVERSION;
 
-    if !sql.table_exists("config").await? {
+    if !sql
+        .table_exists("config")
+        .await
+        .context("failed to check if config table exists")?
+    {
         info!(context, "First time init: creating tables",);
         sql.transaction(move |transaction| {
             transaction.execute_batch(TABLES)?;
@@ -497,6 +501,84 @@ item TEXT DEFAULT '');"#,
         )
         .await?;
     }
+    if dbversion < 81 {
+        info!(context, "[migration] v81");
+        sql.execute_migration("ALTER TABLE msgs ADD COLUMN hop_info TEXT;", 81)
+            .await?;
+    }
+    if dbversion < 82 {
+        info!(context, "[migration] v82");
+        sql.execute_migration(
+            r#"CREATE TABLE imap (
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+rfc724_mid TEXT DEFAULT '', -- Message-ID header
+folder TEXT DEFAULT '', -- IMAP folder
+target TEXT DEFAULT '', -- Destination folder, empty to delete.
+uid INTEGER DEFAULT 0, -- UID
+uidvalidity INTEGER DEFAULT 0,
+UNIQUE (folder, uid, uidvalidity)
+);
+CREATE INDEX imap_folder ON imap(folder);
+CREATE INDEX imap_messageid ON imap(rfc724_mid);
+
+INSERT INTO imap
+(rfc724_mid, folder, target, uid, uidvalidity)
+SELECT
+rfc724_mid,
+server_folder AS folder,
+server_folder AS target,
+server_uid AS uid,
+(SELECT uidvalidity FROM imap_sync WHERE folder=server_folder) AS uidvalidity
+FROM msgs
+WHERE server_uid>0
+ON CONFLICT (folder, uid, uidvalidity)
+DO UPDATE SET rfc724_mid=excluded.rfc724_mid,
+              target=excluded.target;
+"#,
+            82,
+        )
+        .await?;
+    }
+    if dbversion < 83 {
+        info!(context, "[migration] v83");
+        sql.execute_migration(
+            "ALTER TABLE imap_sync
+             ADD COLUMN modseq -- Highest modification sequence
+             INTEGER DEFAULT 0",
+            83,
+        )
+        .await?;
+    }
+    if dbversion < 84 {
+        info!(context, "[migration] v84");
+        sql.execute_migration(
+            r#"CREATE TABLE msgs_status_updates (
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+msg_id INTEGER,
+update_item TEXT DEFAULT '',
+update_item_read INTEGER DEFAULT 0);
+CREATE INDEX msgs_status_updates_index1 ON msgs_status_updates (msg_id);"#,
+            84,
+        )
+        .await?;
+    }
+    if dbversion < 85 {
+        info!(context, "[migration] v85");
+        sql.execute_migration(
+            r#"CREATE TABLE smtp (
+id INTEGER PRIMARY KEY,
+rfc724_mid TEXT NOT NULL,          -- Message-ID
+mime TEXT NOT NULL,                -- SMTP payload
+msg_id INTEGER NOT NULL,           -- ID of the message in `msgs` table
+recipients TEXT NOT NULL,          -- List of recipients separated by space
+retries INTEGER NOT NULL DEFAULT 0 -- Number of failed attempts to send the messsage
+);
+CREATE INDEX smtp_messageid ON imap(rfc724_mid);
+"#,
+            85,
+        )
+        .await?;
+    }
 
     Ok((
         recalc_fingerprints,
@@ -524,7 +606,8 @@ impl Sql {
 
             Ok(())
         })
-        .await?;
+        .await
+        .with_context(|| format!("execute_migration failed for version {}", version))?;
 
         Ok(())
     }

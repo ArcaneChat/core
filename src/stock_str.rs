@@ -53,9 +53,6 @@ pub enum StockMessage {
     #[strum(props(fallback = "File"))]
     File = 12,
 
-    #[strum(props(fallback = "Sent with my Delta Chat Messenger: https://delta.chat"))]
-    StatusLine = 13,
-
     #[strum(props(fallback = "Group name changed from \"%1$s\" to \"%2$s\"."))]
     MsgGrpName = 15,
 
@@ -453,11 +450,6 @@ pub(crate) async fn audio(context: &Context) -> String {
 /// Stock string: `File`.
 pub(crate) async fn file(context: &Context) -> String {
     translated(context, StockMessage::File).await
-}
-
-/// Stock string: `Sent with my Delta Chat Messenger: https://delta.chat`.
-pub(crate) async fn status_line(context: &Context) -> String {
-    translated(context, StockMessage::StatusLine).await
 }
 
 /// Stock string: `Group name changed from "%1$s" to "%2$s".`.
@@ -1288,11 +1280,13 @@ mod tests {
         let chats = Chatlist::try_load(&t, 0, None, None).await.unwrap();
         assert_eq!(chats.len(), 2);
 
-        let chat0 = Chat::load_from_db(&t, chats.get_chat_id(0)).await.unwrap();
+        let chat0 = Chat::load_from_db(&t, chats.get_chat_id(0).unwrap())
+            .await
+            .unwrap();
         let (self_talk_id, device_chat_id) = if chat0.is_self_talk() {
-            (chats.get_chat_id(0), chats.get_chat_id(1))
+            (chats.get_chat_id(0).unwrap(), chats.get_chat_id(1).unwrap())
         } else {
-            (chats.get_chat_id(1), chats.get_chat_id(0))
+            (chats.get_chat_id(1).unwrap(), chats.get_chat_id(0).unwrap())
         };
 
         // delete self-talk first; this adds a message to device-chat about how self-talk can be restored

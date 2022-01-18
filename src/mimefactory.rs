@@ -2,7 +2,7 @@
 
 use std::convert::TryInto;
 
-use anyhow::{bail, ensure, format_err, Result};
+use anyhow::{bail, ensure, Context as _, Result};
 use chrono::TimeZone;
 use lettre_email::{mime, Address, Header, MimeMultipartType, PartBuilder};
 
@@ -81,7 +81,7 @@ pub struct MimeFactory<'a> {
 /// Result of rendering a message, ready to be submitted to a send job.
 #[derive(Debug, Clone)]
 pub struct RenderedEmail {
-    pub message: Vec<u8>,
+    pub message: String,
     // pub envelope: Envelope,
     pub is_encrypted: bool,
     pub is_gossiped: bool,
@@ -154,6 +154,12 @@ impl<'a> MimeFactory<'a> {
 
         if chat.is_self_talk() {
             recipients.push((from_displayname.to_string(), from_addr.to_string()));
+        } else if chat.is_mailing_list() {
+            let list_post = chat
+                .param
+                .get(Param::ListPost)
+                .context("Can't write to mailinglist without ListPost param")?;
+            recipients.push(("".to_string(), list_post.to_string()));
         } else {
             context
                 .sql
@@ -201,7 +207,6 @@ impl<'a> MimeFactory<'a> {
             )
             .await?;
 
-        let default_str = stock_str::status_line(context).await;
         let factory = MimeFactory {
             from_addr,
             from_displayname,
@@ -209,7 +214,7 @@ impl<'a> MimeFactory<'a> {
             selfstatus: context
                 .get_config(Config::Selfstatus)
                 .await?
-                .unwrap_or(default_str),
+                .unwrap_or_default(),
             recipients,
             timestamp: msg.timestamp_sort,
             loaded: Loaded::Message { chat },
@@ -240,11 +245,10 @@ impl<'a> MimeFactory<'a> {
             .get_config(Config::Displayname)
             .await?
             .unwrap_or_default();
-        let default_str = stock_str::status_line(context).await;
         let selfstatus = context
             .get_config(Config::Selfstatus)
             .await?
-            .unwrap_or(default_str);
+            .unwrap_or_default();
         let timestamp = dc_create_smeared_timestamp(context).await;
 
         let res = MimeFactory::<'a> {
@@ -277,7 +281,7 @@ impl<'a> MimeFactory<'a> {
         let self_addr = context
             .get_config(Config::ConfiguredAddr)
             .await?
-            .ok_or_else(|| format_err!("Not configured"))?;
+            .context("not configured")?;
 
         let mut res = Vec::new();
         for (_, addr) in self
@@ -616,6 +620,11 @@ impl<'a> MimeFactory<'a> {
                     "Content-Type".to_string(),
                     "multipart/report; report-type=multi-device-sync".to_string(),
                 ))
+            } else if self.msg.param.get_cmd() == SystemMessage::WebxdcStatusUpdate {
+                PartBuilder::new().header((
+                    "Content-Type".to_string(),
+                    "multipart/report; report-type=status-update".to_string(),
+                ))
             } else {
                 PartBuilder::new().message_type(MimeMultipartType::Mixed)
             };
@@ -740,7 +749,7 @@ impl<'a> MimeFactory<'a> {
         } = self;
 
         Ok(RenderedEmail {
-            message: outer_message.build().as_string().into_bytes(),
+            message: outer_message.build().as_string(),
             // envelope: Envelope::new,
             is_encrypted,
             is_gossiped,
@@ -890,7 +899,9 @@ impl<'a> MimeFactory<'a> {
                     "ephemeral-timer-changed".to_string(),
                 ));
             }
-            SystemMessage::LocationOnly | SystemMessage::MultiDeviceSync => {
+            SystemMessage::LocationOnly
+            | SystemMessage::MultiDeviceSync
+            | SystemMessage::WebxdcStatusUpdate => {
                 // This should prevent automatic replies,
                 // such as non-delivery reports.
                 //
@@ -1127,6 +1138,16 @@ impl<'a> MimeFactory<'a> {
             let ids = self.msg.param.get(Param::Arg2).unwrap_or_default();
             parts.push(context.build_sync_part(json.to_string()).await);
             self.sync_ids_to_delete = Some(ids.to_string());
+        } else if command == SystemMessage::WebxdcStatusUpdate {
+            let json = self.msg.param.get(Param::Arg).unwrap_or_default();
+            parts.push(context.build_status_update_part(json).await);
+        } else if self.msg.viewtype == Viewtype::Webxdc {
+            if let Some(json) = context
+                .render_webxdc_status_update_object(self.msg.id, None)
+                .await?
+            {
+                parts.push(context.build_status_update_part(&json).await);
+            }
         }
 
         if self.attach_selfavatar {
@@ -1258,7 +1279,7 @@ async fn build_body_file(
         .param
         .get_blob(Param::File, context, true)
         .await?
-        .ok_or_else(|| format_err!("msg has no filename"))?;
+        .context("msg has no filename")?;
     let suffix = blob.suffix().unwrap_or("dat");
 
     // Get file name to use for sending.  For privacy purposes, we do
@@ -1286,8 +1307,7 @@ async fn build_body_file(
             "video_{}.{}",
             chrono::Utc
                 .timestamp(msg.timestamp_sort, 0)
-                .format("%Y-%m-%d_%H-%M-%S")
-                .to_string(),
+                .format("%Y-%m-%d_%H-%M-%S"),
             &suffix
         ),
         _ => blob.as_file_name().to_string(),
@@ -1616,7 +1636,6 @@ mod tests {
             \n\
             hello\n",
             "INBOX",
-            1,
             false,
         )
         .await
@@ -1662,7 +1681,7 @@ mod tests {
             let mut new_msg = Message::new(Viewtype::Text);
             new_msg.set_text(Some("Hi".to_string()));
             if let Some(q) = quote {
-                new_msg.set_quote(t, q).await?;
+                new_msg.set_quote(t, Some(q)).await?;
             }
             let sent = t.send_msg(group_id, &mut new_msg).await;
             get_subject(t, sent).await
@@ -1710,7 +1729,6 @@ mod tests {
             )
             .as_bytes(),
             "INBOX",
-            5,
             false,
         )
         .await?;
@@ -1822,7 +1840,6 @@ mod tests {
                     \n\
                     Some other, completely unrelated content\n",
                 "INBOX",
-                2,
                 false,
             )
             .await
@@ -1833,7 +1850,7 @@ mod tests {
         }
 
         if reply {
-            new_msg.set_quote(&t, &incoming_msg).await.unwrap();
+            new_msg.set_quote(&t, Some(&incoming_msg)).await.unwrap();
         }
 
         let mf = MimeFactory::from_msg(&t, &new_msg, false).await.unwrap();
@@ -1847,13 +1864,13 @@ mod tests {
             .await
             .unwrap();
 
-        dc_receive_imf(context, imf_raw, "INBOX", 1, false)
+        dc_receive_imf(context, imf_raw, "INBOX", false)
             .await
             .unwrap();
 
         let chats = Chatlist::try_load(context, 0, None, None).await.unwrap();
 
-        let chat_id = chats.get_chat_id(0);
+        let chat_id = chats.get_chat_id(0).unwrap();
         chat_id.accept(context).await.unwrap();
 
         let mut new_msg = Message::new(Viewtype::Text);
@@ -1893,7 +1910,7 @@ mod tests {
 
         let rendered_msg = mimefactory.render(context).await.unwrap();
 
-        let mail = mailparse::parse_mail(&rendered_msg.message).unwrap();
+        let mail = mailparse::parse_mail(rendered_msg.message.as_bytes()).unwrap();
         assert_eq!(
             mail.headers
                 .iter()
@@ -1903,7 +1920,7 @@ mod tests {
             "1.0"
         );
 
-        let _mime_msg = MimeMessage::from_bytes(context, &rendered_msg.message)
+        let _mime_msg = MimeMessage::from_bytes(context, rendered_msg.message.as_bytes())
             .await
             .unwrap();
     }
@@ -1977,8 +1994,9 @@ mod tests {
         let mut msg = Message::new(Viewtype::Text);
         msg.set_text(Some("this is the text!".to_string()));
 
-        let payload = t.send_msg(chat.id, &mut msg).await.payload();
-        let mut payload = payload.splitn(3, "\r\n\r\n");
+        let sent_msg = t.send_msg(chat.id, &mut msg).await;
+        let mut payload = sent_msg.payload().splitn(3, "\r\n\r\n");
+
         let outer = payload.next().unwrap();
         let inner = payload.next().unwrap();
         let body = payload.next().unwrap();
@@ -1996,8 +2014,8 @@ mod tests {
 
         // if another message is sent, that one must not contain the avatar
         // and no artificial multipart/mixed nesting
-        let payload = t.send_msg(chat.id, &mut msg).await.payload();
-        let mut payload = payload.splitn(2, "\r\n\r\n");
+        let sent_msg = t.send_msg(chat.id, &mut msg).await;
+        let mut payload = sent_msg.payload().splitn(2, "\r\n\r\n");
         let outer = payload.next().unwrap();
         let body = payload.next().unwrap();
 
@@ -2036,11 +2054,11 @@ mod tests {
         let to = parsed
             .headers
             .get_first_header("To")
-            .ok_or_else(|| format_err!("No To: header parsed"))?;
+            .context("no To: header parsed")?;
         let to = addrparse_header(to)?;
         let mailbox = to
             .extract_single_info()
-            .ok_or_else(|| format_err!("To: field does not contain exactly one address"))?;
+            .context("to: field does not contain exactly one address")?;
         assert_eq!(mailbox.addr, "bob@example.net");
 
         Ok(())

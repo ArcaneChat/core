@@ -87,6 +87,7 @@ pub mod stock_str;
 mod sync;
 mod token;
 mod update_helper;
+pub mod webxdc;
 #[macro_use]
 mod dehtml;
 mod color;

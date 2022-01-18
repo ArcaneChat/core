@@ -10,7 +10,7 @@ use async_std::prelude::*;
 use super::{get_folder_meaning, get_folder_meaning_by_name};
 
 impl Imap {
-    pub async fn scan_folders(&mut self, context: &Context) -> Result<()> {
+    pub(crate) async fn scan_folders(&mut self, context: &Context) -> Result<()> {
         // First of all, debounce to once per minute:
         let mut last_scan = context.last_full_folder_scan.lock().await;
         if let Some(last_scan) = *last_scan {
@@ -29,7 +29,7 @@ impl Imap {
         let session = self.session.as_mut();
         let session = session.context("scan_folders(): IMAP No Connection established")?;
         let folders: Vec<_> = session.list(Some(""), Some("*")).await?.collect().await;
-        let watched_folders = get_watched_folders(context).await;
+        let watched_folders = get_watched_folders(context).await?;
 
         let mut folder_configs = BTreeMap::new();
 
@@ -71,15 +71,15 @@ impl Imap {
             // Don't scan folders that are watched anyway
             if !watched_folders.contains(&folder.name().to_string()) && !is_drafts {
                 // Drain leftover unsolicited EXISTS messages
-                self.server_sent_unsolicited_exists(context);
+                self.server_sent_unsolicited_exists(context)?;
 
                 loop {
-                    self.fetch_new_messages(context, folder.name(), false)
+                    self.fetch_move_delete(context, folder.name())
                         .await
                         .ok_or_log_msg(context, "Can't fetch new msgs in scanned folder");
 
                     // If the server sent an unsocicited EXISTS during the fetch, we need to fetch again
-                    if !self.server_sent_unsolicited_exists(context) {
+                    if !self.server_sent_unsolicited_exists(context)? {
                         break;
                     }
                 }
@@ -102,19 +102,21 @@ impl Imap {
     }
 }
 
-pub(crate) async fn get_watched_folders(context: &Context) -> Vec<String> {
+pub(crate) async fn get_watched_folders(context: &Context) -> Result<Vec<String>> {
     let mut res = Vec::new();
+    if let Some(inbox_folder) = context.get_config(Config::ConfiguredInboxFolder).await? {
+        res.push(inbox_folder);
+    }
     let folder_watched_configured = &[
         (Config::SentboxWatch, Config::ConfiguredSentboxFolder),
-        (Config::MvboxWatch, Config::ConfiguredMvboxFolder),
-        (Config::InboxWatch, Config::ConfiguredInboxFolder),
+        (Config::MvboxMove, Config::ConfiguredMvboxFolder),
     ];
     for (watched, configured) in folder_watched_configured {
-        if context.get_config_bool(*watched).await.unwrap_or_default() {
-            if let Ok(Some(folder)) = context.get_config(*configured).await {
+        if context.get_config_bool(*watched).await? {
+            if let Some(folder) = context.get_config(*configured).await? {
                 res.push(folder);
             }
         }
     }
-    res
+    Ok(res)
 }

@@ -101,7 +101,7 @@ async fn reset_tables(context: &Context, bits: i32) {
 async fn poke_eml_file(context: &Context, filename: impl AsRef<Path>) -> Result<()> {
     let data = dc_read_file(context, filename).await?;
 
-    if let Err(err) = dc_receive_imf(context, &data, "import", 0, false).await {
+    if let Err(err) = dc_receive_imf(context, &data, "import", false).await {
         println!("dc_receive_imf errored: {:?}", err);
     }
     Ok(())
@@ -387,6 +387,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
                  sendfile <file> [<text>]\n\
                  sendhtml <file for html-part> [<text for plain-part>]\n\
                  sendsyncmsg\n\
+                 sendupdate <msg-id> <json status update>\n\
                  videochat\n\
                  draft [<text>]\n\
                  devicemsg <text>\n\
@@ -563,7 +564,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
                 );
 
                 for i in (0..cnt).rev() {
-                    let chat = Chat::load_from_db(&context, chatlist.get_chat_id(i)).await?;
+                    let chat = Chat::load_from_db(&context, chatlist.get_chat_id(i)?).await?;
                     println!(
                         "{}#{}: {} [{} fresh] {}{}{}{}",
                         chat_prefix(&chat),
@@ -907,6 +908,16 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             Some(msg_id) => println!("sync message sent as {}.", msg_id),
             None => println!("sync message not needed."),
         },
+        "sendupdate" => {
+            ensure!(
+                !arg1.is_empty() && !arg2.is_empty(),
+                "Arguments <msg-id> <json status update> expected"
+            );
+            let msg_id = MsgId::new(arg1.parse()?);
+            context
+                .send_webxdc_status_update(msg_id, arg2, "this is a webxdc status update")
+                .await?;
+        }
         "videochat" => {
             ensure!(sel_chat.is_some(), "No chat selected.");
             chat::send_videochat_invitation(&context, sel_chat.as_ref().unwrap().get_id()).await?;
@@ -1142,7 +1153,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
                     if 0 != i {
                         res += ", ";
                     }
-                    let chat = Chat::load_from_db(&context, chatlist.get_chat_id(i)).await?;
+                    let chat = Chat::load_from_db(&context, chatlist.get_chat_id(i)?).await?;
                     res += &format!("{}#{}", chat_prefix(&chat), chat.get_id());
                 }
             }

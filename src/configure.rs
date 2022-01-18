@@ -443,8 +443,7 @@ async fn configure(ctx: &Context, param: &mut LoginParam) -> Result<()> {
 
     progress!(ctx, 900);
 
-    let create_mvbox = ctx.get_config_bool(Config::MvboxWatch).await?
-        || ctx.get_config_bool(Config::MvboxMove).await?;
+    let create_mvbox = ctx.get_config_bool(Config::MvboxMove).await?;
 
     imap.configure_folders(ctx, create_mvbox).await?;
 
@@ -455,11 +454,8 @@ async fn configure(ctx: &Context, param: &mut LoginParam) -> Result<()> {
     drop(imap);
 
     progress!(ctx, 910);
-    // configuration success - write back the configured parameters with the
-    // "configured_" prefix; also write the "configured"-flag */
     // the trailing underscore is correct
     param.save_to_database(ctx, "configured_").await?;
-    ctx.sql.set_raw_config_bool("configured", true).await?;
     ctx.set_config(Config::ConfiguredTimestamp, Some(&time().to_string()))
         .await?;
 
@@ -476,6 +472,8 @@ async fn configure(ctx: &Context, param: &mut LoginParam) -> Result<()> {
 
     progress!(ctx, 940);
     update_device_chats_handle.await?;
+
+    ctx.sql.set_raw_config_bool("configured", true).await?;
 
     Ok(())
 }

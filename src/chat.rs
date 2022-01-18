@@ -5,7 +5,7 @@ use std::convert::{TryFrom, TryInto};
 use std::str::FromStr;
 use std::time::{Duration, SystemTime};
 
-use anyhow::{bail, ensure, format_err, Context as _, Result};
+use anyhow::{bail, ensure, Context as _, Result};
 use async_std::path::{Path, PathBuf};
 use deltachat_derive::{FromSql, ToSql};
 use serde::{Deserialize, Serialize};
@@ -25,18 +25,23 @@ use crate::context::Context;
 use crate::dc_receive_imf::ReceivedMsg;
 use crate::dc_tools::{
     dc_create_id, dc_create_outgoing_rfc724_mid, dc_create_smeared_timestamp,
-    dc_create_smeared_timestamps, dc_get_abs_path, dc_gm2local_offset, improve_single_line_input,
-    time, IsNoneOrEmpty,
+    dc_create_smeared_timestamps, dc_get_abs_path, dc_get_filebytes, dc_gm2local_offset,
+    improve_single_line_input, time, IsNoneOrEmpty,
 };
 use crate::ephemeral::{delete_expired_messages, schedule_ephemeral_task, Timer as EphemeralTimer};
 use crate::events::EventType;
 use crate::html::new_html_mimepart;
 use crate::job::{self, Action};
+use crate::location;
 use crate::message::{self, Message, MessageState, MsgId};
+use crate::mimefactory::MimeFactory;
 use crate::mimeparser::SystemMessage;
 use crate::param::{Param, Params};
 use crate::peerstate::{Peerstate, PeerstateVerifiedStatus};
+use crate::scheduler::InterruptInfo;
+use crate::smtp::send_msg_to_smtp;
 use crate::stock_str;
+use crate::webxdc::{WEBXDC_SENDING_LIMIT, WEBXDC_SUFFIX};
 
 /// An chat item, such as a message or a marker.
 #[derive(Debug, Copy, Clone)]
@@ -221,31 +226,30 @@ impl ChatId {
     pub(crate) async fn create_multiuser_record(
         context: &Context,
         chattype: Chattype,
-        grpid: impl AsRef<str>,
-        grpname: impl AsRef<str>,
+        grpid: &str,
+        grpname: &str,
         create_blocked: Blocked,
         create_protected: ProtectionStatus,
+        param: Option<String>,
     ) -> Result<Self> {
         let row_id =
             context.sql.insert(
-                "INSERT INTO chats (type, name, grpid, blocked, created_timestamp, protected) VALUES(?, ?, ?, ?, ?, ?);",
+                "INSERT INTO chats (type, name, grpid, blocked, created_timestamp, protected, param) VALUES(?, ?, ?, ?, ?, ?, ?);",
                 paramsv![
                     chattype,
-                    grpname.as_ref(),
-                    grpid.as_ref(),
+                    grpname,
+                    grpid,
                     create_blocked,
                     dc_create_smeared_timestamp(context).await,
                     create_protected,
+                    param.unwrap_or_default(),
                 ],
             ).await?;
 
         let chat_id = ChatId::new(u32::try_from(row_id)?);
         info!(
             context,
-            "Created group/mailinglist '{}' grpid={} as {}",
-            grpname.as_ref(),
-            grpid.as_ref(),
-            chat_id
+            "Created group/mailinglist '{}' grpid={} as {}", grpname, grpid, chat_id
         );
 
         Ok(chat_id)
@@ -436,7 +440,7 @@ impl ChatId {
             add_info_msg_with_cmd(
                 context,
                 self,
-                msg_text,
+                &msg_text,
                 cmd,
                 dc_create_smeared_timestamp(context).await,
             )
@@ -621,7 +625,10 @@ impl ChatId {
     /// Returns `true`, if message was deleted, `false` otherwise.
     async fn maybe_delete_draft(self, context: &Context) -> Result<bool> {
         match self.get_draft_msg_id(context).await? {
-            Some(msg_id) => Ok(msg_id.delete_from_db(context).await.is_ok()),
+            Some(msg_id) => {
+                msg_id.delete_from_db(context).await?;
+                Ok(true)
+            }
             None => Ok(false),
         }
     }
@@ -641,8 +648,11 @@ impl ChatId {
                     .param
                     .get_blob(Param::File, context, !msg.is_increation())
                     .await?
-                    .ok_or_else(|| format_err!("No file stored in params"))?;
+                    .context("no file stored in params")?;
                 msg.param.set(Param::File, blob.as_name());
+                if blob.suffix() == Some(WEBXDC_SUFFIX) {
+                    msg.viewtype = Viewtype::Webxdc;
+                }
             }
         }
 
@@ -1061,11 +1071,12 @@ impl Chat {
 
     /// Returns true if user can send messages to this chat.
     pub async fn can_send(&self, context: &Context) -> Result<bool> {
-        Ok(!self.id.is_special()
-            && !self.is_device_talk()
-            && !self.is_mailing_list()
-            && !self.is_contact_request()
-            && self.is_self_in_chat(context).await?)
+        let cannot_send = self.id.is_special()
+            || self.is_device_talk()
+            || self.is_contact_request()
+            || (self.is_mailing_list() && self.param.get(Param::ListPost).is_none_or_empty())
+            || !self.is_self_in_chat(context).await?;
+        Ok(!cannot_send)
     }
 
     /// Checks if the user is part of a chat
@@ -1276,7 +1287,7 @@ impl Chat {
             msg.param.set_int(Param::AttachGroupImage, 1);
             self.param.remove(Param::Unpromoted);
             self.update_param(context).await?;
-            // send_sync_msg() is called (usually) a moment later at Job::send_msg_to_smtp()
+            // send_sync_msg() is called (usually) a moment later at send_msg_to_smtp()
             // when the group-creation message is actually sent though SMTP -
             // this makes sure, the other devices are aware of grpid that is used in the sync-message.
             context.sync_qr_code_tokens(Some(self.id)).await?;
@@ -1793,6 +1804,7 @@ pub(crate) fn msgtype_has_file(msgtype: Viewtype) -> bool {
         Viewtype::Video => true,
         Viewtype::File => true,
         Viewtype::VideochatInvitation => false,
+        Viewtype::Webxdc => true,
     }
 }
 
@@ -1804,9 +1816,7 @@ async fn prepare_msg_blob(context: &Context, msg: &mut Message) -> Result<()> {
             .param
             .get_blob(Param::File, context, !msg.is_increation())
             .await?
-            .ok_or_else(|| {
-                format_err!("Attachment missing for message of type #{}", msg.viewtype)
-            })?;
+            .with_context(|| format!("attachment missing for message of type #{}", msg.viewtype))?;
 
         if msg.viewtype == Viewtype::Image {
             if let Err(e) = blob.recode_to_image_size(context).await {
@@ -1835,6 +1845,25 @@ async fn prepare_msg_blob(context: &Context, msg: &mut Message) -> Result<()> {
                 msg.param.set(Param::MimeType, mime);
             }
         }
+
+        if msg.viewtype == Viewtype::Webxdc {
+            if blob.suffix() != Some(WEBXDC_SUFFIX) {
+                bail!(
+                    "webxdc message {} does not have suffix {}",
+                    blob,
+                    WEBXDC_SUFFIX
+                );
+            } else if dc_get_filebytes(context, blob.to_abs_path()).await
+                > WEBXDC_SENDING_LIMIT as u64
+            {
+                bail!(
+                    "webxdc message {} exceeds acceptable size of {} bytes",
+                    blob.as_name(),
+                    WEBXDC_SENDING_LIMIT
+                );
+            }
+        }
+
         info!(
             context,
             "Attaching \"{}\" for message type #{}.",
@@ -1938,41 +1967,25 @@ pub async fn send_msg(context: &Context, chat_id: ChatId, msg: &mut Message) -> 
 
 /// Tries to send a message synchronously.
 ///
-/// Directly  opens an smtp
-/// connection and sends the message, bypassing the job system. If this fails, it writes a send job to
-/// the database.
+/// Creates a new message in `smtp` table, then drectly opens an SMTP connection and sends the
+/// message. If this fails, the message remains in the database to be sent later.
 pub async fn send_msg_sync(context: &Context, chat_id: ChatId, msg: &mut Message) -> Result<MsgId> {
-    if let Some(mut job) = prepare_send_msg(context, chat_id, msg).await? {
+    if let Some(rowid) = prepare_send_msg(context, chat_id, msg).await? {
         let mut smtp = crate::smtp::Smtp::new();
+        send_msg_to_smtp(context, &mut smtp, rowid)
+            .await
+            .context("failed to send message, queued for later sending")?;
 
-        let status = job.send_msg_to_smtp(context, &mut smtp).await;
-
-        match status {
-            job::Status::Finished(Ok(_)) => {
-                context.emit_event(EventType::MsgsChanged {
-                    chat_id: msg.chat_id,
-                    msg_id: msg.id,
-                });
-
-                Ok(msg.id)
-            }
-            _ => {
-                job.save(context).await?;
-                Err(format_err!(
-                    "failed to send message, queued for later sending"
-                ))
-            }
-        }
-    } else {
-        // Nothing to do
-        Ok(msg.id)
+        context.emit_event(EventType::MsgsChanged {
+            chat_id: msg.chat_id,
+            msg_id: msg.id,
+        });
     }
+    Ok(msg.id)
 }
 
 async fn send_msg_inner(context: &Context, chat_id: ChatId, msg: &mut Message) -> Result<MsgId> {
-    if let Some(send_job) = prepare_send_msg(context, chat_id, msg).await? {
-        job::add(context, send_job).await?;
-
+    if prepare_send_msg(context, chat_id, msg).await?.is_some() {
         context.emit_event(EventType::MsgsChanged {
             chat_id: msg.chat_id,
             msg_id: msg.id,
@@ -1981,16 +1994,19 @@ async fn send_msg_inner(context: &Context, chat_id: ChatId, msg: &mut Message) -
         if msg.param.exists(Param::SetLatitude) {
             context.emit_event(EventType::LocationChanged(Some(DC_CONTACT_ID_SELF)));
         }
+
+        context.interrupt_smtp(InterruptInfo::new(false)).await;
     }
 
     Ok(msg.id)
 }
 
+/// Returns rowid from `smtp` table.
 async fn prepare_send_msg(
     context: &Context,
     chat_id: ChatId,
     msg: &mut Message,
-) -> Result<Option<crate::job::Job>> {
+) -> Result<Option<i64>> {
     // dc_prepare_msg() leaves the message state to OutPreparing, we
     // only have to change the state to OutPending in this case.
     // Otherwise we still have to prepare the message, which will set
@@ -2004,11 +2020,145 @@ async fn prepare_send_msg(
             chat_id.is_unset() || chat_id == msg.chat_id,
             "Inconsistent chat ID"
         );
-        message::update_msg_state(context, msg.id, MessageState::OutPending).await;
+        message::update_msg_state(context, msg.id, MessageState::OutPending).await?;
     }
-    let job = job::send_msg_job(context, msg.id).await?;
+    let row_id = create_send_msg_job(context, msg.id).await?;
+    Ok(row_id)
+}
 
-    Ok(job)
+/// Constructs a job for sending a message and inserts into `smtp` table.
+///
+/// Returns rowid if job was created or `None` if SMTP job is not needed, e.g. when sending to a
+/// group with only self and no BCC-to-self configured.
+///
+/// The caller has to interrupt SMTP loop or otherwise process a new row.
+async fn create_send_msg_job(context: &Context, msg_id: MsgId) -> Result<Option<i64>> {
+    let mut msg = Message::load_from_db(context, msg_id).await?;
+    msg.try_calc_and_set_dimensions(context)
+        .await
+        .context("failed to calculate media dimensions")?;
+
+    /* create message */
+    let needs_encryption = msg.param.get_bool(Param::GuaranteeE2ee).unwrap_or_default();
+
+    let attach_selfavatar = match shall_attach_selfavatar(context, msg.chat_id).await {
+        Ok(attach_selfavatar) => attach_selfavatar,
+        Err(err) => {
+            warn!(context, "job: cannot get selfavatar-state: {}", err);
+            false
+        }
+    };
+
+    let mimefactory = MimeFactory::from_msg(context, &msg, attach_selfavatar).await?;
+
+    let mut recipients = mimefactory.recipients();
+
+    let from = context
+        .get_config(Config::ConfiguredAddr)
+        .await?
+        .unwrap_or_default();
+    let lowercase_from = from.to_lowercase();
+
+    // Send BCC to self if it is enabled and we are not going to
+    // delete it immediately.
+    if context.get_config_bool(Config::BccSelf).await?
+        && context.get_config_delete_server_after().await? != Some(0)
+        && !recipients
+            .iter()
+            .any(|x| x.to_lowercase() == lowercase_from)
+    {
+        recipients.push(from);
+    }
+
+    if recipients.is_empty() {
+        // may happen eg. for groups with only SELF and bcc_self disabled
+        info!(
+            context,
+            "message {} has no recipient, skipping smtp-send", msg_id
+        );
+        msg_id.set_delivered(context).await?;
+        return Ok(None);
+    }
+
+    let rendered_msg = match mimefactory.render(context).await {
+        Ok(res) => Ok(res),
+        Err(err) => {
+            message::set_msg_failed(context, msg_id, Some(err.to_string())).await;
+            Err(err)
+        }
+    }?;
+
+    if needs_encryption && !rendered_msg.is_encrypted {
+        /* unrecoverable */
+        message::set_msg_failed(
+            context,
+            msg_id,
+            Some("End-to-end-encryption unavailable unexpectedly."),
+        )
+        .await;
+        bail!(
+            "e2e encryption unavailable {} - {:?}",
+            msg_id,
+            needs_encryption
+        );
+    }
+
+    if rendered_msg.is_gossiped {
+        msg.chat_id.set_gossiped_timestamp(context, time()).await?;
+    }
+
+    if 0 != rendered_msg.last_added_location_id {
+        if let Err(err) = location::set_kml_sent_timestamp(context, msg.chat_id, time()).await {
+            error!(context, "Failed to set kml sent_timestamp: {:?}", err);
+        }
+        if !msg.hidden {
+            if let Err(err) =
+                location::set_msg_location_id(context, msg.id, rendered_msg.last_added_location_id)
+                    .await
+            {
+                error!(context, "Failed to set msg_location_id: {:?}", err);
+            }
+        }
+    }
+
+    if let Some(sync_ids) = rendered_msg.sync_ids_to_delete {
+        if let Err(err) = context.delete_sync_ids(sync_ids).await {
+            error!(context, "Failed to delete sync ids: {:?}", err);
+        }
+    }
+
+    if attach_selfavatar {
+        if let Err(err) = msg.chat_id.set_selfavatar_timestamp(context, time()).await {
+            error!(context, "Failed to set selfavatar timestamp: {:?}", err);
+        }
+    }
+
+    if rendered_msg.is_encrypted && !needs_encryption {
+        msg.param.set_int(Param::GuaranteeE2ee, 1);
+        msg.update_param(context).await;
+    }
+
+    ensure!(!recipients.is_empty(), "no recipients for smtp job set");
+
+    let recipients = recipients.join(" ");
+
+    msg.subject = rendered_msg.subject.clone();
+    msg.update_subject(context).await;
+
+    let row_id = context
+        .sql
+        .insert(
+            "INSERT INTO smtp (rfc724_mid, recipients, mime, msg_id)
+             VALUES           (?1,         ?2,         ?3,   ?4)",
+            paramsv![
+                &rendered_msg.rfc724_mid,
+                recipients,
+                &rendered_msg.message,
+                msg_id
+            ],
+        )
+        .await?;
+    Ok(Some(row_id))
 }
 
 pub async fn send_text_msg(
@@ -2815,15 +2965,12 @@ async fn set_group_explicitly_left(context: &Context, grpid: &str) -> Result<()>
     Ok(())
 }
 
-pub(crate) async fn is_group_explicitly_left(
-    context: &Context,
-    grpid: impl AsRef<str>,
-) -> Result<bool> {
+pub(crate) async fn is_group_explicitly_left(context: &Context, grpid: &str) -> Result<bool> {
     let exists = context
         .sql
         .exists(
             "SELECT COUNT(*) FROM leftgrps WHERE grpid=?;",
-            paramsv![grpid.as_ref()],
+            paramsv![grpid],
         )
         .await?;
     Ok(exists)
@@ -2996,6 +3143,8 @@ pub async fn forward_msgs(context: &Context, msg_ids: &[MsgId], chat_id: ChatId)
             msg.param.remove(Param::ForcePlaintext);
             msg.param.remove(Param::Cmd);
             msg.param.remove(Param::OverrideSenderDisplayname);
+            msg.param.remove(Param::WebxdcSummary);
+            msg.param.remove(Param::WebxdcSummaryTimestamp);
             msg.in_reply_to = None;
 
             // do not leak data as group names; a default subject is generated by mimfactory
@@ -3027,8 +3176,8 @@ pub async fn forward_msgs(context: &Context, msg_ids: &[MsgId], chat_id: ChatId)
                     .prepare_msg_raw(context, &mut msg, None, curr_timestamp)
                     .await?;
                 curr_timestamp += 1;
-                if let Some(send_job) = job::send_msg_job(context, new_msg_id).await? {
-                    job::add(context, send_job).await?;
+                if create_send_msg_job(context, new_msg_id).await?.is_some() {
+                    context.interrupt_smtp(InterruptInfo::new(false)).await;
                 }
             }
             created_chats.push(chat_id);
@@ -3063,13 +3212,13 @@ pub(crate) async fn get_chat_cnt(context: &Context) -> Result<usize> {
 /// Returns a tuple of `(chatid, is_protected, blocked)`.
 pub(crate) async fn get_chat_id_by_grpid(
     context: &Context,
-    grpid: impl AsRef<str>,
+    grpid: &str,
 ) -> Result<Option<(ChatId, bool, Blocked)>> {
     context
         .sql
         .query_row_optional(
             "SELECT id, blocked, protected FROM chats WHERE grpid=?;",
-            paramsv![grpid.as_ref()],
+            paramsv![grpid],
             |row| {
                 let chat_id = row.get::<_, ChatId>(0)?;
 
@@ -3239,7 +3388,7 @@ pub(crate) async fn delete_and_reset_all_device_msgs(context: &Context) -> Resul
 pub(crate) async fn add_info_msg_with_cmd(
     context: &Context,
     chat_id: ChatId,
-    text: impl AsRef<str>,
+    text: &str,
     cmd: SystemMessage,
     timestamp: i64,
 ) -> Result<MsgId> {
@@ -3261,7 +3410,7 @@ pub(crate) async fn add_info_msg_with_cmd(
             timestamp,
             Viewtype::Text,
             MessageState::InNoticed,
-            text.as_ref().to_string(),
+            text,
             rfc724_mid,
             ephemeral_timer,
             param.to_string(),
@@ -3277,7 +3426,7 @@ pub(crate) async fn add_info_msg_with_cmd(
 pub(crate) async fn add_info_msg(
     context: &Context,
     chat_id: ChatId,
-    text: impl AsRef<str>,
+    text: &str,
     timestamp: i64,
 ) -> Result<MsgId> {
     add_info_msg_with_cmd(context, chat_id, text, SystemMessage::Unknown, timestamp).await
@@ -3445,6 +3594,58 @@ mod tests {
     }
 
     #[async_std::test]
+    async fn test_change_quotes_on_reused_message_object() -> Result<()> {
+        let t = TestContext::new_alice().await;
+        let chat_id = create_group_chat(&t, ProtectionStatus::Unprotected, "chat").await?;
+        let quote1 =
+            Message::load_from_db(&t, send_text_msg(&t, chat_id, "quote1".to_string()).await?)
+                .await?;
+        let quote2 =
+            Message::load_from_db(&t, send_text_msg(&t, chat_id, "quote2".to_string()).await?)
+                .await?;
+
+        // save a draft
+        let mut draft = Message::new(Viewtype::Text);
+        draft.set_text(Some("draft text".to_string()));
+        chat_id.set_draft(&t, Some(&mut draft)).await?;
+
+        let test = Message::load_from_db(&t, draft.id).await?;
+        assert_eq!(test.text, Some("draft text".to_string()));
+        assert!(test.quoted_text().is_none());
+        assert!(test.quoted_message(&t).await?.is_none());
+
+        // add quote to same message object
+        draft.set_quote(&t, Some(&quote1)).await?;
+        chat_id.set_draft(&t, Some(&mut draft)).await?;
+
+        let test = Message::load_from_db(&t, draft.id).await?;
+        assert_eq!(test.text, Some("draft text".to_string()));
+        assert_eq!(test.quoted_text(), Some("quote1".to_string()));
+        assert_eq!(test.quoted_message(&t).await?.unwrap().id, quote1.id);
+
+        // change quote on same message object
+        draft.set_text(Some("another draft text".to_string()));
+        draft.set_quote(&t, Some(&quote2)).await?;
+        chat_id.set_draft(&t, Some(&mut draft)).await?;
+
+        let test = Message::load_from_db(&t, draft.id).await?;
+        assert_eq!(test.text, Some("another draft text".to_string()));
+        assert_eq!(test.quoted_text(), Some("quote2".to_string()));
+        assert_eq!(test.quoted_message(&t).await?.unwrap().id, quote2.id);
+
+        // remove quote on same message object
+        draft.set_quote(&t, None).await?;
+        chat_id.set_draft(&t, Some(&mut draft)).await?;
+
+        let test = Message::load_from_db(&t, draft.id).await?;
+        assert_eq!(test.text, Some("another draft text".to_string()));
+        assert!(test.quoted_text().is_none());
+        assert!(test.quoted_message(&t).await?.is_none());
+
+        Ok(())
+    }
+
+    #[async_std::test]
     async fn test_add_contact_to_chat_ex_add_self() {
         // Adding self to a contact should succeed, even though it's pointless.
         let t = TestContext::new().await;
@@ -3594,6 +3795,79 @@ mod tests {
         async_std::task::sleep(std::time::Duration::from_millis(1100)).await;
 
         assert_eq!(get_chat_contacts(&bob, bob_chat_id).await?.len(), 2);
+
+        Ok(())
+    }
+
+    /// Test that group updates are robust to lost messages and eventual out of order arrival.
+    #[async_std::test]
+    async fn test_modify_chat_lost() -> Result<()> {
+        let alice = TestContext::new_alice().await;
+
+        let bob_id = Contact::create(&alice, "", "bob@example.net").await?;
+        let claire_id = Contact::create(&alice, "", "claire@foo.de").await?;
+        let daisy_id = Contact::create(&alice, "", "daisy@bar.de").await?;
+
+        let alice_chat_id = create_group_chat(&alice, ProtectionStatus::Unprotected, "foo").await?;
+        add_contact_to_chat(&alice, alice_chat_id, bob_id).await?;
+        add_contact_to_chat(&alice, alice_chat_id, claire_id).await?;
+        add_contact_to_chat(&alice, alice_chat_id, daisy_id).await?;
+
+        send_text_msg(&alice, alice_chat_id, "populate".to_string()).await?;
+        let add = alice.pop_sent_msg().await;
+        async_std::task::sleep(std::time::Duration::from_millis(1100)).await;
+
+        remove_contact_from_chat(&alice, alice_chat_id, claire_id).await?;
+        let remove1 = alice.pop_sent_msg().await;
+        async_std::task::sleep(std::time::Duration::from_millis(1100)).await;
+
+        remove_contact_from_chat(&alice, alice_chat_id, daisy_id).await?;
+        let remove2 = alice.pop_sent_msg().await;
+
+        let bob = TestContext::new_bob().await;
+
+        bob.recv_msg(&add).await;
+        let bob_chat_id = bob.get_last_msg().await.chat_id;
+        assert_eq!(get_chat_contacts(&bob, bob_chat_id).await?.len(), 4);
+
+        // First removal message is lost.
+        // Nevertheless, two members are removed.
+        bob.recv_msg(&remove2).await;
+        assert_eq!(get_chat_contacts(&bob, bob_chat_id).await?.len(), 2);
+
+        // Eventually, first removal message arrives.
+        // This has no effect.
+        bob.recv_msg(&remove1).await;
+        assert_eq!(get_chat_contacts(&bob, bob_chat_id).await?.len(), 2);
+        Ok(())
+    }
+
+    #[async_std::test]
+    async fn test_leave_group() -> Result<()> {
+        let alice = TestContext::new_alice().await;
+        let bob = TestContext::new_bob().await;
+
+        // Create group chat with Bob.
+        let alice_chat_id = create_group_chat(&alice, ProtectionStatus::Unprotected, "foo").await?;
+        let bob_contact = Contact::create(&alice, "", "bob@example.net").await?;
+        add_contact_to_chat(&alice, alice_chat_id, bob_contact).await?;
+
+        // Alice sends first message to group.
+        let sent_msg = alice.send_text(alice_chat_id, "Hello!").await;
+        bob.recv_msg(&sent_msg).await;
+
+        assert_eq!(get_chat_contacts(&alice, alice_chat_id).await?.len(), 2);
+
+        // Bob leaves the group.
+        let bob_msg = bob.get_last_msg().await;
+        let bob_chat_id = bob_msg.chat_id;
+        bob_chat_id.accept(&bob).await?;
+        remove_contact_from_chat(&bob, bob_chat_id, DC_CONTACT_ID_SELF).await?;
+
+        let leave_msg = bob.pop_sent_msg().await;
+        alice.recv_msg(&leave_msg).await;
+
+        assert_eq!(get_chat_contacts(&alice, alice_chat_id).await?.len(), 1);
 
         Ok(())
     }
@@ -3792,7 +4066,7 @@ mod tests {
         assert_eq!(chats.len(), 1);
 
         // after the device-chat and all messages are deleted, a re-adding should do nothing
-        chats.get_chat_id(0).delete(&t).await.ok();
+        chats.get_chat_id(0).unwrap().delete(&t).await.ok();
         add_device_msg(&t, Some("some-label"), Some(&mut msg))
             .await
             .ok();
@@ -3957,7 +4231,7 @@ mod tests {
             .unwrap();
         let mut result = Vec::new();
         for chatlist_index in 0..chatlist.len() {
-            result.push(chatlist.get_chat_id(chatlist_index))
+            result.push(chatlist.get_chat_id(chatlist_index).unwrap())
         }
         result
     }
@@ -4320,13 +4594,14 @@ mod tests {
         );
 
         // Alice has an SMTP-server replacing the `Message-ID:`-header (as done eg. by outlook.com).
-        let msg = alice.pop_sent_msg().await.payload();
+        let sent_msg = alice.pop_sent_msg().await;
+        let msg = sent_msg.payload();
         assert_eq!(msg.match_indices("Gr.").count(), 2);
         let msg = msg.replace("Message-ID: <Gr.", "Message-ID: <XXX");
         assert_eq!(msg.match_indices("Gr.").count(), 1);
 
         // Bob receives this message, he may detect group by `References:`- or `Chat-Group:`-header
-        dc_receive_imf(&bob, msg.as_bytes(), "INBOX", 1, false)
+        dc_receive_imf(&bob, msg.as_bytes(), "INBOX", false)
             .await
             .unwrap();
         let msg = bob.get_last_msg().await;
@@ -4340,13 +4615,14 @@ mod tests {
         // Bob answers - simulate a normal MUA by not setting `Chat-*`-headers;
         // moreover, Bob's SMTP-server also replaces the `Message-ID:`-header
         send_text_msg(&bob, bob_chat.id, "ho!".to_string()).await?;
-        let msg = bob.pop_sent_msg().await.payload();
+        let sent_msg = bob.pop_sent_msg().await;
+        let msg = sent_msg.payload();
         let msg = msg.replace("Message-ID: <Gr.", "Message-ID: <XXX");
         let msg = msg.replace("Chat-", "XXXX-");
         assert_eq!(msg.match_indices("Chat-").count(), 0);
 
         // Alice receives this message - she can still detect the group by the `References:`-header
-        dc_receive_imf(&alice, msg.as_bytes(), "INBOX", 2, false)
+        dc_receive_imf(&alice, msg.as_bytes(), "INBOX", false)
             .await
             .unwrap();
         let msg = alice.get_last_msg().await;
@@ -4374,14 +4650,13 @@ mod tests {
                  \n\
                  hello\n",
             "INBOX",
-            1,
             false,
         )
         .await?;
 
         let chats = Chatlist::try_load(&t, 0, None, None).await?;
         assert_eq!(chats.len(), 1);
-        assert_eq!(chats.get_chat_id(0), chat.id);
+        assert_eq!(chats.get_chat_id(0)?, chat.id);
         assert_eq!(chat.id.get_fresh_msg_cnt(&t).await?, 1);
         assert_eq!(t.get_fresh_msgs().await?.len(), 1);
 
@@ -4423,14 +4698,13 @@ mod tests {
                  \n\
                  hello\n",
             "INBOX",
-            1,
             false,
         )
         .await?;
 
         let chats = Chatlist::try_load(&t, 0, None, None).await?;
         assert_eq!(chats.len(), 1);
-        let chat_id = chats.get_chat_id(0);
+        let chat_id = chats.get_chat_id(0).unwrap();
         assert!(Chat::load_from_db(&t, chat_id)
             .await
             .unwrap()
@@ -4472,14 +4746,13 @@ mod tests {
                  \n\
                  hello\n",
             "INBOX",
-            1,
             false,
         )
         .await?;
 
         let chats = Chatlist::try_load(&t, 0, None, None).await?;
         assert_eq!(chats.len(), 1);
-        let chat_id = chats.get_chat_id(0);
+        let chat_id = chats.get_chat_id(0)?;
         assert!(Chat::load_from_db(&t, chat_id).await?.is_contact_request());
         assert_eq!(dc_get_archived_cnt(&t).await?, 0);
 
@@ -4488,13 +4761,13 @@ mod tests {
 
         let chats = Chatlist::try_load(&t, 0, None, None).await?;
         assert_eq!(chats.len(), 1);
-        let chat_id = chats.get_chat_id(0);
+        let chat_id = chats.get_chat_id(0)?;
         assert!(chat_id.is_archived_link());
         assert_eq!(dc_get_archived_cnt(&t).await?, 1);
 
         let chats = Chatlist::try_load(&t, DC_GCL_ARCHIVED_ONLY, None, None).await?;
         assert_eq!(chats.len(), 1);
-        let chat_id = chats.get_chat_id(0);
+        let chat_id = chats.get_chat_id(0)?;
         assert!(Chat::load_from_db(&t, chat_id).await?.is_contact_request());
 
         Ok(())
@@ -4520,7 +4793,6 @@ mod tests {
                  \n\
                  hello\n",
             "INBOX",
-            1,
             false,
         )
         .await?;
@@ -4680,7 +4952,7 @@ mod tests {
         // Bob quotes received message and sends a reply to Alice.
         let mut reply = Message::new(Viewtype::Text);
         reply.set_text(Some("Reply".to_owned()));
-        reply.set_quote(&bob, &received_msg).await?;
+        reply.set_quote(&bob, Some(&received_msg)).await?;
         let sent_reply = bob.send_msg(bob_chat.id, &mut reply).await;
         alice.recv_msg(&sent_reply).await;
         let received_reply = alice.get_last_msg().await;

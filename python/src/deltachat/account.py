@@ -179,6 +179,12 @@ class Account(object):
         """
         return True if lib.dc_is_configured(self._dc_context) else False
 
+    def is_open(self) -> bool:
+        """Determine if account is open
+
+        :returns True if account is open."""
+        return True if lib.dc_context_is_open(self._dc_context) else False
+
     def set_avatar(self, img_path: Optional[str]) -> None:
         """Set self avatar.
 
@@ -403,7 +409,10 @@ class Account(object):
         """
         arr = array("i")
         for msg in messages:
-            arr.append(getattr(msg, "id", msg))
+            if isinstance(msg, Message):
+                arr.append(msg.id)
+            else:
+                arr.append(msg)
         msg_ids = ffi.cast("uint32_t*", ffi.from_buffer(arr))
         lib.dc_markseen_msgs(self._dc_context, msg_ids, len(messages))
 

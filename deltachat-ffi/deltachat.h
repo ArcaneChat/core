@@ -179,16 +179,31 @@ typedef struct _dc_accounts_event_emitter dc_accounts_event_emitter_t;
 // create/open/config/information
 
 /**
- * Create a new context object.  After creation it is usually
- * opened, connected and mails are fetched.
+ * Create a new context object and try to open it without passphrase. If
+ * database is encrypted, the result is the same as using
+ * dc_context_new_closed() and the database should be opened with
+ * dc_context_open() before using.
  *
  * @memberof dc_context_t
- * @param os_name is only for decorative use.
- *     You can give the name of the app, the operating system,
- *     the used environment and/or the version here.
+ * @param os_name Deprecated, pass NULL or empty string here.
  * @param dbfile The file to use to store the database,
  *     something like `~/file` won't work, use absolute paths.
  * @param blobdir Deprecated, pass NULL or an empty string here.
+ * @return A context object with some public members.
+ *     The object must be passed to the other context functions
+ *     and must be freed using dc_context_unref() after usage.
+ */
+dc_context_t*   dc_context_new               (const char* os_name, const char* dbfile, const char* blobdir);
+
+
+/**
+ * Create a new context object.  After creation it is usually opened with
+ * dc_context_open() and started with dc_start_io() so it is connected and
+ * mails are fetched.
+ *
+ * @memberof dc_context_t
+ * @param dbfile The file to use to store the database,
+ *     something like `~/file` won't work, use absolute paths.
  * @return A context object with some public members.
  *     The object must be passed to the other context functions
  *     and must be freed using dc_context_unref() after usage.
@@ -196,7 +211,34 @@ typedef struct _dc_accounts_event_emitter dc_accounts_event_emitter_t;
  * If you want to use multiple context objects at the same time,
  * this can be managed using dc_accounts_t.
  */
-dc_context_t*   dc_context_new               (const char* os_name, const char* dbfile, const char* blobdir);
+dc_context_t*   dc_context_new_closed        (const char* dbfile);
+
+
+/**
+ * Opens the database with the given passphrase. This can only be used on
+ * closed context, such as created by dc_context_new_closed(). If the database
+ * is new, this operation sets the database passphrase. For existing databases
+ * the passphrase should be the one used to encrypt the database the first
+ * time.
+ *
+ * @memberof dc_context_t
+ * @param context The context object.
+ * @param passphrase The passphrase to use with the database. Pass NULL or
+ * empty string to use no passphrase and no encryption.
+ * @return 1 if the database is opened with this passphrase, 0 if the
+ * passphrase is incorrect and on error.
+ */
+int             dc_context_open              (dc_context_t *context, const char* passphrase);
+
+
+/**
+ * Returns 1 if database is open.
+ *
+ * @memberof dc_context_t
+ * @param context The context object.
+ * @return 1 if database is open, 0 if database is closed
+ */
+int             dc_context_is_open           (dc_context_t *context);
 
 
 /**
@@ -279,7 +321,7 @@ char*           dc_get_blobdir               (const dc_context_t* context);
  * - `imap_certificate_checks` = how to check IMAP certificates, one of the @ref DC_CERTCK flags, defaults to #DC_CERTCK_AUTO (0)
  * - `smtp_certificate_checks` = how to check SMTP certificates, one of the @ref DC_CERTCK flags, defaults to #DC_CERTCK_AUTO (0)
  * - `displayname`  = Own name to use when sending messages.  MUAs are allowed to spread this way e.g. using CC, defaults to empty
- * - `selfstatus`   = Own status to display e.g. in email footers, defaults to a standard text defined by #DC_STR_STATUSLINE
+ * - `selfstatus`   = Own status to display e.g. in email footers, defaults to empty
  * - `selfavatar`   = File containing avatar. Will immediately be copied to the 
  *                    `blobdir`; the original image will not be needed anymore.
  *                    NULL to remove the avatar.
@@ -293,18 +335,14 @@ char*           dc_get_blobdir               (const dc_context_t* context);
  *                    1=send a copy of outgoing messages to self.
  *                    Sending messages to self is needed for a proper multi-account setup,
  *                    however, on the other hand, may lead to unwanted notifications in non-delta clients.
- * - `inbox_watch`  = 1=watch `INBOX`-folder for changes (default),
- *                    0=do not watch the `INBOX`-folder,
- *                    changes require restarting IO by calling dc_stop_io() and then dc_start_io().
  * - `sentbox_watch`= 1=watch `Sent`-folder for changes (default),
  *                    0=do not watch the `Sent`-folder,
  *                    changes require restarting IO by calling dc_stop_io() and then dc_start_io().
- * - `mvbox_watch`  = 1=watch `DeltaChat`-folder for changes (default),
- *                    0=do not watch the `DeltaChat`-folder,
- *                    changes require restarting IO by calling dc_stop_io() and then dc_start_io().
- * - `mvbox_move`   = 1=heuristically detect chat-messages
- *                    and move them to the `DeltaChat`-folder,
+ * - `mvbox_move`   = 1=detect chat messages,
+ *                    move them to the `DeltaChat` folder,
+ *                    and watch the `DeltaChat` folder for updates (default),
  *                    0=do not move chat-messages
+ *                    changes require restarting IO by calling dc_stop_io() and then dc_start_io().
  * - `show_emails`  = DC_SHOW_EMAILS_OFF (0)=
  *                    show direct replies to chats only (default),
  *                    DC_SHOW_EMAILS_ACCEPTED_CONTACTS (1)=
@@ -943,6 +981,64 @@ uint32_t        dc_send_text_msg             (dc_context_t* context, uint32_t ch
  */
 uint32_t dc_send_videochat_invitation (dc_context_t* context, uint32_t chat_id);
 
+
+/**
+ * An webxdc instance send a status update to its other members.
+ *
+ * In js-land, that would be mapped to sth. as:
+ * ```
+ * success = window.webxdc.sendUpdate('{"action":"move","src":"A3","dest":"B4"}', 'move A3 B4');
+ * ```
+ * `context` and `msg_id` is not needed in js as that is unique within an webxdc instance.
+ * See dc_get_webxdc_status_updates() for the receiving counterpart.
+ *
+ * If the webxdc instance is a draft, the update is not send immediately.
+ * Instead, the updates are collected and sent out in batch when the instance is actually sent.
+ * This allows preparing webxdc instances,
+ * eg. defining a poll with predefined answers.
+ *
+ * Other members will be informed by #DC_EVENT_WEBXDC_STATUS_UPDATE that there is a new update.
+ * You will also get the #DC_EVENT_WEBXDC_STATUS_UPDATE yourself
+ * and the update you're sent will also be included in dc_get_webxdc_status_updates().
+ *
+ * @memberof dc_context_t
+ * @param context The context object
+ * @param msg_id id of the message with the webxdc instance
+ * @param json program-readable data, the actual payload
+ * @param descr user-visible description of the json-data,
+ *     in case of a chess game, eg. the move.
+ * @return 1=success, 0=error
+ */
+int dc_send_webxdc_status_update (dc_context_t* context, uint32_t msg_id, const char* json, const char* descr);
+
+
+/**
+ * Get webxdc status updates.
+ * The status updates may be sent by yourself or by other members using dc_send_webxdc_status_update().
+ * In both cases, you will be informed by #DC_EVENT_WEBXDC_STATUS_UPDATE
+ * whenever there is a new update.
+ *
+ * In js-land, that would be mapped to sth. as:
+ * ```
+ * window.webxdc.setUpdateListener((update) => {
+ *    if (update.payload.action === "move") {
+ *       print(update.payload.src)
+ *       print(update.payload.dest)
+ *    }
+ * });
+ * ```
+ *
+ * @memberof dc_context_t
+ * @param context The context object
+ * @param msg_id id of the message with the webxdc instance
+ * @param status_update_id Can be used to filter out only a concrete status update.
+ *     When set to 0, all known status updates are returned.
+ * @return JSON-array containing the requested updates,
+ *     each element was created by dc_send_webxdc_status_update()
+ *     on this or other devices.
+ *     If there are no updates, an empty JSON-array is returned.
+ */
+char* dc_get_webxdc_status_updates (dc_context_t* context, uint32_t msg_id, uint32_t status_update_id);
 
 /**
  * Save a draft for a chat in the database.
@@ -2474,6 +2570,7 @@ void dc_str_unref (char* str);
  * To make this possible, some dc_context_t functions must not be called
  * when using the account manager:
  * - use dc_accounts_add_account() and dc_accounts_get_account() instead of dc_context_new()
+ * - use dc_accounts_add_closed_account() instead of dc_context_new_closed()
  * - use dc_accounts_start_io() and dc_accounts_stop_io() instead of dc_start_io() and dc_stop_io()
  * - use dc_accounts_maybe_network() instead of dc_maybe_network()
  * - use dc_accounts_get_event_emitter() instead of dc_get_event_emitter()
@@ -2531,6 +2628,22 @@ void           dc_accounts_unref                (dc_accounts_t* accounts);
  */
 uint32_t       dc_accounts_add_account          (dc_accounts_t* accounts);
 
+/**
+ * Add a new closed account to the account manager.
+ * Internally, dc_context_new_closed() is called using a unique database-name
+ * in the directory specified at dc_accounts_new().
+ *
+ * If the function succeeds,
+ * dc_accounts_get_all() will return one more account
+ * and you can access the newly created account using dc_accounts_get_account().
+ * Moreover, the newly created account will be the selected one.
+ *
+ * @memberof dc_accounts_t
+ * @param accounts Account manager as created by dc_accounts_new().
+ * @return Account-id, use dc_accounts_get_account() to get the context object.
+ *     On errors, 0 is returned.
+ */
+uint32_t       dc_accounts_add_closed_account   (dc_accounts_t* accounts);
 
 /**
  * Migrate independent accounts into accounts managed by the account manager.
@@ -3563,6 +3676,45 @@ char*           dc_msg_get_filemime           (const dc_msg_t* msg);
 
 
 /**
+ * Return file from inside an webxdc message.
+ *
+ * @memberof dc_msg_t
+ * @param msg The webxdc instance.
+ * @param filename The name inside the archive,
+ *     can be given as an absolute path (`/file.png`)
+ *     or as a relative path (`file.png`, no leading slash)
+ * @param ret_bytes Pointer to a size_t. The size of the blob will be written here.
+ * @return The blob must be released using dc_str_unref() after usage.
+ *     NULL if there is no such file in the archive or on errors.
+ */
+char*             dc_msg_get_webxdc_blob      (const dc_msg_t* msg, const char* filename, size_t* ret_bytes);
+
+
+/**
+ * Get info from a webxdc message, in JSON format.
+ * The returned JSON string has the following key/values:
+ *
+ * - name: The name of the app.
+ *   Defaults to the filename if not set in the manifest.
+ * - icon: App icon file name.
+ *   Defaults to an standard icon if nothing is set in the manifest.
+ *   To get the file, use dc_msg_get_webxdc_blob().
+ *   App icons should should be square,
+ *   the implementations will add round corners etc. as needed.
+ * - summary: short string describing the state of the app,
+ *   sth. as "2 votes", "Highscore: 123",
+ *   can be changed by the apps and defaults to an empty string.
+ *
+ * @memberof dc_msg_t
+ * @param msg The webxdc instance.
+ * @return a UTF8-encoded JSON string containing all requested info.
+ *     Must be freed using dc_str_unref().
+ *     NULL is never returned.
+ */
+char*             dc_msg_get_webxdc_info      (const dc_msg_t* msg);
+
+
+/**
  * Get the size of the file.  Returns the size of the file associated with a
  * message, if applicable.
  *
@@ -4169,7 +4321,8 @@ void            dc_msg_latefiling_mediasize   (dc_msg_t* msg, int width, int hei
  *
  * @memberof dc_msg_t
  * @param msg The message object to set the reply to.
- * @param quote The quote to set for msg.
+ * @param quote The quote to set for the message object given as `msg`.
+ *     NULL removes an previously set quote.
  */
 void             dc_msg_set_quote             (dc_msg_t* msg, const dc_msg_t* quote);
 
@@ -4717,6 +4870,15 @@ int64_t          dc_lot_get_timestamp     (const dc_lot_t* lot);
  * The url for joining can be retrieved using dc_msg_get_videochat_url().
  */
 #define DC_MSG_VIDEOCHAT_INVITATION 70
+
+
+/**
+ * The message is a webxdc instance.
+ *
+ * To send data to a webxdc instance, use dc_send_webxdc_status_update()
+ */
+#define DC_MSG_WEBXDC    80
+
 
 /**
  * @}
@@ -5412,6 +5574,21 @@ void dc_event_unref(dc_event_t* event);
 
 
 /**
+ * webxdc status update received.
+ * To get the received status update, use dc_get_webxdc_status_updates().
+ * To send status updates, use dc_send_webxdc_status_update().
+ *
+ * Note, that you do not get events that arrive when the app is not running;
+ * instead, you can use dc_get_webxdc_status_updates() to get all status updates
+ * and catch up that way.
+ *
+ * @param data1 (int) msg_id
+ * @param data2 (int) status_update_id
+ */
+#define DC_EVENT_WEBXDC_STATUS_UPDATE                2120
+
+
+/**
  * @}
  */
 
@@ -5636,12 +5813,6 @@ void dc_event_unref(dc_event_t* event);
 ///
 /// Used in summaries.
 #define DC_STR_FILE                       12
-
-/// "Sent with my Delta Chat Messenger: https://delta.chat"
-///
-/// Used as the default footer
-/// if nothing else is set by the dc_set_config()-option `selfstatus`.
-#define DC_STR_STATUSLINE                 13
 
 /// "Group name changed from %1$s to %2$s."
 ///

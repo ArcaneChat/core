@@ -1,0 +1,21 @@
+Subject: webxdc object attached
+Message-ID: 67890@example.org
+Date: Fri, 03 Dec 2021 10:00:27 +0000
+To: alice@example.org
+From: bob@example.org
+Chat-Version: 1.0
+Content-Type: multipart/mixed; boundary="==BREAK=="
+
+
+--==BREAK==
+Content-Type: text/plain; charset=utf-8
+
+webxdc with bad extension and bad content.
+
+--==BREAK==
+Content-Type: application/webxdc+zip
+Content-Disposition: attachment; filename=index.html
+
+<html>hey!<html>
+
+--==BREAK==--

@@ -10,8 +10,7 @@ use crate::context::Context;
 use crate::dc_tools::maybe_add_time_based_warnings;
 use crate::imap::Imap;
 use crate::job::{self, Thread};
-use crate::message::MsgId;
-use crate::smtp::Smtp;
+use crate::smtp::{send_smtp_messages, Smtp};
 
 use self::connectivity::ConnectivityStore;
 
@@ -82,11 +81,15 @@ async fn inbox_loop(ctx: Context, started: Sender<()>, inbox_handlers: ImapConne
         let mut jobs_loaded = 0;
         let mut info = InterruptInfo::default();
         loop {
-            match job::load_next(&ctx, Thread::Imap, &info)
-                .await
-                .ok()
-                .flatten()
-            {
+            let job = match job::load_next(&ctx, Thread::Imap, &info).await {
+                Err(err) => {
+                    error!(ctx, "Failed loading job from the database: {:#}.", err);
+                    None
+                }
+                Ok(job) => job,
+            };
+
+            match job {
                 Some(job) if jobs_loaded <= 20 => {
                     jobs_loaded += 1;
                     job::perform_job(&ctx, job::Connection::Inbox(&mut connection), job).await;
@@ -95,41 +98,15 @@ async fn inbox_loop(ctx: Context, started: Sender<()>, inbox_handlers: ImapConne
                 Some(job) => {
                     // Let the fetch run, but return back to the job afterwards.
                     jobs_loaded = 0;
-                    if ctx
-                        .get_config_bool(Config::InboxWatch)
-                        .await
-                        .unwrap_or_default()
-                    {
-                        info!(ctx, "postponing imap-job {} to run fetch...", job);
-                        fetch(&ctx, &mut connection).await;
-                    }
+                    info!(ctx, "postponing imap-job {} to run fetch...", job);
+                    fetch(&ctx, &mut connection).await;
                 }
                 None => {
                     jobs_loaded = 0;
 
-                    // Expunge folder if needed, e.g. if some jobs have
-                    // deleted messages on the server.
-                    if let Err(err) = connection.maybe_close_folder(&ctx).await {
-                        warn!(ctx, "failed to close folder: {:?}", err);
-                    }
-
                     maybe_add_time_based_warnings(&ctx).await;
 
-                    info = if ctx
-                        .get_config_bool(Config::InboxWatch)
-                        .await
-                        .unwrap_or_default()
-                    {
-                        fetch_idle(&ctx, &mut connection, Config::ConfiguredInboxFolder).await
-                    } else {
-                        if let Err(err) = connection.scan_folders(&ctx).await {
-                            warn!(ctx, "{}", err);
-                            connection.connectivity.set_err(&ctx, err).await;
-                        } else {
-                            connection.connectivity.set_not_configured(&ctx).await;
-                        }
-                        connection.fake_idle(&ctx, None).await
-                    };
+                    info = fetch_idle(&ctx, &mut connection, Config::ConfiguredInboxFolder).await;
                 }
             }
         }
@@ -157,7 +134,7 @@ async fn fetch(ctx: &Context, connection: &mut Imap) {
             }
 
             // fetch
-            if let Err(err) = connection.fetch(ctx, &watch_folder).await {
+            if let Err(err) = connection.fetch_move_delete(ctx, &watch_folder).await {
                 connection.trigger_reconnect(ctx).await;
                 warn!(ctx, "{:#}", err);
             }
@@ -183,13 +160,9 @@ async fn fetch_idle(ctx: &Context, connection: &mut Imap, folder: Config) -> Int
                 return connection.fake_idle(ctx, Some(watch_folder)).await;
             }
 
-            // fetch
-            if let Err(err) = connection.fetch(ctx, &watch_folder).await {
-                connection.trigger_reconnect(ctx).await;
-                warn!(ctx, "{:#}", err);
-                return InterruptInfo::new(false, None);
-            }
-
+            // Scan other folders before fetching from watched folder. This may result in the
+            // messages being moved into the watched folder, for example from the Spam folder to
+            // the Inbox folder.
             if folder == Config::ConfiguredInboxFolder {
                 // Only scan on the Inbox thread in order to prevent parallel scans, which might lead to duplicate messages
                 if let Err(err) = connection.scan_folders(ctx).await {
@@ -197,6 +170,13 @@ async fn fetch_idle(ctx: &Context, connection: &mut Imap, folder: Config) -> Int
                     // but maybe just one folder can't be selected or something
                     warn!(ctx, "{}", err);
                 }
+            }
+
+            // fetch
+            if let Err(err) = connection.fetch_move_delete(ctx, &watch_folder).await {
+                connection.trigger_reconnect(ctx).await;
+                warn!(ctx, "{:#}", err);
+                return InterruptInfo::new(false);
             }
 
             connection.connectivity.set_connected(ctx).await;
@@ -208,7 +188,7 @@ async fn fetch_idle(ctx: &Context, connection: &mut Imap, folder: Config) -> Int
                     Err(err) => {
                         connection.trigger_reconnect(ctx).await;
                         warn!(ctx, "{}", err);
-                        InterruptInfo::new(false, None)
+                        InterruptInfo::new(false)
                     }
                 }
             } else {
@@ -293,17 +273,25 @@ async fn smtp_loop(ctx: Context, started: Sender<()>, smtp_handlers: SmtpConnect
 
         let mut interrupt_info = Default::default();
         loop {
-            match job::load_next(&ctx, Thread::Smtp, &interrupt_info)
-                .await
-                .ok()
-                .flatten()
-            {
+            let job = match job::load_next(&ctx, Thread::Smtp, &interrupt_info).await {
+                Err(err) => {
+                    error!(ctx, "Failed loading job from the database: {:#}.", err);
+                    None
+                }
+                Ok(job) => job,
+            };
+
+            match job {
                 Some(job) => {
                     info!(ctx, "executing smtp job");
                     job::perform_job(&ctx, job::Connection::Smtp(&mut connection), job).await;
                     interrupt_info = Default::default();
                 }
                 None => {
+                    if let Err(err) = send_smtp_messages(&ctx, &mut connection).await {
+                        warn!(ctx, "send_smtp_messages failed: {:#}", err);
+                    }
+
                     // Fake Idle
                     info!(ctx, "smtp fake idle - started");
                     match &connection.last_send_error {
@@ -353,7 +341,7 @@ impl Scheduler {
             }))
         };
 
-        if ctx.get_config_bool(Config::MvboxWatch).await? {
+        if ctx.get_config_bool(Config::MvboxMove).await? {
             let ctx = ctx.clone();
             mvbox_handle = Some(task::spawn(async move {
                 simple_imap_loop(
@@ -437,10 +425,10 @@ impl Scheduler {
             return;
         }
 
-        self.interrupt_inbox(InterruptInfo::new(true, None))
-            .join(self.interrupt_mvbox(InterruptInfo::new(true, None)))
-            .join(self.interrupt_sentbox(InterruptInfo::new(true, None)))
-            .join(self.interrupt_smtp(InterruptInfo::new(true, None)))
+        self.interrupt_inbox(InterruptInfo::new(true))
+            .join(self.interrupt_mvbox(InterruptInfo::new(true)))
+            .join(self.interrupt_sentbox(InterruptInfo::new(true)))
+            .join(self.interrupt_smtp(InterruptInfo::new(true)))
             .await;
     }
 
@@ -449,10 +437,10 @@ impl Scheduler {
             return;
         }
 
-        self.interrupt_inbox(InterruptInfo::new(false, None))
-            .join(self.interrupt_mvbox(InterruptInfo::new(false, None)))
-            .join(self.interrupt_sentbox(InterruptInfo::new(false, None)))
-            .join(self.interrupt_smtp(InterruptInfo::new(false, None)))
+        self.interrupt_inbox(InterruptInfo::new(false))
+            .join(self.interrupt_mvbox(InterruptInfo::new(false)))
+            .join(self.interrupt_sentbox(InterruptInfo::new(false)))
+            .join(self.interrupt_smtp(InterruptInfo::new(false)))
             .await;
     }
 
@@ -682,14 +670,10 @@ struct ImapConnectionHandlers {
 #[derive(Default, Debug)]
 pub struct InterruptInfo {
     pub probe_network: bool,
-    pub msg_id: Option<MsgId>,
 }
 
 impl InterruptInfo {
-    pub fn new(probe_network: bool, msg_id: Option<MsgId>) -> Self {
-        Self {
-            probe_network,
-            msg_id,
-        }
+    pub fn new(probe_network: bool) -> Self {
+        Self { probe_network }
     }
 }

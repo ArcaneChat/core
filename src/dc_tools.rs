@@ -5,6 +5,7 @@ use core::cmp::{max, min};
 use std::borrow::Cow;
 use std::fmt;
 use std::io::Cursor;
+use std::str::from_utf8;
 use std::str::FromStr;
 use std::time::{Duration, SystemTime};
 
@@ -14,6 +15,9 @@ use async_std::{fs, io};
 
 use anyhow::{bail, Error};
 use chrono::{Local, TimeZone};
+use mailparse::dateparse;
+use mailparse::headers::Headers;
+use mailparse::MailHeaderMap;
 use rand::{thread_rng, Rng};
 
 use crate::chat::{add_device_msg, add_device_msg_with_importance};
@@ -350,63 +354,6 @@ pub async fn dc_delete_files_in_dir(context: &Context, path: impl AsRef<Path>) {
     }
 }
 
-pub(crate) async fn dc_copy_file(
-    context: &Context,
-    src_path: impl AsRef<Path>,
-    dest_path: impl AsRef<Path>,
-) -> bool {
-    let src_abs = dc_get_abs_path(context, &src_path);
-    let mut src_file = match fs::File::open(&src_abs).await {
-        Ok(file) => file,
-        Err(err) => {
-            warn!(
-                context,
-                "failed to open for read '{}': {}",
-                src_abs.display(),
-                err
-            );
-            return false;
-        }
-    };
-
-    let dest_abs = dc_get_abs_path(context, &dest_path);
-    let mut dest_file = match fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&dest_abs)
-        .await
-    {
-        Ok(file) => file,
-        Err(err) => {
-            warn!(
-                context,
-                "failed to open for write '{}': {}",
-                dest_abs.display(),
-                err
-            );
-            return false;
-        }
-    };
-
-    match io::copy(&mut src_file, &mut dest_file).await {
-        Ok(_) => true,
-        Err(err) => {
-            error!(
-                context,
-                "Cannot copy \"{}\" to \"{}\": {}",
-                src_abs.display(),
-                dest_abs.display(),
-                err
-            );
-            {
-                // Attempt to remove the failed file, swallow errors resulting from that.
-                fs::remove_file(dest_abs).await.ok();
-            }
-            false
-        }
-    }
-}
-
 pub(crate) async fn dc_create_folder(
     context: &Context,
     path: impl AsRef<Path>,
@@ -670,13 +617,144 @@ pub fn remove_subject_prefix(last_subject: &str) -> String {
         .to_string()
 }
 
+// Types and methods to create hop-info for message-info
+
+fn extract_address_from_receive_header<'a>(header: &'a str, start: &str) -> Option<&'a str> {
+    let header_len = header.len();
+    header.find(start).and_then(|mut begin| {
+        begin += start.len();
+        let end = header
+            .get(begin..)?
+            .find(|c: char| c.is_whitespace())
+            .unwrap_or(header_len);
+        header.get(begin..begin + end)
+    })
+}
+
+pub(crate) fn parse_receive_header(header: &str) -> String {
+    let header = header.replace(&['\r', '\n'][..], "");
+    let mut hop_info = String::from("Hop: ");
+
+    if let Some(from) = extract_address_from_receive_header(&header, "from ") {
+        hop_info += &format!("From: {}; ", from.trim());
+    }
+
+    if let Some(by) = extract_address_from_receive_header(&header, "by ") {
+        hop_info += &format!("By: {}; ", by.trim());
+    }
+
+    if let Ok(date) = dateparse(&header) {
+        // In tests, use the UTC timezone so that the test is reproducible
+        #[cfg(test)]
+        let date_obj = chrono::Utc.timestamp(date, 0);
+        #[cfg(not(test))]
+        let date_obj = Local.timestamp(date, 0);
+
+        hop_info += &format!("Date: {}", date_obj.to_rfc2822());
+    };
+
+    hop_info
+}
+
+/// parses "receive"-headers
+pub(crate) fn parse_receive_headers(headers: &Headers) -> String {
+    headers
+        .get_all_headers("Received")
+        .iter()
+        .rev()
+        .filter_map(|header_map_item| from_utf8(header_map_item.get_value_raw()).ok())
+        .map(parse_receive_header)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::indexing_slicing)]
 
     use super::*;
 
-    use crate::test_utils::TestContext;
+    use crate::{
+        config::Config, dc_receive_imf::dc_receive_imf, message::get_msg_info,
+        test_utils::TestContext,
+    };
+
+    #[test]
+    fn test_parse_receive_headers() {
+        // Test `parse_receive_headers()` with some more-or-less random emails from the test-data
+        let raw = include_bytes!("../test-data/message/mail_with_cc.txt");
+        let expected =
+            "Hop: From: localhost; By: hq5.merlinux.eu; Date: Sat, 14 Sep 2019 17:00:22 +0000\n\
+             Hop: From: hq5.merlinux.eu; By: hq5.merlinux.eu; Date: Sat, 14 Sep 2019 17:00:25 +0000";
+        check_parse_receive_headers(raw, expected);
+
+        let raw = include_bytes!("../test-data/message/wrong-html.eml");
+        let expected =
+            "Hop: From: oxbsltgw18.schlund.de; By: mrelayeu.kundenserver.de; Date: Thu, 06 Aug 2020 16:40:31 +0000\n\
+             Hop: From: mout.kundenserver.de; By: dd37930.kasserver.com; Date: Thu, 06 Aug 2020 16:40:32 +0000";
+        check_parse_receive_headers(raw, expected);
+
+        let raw = include_bytes!("../test-data/message/posteo_ndn.eml");
+        let expected =
+            "Hop: By: mout01.posteo.de; Date: Tue, 09 Jun 2020 18:44:22 +0000\n\
+             Hop: From: mout01.posteo.de; By: mx04.posteo.de; Date: Tue, 09 Jun 2020 18:44:22 +0000\n\
+             Hop: From: mx04.posteo.de; By: mailin06.posteo.de; Date: Tue, 09 Jun 2020 18:44:23 +0000\n\
+             Hop: From: mailin06.posteo.de; By: proxy02.posteo.de; Date: Tue, 09 Jun 2020 18:44:23 +0000\n\
+             Hop: From: proxy02.posteo.de; By: proxy02.posteo.name; Date: Tue, 09 Jun 2020 18:44:23 +0000\n\
+             Hop: From: proxy02.posteo.name; By: dovecot03.posteo.local; Date: Tue, 09 Jun 2020 18:44:24 +0000";
+        check_parse_receive_headers(raw, expected);
+    }
+
+    fn check_parse_receive_headers(raw: &[u8], expected: &str) {
+        let mail = mailparse::parse_mail(raw).unwrap();
+        let hop_info = parse_receive_headers(&mail.get_headers());
+        assert_eq!(hop_info, expected)
+    }
+
+    #[async_std::test]
+    async fn test_parse_receive_headers_integration() {
+        let raw = include_bytes!("../test-data/message/mail_with_cc.txt");
+        let expected = r"State: Fresh
+
+hi
+
+Message-ID: 2dfdbde7@example.org
+
+Hop: From: localhost; By: hq5.merlinux.eu; Date: Sat, 14 Sep 2019 17:00:22 +0000
+Hop: From: hq5.merlinux.eu; By: hq5.merlinux.eu; Date: Sat, 14 Sep 2019 17:00:25 +0000";
+        check_parse_receive_headers_integration(raw, expected).await;
+
+        let raw = include_bytes!("../test-data/message/encrypted_with_received_headers.eml");
+        let expected = "State: Fresh, Encrypted
+
+Re: Message from alice@example.org
+
+hi back\r\n\
+\r\n\
+-- \r\n\
+Sent with my Delta Chat Messenger: https://delta.chat
+
+Message-ID: Mr.adQpEwndXLH.LPDdlFVJ7wG@example.net
+
+Hop: From: [127.0.0.1]; By: mail.example.org; Date: Mon, 27 Dec 2021 11:21:21 +0000
+Hop: From: mout.example.org; By: hq5.example.org; Date: Mon, 27 Dec 2021 11:21:22 +0000
+Hop: From: hq5.example.org; By: hq5.example.org; Date: Mon, 27 Dec 2021 11:21:22 +0000";
+        check_parse_receive_headers_integration(raw, expected).await;
+    }
+
+    async fn check_parse_receive_headers_integration(raw: &[u8], expected: &str) {
+        let t = TestContext::new_alice().await;
+        t.set_config(Config::ShowEmails, Some("2")).await.unwrap();
+        dc_receive_imf(&t, raw, "INBOX", false).await.unwrap();
+        let msg = t.get_last_msg().await;
+        let msg_info = get_msg_info(&t, msg.id).await.unwrap();
+
+        // Ignore the first rows of the msg_info because they contain a
+        // received time that depends on the test time which makes it impossible to
+        // compare with a static string
+        let capped_result = &msg_info[msg_info.find("State").unwrap()..];
+        assert_eq!(expected, capped_result);
+    }
 
     #[test]
     fn test_rust_ftoa() {
@@ -890,20 +968,7 @@ mod tests {
 
         assert!(dc_file_exist!(context, &abs_path).await);
 
-        assert!(dc_copy_file(context, "$BLOBDIR/foobar", "$BLOBDIR/dada").await);
-
-        // attempting to copy a second time should fail
-        assert!(!dc_copy_file(context, "$BLOBDIR/foobar", "$BLOBDIR/dada").await);
-
-        assert_eq!(dc_get_filebytes(context, "$BLOBDIR/dada").await, 7);
-
-        let buf = dc_read_file(context, "$BLOBDIR/dada").await.unwrap();
-
-        assert_eq!(buf.len(), 7);
-        assert_eq!(&buf, b"content");
-
         assert!(dc_delete_file(context, "$BLOBDIR/foobar").await);
-        assert!(dc_delete_file(context, "$BLOBDIR/dada").await);
         assert!(dc_create_folder(context, "$BLOBDIR/foobar-folder")
             .await
             .is_ok());
@@ -1029,7 +1094,7 @@ mod tests {
         maybe_warn_on_bad_time(&t, timestamp_past, get_provider_update_timestamp()).await;
         let chats = Chatlist::try_load(&t, 0, None, None).await.unwrap();
         assert_eq!(chats.len(), 1);
-        let device_chat_id = chats.get_chat_id(0);
+        let device_chat_id = chats.get_chat_id(0).unwrap();
         let msgs = chat::get_chat_msgs(&t, device_chat_id, 0, None)
             .await
             .unwrap();
@@ -1067,7 +1132,7 @@ mod tests {
         .await;
         let chats = Chatlist::try_load(&t, 0, None, None).await.unwrap();
         assert_eq!(chats.len(), 1);
-        assert_eq!(device_chat_id, chats.get_chat_id(0));
+        assert_eq!(device_chat_id, chats.get_chat_id(0).unwrap());
         let msgs = chat::get_chat_msgs(&t, device_chat_id, 0, None)
             .await
             .unwrap();
@@ -1099,7 +1164,7 @@ mod tests {
         .await;
         let chats = Chatlist::try_load(&t, 0, None, None).await.unwrap();
         assert_eq!(chats.len(), 1);
-        let device_chat_id = chats.get_chat_id(0);
+        let device_chat_id = chats.get_chat_id(0).unwrap();
         let msgs = chat::get_chat_msgs(&t, device_chat_id, 0, None)
             .await
             .unwrap();
@@ -1121,7 +1186,7 @@ mod tests {
         .await;
         let chats = Chatlist::try_load(&t, 0, None, None).await.unwrap();
         assert_eq!(chats.len(), 1);
-        let device_chat_id = chats.get_chat_id(0);
+        let device_chat_id = chats.get_chat_id(0).unwrap();
         let msgs = chat::get_chat_msgs(&t, device_chat_id, 0, None)
             .await
             .unwrap();
@@ -1138,7 +1203,7 @@ mod tests {
         .await;
         let chats = Chatlist::try_load(&t, 0, None, None).await.unwrap();
         assert_eq!(chats.len(), 1);
-        let device_chat_id = chats.get_chat_id(0);
+        let device_chat_id = chats.get_chat_id(0).unwrap();
         let msgs = chat::get_chat_msgs(&t, device_chat_id, 0, None)
             .await
             .unwrap();

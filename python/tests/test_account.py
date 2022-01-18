@@ -41,8 +41,8 @@ class TestOfflineAccountBasic:
     def test_wrong_db(self, tmpdir):
         p = tmpdir.join("hello.db")
         p.write("123")
-        with pytest.raises(ValueError):
-            Account(p.strpath)
+        account = Account(p.strpath)
+        assert not account.is_open()
 
     def test_os_name(self, tmpdir):
         p = tmpdir.join("hello.db")
@@ -737,7 +737,6 @@ class TestOnlineAccount:
         # make sure we are not sending message to ourselves
         assert self_addr not in ev.data2
         assert other_addr in ev.data2
-        ev = ac1._evtracker.get_matching("DC_EVENT_DELETED_BLOB_FILE")
 
         lp.sec("ac1: setting bcc_self=1")
         ac1.set_config("bcc_self", "1")
@@ -753,7 +752,6 @@ class TestOnlineAccount:
         # now make sure we are sending message to ourselves too
         assert self_addr in ev.data2
         assert other_addr in ev.data2
-        ev = ac1._evtracker.get_matching("DC_EVENT_DELETED_BLOB_FILE")
         assert ac1.direct_imap.idle_wait_for_seen()
 
         # Second client receives only second message, but not the first
@@ -860,7 +858,7 @@ class TestOnlineAccount:
 
     def test_mvbox_sentbox_threads(self, acfactory, lp):
         lp.sec("ac1: start with mvbox thread")
-        ac1 = acfactory.get_online_configuring_account(mvbox=True, move=True, sentbox=True)
+        ac1 = acfactory.get_online_configuring_account(move=True, sentbox=True)
 
         lp.sec("ac2: start without mvbox/sentbox threads")
         ac2 = acfactory.get_online_configuring_account()
@@ -874,16 +872,20 @@ class TestOnlineAccount:
 
     def test_move_works(self, acfactory):
         ac1 = acfactory.get_online_configuring_account()
-        ac2 = acfactory.get_online_configuring_account(mvbox=True, move=True)
+        ac2 = acfactory.get_online_configuring_account(move=True)
         acfactory.wait_configure_and_start_io()
         chat = acfactory.get_accepted_chat(ac1, ac2)
         chat.send_text("message1")
-        ev = ac2._evtracker.get_matching("DC_EVENT_INCOMING_MSG")
-        assert ev.data2 > const.DC_CHAT_ID_LAST_SPECIAL
+
+        # Message is moved to the movebox
         ac2._evtracker.get_matching("DC_EVENT_IMAP_MESSAGE_MOVED")
 
+        # Message is downloaded
+        ev = ac2._evtracker.get_matching("DC_EVENT_INCOMING_MSG")
+        assert ev.data2 > const.DC_CHAT_ID_LAST_SPECIAL
+
     def test_move_works_on_self_sent(self, acfactory):
-        ac1 = acfactory.get_online_configuring_account(mvbox=True, move=True)
+        ac1 = acfactory.get_online_configuring_account(move=True)
         ac2 = acfactory.get_online_configuring_account()
         acfactory.wait_configure_and_start_io()
         ac1.set_config("bcc_self", "1")
@@ -953,7 +955,7 @@ class TestOnlineAccount:
         assert msg_in.is_forwarded()
 
     def test_send_self_message(self, acfactory, lp):
-        ac1 = acfactory.get_one_online_account(mvbox=True, move=True)
+        ac1 = acfactory.get_one_online_account(move=True)
         lp.sec("ac1: create self chat")
         chat = ac1.get_self_contact().create_chat()
         chat.send_text("hello")
@@ -983,7 +985,8 @@ class TestOnlineAccount:
         assert msg2 in chat2.get_messages()
         assert chat2.is_contact_request()
         assert chat2.count_fresh_messages() == 1
-        assert msg2.time_received >= msg1.time_sent
+        # Like it or not, this assert is flaky
+        # assert msg2.time_received >= msg1.time_sent
 
         lp.sec("create new chat with contact and verify it's proper")
         chat2b = msg2.create_chat()
@@ -1034,30 +1037,69 @@ class TestOnlineAccount:
 
     def test_moved_markseen(self, acfactory, lp):
         """Test that message already moved to DeltaChat folder is marked as seen."""
-        ac1 = acfactory.get_online_configuring_account(mvbox=True, config={"inbox_watch": "0"})
-        ac2 = acfactory.get_online_configuring_account()
+        ac1 = acfactory.get_online_configuring_account()
+        ac2 = acfactory.get_online_configuring_account(move=True)
         acfactory.wait_configure_and_start_io([ac1, ac2])
-        ac1.set_config("bcc_self", "1")
 
-        ac1.direct_imap.idle_start()
+        ac2.stop_io()
+        ac2.direct_imap.idle_start()
+
         ac1.create_chat(ac2).send_text("Hello!")
-        ac1.direct_imap.idle_check(terminate=True)
-        ac1.stop_io()
+
+        # Wait for the message to arrive.
+        ac2.direct_imap.idle_check(terminate=True)
 
         # Emulate moving of the message to DeltaChat folder by Sieve rule.
         # mailcow server contains this rule by default.
-        ac1.direct_imap.conn.move(["*"], "DeltaChat")
+        ac2.direct_imap.conn.move(["*"], "DeltaChat")
 
-        ac1.direct_imap.select_folder("DeltaChat")
-        ac1.direct_imap.idle_start()
-        ac1.start_io()
-        ac1.direct_imap.idle_wait_for_seen()
-        ac1.direct_imap.idle_done()
+        ac2.direct_imap.select_folder("DeltaChat")
+        ac2.direct_imap.idle_start()
+        ac2.start_io()
+        msg = ac2._evtracker.wait_next_incoming_message()
 
-        fetch = list(ac1.direct_imap.conn.fetch("*", b'FLAGS').values())
+        # Accept the contact request.
+        msg.chat.accept()
+        ac2.mark_seen_messages([msg])
+        ac2.direct_imap.idle_wait_for_seen()
+        ac2.direct_imap.idle_done()
+
+        fetch = list(ac2.direct_imap.conn.fetch("*", b'FLAGS').values())
         flags = fetch[-1][b'FLAGS']
         is_seen = b'\\Seen' in flags
         assert is_seen
+
+    def test_multidevice_sync_seen(self, acfactory, lp):
+        """Test that message marked as seen on one device is marked as seen on another."""
+        ac1 = acfactory.get_online_configuring_account()
+        ac2 = acfactory.get_online_configuring_account()
+        ac1_clone = acfactory.clone_online_account(ac1)
+        acfactory.wait_configure_and_start_io()
+
+        ac1.set_config("bcc_self", "1")
+        ac1_clone.set_config("bcc_self", "1")
+
+        ac1_chat = ac1.create_chat(ac2)
+        ac1_clone_chat = ac1_clone.create_chat(ac2)
+        ac2_chat = ac2.create_chat(ac1)
+
+        lp.sec("Send a message from ac2 to ac1 and check that it's 'fresh'")
+        ac2_chat.send_text("Hi")
+        ac1_message = ac1._evtracker.wait_next_incoming_message()
+        ac1_clone_message = ac1_clone._evtracker.wait_next_incoming_message()
+        assert ac1_chat.count_fresh_messages() == 1
+        assert ac1_clone_chat.count_fresh_messages() == 1
+        assert ac1_message.is_in_fresh
+        assert ac1_clone_message.is_in_fresh
+
+        lp.sec("ac1 marks message as seen on the first device")
+        ac1.mark_seen_messages([ac1_message])
+        assert ac1_message.is_in_seen
+
+        lp.sec("ac1 clone detects that message is marked as seen")
+        ev = ac1_clone._evtracker.get_matching("DC_EVENT_MSGS_NOTICED")
+        assert ev.data1 == ac1_clone_chat.id
+        assert ac1_clone_message.is_in_seen
 
     def test_message_override_sender_name(self, acfactory, lp):
         ac1, ac2 = acfactory.get_two_online_accounts()
@@ -1095,8 +1137,8 @@ class TestOnlineAccount:
     def test_markseen_message_and_mdn(self, acfactory, mvbox_move):
         # Please only change this test if you are very sure that it will still catch the issues it catches now.
         # We had so many problems with markseen, if in doubt, rather create another test, it can't harm.
-        ac1 = acfactory.get_online_configuring_account(move=mvbox_move, mvbox=mvbox_move)
-        ac2 = acfactory.get_online_configuring_account(move=mvbox_move, mvbox=mvbox_move)
+        ac1 = acfactory.get_online_configuring_account(move=mvbox_move)
+        ac2 = acfactory.get_online_configuring_account(move=mvbox_move)
 
         acfactory.wait_configure_and_start_io()
         # Do not send BCC to self, we only want to test MDN on ac1.
@@ -1142,7 +1184,7 @@ class TestOnlineAccount:
         assert not msg_reply1.chat.is_group()
         assert msg_reply1.chat.id == private_chat1.id
 
-    def test_mdn_asymetric(self, acfactory, lp):
+    def test_mdn_asymmetric(self, acfactory, lp):
         ac1, ac2 = acfactory.get_two_online_accounts(move=True)
 
         lp.sec("ac1: create chat with ac2")
@@ -1166,6 +1208,9 @@ class TestOnlineAccount:
 
         assert len(msg.chat.get_messages()) == 1
 
+        ac1.direct_imap.select_config_folder("mvbox")
+        ac1.direct_imap.idle_start()
+
         lp.sec("ac2: mark incoming message as seen")
         ac2.mark_seen_messages([msg])
 
@@ -1174,6 +1219,9 @@ class TestOnlineAccount:
         ac1._evtracker.get_matching("DC_EVENT_IMAP_MESSAGE_MOVED")
 
         assert len(chat.get_messages()) == 1
+
+        # Wait for the message to be marked as seen on IMAP.
+        assert ac1.direct_imap.idle_wait_for_seen()
 
         # MDN is received even though MDNs are already disabled
         assert msg_out.is_out_mdn_received()
@@ -1438,7 +1486,7 @@ class TestOnlineAccount:
         ac1_clone.create_chat(ac2).send_text("Hi back")
         ev = ac1._evtracker.get_matching("DC_EVENT_MSGS_NOTICED")
 
-        assert ev.data1 == first_msg_id.id
+        assert ev.data1 == first_msg_id.chat.id
         assert ac1.create_chat(ac2).count_fresh_messages() == 0
         assert len(list(ac1.get_fresh_messages())) == 0
 
@@ -2106,10 +2154,8 @@ class TestOnlineAccount:
         assert msg_back.chat == chat
         assert chat.get_profile_image() is None
 
-    @pytest.mark.parametrize("inbox_watch", ["0", "1"])
-    def test_connectivity(self, acfactory, lp, inbox_watch):
+    def test_connectivity(self, acfactory, lp):
         ac1, ac2 = acfactory.get_two_online_accounts()
-        ac1.set_config("inbox_watch", inbox_watch)
         ac1.set_config("scan_all_folders_debounce_secs", "0")
 
         ac1._evtracker.wait_for_connectivity(const.DC_CONNECTIVITY_CONNECTED)
@@ -2349,7 +2395,7 @@ class TestOnlineAccount:
 
     def test_immediate_autodelete(self, acfactory, lp):
         ac1 = acfactory.get_online_configuring_account()
-        ac2 = acfactory.get_online_configuring_account(mvbox=False, move=False, sentbox=False)
+        ac2 = acfactory.get_online_configuring_account(move=False, sentbox=False)
 
         # "1" means delete immediately, while "0" means do not delete
         ac2.set_config("delete_server_after", "1")
@@ -2610,31 +2656,26 @@ class TestOnlineAccount:
         assert received_reply.quoted_text == "hello"
         assert received_reply.quote.id == out_msg.id
 
-    @pytest.mark.parametrize("folder,move,expected_destination,inbox_watch,", [
-        ("xyz", False, "xyz", "1"),  # Test that emails are recognized in a random folder but not moved
-        ("xyz", True, "DeltaChat", "1"),  # ...emails are found in a random folder and moved to DeltaChat
-        ("Spam", False, "INBOX", "1"),  # ...emails are moved from the spam folder to the Inbox
-        ("INBOX", False, "INBOX", "0"),  # ...emails are found in the `Inbox` folder even if `inbox_watch` is "0"
+    @pytest.mark.parametrize("folder,move,expected_destination,", [
+        ("xyz", False, "xyz"),  # Test that emails are recognized in a random folder but not moved
+        ("xyz", True, "DeltaChat"),  # ...emails are found in a random folder and moved to DeltaChat
+        ("Spam", False, "INBOX"),  # ...emails are moved from the spam folder to the Inbox
     ])
     # Testrun.org does not support the CREATE-SPECIAL-USE capability, which means that we can't create a folder with
     # the "\Junk" flag (see https://tools.ietf.org/html/rfc6154). So, we can't test spam folder detection by flag.
-    def test_scan_folders(self, acfactory, lp, folder, move, expected_destination, inbox_watch):
+    def test_scan_folders(self, acfactory, lp, folder, move, expected_destination):
         """Delta Chat periodically scans all folders for new messages to make sure we don't miss any."""
         variant = folder + "-" + str(move) + "-" + expected_destination
         lp.sec("Testing variant " + variant)
         ac1 = acfactory.get_online_configuring_account(move=move)
         ac2 = acfactory.get_online_configuring_account()
-        ac1.set_config("inbox_watch", inbox_watch)
 
         acfactory.wait_configure(ac1)
         ac1.direct_imap.create_folder(folder)
 
         acfactory.wait_configure_and_start_io()
         # Wait until each folder was selected once and we are IDLEing:
-        if inbox_watch == "1":
-            ac1._evtracker.get_info_contains("INBOX: Idle entering wait-on-remote state")
-        else:
-            ac1._evtracker.get_info_contains("IMAP-fake-IDLE: no folder, waiting for interrupt")
+        ac1._evtracker.get_info_contains("INBOX: Idle entering wait-on-remote state")
         ac1.stop_io()
 
         # Send a message to ac1 and move it to the mvbox:
@@ -2650,11 +2691,7 @@ class TestOnlineAccount:
         msg = ac1._evtracker.wait_next_incoming_message()
         assert msg.text == "hello"
 
-        # Wait until the message was moved (if at all) and we are IDLEing again:
-        if inbox_watch == "1":
-            ac1._evtracker.get_info_contains("INBOX: Idle entering wait-on-remote state")
-        else:
-            ac1._evtracker.get_info_contains("IMAP-fake-IDLE: no folder, waiting for interrupt")
+        # The message has been downloaded, which means it has reached its destination.
         ac1.direct_imap.select_folder(expected_destination)
         assert len(ac1.direct_imap.get_all_messages()) == 1
         if folder != expected_destination:
@@ -2677,7 +2714,7 @@ class TestOnlineAccount:
             if mvbox_move:
                 assert ac.get_config("configured_mvbox_folder")
 
-        ac1 = acfactory.get_online_configuring_account(mvbox=mvbox_move, move=mvbox_move)
+        ac1 = acfactory.get_online_configuring_account(move=mvbox_move)
         ac1.set_config("sentbox_move", "1")
         ac2 = acfactory.get_online_configuring_account()
 
@@ -2777,7 +2814,7 @@ class TestOnlineAccount:
 
     def test_delete_deltachat_folder(self, acfactory):
         """Test that DeltaChat folder is recreated if user deletes it manually."""
-        ac1 = acfactory.get_online_configuring_account(mvbox=True)
+        ac1 = acfactory.get_online_configuring_account(move=True)
         ac2 = acfactory.get_online_configuring_account()
         acfactory.wait_configure(ac1)
 
@@ -2905,7 +2942,8 @@ class TestGroupStressTests:
         lp.sec("ac2: check that ac3 is removed")
         msg = ac2._evtracker.wait_next_incoming_message()
 
-        assert msg.chat.num_contacts() == chat.num_contacts()
+        assert chat.num_contacts() == 2
+        assert msg.chat.num_contacts() == 2
         acfactory.dump_imap_summary(sys.stdout)
 
 

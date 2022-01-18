@@ -42,8 +42,6 @@ impl Deref for Context {
 
 #[derive(Debug)]
 pub struct InnerContext {
-    /// Database file path
-    pub(crate) dbfile: PathBuf,
     /// Blob directory path
     pub(crate) blobdir: PathBuf,
     pub(crate) sql: Sql,
@@ -84,7 +82,7 @@ pub struct InnerContext {
 
 #[derive(Debug)]
 pub struct RunningState {
-    pub ongoing_running: bool,
+    ongoing_running: bool,
     shall_stop_ongoing: bool,
     cancel_sender: Option<Sender<()>>,
 }
@@ -106,10 +104,19 @@ pub fn get_info() -> BTreeMap<&'static str, String> {
 }
 
 impl Context {
-    /// Creates new context.
+    /// Creates new context and opens the database.
     pub async fn new(dbfile: PathBuf, id: u32) -> Result<Context> {
-        // pretty_env_logger::try_init_timed().ok();
+        let context = Self::new_closed(dbfile, id).await?;
 
+        // Open the database if is not encrypted.
+        if context.set_passphrase("".to_string()).await? {
+            context.sql.open(&context).await?;
+        }
+        Ok(context)
+    }
+
+    /// Creates new context without opening the database.
+    pub async fn new_closed(dbfile: PathBuf, id: u32) -> Result<Context> {
         let mut blob_fname = OsString::new();
         blob_fname.push(dbfile.file_name().unwrap_or_default());
         blob_fname.push("-blobs");
@@ -117,7 +124,35 @@ impl Context {
         if !blobdir.exists().await {
             async_std::fs::create_dir_all(&blobdir).await?;
         }
-        Context::with_blobdir(dbfile, blobdir, id).await
+        let context = Context::with_blobdir(dbfile, blobdir, id).await?;
+        Ok(context)
+    }
+
+    /// Opens the database with the given passphrase.
+    ///
+    /// Returns true if passphrase is correct, false is passphrase is not correct. Fails on other
+    /// errors.
+    pub async fn open(&self, passphrase: String) -> Result<bool> {
+        if self.sql.set_passphrase(passphrase).await? {
+            self.sql.open(self).await?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Returns true if database is open.
+    pub async fn is_open(&self) -> bool {
+        self.sql.is_open().await
+    }
+
+    /// Sets the database passphrase.
+    ///
+    /// Returns true if passphrase is correct.
+    ///
+    /// Fails if database is already open.
+    pub async fn set_passphrase(&self, passphrase: String) -> Result<bool> {
+        self.sql.set_passphrase(passphrase).await
     }
 
     pub(crate) async fn with_blobdir(
@@ -134,9 +169,8 @@ impl Context {
         let inner = InnerContext {
             id,
             blobdir,
-            dbfile,
             running_state: RwLock::new(Default::default()),
-            sql: Sql::new(),
+            sql: Sql::new(dbfile),
             bob: Default::default(),
             last_smeared_timestamp: RwLock::new(0),
             generating_key_mutex: Mutex::new(()),
@@ -155,7 +189,6 @@ impl Context {
         let ctx = Context {
             inner: Arc::new(inner),
         };
-        ctx.sql.open(&ctx, &ctx.dbfile, false).await?;
 
         Ok(ctx)
     }
@@ -193,7 +226,7 @@ impl Context {
 
     /// Returns database file path.
     pub fn get_dbfile(&self) -> &Path {
-        self.dbfile.as_path()
+        self.sql.dbfile.as_path()
     }
 
     /// Returns blob directory path.
@@ -224,7 +257,7 @@ impl Context {
 
     // Ongoing process allocation/free/check
 
-    pub async fn alloc_ongoing(&self) -> Result<Receiver<()>> {
+    pub(crate) async fn alloc_ongoing(&self) -> Result<Receiver<()>> {
         if self.has_ongoing().await {
             bail!("There is already another ongoing process running.");
         }
@@ -240,7 +273,7 @@ impl Context {
         Ok(receiver)
     }
 
-    pub async fn free_ongoing(&self) {
+    pub(crate) async fn free_ongoing(&self) {
         let s_a = &self.running_state;
         let mut s = s_a.write().await;
 
@@ -249,7 +282,7 @@ impl Context {
         s.cancel_sender.take();
     }
 
-    pub async fn has_ongoing(&self) -> bool {
+    pub(crate) async fn has_ongoing(&self) -> bool {
         let s_a = &self.running_state;
         let s = s_a.read().await;
 
@@ -274,7 +307,7 @@ impl Context {
         };
     }
 
-    pub async fn shall_stop_ongoing(&self) -> bool {
+    pub(crate) async fn shall_stop_ongoing(&self) -> bool {
         self.running_state.read().await.shall_stop_ongoing
     }
 
@@ -322,9 +355,7 @@ impl Context {
             Err(err) => format!("<key failure: {}>", err),
         };
 
-        let inbox_watch = self.get_config_int(Config::InboxWatch).await?;
         let sentbox_watch = self.get_config_int(Config::SentboxWatch).await?;
-        let mvbox_watch = self.get_config_int(Config::MvboxWatch).await?;
         let mvbox_move = self.get_config_int(Config::MvboxMove).await?;
         let sentbox_move = self.get_config_int(Config::SentboxMove).await?;
         let folders_configured = self
@@ -381,9 +412,7 @@ impl Context {
                 .await?
                 .to_string(),
         );
-        res.insert("inbox_watch", inbox_watch.to_string());
         res.insert("sentbox_watch", sentbox_watch.to_string());
-        res.insert("mvbox_watch", mvbox_watch.to_string());
         res.insert("mvbox_move", mvbox_move.to_string());
         res.insert("sentbox_move", sentbox_move.to_string());
         res.insert("folders_configured", folders_configured.to_string());
@@ -578,14 +607,14 @@ impl Context {
         Ok(spam.as_deref() == Some(folder_name))
     }
 
-    pub fn derive_blobdir(dbfile: &PathBuf) -> PathBuf {
+    pub(crate) fn derive_blobdir(dbfile: &PathBuf) -> PathBuf {
         let mut blob_fname = OsString::new();
         blob_fname.push(dbfile.file_name().unwrap_or_default());
         blob_fname.push("-blobs");
         dbfile.with_file_name(blob_fname)
     }
 
-    pub fn derive_walfile(dbfile: &PathBuf) -> PathBuf {
+    pub(crate) fn derive_walfile(dbfile: &PathBuf) -> PathBuf {
         let mut wal_fname = OsString::new();
         wal_fname.push(dbfile.file_name().unwrap_or_default());
         wal_fname.push("-wal");
@@ -642,16 +671,21 @@ mod tests {
     use crate::dc_tools::dc_create_outgoing_rfc724_mid;
     use crate::message::Message;
     use crate::test_utils::TestContext;
+    use anyhow::Context as _;
     use std::time::Duration;
     use strum::IntoEnumIterator;
+    use tempfile::tempdir;
 
     #[async_std::test]
-    async fn test_wrong_db() {
-        let tmp = tempfile::tempdir().unwrap();
+    async fn test_wrong_db() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
         let dbfile = tmp.path().join("db.sqlite");
-        std::fs::write(&dbfile, b"123").unwrap();
-        let res = Context::new(dbfile.into(), 1).await;
-        assert!(res.is_err());
+        std::fs::write(&dbfile, b"123")?;
+        let res = Context::new(dbfile.into(), 1).await?;
+
+        // Broken database is indistinguishable from encrypted one.
+        assert_eq!(res.is_open().await, false);
+        Ok(())
     }
 
     #[async_std::test]
@@ -678,7 +712,7 @@ mod tests {
             dc_create_outgoing_rfc724_mid(None, contact.get_addr())
         );
         println!("{}", msg);
-        dc_receive_imf(t, msg.as_bytes(), "INBOX", 1, false)
+        dc_receive_imf(t, msg.as_bytes(), "INBOX", false)
             .await
             .unwrap();
     }
@@ -1000,6 +1034,31 @@ mod tests {
         // In-chat should not be not limited
         let res = alice.search_msgs(Some(chat.id), "foo").await?;
         assert_eq!(res.len(), 1001);
+
+        Ok(())
+    }
+
+    #[async_std::test]
+    async fn test_set_passphrase() -> Result<()> {
+        let dir = tempdir()?;
+        let dbfile = dir.path().join("db.sqlite");
+
+        let id = 1;
+        let context = Context::new_closed(dbfile.clone().into(), id)
+            .await
+            .context("failed to create context")?;
+        assert_eq!(context.open("foo".to_string()).await?, true);
+        assert_eq!(context.is_open().await, true);
+        drop(context);
+
+        let id = 2;
+        let context = Context::new(dbfile.into(), id)
+            .await
+            .context("failed to create context")?;
+        assert_eq!(context.is_open().await, false);
+        assert_eq!(context.set_passphrase("bar".to_string()).await?, false);
+        assert_eq!(context.open("false".to_string()).await?, false);
+        assert_eq!(context.open("foo".to_string()).await?, true);
 
         Ok(())
     }

@@ -282,61 +282,23 @@ static P_DISROOT: Lazy<Provider> = Lazy::new(|| Provider {
     before_login_hint: "",
     after_login_hint: "",
     overview_page: "https://providers.delta.chat/disroot",
-    server: vec![],
-    config_defaults: None,
-    strict_tls: true,
-    max_smtp_rcpt_to: None,
-    oauth2_authorizer: None,
-});
-
-// dubby.org.md: dubby.org
-static P_DUBBY_ORG: Lazy<Provider> = Lazy::new(|| Provider {
-    id: "dubby.org",
-    status: Status::Ok,
-    before_login_hint: "",
-    after_login_hint: "",
-    overview_page: "https://providers.delta.chat/dubby-org",
     server: vec![
         Server {
             protocol: Imap,
             socket: Ssl,
-            hostname: "dubby.org",
+            hostname: "disroot.org",
             port: 993,
             username_pattern: Email,
         },
         Server {
             protocol: Smtp,
             socket: Starttls,
-            hostname: "dubby.org",
+            hostname: "disroot.org",
             port: 587,
             username_pattern: Email,
         },
-        Server {
-            protocol: Smtp,
-            socket: Ssl,
-            hostname: "dubby.org",
-            port: 465,
-            username_pattern: Email,
-        },
     ],
-    config_defaults: Some(vec![
-        ConfigDefault {
-            key: Config::BccSelf,
-            value: "1",
-        },
-        ConfigDefault {
-            key: Config::SentboxWatch,
-            value: "0",
-        },
-        ConfigDefault {
-            key: Config::MvboxWatch,
-            value: "0",
-        },
-        ConfigDefault {
-            key: Config::MvboxMove,
-            value: "0",
-        },
-    ]),
+    config_defaults: None,
     strict_tls: true,
     max_smtp_rcpt_to: None,
     oauth2_authorizer: None,
@@ -473,10 +435,6 @@ static P_FIVE_CHAT: Lazy<Provider> = Lazy::new(|| Provider {
         },
         ConfigDefault {
             key: Config::SentboxWatch,
-            value: "0",
-        },
-        ConfigDefault {
-            key: Config::MvboxWatch,
             value: "0",
         },
         ConfigDefault {
@@ -668,6 +626,35 @@ static P_ICLOUD: Lazy<Provider> = Lazy::new(|| Provider {
     oauth2_authorizer: None,
 });
 
+// infomaniak.com.md: ik.me
+static P_INFOMANIAK_COM: Lazy<Provider> = Lazy::new(|| Provider {
+    id: "infomaniak.com",
+    status: Status::Ok,
+    before_login_hint: "",
+    after_login_hint: "",
+    overview_page: "https://providers.delta.chat/infomaniak-com",
+    server: vec![
+        Server {
+            protocol: Imap,
+            socket: Ssl,
+            hostname: "mail.infomaniak.com",
+            port: 993,
+            username_pattern: Email,
+        },
+        Server {
+            protocol: Smtp,
+            socket: Ssl,
+            hostname: "mail.infomaniak.com",
+            port: 465,
+            username_pattern: Email,
+        },
+    ],
+    config_defaults: None,
+    strict_tls: true,
+    max_smtp_rcpt_to: Some(10),
+    oauth2_authorizer: None,
+});
+
 // kolst.com.md: kolst.com
 static P_KOLST_COM: Lazy<Provider> = Lazy::new(|| Provider {
     id: "kolst.com",
@@ -690,6 +677,35 @@ static P_KONTENT_COM: Lazy<Provider> = Lazy::new(|| Provider {
     after_login_hint: "",
     overview_page: "https://providers.delta.chat/kontent-com",
     server: vec![],
+    config_defaults: None,
+    strict_tls: true,
+    max_smtp_rcpt_to: None,
+    oauth2_authorizer: None,
+});
+
+// mail.de.md: mail.de
+static P_MAIL_DE: Lazy<Provider> = Lazy::new(|| Provider {
+    id: "mail.de",
+    status: Status::Ok,
+    before_login_hint: "",
+    after_login_hint: "",
+    overview_page: "https://providers.delta.chat/mail-de",
+    server: vec![
+        Server {
+            protocol: Imap,
+            socket: Ssl,
+            hostname: "imap.mail.de",
+            port: 993,
+            username_pattern: Email,
+        },
+        Server {
+            protocol: Smtp,
+            socket: Ssl,
+            hostname: "smtp.mail.de",
+            port: 465,
+            username_pattern: Email,
+        },
+    ],
     config_defaults: None,
     strict_tls: true,
     max_smtp_rcpt_to: None,
@@ -751,7 +767,22 @@ static P_MAILBOX_ORG: Lazy<Provider> = Lazy::new(|| Provider {
     before_login_hint: "",
     after_login_hint: "",
     overview_page: "https://providers.delta.chat/mailbox-org",
-    server: vec![],
+    server: vec![
+        Server {
+            protocol: Imap,
+            socket: Ssl,
+            hostname: "imap.mailbox.org",
+            port: 993,
+            username_pattern: Email,
+        },
+        Server {
+            protocol: Smtp,
+            socket: Ssl,
+            hostname: "smtp.mailbox.org",
+            port: 465,
+            username_pattern: Email,
+        },
+    ],
     config_defaults: None,
     strict_tls: true,
     max_smtp_rcpt_to: None,
@@ -821,10 +852,6 @@ static P_NAUTA_CU: Lazy<Provider> = Lazy::new(|| Provider {
         },
         ConfigDefault {
             key: Config::SentboxWatch,
-            value: "0",
-        },
-        ConfigDefault {
-            key: Config::MvboxWatch,
             value: "0",
         },
         ConfigDefault {
@@ -907,7 +934,7 @@ static P_OUTLOOK_COM: Lazy<Provider> = Lazy::new(|| Provider {
     oauth2_authorizer: None,
 });
 
-// posteo.md: posteo.de, posteo.af, posteo.at, posteo.be, posteo.ch, posteo.cl, posteo.co, posteo.co.uk, posteo.com.br, posteo.cr, posteo.cz, posteo.dk, posteo.ee, posteo.es, posteo.eu, posteo.fi, posteo.gl, posteo.gr, posteo.hn, posteo.hr, posteo.hu, posteo.ie, posteo.in, posteo.is, posteo.it, posteo.jp, posteo.la, posteo.li, posteo.lt, posteo.lu, posteo.me, posteo.mx, posteo.my, posteo.net, posteo.nl, posteo.no, posteo.nz, posteo.org, posteo.pe, posteo.pl, posteo.pm, posteo.pt, posteo.ro, posteo.ru, posteo.se, posteo.sg, posteo.si, posteo.tn, posteo.uk, posteo.us
+// posteo.md: posteo.de, posteo.af, posteo.at, posteo.be, posteo.ca, posteo.ch, posteo.cl, posteo.co, posteo.co.uk, posteo.com.br, posteo.cr, posteo.cz, posteo.dk, posteo.ee, posteo.es, posteo.eu, posteo.fi, posteo.gl, posteo.gr, posteo.hn, posteo.hr, posteo.hu, posteo.ie, posteo.in, posteo.is, posteo.it, posteo.jp, posteo.la, posteo.li, posteo.lt, posteo.lu, posteo.me, posteo.mx, posteo.my, posteo.net, posteo.nl, posteo.no, posteo.nz, posteo.org, posteo.pe, posteo.pl, posteo.pm, posteo.pt, posteo.ro, posteo.ru, posteo.se, posteo.sg, posteo.si, posteo.tn, posteo.uk, posteo.us
 static P_POSTEO: Lazy<Provider> = Lazy::new(|| Provider {
     id: "posteo",
     status: Status::Ok,
@@ -936,7 +963,7 @@ static P_POSTEO: Lazy<Provider> = Lazy::new(|| Provider {
     oauth2_authorizer: None,
 });
 
-// protonmail.md: protonmail.com, protonmail.ch
+// protonmail.md: protonmail.com, protonmail.ch, pm.me
 static P_PROTONMAIL: Lazy<Provider> = Lazy::new(|| {
     Provider {
     id: "protonmail",
@@ -979,7 +1006,22 @@ static P_RISEUP_NET: Lazy<Provider> = Lazy::new(|| Provider {
     before_login_hint: "",
     after_login_hint: "",
     overview_page: "https://providers.delta.chat/riseup-net",
-    server: vec![],
+    server: vec![
+        Server {
+            protocol: Imap,
+            socket: Ssl,
+            hostname: "mail.riseup.net",
+            port: 993,
+            username_pattern: Email,
+        },
+        Server {
+            protocol: Smtp,
+            socket: Ssl,
+            hostname: "mail.riseup.net",
+            port: 465,
+            username_pattern: Email,
+        },
+    ],
     config_defaults: None,
     strict_tls: true,
     max_smtp_rcpt_to: None,
@@ -1036,7 +1078,22 @@ static P_SYSTEMLI_ORG: Lazy<Provider> = Lazy::new(|| Provider {
     before_login_hint: "",
     after_login_hint: "",
     overview_page: "https://providers.delta.chat/systemli-org",
-    server: vec![],
+    server: vec![
+        Server {
+            protocol: Imap,
+            socket: Ssl,
+            hostname: "mail.systemli.org",
+            port: 993,
+            username_pattern: Email,
+        },
+        Server {
+            protocol: Smtp,
+            socket: Ssl,
+            hostname: "mail.systemli.org",
+            port: 465,
+            username_pattern: Email,
+        },
+    ],
     config_defaults: None,
     strict_tls: true,
     max_smtp_rcpt_to: None,
@@ -1099,10 +1156,6 @@ static P_TESTRUN: Lazy<Provider> = Lazy::new(|| Provider {
         },
         ConfigDefault {
             key: Config::SentboxWatch,
-            value: "0",
-        },
-        ConfigDefault {
-            key: Config::MvboxWatch,
             value: "0",
         },
         ConfigDefault {
@@ -1437,7 +1490,6 @@ pub(crate) static PROVIDER_DATA: Lazy<HashMap<&'static str, &'static Provider>> 
         ("comcast.net", &*P_COMCAST),
         ("dismail.de", &*P_DISMAIL_DE),
         ("disroot.org", &*P_DISROOT),
-        ("dubby.org", &*P_DUBBY_ORG),
         ("e.email", &*P_E_EMAIL),
         ("espiv.net", &*P_ESPIV_NET),
         ("example.com", &*P_EXAMPLE_COM),
@@ -1467,8 +1519,10 @@ pub(crate) static PROVIDER_DATA: Lazy<HashMap<&'static str, &'static Provider>> 
         ("icloud.com", &*P_ICLOUD),
         ("me.com", &*P_ICLOUD),
         ("mac.com", &*P_ICLOUD),
+        ("ik.me", &*P_INFOMANIAK_COM),
         ("kolst.com", &*P_KOLST_COM),
         ("kontent.com", &*P_KONTENT_COM),
+        ("mail.de", &*P_MAIL_DE),
         ("mail.ru", &*P_MAIL_RU),
         ("inbox.ru", &*P_MAIL_RU),
         ("internet.ru", &*P_MAIL_RU),
@@ -1489,6 +1543,7 @@ pub(crate) static PROVIDER_DATA: Lazy<HashMap<&'static str, &'static Provider>> 
         ("posteo.af", &*P_POSTEO),
         ("posteo.at", &*P_POSTEO),
         ("posteo.be", &*P_POSTEO),
+        ("posteo.ca", &*P_POSTEO),
         ("posteo.ch", &*P_POSTEO),
         ("posteo.cl", &*P_POSTEO),
         ("posteo.co", &*P_POSTEO),
@@ -1537,6 +1592,7 @@ pub(crate) static PROVIDER_DATA: Lazy<HashMap<&'static str, &'static Provider>> 
         ("posteo.us", &*P_POSTEO),
         ("protonmail.com", &*P_PROTONMAIL),
         ("protonmail.ch", &*P_PROTONMAIL),
+        ("pm.me", &*P_PROTONMAIL),
         ("qq.com", &*P_QQ),
         ("foxmail.com", &*P_QQ),
         ("riseup.net", &*P_RISEUP_NET),
@@ -1633,7 +1689,6 @@ pub(crate) static PROVIDER_IDS: Lazy<HashMap<&'static str, &'static Provider>> =
         ("comcast", &*P_COMCAST),
         ("dismail.de", &*P_DISMAIL_DE),
         ("disroot", &*P_DISROOT),
-        ("dubby.org", &*P_DUBBY_ORG),
         ("e.email", &*P_E_EMAIL),
         ("espiv.net", &*P_ESPIV_NET),
         ("example.com", &*P_EXAMPLE_COM),
@@ -1648,8 +1703,10 @@ pub(crate) static PROVIDER_IDS: Lazy<HashMap<&'static str, &'static Provider>> =
         ("i.ua", &*P_I_UA),
         ("i3.net", &*P_I3_NET),
         ("icloud", &*P_ICLOUD),
+        ("infomaniak.com", &*P_INFOMANIAK_COM),
         ("kolst.com", &*P_KOLST_COM),
         ("kontent.com", &*P_KONTENT_COM),
+        ("mail.de", &*P_MAIL_DE),
         ("mail.ru", &*P_MAIL_RU),
         ("mail2tor", &*P_MAIL2TOR),
         ("mailbox.org", &*P_MAILBOX_ORG),
@@ -1686,4 +1743,4 @@ pub(crate) static PROVIDER_IDS: Lazy<HashMap<&'static str, &'static Provider>> =
 });
 
 pub static PROVIDER_UPDATED: Lazy<chrono::NaiveDate> =
-    Lazy::new(|| chrono::NaiveDate::from_ymd(2021, 9, 29));
+    Lazy::new(|| chrono::NaiveDate::from_ymd(2022, 1, 11));
