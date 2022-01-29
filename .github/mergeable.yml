@@ -3,11 +3,16 @@ mergeable:
   - when: pull_request.*
     name: "Changelog check"
     validate:
+      - do: or
+        validate:
+        - do: description
+          must_include:
+            regex: '#skip-changelog'
         - do: and
           validate:
             - do: dependent
               changed:
-                file: 'src/**' 
+                file: 'src/**'
                 required: ['CHANGELOG.md']
             - do: dependent
               changed:
@@ -18,4 +23,4 @@ mergeable:
         status: 'action_required' 
         payload:
           title: Changlog might need an update
-          summary: "Changelog not updated, please check if an update is needed."
+          summary: "Check if CHANGELOG.md needs an update or add #skip-changelog to the PR description."

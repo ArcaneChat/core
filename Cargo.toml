@@ -1,6 +1,6 @@
 [package]
 name = "deltachat"
-version = "1.70.0"
+version = "1.72.0"
 authors = ["Delta Chat Developers (ML) <delta@codespeak.net>"]
 edition = "2018"
 license = "MPL-2.0"
@@ -11,6 +11,9 @@ debug = 0
 
 [profile.release]
 lto = true
+
+[patch.crates-io]
+rusqlite = { git = "https://github.com/rusqlite/rusqlite", branch="master" }
 
 [dependencies]
 deltachat_derive = { path = "./deltachat_derive" }
@@ -63,7 +66,7 @@ serde = { version = "1.0", features = ["derive"] }
 sha-1 = "0.10"
 sha2 = "0.10"
 smallvec = "1"
-stop-token = "0.6"
+stop-token = "0.7"
 strum = "0.23"
 strum_macros = "0.23"
 surf = { version = "2.3", default-features = false, features = ["h1-client"] }

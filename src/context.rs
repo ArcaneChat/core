@@ -109,8 +109,8 @@ impl Context {
         let context = Self::new_closed(dbfile, id).await?;
 
         // Open the database if is not encrypted.
-        if context.set_passphrase("".to_string()).await? {
-            context.sql.open(&context).await?;
+        if context.check_passphrase("".to_string()).await? {
+            context.sql.open(&context, "".to_string()).await?;
         }
         Ok(context)
     }
@@ -133,8 +133,8 @@ impl Context {
     /// Returns true if passphrase is correct, false is passphrase is not correct. Fails on other
     /// errors.
     pub async fn open(&self, passphrase: String) -> Result<bool> {
-        if self.sql.set_passphrase(passphrase).await? {
-            self.sql.open(self).await?;
+        if self.sql.check_passphrase(passphrase.clone()).await? {
+            self.sql.open(self, passphrase).await?;
             Ok(true)
         } else {
             Ok(false)
@@ -146,13 +146,13 @@ impl Context {
         self.sql.is_open().await
     }
 
-    /// Sets the database passphrase.
+    /// Tests the database passphrase.
     ///
     /// Returns true if passphrase is correct.
     ///
     /// Fails if database is already open.
-    pub async fn set_passphrase(&self, passphrase: String) -> Result<bool> {
-        self.sql.set_passphrase(passphrase).await
+    pub(crate) async fn check_passphrase(&self, passphrase: String) -> Result<bool> {
+        self.sql.check_passphrase(passphrase).await
     }
 
     pub(crate) async fn with_blobdir(
@@ -383,6 +383,13 @@ impl Context {
         res.insert("number_of_contacts", contacts.to_string());
         res.insert("database_dir", self.get_dbfile().display().to_string());
         res.insert("database_version", dbversion.to_string());
+        res.insert(
+            "database_encrypted",
+            self.sql
+                .is_encrypted()
+                .await
+                .map_or_else(|| "closed".to_string(), |b| b.to_string()),
+        );
         res.insert("journal_mode", journal_mode);
         res.insert("blobdir", self.get_blobdir().display().to_string());
         res.insert("display_name", displayname.unwrap_or_else(|| unset.into()));
@@ -1039,7 +1046,7 @@ mod tests {
     }
 
     #[async_std::test]
-    async fn test_set_passphrase() -> Result<()> {
+    async fn test_check_passphrase() -> Result<()> {
         let dir = tempdir()?;
         let dbfile = dir.path().join("db.sqlite");
 
@@ -1056,7 +1063,7 @@ mod tests {
             .await
             .context("failed to create context")?;
         assert_eq!(context.is_open().await, false);
-        assert_eq!(context.set_passphrase("bar".to_string()).await?, false);
+        assert_eq!(context.check_passphrase("bar".to_string()).await?, false);
         assert_eq!(context.open("false".to_string()).await?, false);
         assert_eq!(context.open("foo".to_string()).await?, true);
 

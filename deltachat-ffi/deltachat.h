@@ -2023,8 +2023,8 @@ dc_contact_t*   dc_get_contact               (dc_context_t* context, uint32_t co
 
 #define         DC_IMEX_EXPORT_SELF_KEYS      1 // param1 is a directory where the keys are written to
 #define         DC_IMEX_IMPORT_SELF_KEYS      2 // param1 is a directory where the keys are searched in and read from
-#define         DC_IMEX_EXPORT_BACKUP        11 // param1 is a directory where the backup is written to
-#define         DC_IMEX_IMPORT_BACKUP        12 // param1 is the file with the backup to import
+#define         DC_IMEX_EXPORT_BACKUP        11 // param1 is a directory where the backup is written to, param2 is a passphrase to encrypt the backup
+#define         DC_IMEX_IMPORT_BACKUP        12 // param1 is the file with the backup to import, param2 is the backup's passphrase
 
 
 /**
@@ -2033,14 +2033,16 @@ dc_contact_t*   dc_get_contact               (dc_context_t* context, uint32_t co
  * if needed stop IO using dc_accounts_stop_io() or dc_stop_io() first.
  * What to do is defined by the _what_ parameter which may be one of the following:
  *
- * - **DC_IMEX_EXPORT_BACKUP** (11) - Export a backup to the directory given as `param1`.
+ * - **DC_IMEX_EXPORT_BACKUP** (11) - Export a backup to the directory given as `param1`
+ *   encrypted with the passphrase given as `param2`. If `param2` is NULL or empty string,
+ *   the backup is not encrypted.
  *   The backup contains all contacts, chats, images and other data and device independent settings.
  *   The backup does not contain device dependent settings as ringtones or LED notification settings.
  *   The name of the backup is typically `delta-chat-<day>.tar`, if more than one backup is create on a day,
  *   the format is `delta-chat-<day>-<number>.tar`
  *
- * - **DC_IMEX_IMPORT_BACKUP** (12) - `param1` is the file (not: directory) to import. The file is normally
- *   created by DC_IMEX_EXPORT_BACKUP and detected by dc_imex_has_backup(). Importing a backup
+ * - **DC_IMEX_IMPORT_BACKUP** (12) - `param1` is the file (not: directory) to import. `param2` is the passphrase.
+ *   The file is normally created by DC_IMEX_EXPORT_BACKUP and detected by dc_imex_has_backup(). Importing a backup
  *   is only possible as long as the context is not configured or used in another way.
  *
  * - **DC_IMEX_EXPORT_SELF_KEYS** (1) - Export all private keys and all public keys of the user to the
@@ -3965,8 +3967,11 @@ int             dc_msg_is_forwarded           (const dc_msg_t* msg);
  * These messages are typically shown in the center of the chat view,
  * dc_msg_get_text() returns a descriptive text about what is going on.
  *
+ * For informational messages created by Webxdc apps,
+ * dc_msg_get_parent() usually returns the Webxdc instance;
+ * UIs can use that to scroll to the Webxdc app when the info is tapped.
+ *
  * There is no need to perform any action when seeing such a message - this is already done by the core.
- * Typically, these messages are displayed in the center of the chat.
  *
  * @memberof dc_msg_t
  * @param msg The message object.
@@ -4366,6 +4371,23 @@ char*           dc_msg_get_quoted_text        (const dc_msg_t* msg);
  *     Must be freed using dc_msg_unref() after usage.
  */
 dc_msg_t*       dc_msg_get_quoted_msg         (const dc_msg_t* msg);
+
+/**
+ * Get parent message, if available.
+ *
+ * Used for Webxdc-info-messages
+ * to jump to the corresponding instance that created the info message.
+ *
+ * For quotes, please use the more specialized
+ * dc_msg_get_quoted_text() and dc_msg_get_quoted_msg().
+ *
+ * @memberof dc_msg_t
+ * @param msg The message object.
+ * @return The parent message or NULL.
+ *     Must be freed using dc_msg_unref() after usage.
+ */
+dc_msg_t*       dc_msg_get_parent             (const dc_msg_t* msg);
+
 
 /**
  * Force the message to be sent in plain text.

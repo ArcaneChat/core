@@ -3,6 +3,8 @@
 ## Webxdc File Format
 
 - a **Webxdc app** is a **ZIP-file** with the extension `.xdc`
+- the ZIP-file must use the default compression methods as of RFC 1950,
+  this is "Deflate" or "Store"
 - the ZIP-file must contain at least the file `index.html`
 - if the Webxdc app is started, `index.html` is opened in a restricted webview
   that allow accessing resources only from the ZIP-file
@@ -42,6 +44,13 @@ To get a shared state, the peers use `sendUpdate()` to send updates to each othe
 All peers, including the sending one,
 will receive the update by the callback given to `setUpdateListener()`.
 
+There are situations where the user cannot send messages to a chat,
+eg. contact requests or if the user has left a group.
+In these cases, you can still call `sendUpdate()`,
+however, the update won't be sent to other peers
+and you won't get the update by `setUpdateListener()` nor by `getAllUpdates()`.
+
+
 ### setUpdateListener()
 
 ```js
@@ -59,38 +68,46 @@ The callback is called for updates sent by you or other peers.
 
 ### getAllUpdates()
 
-```
-payloads = window.webxdc.getAllUpdates()
+```js
+updates = await window.webxdc.getAllUpdates();
 ```
 
 In case your Webxdc was just started,
 you may want to reconstruct the state from the last run -
 and also incorporate updates that may have arrived while the app was not running.
 
-- `payloads`: the function returns all previous updates in an array, 
+- `updates`: All previous updates in an array, 
   eg. `[{payload: "foo"},{payload: "bar"}]`
-  if `webxdc.sendUpdate("foo"); webxdc.sendUpdate("bar");` was called on the last run.
+  if `webxdc.sendUpdate({payload: "foo"}); webxdc.sendUpdate({payload: "bar"};` was called on the last run.
 
-
-### selfAddr()
+The updates are wrapped into a Promise that you can `await` for.
+If you are not in an async function and cannot use `await` therefore,
+you can get the updates with `then()`:
 
 ```js
-addr = window.webxdc.selfAddr()
+window.webxdc.getAllUpdates().then(updates => {});
 ```
 
-Returns the peer's own address.
+
+### selfAddr
+
+```js
+window.webxdc.selfAddr
+```
+
+Property with the peer's own address.
 This is esp. useful if you want to differ between different peers -
 just send the address along with the payload,
 and, if needed, compare the payload addresses against selfAddr() later on.
 
 
-### selfName()
+### selfName
 
 ```js
-addr = window.webxdc.selfName()
+window.webxdc.selfName
 ```
 
-Returns the peer's own name.
+Property with the peer's own name.
 This is name chosen by the user in their settings,
 if there is nothing set, that defaults to the peer's address.
 
@@ -119,7 +136,7 @@ round corners etc. will be added by the implementations as needed.
 If no icon is set, a default icon will be used.
 
 
-## Webxdc Example
+## Webxdc Examples
 
 The following example shows an input field and  every input is show on all peers.
 
@@ -146,14 +163,26 @@ The following example shows an input field and  every input is show on all peers
       }
     
       window.webxdc.setUpdateListener(receiveUpdate);
-      window.webxdc.getAllUpdates().forEach(receiveUpdate);
+      window.webxdc.getAllUpdates().then(updates => updates.forEach(receiveUpdate));
 
     </script>
   </body>
 </html>
 ```
 
-For a more advanved example, see https://github.com/r10s/webxdc-poll/ .
+[Webxdc Development Tool](https://github.com/deltachat/webxdc-dev)
+offers an **Webxdc Simulator** that can be used in many browsers without any installation needed.
+You can also use that repository as a template for your own app -
+just clone and start adapting things to your need.
+
+
+### Advanced Examples
+
+- [2048](https://github.com/adbenitez/2048.xdc)
+- [Draw](https://github.com/adbenitez/draw.xdc)
+- [Poll](https://github.com/r10s/webxdc-poll/)
+- [Tic Tac Toe](https://github.com/Simon-Laux/tictactoe.xdc)
+- Even more with [Topic #webxdc on Github](https://github.com/topics/webxdc)
 
 
 ## Closing Remarks

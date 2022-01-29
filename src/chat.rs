@@ -25,8 +25,8 @@ use crate::context::Context;
 use crate::dc_receive_imf::ReceivedMsg;
 use crate::dc_tools::{
     dc_create_id, dc_create_outgoing_rfc724_mid, dc_create_smeared_timestamp,
-    dc_create_smeared_timestamps, dc_get_abs_path, dc_get_filebytes, dc_gm2local_offset,
-    improve_single_line_input, time, IsNoneOrEmpty,
+    dc_create_smeared_timestamps, dc_get_abs_path, dc_gm2local_offset, improve_single_line_input,
+    time, IsNoneOrEmpty,
 };
 use crate::ephemeral::{delete_expired_messages, schedule_ephemeral_task, Timer as EphemeralTimer};
 use crate::events::EventType;
@@ -41,7 +41,7 @@ use crate::peerstate::{Peerstate, PeerstateVerifiedStatus};
 use crate::scheduler::InterruptInfo;
 use crate::smtp::send_msg_to_smtp;
 use crate::stock_str;
-use crate::webxdc::{WEBXDC_SENDING_LIMIT, WEBXDC_SUFFIX};
+use crate::webxdc::WEBXDC_SUFFIX;
 
 /// An chat item, such as a message or a marker.
 #[derive(Debug, Copy, Clone)]
@@ -443,6 +443,7 @@ impl ChatId {
                 &msg_text,
                 cmd,
                 dc_create_smeared_timestamp(context).await,
+                None,
             )
             .await?;
         }
@@ -1835,32 +1836,27 @@ async fn prepare_msg_blob(context: &Context, msg: &mut Message) -> Result<()> {
             if let Some((better_type, better_mime)) =
                 message::guess_msgtype_from_suffix(&blob.to_abs_path())
             {
-                msg.viewtype = better_type;
-                if !msg.param.exists(Param::MimeType) {
-                    msg.param.set(Param::MimeType, better_mime);
+                if better_type != Viewtype::Webxdc
+                    || context
+                        .ensure_sendable_webxdc_file(&blob.to_abs_path())
+                        .await
+                        .is_ok()
+                {
+                    msg.viewtype = better_type;
+                    if !msg.param.exists(Param::MimeType) {
+                        msg.param.set(Param::MimeType, better_mime);
+                    }
                 }
             }
-        } else if !msg.param.exists(Param::MimeType) {
-            if let Some((_, mime)) = message::guess_msgtype_from_suffix(&blob.to_abs_path()) {
-                msg.param.set(Param::MimeType, mime);
-            }
+        } else if msg.viewtype == Viewtype::Webxdc {
+            context
+                .ensure_sendable_webxdc_file(&blob.to_abs_path())
+                .await?;
         }
 
-        if msg.viewtype == Viewtype::Webxdc {
-            if blob.suffix() != Some(WEBXDC_SUFFIX) {
-                bail!(
-                    "webxdc message {} does not have suffix {}",
-                    blob,
-                    WEBXDC_SUFFIX
-                );
-            } else if dc_get_filebytes(context, blob.to_abs_path()).await
-                > WEBXDC_SENDING_LIMIT as u64
-            {
-                bail!(
-                    "webxdc message {} exceeds acceptable size of {} bytes",
-                    blob.as_name(),
-                    WEBXDC_SENDING_LIMIT
-                );
+        if !msg.param.exists(Param::MimeType) {
+            if let Some((_, mime)) = message::guess_msgtype_from_suffix(&blob.to_abs_path()) {
+                msg.param.set(Param::MimeType, mime);
             }
         }
 
@@ -3391,6 +3387,7 @@ pub(crate) async fn add_info_msg_with_cmd(
     text: &str,
     cmd: SystemMessage,
     timestamp: i64,
+    parent: Option<&Message>,
 ) -> Result<MsgId> {
     let rfc724_mid = dc_create_outgoing_rfc724_mid(None, "@device");
     let ephemeral_timer = chat_id.get_ephemeral_timer(context).await?;
@@ -3402,7 +3399,7 @@ pub(crate) async fn add_info_msg_with_cmd(
 
     let row_id =
     context.sql.insert(
-        "INSERT INTO msgs (chat_id,from_id,to_id,timestamp,type,state,txt,rfc724_mid,ephemeral_timer, param) VALUES (?,?,?, ?,?,?, ?,?,?, ?);",
+        "INSERT INTO msgs (chat_id,from_id,to_id,timestamp,type,state,txt,rfc724_mid,ephemeral_timer, param,mime_in_reply_to) VALUES (?,?,?, ?,?,?, ?,?,?, ?,?);",
         paramsv![
             chat_id,
             DC_CONTACT_ID_INFO,
@@ -3414,6 +3411,7 @@ pub(crate) async fn add_info_msg_with_cmd(
             rfc724_mid,
             ephemeral_timer,
             param.to_string(),
+            parent.map(|msg|msg.rfc724_mid.clone()).unwrap_or_default()
         ]
     ).await?;
 
@@ -3429,7 +3427,15 @@ pub(crate) async fn add_info_msg(
     text: &str,
     timestamp: i64,
 ) -> Result<MsgId> {
-    add_info_msg_with_cmd(context, chat_id, text, SystemMessage::Unknown, timestamp).await
+    add_info_msg_with_cmd(
+        context,
+        chat_id,
+        text,
+        SystemMessage::Unknown,
+        timestamp,
+        None,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -4415,34 +4421,37 @@ mod tests {
         assert_eq!(msg.get_text().unwrap(), "foo info");
         assert!(msg.is_info());
         assert_eq!(msg.get_info_type(), SystemMessage::Unknown);
+        assert!(msg.parent(&t).await?.is_none());
+        assert!(msg.quoted_message(&t).await?.is_none());
         Ok(())
     }
 
     #[async_std::test]
-    async fn test_add_info_msg_with_cmd() {
+    async fn test_add_info_msg_with_cmd() -> Result<()> {
         let t = TestContext::new().await;
-        let chat_id = create_group_chat(&t, ProtectionStatus::Unprotected, "foo")
-            .await
-            .unwrap();
+        let chat_id = create_group_chat(&t, ProtectionStatus::Unprotected, "foo").await?;
         let msg_id = add_info_msg_with_cmd(
             &t,
             chat_id,
             "foo bar info",
             SystemMessage::EphemeralTimerChanged,
             10000,
+            None,
         )
-        .await
-        .unwrap();
+        .await?;
 
-        let msg = Message::load_from_db(&t, msg_id).await.unwrap();
+        let msg = Message::load_from_db(&t, msg_id).await?;
         assert_eq!(msg.get_chat_id(), chat_id);
         assert_eq!(msg.get_viewtype(), Viewtype::Text);
         assert_eq!(msg.get_text().unwrap(), "foo bar info");
         assert!(msg.is_info());
         assert_eq!(msg.get_info_type(), SystemMessage::EphemeralTimerChanged);
+        assert!(msg.parent(&t).await?.is_none());
+        assert!(msg.quoted_message(&t).await?.is_none());
 
         let msg2 = t.get_last_msg_in(chat_id).await;
         assert_eq!(msg.get_id(), msg2.get_id());
+        Ok(())
     }
 
     #[async_std::test]
