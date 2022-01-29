@@ -8,7 +8,7 @@ use anyhow::{bail, format_err, Context as _, Error, Result};
 use deltachat_derive::{FromSql, ToSql};
 use rand::{thread_rng, Rng};
 
-use crate::chat::{self, Chat};
+use crate::chat::Chat;
 use crate::config::Config;
 use crate::constants::Chattype;
 use crate::contact::{normalize_name, Contact, Modifier, Origin};
