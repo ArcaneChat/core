@@ -10,11 +10,10 @@ use strum_macros::EnumProperty;
 use crate::blob::BlobObject;
 use crate::chat::{self, Chat, ChatId, ProtectionStatus};
 use crate::config::Config;
-use crate::constants::{Viewtype, DC_CONTACT_ID_SELF};
-use crate::contact::{Contact, Origin};
+use crate::contact::{Contact, ContactId, Origin};
 use crate::context::Context;
 use crate::dc_tools::dc_timestamp_to_str;
-use crate::message::Message;
+use crate::message::{Message, Viewtype};
 use crate::param::Param;
 use humansize::{file_size_opts, FileSize};
 
@@ -389,7 +388,7 @@ trait StockStringMods: AsRef<str> + Sized {
     fn action_by_contact<'a>(
         self,
         context: &'a Context,
-        contact_id: u32,
+        contact_id: ContactId,
     ) -> Pin<Box<dyn Future<Output = String> + Send + 'a>>
     where
         Self: Send + 'a,
@@ -397,7 +396,7 @@ trait StockStringMods: AsRef<str> + Sized {
         Box::pin(async move {
             let message = self.as_ref().trim_end_matches('.');
             match contact_id {
-                DC_CONTACT_ID_SELF => msg_action_by_me(context, message).await,
+                ContactId::SELF => msg_action_by_me(context, message).await,
                 _ => {
                     let displayname = Contact::get_by_id(context, contact_id)
                         .await
@@ -457,7 +456,7 @@ pub(crate) async fn msg_grp_name(
     context: &Context,
     from_group: impl AsRef<str>,
     to_group: impl AsRef<str>,
-    by_contact: u32,
+    by_contact: ContactId,
 ) -> String {
     translated(context, StockMessage::MsgGrpName)
         .await
@@ -468,7 +467,7 @@ pub(crate) async fn msg_grp_name(
 }
 
 /// Stock string: `Group image changed.`.
-pub(crate) async fn msg_grp_img_changed(context: &Context, by_contact: u32) -> String {
+pub(crate) async fn msg_grp_img_changed(context: &Context, by_contact: ContactId) -> String {
     translated(context, StockMessage::MsgGrpImgChanged)
         .await
         .action_by_contact(context, by_contact)
@@ -482,7 +481,7 @@ pub(crate) async fn msg_grp_img_changed(context: &Context, by_contact: u32) -> S
 pub(crate) async fn msg_add_member(
     context: &Context,
     added_member_addr: impl AsRef<str>,
-    by_contact: u32,
+    by_contact: ContactId,
 ) -> String {
     let addr = added_member_addr.as_ref();
     let who = match Contact::lookup_id_by_addr(context, addr, Origin::Unknown).await {
@@ -506,7 +505,7 @@ pub(crate) async fn msg_add_member(
 pub(crate) async fn msg_del_member(
     context: &Context,
     removed_member_addr: impl AsRef<str>,
-    by_contact: u32,
+    by_contact: ContactId,
 ) -> String {
     let addr = removed_member_addr.as_ref();
     let who = match Contact::lookup_id_by_addr(context, addr, Origin::Unknown).await {
@@ -524,7 +523,7 @@ pub(crate) async fn msg_del_member(
 }
 
 /// Stock string: `Group left.`.
-pub(crate) async fn msg_group_left(context: &Context, by_contact: u32) -> String {
+pub(crate) async fn msg_group_left(context: &Context, by_contact: ContactId) -> String {
     translated(context, StockMessage::MsgGroupLeft)
         .await
         .action_by_contact(context, by_contact)
@@ -574,7 +573,7 @@ pub(crate) async fn read_rcpt_mail_body(context: &Context, message: impl AsRef<s
 }
 
 /// Stock string: `Group image deleted.`.
-pub(crate) async fn msg_grp_img_deleted(context: &Context, by_contact: u32) -> String {
+pub(crate) async fn msg_grp_img_deleted(context: &Context, by_contact: ContactId) -> String {
     translated(context, StockMessage::MsgGrpImgDeleted)
         .await
         .action_by_contact(context, by_contact)
@@ -587,7 +586,10 @@ pub(crate) async fn e2e_preferred(context: &Context) -> String {
 }
 
 /// Stock string: `%1$s invited you to join this group. Waiting for the device of %2$s to reply…`.
-pub(crate) async fn secure_join_started(context: &Context, inviter_contact_id: u32) -> String {
+pub(crate) async fn secure_join_started(
+    context: &Context,
+    inviter_contact_id: ContactId,
+) -> String {
     if let Ok(contact) = Contact::get_by_id(context, inviter_contact_id).await {
         translated(context, StockMessage::SecureJoinStarted)
             .await
@@ -602,7 +604,7 @@ pub(crate) async fn secure_join_started(context: &Context, inviter_contact_id: u
 }
 
 /// Stock string: `%1$s replied, waiting for being added to the group…`.
-pub(crate) async fn secure_join_replies(context: &Context, contact_id: u32) -> String {
+pub(crate) async fn secure_join_replies(context: &Context, contact_id: ContactId) -> String {
     if let Ok(contact) = Contact::get_by_id(context, contact_id).await {
         translated(context, StockMessage::SecureJoinReplies)
             .await
@@ -636,20 +638,19 @@ pub(crate) async fn secure_join_group_qr_description(context: &Context, chat: &C
 }
 
 /// Stock string: `%1$s verified.`.
-pub(crate) async fn contact_verified(context: &Context, contact_addr: impl AsRef<str>) -> String {
+pub(crate) async fn contact_verified(context: &Context, contact: &Contact) -> String {
+    let addr = contact.get_name_n_addr();
     translated(context, StockMessage::ContactVerified)
         .await
-        .replace1(contact_addr)
+        .replace1(addr)
 }
 
 /// Stock string: `Cannot verify %1$s`.
-pub(crate) async fn contact_not_verified(
-    context: &Context,
-    contact_addr: impl AsRef<str>,
-) -> String {
+pub(crate) async fn contact_not_verified(context: &Context, contact: &Contact) -> String {
+    let addr = contact.get_name_n_addr();
     translated(context, StockMessage::ContactNotVerified)
         .await
-        .replace1(contact_addr)
+        .replace1(addr)
 }
 
 /// Stock string: `Changed setup for %1$s`.
@@ -719,7 +720,7 @@ pub(crate) async fn msg_location_enabled(context: &Context) -> String {
 }
 
 /// Stock string: `Location streaming enabled by ...`.
-pub(crate) async fn msg_location_enabled_by(context: &Context, contact: u32) -> String {
+pub(crate) async fn msg_location_enabled_by(context: &Context, contact: ContactId) -> String {
     translated(context, StockMessage::MsgLocationEnabled)
         .await
         .action_by_contact(context, contact)
@@ -785,7 +786,10 @@ pub(crate) async fn failed_sending_to(context: &Context, name: impl AsRef<str>) 
 }
 
 /// Stock string: `Message deletion timer is disabled.`.
-pub(crate) async fn msg_ephemeral_timer_disabled(context: &Context, by_contact: u32) -> String {
+pub(crate) async fn msg_ephemeral_timer_disabled(
+    context: &Context,
+    by_contact: ContactId,
+) -> String {
     translated(context, StockMessage::MsgEphemeralTimerDisabled)
         .await
         .action_by_contact(context, by_contact)
@@ -796,7 +800,7 @@ pub(crate) async fn msg_ephemeral_timer_disabled(context: &Context, by_contact: 
 pub(crate) async fn msg_ephemeral_timer_enabled(
     context: &Context,
     timer: impl AsRef<str>,
-    by_contact: u32,
+    by_contact: ContactId,
 ) -> String {
     translated(context, StockMessage::MsgEphemeralTimerEnabled)
         .await
@@ -806,7 +810,7 @@ pub(crate) async fn msg_ephemeral_timer_enabled(
 }
 
 /// Stock string: `Message deletion timer is set to 1 minute.`.
-pub(crate) async fn msg_ephemeral_timer_minute(context: &Context, by_contact: u32) -> String {
+pub(crate) async fn msg_ephemeral_timer_minute(context: &Context, by_contact: ContactId) -> String {
     translated(context, StockMessage::MsgEphemeralTimerMinute)
         .await
         .action_by_contact(context, by_contact)
@@ -814,7 +818,7 @@ pub(crate) async fn msg_ephemeral_timer_minute(context: &Context, by_contact: u3
 }
 
 /// Stock string: `Message deletion timer is set to 1 hour.`.
-pub(crate) async fn msg_ephemeral_timer_hour(context: &Context, by_contact: u32) -> String {
+pub(crate) async fn msg_ephemeral_timer_hour(context: &Context, by_contact: ContactId) -> String {
     translated(context, StockMessage::MsgEphemeralTimerHour)
         .await
         .action_by_contact(context, by_contact)
@@ -822,7 +826,7 @@ pub(crate) async fn msg_ephemeral_timer_hour(context: &Context, by_contact: u32)
 }
 
 /// Stock string: `Message deletion timer is set to 1 day.`.
-pub(crate) async fn msg_ephemeral_timer_day(context: &Context, by_contact: u32) -> String {
+pub(crate) async fn msg_ephemeral_timer_day(context: &Context, by_contact: ContactId) -> String {
     translated(context, StockMessage::MsgEphemeralTimerDay)
         .await
         .action_by_contact(context, by_contact)
@@ -830,7 +834,7 @@ pub(crate) async fn msg_ephemeral_timer_day(context: &Context, by_contact: u32) 
 }
 
 /// Stock string: `Message deletion timer is set to 1 week.`.
-pub(crate) async fn msg_ephemeral_timer_week(context: &Context, by_contact: u32) -> String {
+pub(crate) async fn msg_ephemeral_timer_week(context: &Context, by_contact: ContactId) -> String {
     translated(context, StockMessage::MsgEphemeralTimerWeek)
         .await
         .action_by_contact(context, by_contact)
@@ -875,7 +879,7 @@ pub(crate) async fn error_no_network(context: &Context) -> String {
 }
 
 /// Stock string: `Chat protection enabled.`.
-pub(crate) async fn protection_enabled(context: &Context, by_contact: u32) -> String {
+pub(crate) async fn protection_enabled(context: &Context, by_contact: ContactId) -> String {
     translated(context, StockMessage::ProtectionEnabled)
         .await
         .action_by_contact(context, by_contact)
@@ -883,7 +887,7 @@ pub(crate) async fn protection_enabled(context: &Context, by_contact: u32) -> St
 }
 
 /// Stock string: `Chat protection disabled.`.
-pub(crate) async fn protection_disabled(context: &Context, by_contact: u32) -> String {
+pub(crate) async fn protection_disabled(context: &Context, by_contact: ContactId) -> String {
     translated(context, StockMessage::ProtectionDisabled)
         .await
         .action_by_contact(context, by_contact)
@@ -909,7 +913,7 @@ pub(crate) async fn delete_server_turned_off(context: &Context) -> String {
 pub(crate) async fn msg_ephemeral_timer_minutes(
     context: &Context,
     minutes: impl AsRef<str>,
-    by_contact: u32,
+    by_contact: ContactId,
 ) -> String {
     translated(context, StockMessage::MsgEphemeralTimerMinutes)
         .await
@@ -922,7 +926,7 @@ pub(crate) async fn msg_ephemeral_timer_minutes(
 pub(crate) async fn msg_ephemeral_timer_hours(
     context: &Context,
     hours: impl AsRef<str>,
-    by_contact: u32,
+    by_contact: ContactId,
 ) -> String {
     translated(context, StockMessage::MsgEphemeralTimerHours)
         .await
@@ -935,7 +939,7 @@ pub(crate) async fn msg_ephemeral_timer_hours(
 pub(crate) async fn msg_ephemeral_timer_days(
     context: &Context,
     days: impl AsRef<str>,
-    by_contact: u32,
+    by_contact: ContactId,
 ) -> String {
     translated(context, StockMessage::MsgEphemeralTimerDays)
         .await
@@ -948,7 +952,7 @@ pub(crate) async fn msg_ephemeral_timer_days(
 pub(crate) async fn msg_ephemeral_timer_weeks(
     context: &Context,
     weeks: impl AsRef<str>,
-    by_contact: u32,
+    by_contact: ContactId,
 ) -> String {
     translated(context, StockMessage::MsgEphemeralTimerWeeks)
         .await
@@ -1105,7 +1109,7 @@ impl Context {
     pub(crate) async fn stock_protection_msg(
         &self,
         protect: ProtectionStatus,
-        from_id: u32,
+        from_id: ContactId,
     ) -> String {
         match protect {
             ProtectionStatus::Unprotected => protection_enabled(self, from_id).await,
@@ -1124,7 +1128,7 @@ impl Context {
             self.sql
                 .set_raw_config_bool("self-chat-added", true)
                 .await?;
-            ChatId::create_for_contact(self, DC_CONTACT_ID_SELF).await?;
+            ChatId::create_for_contact(self, ContactId::SELF).await?;
         }
 
         // add welcome-messages. by the label, this is done only once,
@@ -1144,14 +1148,13 @@ impl Context {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::test_utils::TestContext;
-
-    use crate::constants::DC_CONTACT_ID_SELF;
+    use num_traits::ToPrimitive;
 
     use crate::chat::Chat;
     use crate::chatlist::Chatlist;
-    use num_traits::ToPrimitive;
+    use crate::test_utils::TestContext;
+
+    use super::*;
 
     #[test]
     fn test_enum_mapping() {
@@ -1197,8 +1200,15 @@ mod tests {
     #[async_std::test]
     async fn test_stock_string_repl_str() {
         let t = TestContext::new().await;
+        let contact_id = Contact::create(&t.ctx, "Someone", "someone@example.org")
+            .await
+            .unwrap();
+        let contact = Contact::load_from_db(&t.ctx, contact_id).await.unwrap();
         // uses %1$s substitution
-        assert_eq!(contact_verified(&t, "Foo").await, "Foo verified.");
+        assert_eq!(
+            contact_verified(&t, &contact).await,
+            "Someone (someone@example.org) verified."
+        );
         // We have no string using %1$d to test...
     }
 
@@ -1221,7 +1231,7 @@ mod tests {
     async fn test_stock_system_msg_add_member_by_me() {
         let t = TestContext::new().await;
         assert_eq!(
-            msg_add_member(&t, "alice@example.org", DC_CONTACT_ID_SELF).await,
+            msg_add_member(&t, "alice@example.org", ContactId::SELF).await,
             "Member alice@example.org added by me."
         )
     }
@@ -1233,7 +1243,7 @@ mod tests {
             .await
             .expect("failed to create contact");
         assert_eq!(
-            msg_add_member(&t, "alice@example.org", DC_CONTACT_ID_SELF).await,
+            msg_add_member(&t, "alice@example.org", ContactId::SELF).await,
             "Member Alice (alice@example.org) added by me."
         );
     }

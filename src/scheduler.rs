@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{bail, Context as _, Result};
 use async_std::prelude::*;
 use async_std::{
     channel::{self, Receiver, Sender},
@@ -8,8 +8,10 @@ use async_std::{
 use crate::config::Config;
 use crate::context::Context;
 use crate::dc_tools::maybe_add_time_based_warnings;
+use crate::ephemeral::delete_expired_imap_messages;
 use crate::imap::Imap;
 use crate::job::{self, Thread};
+use crate::log::LogExt;
 use crate::smtp::{send_smtp_messages, Smtp};
 
 use self::connectivity::ConnectivityStore;
@@ -160,24 +162,56 @@ async fn fetch_idle(ctx: &Context, connection: &mut Imap, folder: Config) -> Int
                 return connection.fake_idle(ctx, Some(watch_folder)).await;
             }
 
-            // Scan other folders before fetching from watched folder. This may result in the
-            // messages being moved into the watched folder, for example from the Spam folder to
-            // the Inbox folder.
-            if folder == Config::ConfiguredInboxFolder {
-                // Only scan on the Inbox thread in order to prevent parallel scans, which might lead to duplicate messages
-                if let Err(err) = connection.scan_folders(ctx).await {
-                    // Don't reconnect, if there is a problem with the connection we will realize this when IDLEing
-                    // but maybe just one folder can't be selected or something
-                    warn!(ctx, "{}", err);
-                }
+            // Mark expired messages for deletion.
+            if let Err(err) = delete_expired_imap_messages(ctx)
+                .await
+                .context("delete_expired_imap_messages failed")
+            {
+                warn!(ctx, "{:#}", err);
             }
 
-            // fetch
+            // Fetch the watched folder.
             if let Err(err) = connection.fetch_move_delete(ctx, &watch_folder).await {
                 connection.trigger_reconnect(ctx).await;
                 warn!(ctx, "{:#}", err);
                 return InterruptInfo::new(false);
             }
+
+            // Scan additional folders only after finishing fetching the watched folder.
+            //
+            // On iOS the application has strictly limited time to work in background, so we may not
+            // be able to scan all folders before time is up if there are many of them.
+            if folder == Config::ConfiguredInboxFolder {
+                // Only scan on the Inbox thread in order to prevent parallel scans, which might lead to duplicate messages
+                match connection.scan_folders(ctx).await {
+                    Err(err) => {
+                        // Don't reconnect, if there is a problem with the connection we will realize this when IDLEing
+                        // but maybe just one folder can't be selected or something
+                        warn!(ctx, "{}", err);
+                    }
+                    Ok(true) => {
+                        // Fetch the watched folder again in case scanning other folder moved messages
+                        // there.
+                        //
+                        // In most cases this will select the watched folder and return because there are
+                        // no new messages. We want to select the watched folder anyway before going IDLE
+                        // there, so this does not take additional protocol round-trip.
+                        if let Err(err) = connection.fetch_move_delete(ctx, &watch_folder).await {
+                            connection.trigger_reconnect(ctx).await;
+                            warn!(ctx, "{:#}", err);
+                            return InterruptInfo::new(false);
+                        }
+                    }
+                    Ok(false) => {}
+                }
+            }
+
+            // Synchronize Seen flags.
+            connection
+                .sync_seen_flags(ctx, &watch_folder)
+                .await
+                .context("sync_seen_flags")
+                .ok_or_log(ctx);
 
             connection.connectivity.set_connected(ctx).await;
 
@@ -271,6 +305,7 @@ async fn smtp_loop(ctx: Context, started: Sender<()>, smtp_handlers: SmtpConnect
             .expect("smtp loop, missing started receiver");
         let ctx = ctx1;
 
+        let mut timeout = None;
         let mut interrupt_info = Default::default();
         loop {
             let job = match job::load_next(&ctx, Thread::Smtp, &interrupt_info).await {
@@ -288,9 +323,16 @@ async fn smtp_loop(ctx: Context, started: Sender<()>, smtp_handlers: SmtpConnect
                     interrupt_info = Default::default();
                 }
                 None => {
-                    if let Err(err) = send_smtp_messages(&ctx, &mut connection).await {
+                    let res = send_smtp_messages(&ctx, &mut connection).await;
+                    if let Err(err) = &res {
                         warn!(ctx, "send_smtp_messages failed: {:#}", err);
                     }
+                    let success = res.unwrap_or(false);
+                    timeout = if success {
+                        None
+                    } else {
+                        Some(timeout.map_or(30, |timeout: u64| timeout.saturating_mul(3)))
+                    };
 
                     // Fake Idle
                     info!(ctx, "smtp fake idle - started");
@@ -299,7 +341,27 @@ async fn smtp_loop(ctx: Context, started: Sender<()>, smtp_handlers: SmtpConnect
                         Some(err) => connection.connectivity.set_err(&ctx, err).await,
                     }
 
-                    interrupt_info = idle_interrupt_receiver.recv().await.unwrap_or_default();
+                    // If send_smtp_messages() failed, we set a timeout for the fake-idle so that
+                    // sending is retried (at the latest) after the timeout. If sending fails
+                    // again, we increase the timeout exponentially, in order not to do lots of
+                    // unnecessary retries.
+                    if let Some(timeout) = timeout {
+                        info!(
+                            ctx,
+                            "smtp has messages to retry, planning to retry {} seconds later",
+                            timeout
+                        );
+                        let duration = std::time::Duration::from_secs(timeout);
+                        interrupt_info = async_std::future::timeout(duration, async {
+                            idle_interrupt_receiver.recv().await.unwrap_or_default()
+                        })
+                        .await
+                        .unwrap_or_default();
+                    } else {
+                        info!(ctx, "smtp has no messages to retry, waiting for interrupt");
+                        interrupt_info = idle_interrupt_receiver.recv().await.unwrap_or_default();
+                    };
+
                     info!(ctx, "smtp fake idle - interrupted")
                 }
             }
@@ -341,7 +403,7 @@ impl Scheduler {
             }))
         };
 
-        if ctx.get_config_bool(Config::MvboxMove).await? {
+        if ctx.should_watch_mvbox().await? {
             let ctx = ctx.clone();
             mvbox_handle = Some(task::spawn(async move {
                 simple_imap_loop(

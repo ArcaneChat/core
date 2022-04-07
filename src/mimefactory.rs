@@ -7,9 +7,9 @@ use chrono::TimeZone;
 use lettre_email::{mime, Address, Header, MimeMultipartType, PartBuilder};
 
 use crate::blob::BlobObject;
-use crate::chat::{self, Chat};
+use crate::chat::Chat;
 use crate::config::Config;
-use crate::constants::{Chattype, Viewtype, DC_FROM_HANDSHAKE};
+use crate::constants::{Chattype, DC_FROM_HANDSHAKE};
 use crate::contact::Contact;
 use crate::context::{get_version_str, Context};
 use crate::dc_tools::IsNoneOrEmpty;
@@ -22,7 +22,7 @@ use crate::ephemeral::Timer as EphemeralTimer;
 use crate::format_flowed::{format_flowed, format_flowed_quote};
 use crate::html::new_html_mimepart;
 use crate::location;
-use crate::message::{self, Message, MsgId};
+use crate::message::{self, Message, MsgId, Viewtype};
 use crate::mimeparser::SystemMessage;
 use crate::param::Param;
 use crate::peerstate::{Peerstate, PeerstateVerifiedStatus};
@@ -497,33 +497,65 @@ impl<'a> MimeFactory<'a> {
             }
         }
 
+        // Start with Internet Message Format headers in the order of the standard example
+        // <https://datatracker.ietf.org/doc/html/rfc5322#appendix-A.1.1>.
         headers
             .unprotected
-            .push(Header::new("MIME-Version".into(), "1.0".into()));
+            .push(Header::new_with_value("From".into(), vec![from]).unwrap());
+        if let Some(sender_displayname) = &self.sender_displayname {
+            let sender =
+                Address::new_mailbox_with_name(sender_displayname.clone(), self.from_addr.clone());
+            headers
+                .unprotected
+                .push(Header::new_with_value("Sender".into(), vec![sender]).unwrap());
+        }
+        headers
+            .unprotected
+            .push(Header::new_with_value("To".into(), to).unwrap());
 
+        let date = chrono::Utc
+            .from_local_datetime(&chrono::NaiveDateTime::from_timestamp(self.timestamp, 0))
+            .unwrap()
+            .to_rfc2822();
+        headers.unprotected.push(Header::new("Date".into(), date));
+
+        let rfc724_mid = match self.loaded {
+            Loaded::Message { .. } => self.msg.rfc724_mid.clone(),
+            Loaded::Mdn { .. } => dc_create_outgoing_rfc724_mid(None, &self.from_addr),
+        };
+        let rfc724_mid_headervalue = render_rfc724_mid(&rfc724_mid);
+
+        // Amazon's SMTP servers change the `Message-ID`, just as Outlook's SMTP servers do.
+        // Outlook's servers add an `X-Microsoft-Original-Message-ID` header with the original `Message-ID`,
+        // and when downloading messages we look for this header in order to correctly identify
+        // messages.
+        // Amazon's servers do not add such a header, so we just add it ourselves.
+        if let Some(server) = context.get_config(Config::ConfiguredSendServer).await? {
+            if server.ends_with(".amazonaws.com") {
+                headers.unprotected.push(Header::new(
+                    "X-Microsoft-Original-Message-ID".into(),
+                    rfc724_mid_headervalue.clone(),
+                ))
+            }
+        }
+
+        headers
+            .unprotected
+            .push(Header::new("Message-ID".into(), rfc724_mid_headervalue));
+
+        // Reply headers as in <https://datatracker.ietf.org/doc/html/rfc5322#appendix-A.2>.
+        if !self.in_reply_to.is_empty() {
+            headers
+                .unprotected
+                .push(Header::new("In-Reply-To".into(), self.in_reply_to.clone()));
+        }
         if !self.references.is_empty() {
             headers
                 .unprotected
                 .push(Header::new("References".into(), self.references.clone()));
         }
 
-        if !self.in_reply_to.is_empty() {
-            headers
-                .unprotected
-                .push(Header::new("In-Reply-To".into(), self.in_reply_to.clone()));
-        }
-
-        let date = chrono::Utc
-            .from_local_datetime(&chrono::NaiveDateTime::from_timestamp(self.timestamp, 0))
-            .unwrap()
-            .to_rfc2822();
-
-        headers.unprotected.push(Header::new("Date".into(), date));
-
-        headers
-            .unprotected
-            .push(Header::new("Chat-Version".to_string(), "1.0".to_string()));
-
+        // Automatic Response headers <https://www.rfc-editor.org/rfc/rfc3834>
         if let Loaded::Mdn { .. } = self.loaded {
             headers.unprotected.push(Header::new(
                 "Auto-Submitted".to_string(),
@@ -535,6 +567,11 @@ impl<'a> MimeFactory<'a> {
                 "auto-generated".to_string(),
             ));
         }
+
+        // Non-standard headers.
+        headers
+            .unprotected
+            .push(Header::new("Chat-Version".to_string(), "1.0".to_string()));
 
         if self.req_mdn {
             // we use "Chat-Disposition-Notification-To"
@@ -550,7 +587,6 @@ impl<'a> MimeFactory<'a> {
         let grpimage = self.grpimage();
         let force_plaintext = self.should_force_plaintext(context).await;
         let skip_autocrypt = self.should_skip_autocrypt();
-        let subject_str = self.subject_str(context).await?;
         let e2ee_guaranteed = self.is_e2ee_guaranteed();
         let encrypt_helper = EncryptHelper::new(context).await?;
 
@@ -562,11 +598,6 @@ impl<'a> MimeFactory<'a> {
                 .push(Header::new("Autocrypt".into(), aheader));
         }
 
-        let rfc724_mid = match self.loaded {
-            Loaded::Message { .. } => self.msg.rfc724_mid.clone(),
-            Loaded::Mdn { .. } => dc_create_outgoing_rfc724_mid(None, &self.from_addr),
-        };
-
         let ephemeral_timer = self.msg.chat_id.get_ephemeral_timer(context).await?;
         if let EphemeralTimer::Enabled { duration } = ephemeral_timer {
             headers.protected.push(Header::new(
@@ -575,25 +606,11 @@ impl<'a> MimeFactory<'a> {
             ));
         }
 
-        headers.unprotected.push(Header::new(
-            "Message-ID".into(),
-            render_rfc724_mid(&rfc724_mid),
-        ));
-
+        // MIME header <https://datatracker.ietf.org/doc/html/rfc2045>.
+        // Content-Type
         headers
             .unprotected
-            .push(Header::new_with_value("To".into(), to).unwrap());
-
-        headers
-            .unprotected
-            .push(Header::new_with_value("From".into(), vec![from]).unwrap());
-        if let Some(sender_displayname) = &self.sender_displayname {
-            let sender =
-                Address::new_mailbox_with_name(sender_displayname.clone(), self.from_addr.clone());
-            headers
-                .unprotected
-                .push(Header::new_with_value("Sender".into(), vec![sender]).unwrap());
-        }
+            .push(Header::new("MIME-Version".into(), "1.0".into()));
 
         let mut is_gossiped = false;
 
@@ -714,7 +731,6 @@ impl<'a> MimeFactory<'a> {
                         .body(encrypted)
                         .build(),
                 )
-                .header(("Subject".to_string(), "...".to_string()))
         } else {
             let message = if headers.hidden.is_empty() {
                 message
@@ -756,7 +772,7 @@ impl<'a> MimeFactory<'a> {
             last_added_location_id,
             sync_ids_to_delete: self.sync_ids_to_delete,
             rfc724_mid,
-            subject: subject_str,
+            subject: "".to_string(),
         })
     }
 
@@ -1102,7 +1118,7 @@ impl<'a> MimeFactory<'a> {
         }
 
         // add attachment part
-        if chat::msgtype_has_file(self.msg.viewtype) {
+        if self.msg.viewtype.has_file() {
             if !is_file_size_okay(context, self.msg).await? {
                 bail!(
                     "Message exceeds the recommended {} MB.",
@@ -1414,12 +1430,13 @@ fn maybe_encode_words(words: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use async_std::fs::File;
     use async_std::prelude::*;
+    use mailparse::{addrparse_header, MailHeaderMap};
 
     use crate::chat::ChatId;
     use crate::chat::{
-        add_contact_to_chat, create_group_chat, remove_contact_from_chat, send_text_msg,
+        self, add_contact_to_chat, create_group_chat, remove_contact_from_chat, send_text_msg,
         ProtectionStatus,
     };
     use crate::chatlist::Chatlist;
@@ -1428,9 +1445,7 @@ mod tests {
     use crate::mimeparser::MimeMessage;
     use crate::test_utils::{get_chat_msg, TestContext};
 
-    use async_std::fs::File;
-    use mailparse::{addrparse_header, MailHeaderMap};
-
+    use super::*;
     #[test]
     fn test_render_email_address() {
         let display_name = "ä space";
@@ -2060,6 +2075,29 @@ mod tests {
             .extract_single_info()
             .context("to: field does not contain exactly one address")?;
         assert_eq!(mailbox.addr, "bob@example.net");
+
+        Ok(())
+    }
+
+    /// Tests that standard IMF header "From:" comes before non-standard "Autocrypt:" header.
+    #[async_std::test]
+    async fn test_from_before_autocrypt() -> Result<()> {
+        // create chat with bob
+        let t = TestContext::new_alice().await;
+        let chat = t.create_chat_with_contact("bob", "bob@example.org").await;
+
+        // send message to bob: that should get multipart/mixed because of the avatar moved to inner header;
+        // make sure, `Subject:` stays in the outer header (imf header)
+        let mut msg = Message::new(Viewtype::Text);
+        msg.set_text(Some("this is the text!".to_string()));
+
+        let sent_msg = t.send_msg(chat.id, &mut msg).await;
+        let payload = sent_msg.payload();
+
+        assert_eq!(payload.match_indices("Autocrypt:").count(), 1);
+        assert_eq!(payload.match_indices("From:").count(), 1);
+
+        assert!(payload.match_indices("From:").next() < payload.match_indices("Autocrypt:").next());
 
         Ok(())
     }

@@ -31,13 +31,13 @@ use rand::Rng;
 
 use deltachat::chat::{ChatId, ChatVisibility, MuteDuration, ProtectionStatus};
 use deltachat::constants::DC_MSG_ID_LAST_SPECIAL;
-use deltachat::contact::{Contact, Origin};
+use deltachat::contact::{Contact, ContactId, Origin};
 use deltachat::context::Context;
 use deltachat::ephemeral::Timer as EphemeralTimer;
 use deltachat::key::DcKey;
 use deltachat::message::MsgId;
 use deltachat::stock_str::StockMessage;
-use deltachat::webxdc::StatusUpdateId;
+use deltachat::webxdc::StatusUpdateSerial;
 use deltachat::*;
 use deltachat::{accounts::Accounts, log::LogExt};
 
@@ -493,15 +493,17 @@ pub unsafe extern "C" fn dc_event_get_data1_int(event: *mut dc_event_t) -> libc:
         | EventType::ChatEphemeralTimerModified { chat_id, .. } => chat_id.to_u32() as libc::c_int,
         EventType::ContactsChanged(id) | EventType::LocationChanged(id) => {
             let id = id.unwrap_or_default();
-            id as libc::c_int
+            id.to_u32() as libc::c_int
         }
         EventType::ConfigureProgress { progress, .. } | EventType::ImexProgress(progress) => {
             *progress as libc::c_int
         }
         EventType::ImexFileWritten(_) => 0,
         EventType::SecurejoinInviterProgress { contact_id, .. }
-        | EventType::SecurejoinJoinerProgress { contact_id, .. } => *contact_id as libc::c_int,
-        EventType::WebxdcStatusUpdate { msg_id, .. } => msg_id.to_u32() as libc::c_int,
+        | EventType::SecurejoinJoinerProgress { contact_id, .. } => {
+            contact_id.to_u32() as libc::c_int
+        }
+        EventType::WebxdcStatusUpdate(msg_id) => msg_id.to_u32() as libc::c_int,
     }
 }
 
@@ -534,6 +536,7 @@ pub unsafe extern "C" fn dc_event_get_data2_int(event: *mut dc_event_t) -> libc:
         | EventType::MsgsNoticed(_)
         | EventType::ConnectivityChanged
         | EventType::SelfavatarChanged
+        | EventType::WebxdcStatusUpdate(_)
         | EventType::ChatModified(_) => 0,
         EventType::MsgsChanged { msg_id, .. }
         | EventType::IncomingMsg { msg_id, .. }
@@ -543,9 +546,6 @@ pub unsafe extern "C" fn dc_event_get_data2_int(event: *mut dc_event_t) -> libc:
         EventType::SecurejoinInviterProgress { progress, .. }
         | EventType::SecurejoinJoinerProgress { progress, .. } => *progress as libc::c_int,
         EventType::ChatEphemeralTimerModified { timer, .. } => timer.to_u32() as libc::c_int,
-        EventType::WebxdcStatusUpdate {
-            status_update_id, ..
-        } => status_update_id.to_u32() as libc::c_int,
     }
 }
 
@@ -587,7 +587,7 @@ pub unsafe extern "C" fn dc_event_get_data2_str(event: *mut dc_event_t) -> *mut 
         | EventType::SecurejoinJoinerProgress { .. }
         | EventType::ConnectivityChanged
         | EventType::SelfavatarChanged
-        | EventType::WebxdcStatusUpdate { .. }
+        | EventType::WebxdcStatusUpdate(_)
         | EventType::ChatEphemeralTimerModified { .. } => ptr::null_mut(),
         EventType::ConfigureProgress { comment, .. } => {
             if let Some(comment) = comment {
@@ -717,7 +717,11 @@ pub unsafe extern "C" fn dc_get_chatlist(
     let ctx = &*context;
     let qs = to_opt_string_lossy(query_str);
 
-    let qi = if query_id == 0 { None } else { Some(query_id) };
+    let qi = if query_id == 0 {
+        None
+    } else {
+        Some(ContactId::new(query_id))
+    };
 
     block_on(async move {
         match chatlist::Chatlist::try_load(ctx, flags as usize, qs.as_deref(), qi)
@@ -745,7 +749,7 @@ pub unsafe extern "C" fn dc_create_chat_by_contact_id(
     let ctx = &*context;
 
     block_on(async move {
-        ChatId::create_for_contact(ctx, contact_id)
+        ChatId::create_for_contact(ctx, ContactId::new(contact_id))
             .await
             .log_err(ctx, "Failed to create chat from contact_id")
             .map(|id| id.to_u32())
@@ -765,7 +769,7 @@ pub unsafe extern "C" fn dc_get_chat_id_by_contact_id(
     let ctx = &*context;
 
     block_on(async move {
-        ChatId::lookup_by_contact(ctx, contact_id)
+        ChatId::lookup_by_contact(ctx, ContactId::new(contact_id))
             .await
             .log_err(ctx, "Failed to get chat for contact_id")
             .unwrap_or_default() // unwraps the Result
@@ -903,7 +907,7 @@ pub unsafe extern "C" fn dc_send_webxdc_status_update(
 pub unsafe extern "C" fn dc_get_webxdc_status_updates(
     context: *mut dc_context_t,
     msg_id: u32,
-    status_update_id: u32,
+    last_known_serial: u32,
 ) -> *mut libc::c_char {
     if context.is_null() {
         eprintln!("ignoring careless call to dc_get_webxdc_status_updates()");
@@ -913,11 +917,7 @@ pub unsafe extern "C" fn dc_get_webxdc_status_updates(
 
     block_on(ctx.get_webxdc_status_updates(
         MsgId::new(msg_id),
-        if status_update_id == 0 {
-            None
-        } else {
-            Some(StatusUpdateId::new(status_update_id))
-        },
+        StatusUpdateSerial::new(last_known_serial),
     ))
     .unwrap_or_else(|_| "".to_string())
     .strdup()
@@ -1346,7 +1346,10 @@ pub unsafe extern "C" fn dc_get_chat_contacts(
         let arr = dc_array_t::from(
             chat::get_chat_contacts(ctx, ChatId::new(chat_id))
                 .await
-                .unwrap_or_log_default(ctx, "Failed get_chat_contacts"),
+                .unwrap_or_log_default(ctx, "Failed get_chat_contacts")
+                .iter()
+                .map(|id| id.to_u32())
+                .collect::<Vec<u32>>(),
         );
         Box::into_raw(Box::new(arr))
     })
@@ -1456,7 +1459,7 @@ pub unsafe extern "C" fn dc_is_contact_in_chat(
     block_on(chat::is_contact_in_chat(
         ctx,
         ChatId::new(chat_id),
-        contact_id,
+        ContactId::new(contact_id),
     ))
     .log_err(ctx, "is_contact_in_chat failed")
     .unwrap_or_default() as libc::c_int
@@ -1477,7 +1480,7 @@ pub unsafe extern "C" fn dc_add_contact_to_chat(
     block_on(chat::add_contact_to_chat(
         ctx,
         ChatId::new(chat_id),
-        contact_id,
+        ContactId::new(contact_id),
     ))
     .log_err(ctx, "Failed to add contact")
     .is_ok() as libc::c_int
@@ -1498,7 +1501,7 @@ pub unsafe extern "C" fn dc_remove_contact_from_chat(
     block_on(chat::remove_contact_from_chat(
         ctx,
         ChatId::new(chat_id),
-        contact_id,
+        ContactId::new(contact_id),
     ))
     .log_err(ctx, "Failed to remove contact")
     .is_ok() as libc::c_int
@@ -1833,7 +1836,8 @@ pub unsafe extern "C" fn dc_lookup_contact_id_by_addr(
         Contact::lookup_id_by_addr(ctx, &to_string_lossy(addr), Origin::IncomingReplyTo)
             .await
             .unwrap_or_log_default(ctx, "failed to lookup id")
-            .unwrap_or(0)
+            .map(|id| id.to_u32())
+            .unwrap_or_default()
     })
 }
 
@@ -1853,6 +1857,7 @@ pub unsafe extern "C" fn dc_create_contact(
     block_on(async move {
         Contact::create(ctx, &name, &to_string_lossy(addr))
             .await
+            .map(|id| id.to_u32())
             .unwrap_or(0)
     })
 }
@@ -1891,7 +1896,9 @@ pub unsafe extern "C" fn dc_get_contacts(
 
     block_on(async move {
         match Contact::get_all(ctx, flags, query).await {
-            Ok(contacts) => Box::into_raw(Box::new(dc_array_t::from(contacts))),
+            Ok(contacts) => Box::into_raw(Box::new(dc_array_t::from(
+                contacts.iter().map(|id| id.to_u32()).collect::<Vec<u32>>(),
+            ))),
             Err(_) => ptr::null_mut(),
         }
     })
@@ -1928,7 +1935,10 @@ pub unsafe extern "C" fn dc_get_blocked_contacts(
             Contact::get_all_blocked(ctx)
                 .await
                 .log_err(ctx, "Can't get blocked contacts")
-                .unwrap_or_default(),
+                .unwrap_or_default()
+                .iter()
+                .map(|id| id.to_u32())
+                .collect::<Vec<u32>>(),
         )))
     })
 }
@@ -1939,7 +1949,8 @@ pub unsafe extern "C" fn dc_block_contact(
     contact_id: u32,
     block: libc::c_int,
 ) {
-    if context.is_null() || contact_id <= constants::DC_CONTACT_ID_LAST_SPECIAL as u32 {
+    let contact_id = ContactId::new(contact_id);
+    if context.is_null() || contact_id.is_special() {
         eprintln!("ignoring careless call to dc_block_contact()");
         return;
     }
@@ -1969,7 +1980,7 @@ pub unsafe extern "C" fn dc_get_contact_encrinfo(
     let ctx = &*context;
 
     block_on(async move {
-        Contact::get_encrinfo(ctx, contact_id)
+        Contact::get_encrinfo(ctx, ContactId::new(contact_id))
             .await
             .map(|s| s.strdup())
             .unwrap_or_else(|e| {
@@ -1984,7 +1995,8 @@ pub unsafe extern "C" fn dc_delete_contact(
     context: *mut dc_context_t,
     contact_id: u32,
 ) -> libc::c_int {
-    if context.is_null() || contact_id <= constants::DC_CONTACT_ID_LAST_SPECIAL as u32 {
+    let contact_id = ContactId::new(contact_id);
+    if context.is_null() || contact_id.is_special() {
         eprintln!("ignoring careless call to dc_delete_contact()");
         return 0;
     }
@@ -2010,7 +2022,7 @@ pub unsafe extern "C" fn dc_get_contact(
     let ctx = &*context;
 
     block_on(async move {
-        Contact::get_by_id(ctx, contact_id)
+        Contact::get_by_id(ctx, ContactId::new(contact_id))
             .await
             .map(|contact| Box::into_raw(Box::new(ContactWrapper { context, contact })))
             .unwrap_or_else(|_| ptr::null_mut())
@@ -2433,7 +2445,7 @@ pub unsafe extern "C" fn dc_array_get_contact_id(
         return 0;
     }
 
-    (*array).get_location(index).contact_id
+    (*array).get_location(index).contact_id.to_u32()
 }
 #[no_mangle]
 pub unsafe extern "C" fn dc_array_get_msg_id(
@@ -2949,7 +2961,7 @@ pub unsafe extern "C" fn dc_msg_get_from_id(msg: *mut dc_msg_t) -> u32 {
         return 0;
     }
     let ffi_msg = &*msg;
-    ffi_msg.message.get_from_id()
+    ffi_msg.message.get_from_id().to_u32()
 }
 
 #[no_mangle]
@@ -3660,7 +3672,7 @@ pub unsafe extern "C" fn dc_contact_get_id(contact: *mut dc_contact_t) -> u32 {
         return 0;
     }
     let ffi_contact = &*contact;
-    ffi_contact.contact.get_id()
+    ffi_contact.contact.get_id().to_u32()
 }
 
 #[no_mangle]

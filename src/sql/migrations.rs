@@ -36,6 +36,13 @@ pub async fn run(context: &Context, sql: &Sql) -> Result<(bool, bool, bool, bool
             Ok(())
         })
         .await?;
+
+        let mut lock = context.sql.config_cache.write().await;
+        lock.insert(
+            VERSION_CFG.to_string(),
+            Some(format!("{}", dbversion_before_update)),
+        );
+        drop(lock);
     } else {
         exists_before_update = true;
         dbversion_before_update = sql
@@ -579,6 +586,28 @@ CREATE INDEX smtp_messageid ON imap(rfc724_mid);
         )
         .await?;
     }
+    if dbversion < 86 {
+        info!(context, "[migration] v86");
+        sql.execute_migration(
+            r#"CREATE TABLE bobstate (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   invite TEXT NOT NULL,
+                   next_step INTEGER NOT NULL,
+                   chat_id INTEGER NOT NULL
+            );"#,
+            86,
+        )
+        .await?;
+    }
+    if dbversion < 87 {
+        info!(context, "[migration] v87");
+        // the index is used to speed up delete_expired_messages()
+        sql.execute_migration(
+            "CREATE INDEX IF NOT EXISTS msgs_index8 ON msgs (ephemeral_timestamp);",
+            87,
+        )
+        .await?;
+    }
 
     Ok((
         recalc_fingerprints,
@@ -608,6 +637,10 @@ impl Sql {
         })
         .await
         .with_context(|| format!("execute_migration failed for version {}", version))?;
+
+        let mut lock = self.config_cache.write().await;
+        lock.insert(VERSION_CFG.to_string(), Some(format!("{}", version)));
+        drop(lock);
 
         Ok(())
     }

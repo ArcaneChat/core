@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::io::Cursor;
 use std::pin::Pin;
 
 use anyhow::{bail, Result};
@@ -12,8 +13,8 @@ use once_cell::sync::Lazy;
 
 use crate::aheader::Aheader;
 use crate::blob::BlobObject;
-use crate::constants::{Viewtype, DC_DESIRED_TEXT_LEN, DC_ELLIPSIS};
-use crate::contact::addr_normalize;
+use crate::constants::{DC_DESIRED_TEXT_LEN, DC_ELLIPSIS};
+use crate::contact::{addr_normalize, ContactId};
 use crate::context::Context;
 use crate::dc_tools::{dc_get_filemeta, dc_truncate, parse_receive_headers};
 use crate::dehtml::dehtml;
@@ -23,7 +24,7 @@ use crate::format_flowed::unformat_flowed;
 use crate::headerdef::{HeaderDef, HeaderDefMap};
 use crate::key::Fingerprint;
 use crate::location;
-use crate::message;
+use crate::message::{self, Viewtype};
 use crate::param::{Param, Params};
 use crate::peerstate::Peerstate;
 use crate::simplify::simplify;
@@ -368,6 +369,16 @@ impl MimeMessage {
             } else if value == "protection-disabled" {
                 self.is_system_message = SystemMessage::ChatProtectionDisabled;
             }
+        } else if self.get_header(HeaderDef::ChatGroupMemberRemoved).is_some() {
+            self.is_system_message = SystemMessage::MemberRemovedFromGroup;
+        } else if self.get_header(HeaderDef::ChatGroupMemberAdded).is_some() {
+            self.is_system_message = SystemMessage::MemberAddedToGroup;
+        } else if self.get_header(HeaderDef::ChatGroupNameChanged).is_some() {
+            self.is_system_message = SystemMessage::GroupNameChanged;
+        } else if let Some(value) = self.get_header(HeaderDef::ChatContent) {
+            if value == "group-avatar-changed" {
+                self.is_system_message = SystemMessage::GroupImageChanged;
+            }
         }
     }
 
@@ -403,16 +414,18 @@ impl MimeMessage {
     #[allow(clippy::indexing_slicing)]
     fn squash_attachment_parts(&mut self) {
         if let [textpart, filepart] = &self.parts[..] {
-            let need_drop = {
-                textpart.typ == Viewtype::Text
-                    && (filepart.typ == Viewtype::Image
-                        || filepart.typ == Viewtype::Gif
-                        || filepart.typ == Viewtype::Sticker
-                        || filepart.typ == Viewtype::Audio
-                        || filepart.typ == Viewtype::Voice
-                        || filepart.typ == Viewtype::Video
-                        || filepart.typ == Viewtype::File)
-            };
+            let need_drop = textpart.typ == Viewtype::Text
+                && match filepart.typ {
+                    Viewtype::Image
+                    | Viewtype::Gif
+                    | Viewtype::Sticker
+                    | Viewtype::Audio
+                    | Viewtype::Voice
+                    | Viewtype::Video
+                    | Viewtype::File
+                    | Viewtype::Webxdc => true,
+                    Viewtype::Unknown | Viewtype::Text | Viewtype::VideochatInvitation => false,
+                };
 
             if need_drop {
                 let mut filepart = self.parts.swap_remove(1);
@@ -1018,8 +1031,9 @@ impl MimeMessage {
         if decoded_data.is_empty() {
             return;
         }
+        let reader = Cursor::new(decoded_data);
         let msg_type = if context
-            .is_webxdc_file(filename, decoded_data)
+            .is_webxdc_file(filename, reader)
             .await
             .unwrap_or(false)
         {
@@ -1136,7 +1150,7 @@ impl MimeMessage {
         }
     }
 
-    pub fn get_rfc724_mid(&self) -> Option<String> {
+    pub(crate) fn get_rfc724_mid(&self) -> Option<String> {
         self.get_header(HeaderDef::XMicrosoftOriginalMessageId)
             .or_else(|| self.get_header(HeaderDef::MessageId))
             .and_then(|msgid| parse_message_id(msgid).ok())
@@ -1201,6 +1215,9 @@ impl MimeMessage {
         if let Some(_disposition) = report_fields.get_header_value(HeaderDef::Disposition) {
             let original_message_id = report_fields
                 .get_header_value(HeaderDef::OriginalMessageId)
+                // MS Exchange doesn't add an Original-Message-Id header. Instead, they put
+                // the original message id into the In-Reply-To header:
+                .or_else(|| report.headers.get_header_value(HeaderDef::InReplyTo))
                 .and_then(|v| parse_message_id(&v).ok());
             let additional_message_ids = report_fields
                 .get_header_value(HeaderDef::AdditionalMessageIds)
@@ -1364,7 +1381,7 @@ impl MimeMessage {
     pub async fn handle_reports(
         &self,
         context: &Context,
-        from_id: u32,
+        from_id: ContactId,
         sent_timestamp: i64,
         parts: &[Part],
     ) {
@@ -1478,8 +1495,8 @@ async fn update_gossip_peerstates(
 pub(crate) struct Report {
     /// Original-Message-ID header
     ///
-    /// It MUST be present if the original message has a Message-ID according to RFC 8098, but MS
-    /// Exchange does not add it nevertheless, in which case it is `None`.
+    /// It MUST be present if the original message has a Message-ID according to RFC 8098.
+    /// In case we can't find it (shouldn't happen), this is None.
     original_message_id: Option<String>,
     /// Additional-Message-IDs
     additional_message_ids: Vec<String>,
@@ -3181,10 +3198,32 @@ Message.
     #[async_std::test]
     async fn test_ms_exchange_mdn() -> Result<()> {
         let t = TestContext::new_alice().await;
-        let raw =
+        t.set_config(Config::ShowEmails, Some("2")).await?;
+
+        let original =
+            include_bytes!("../test-data/message/ms_exchange_report_original_message.eml");
+        dc_receive_imf(&t, original, "INBOX", false).await?;
+        let original_msg_id = t.get_last_msg().await.id;
+
+        // 1. Test mimeparser directly
+        let mdn =
             include_bytes!("../test-data/message/ms_exchange_report_disposition_notification.eml");
-        let mimeparser = MimeMessage::from_bytes(&t.ctx, raw).await?;
-        assert!(!mimeparser.mdn_reports.is_empty());
+        let mimeparser = MimeMessage::from_bytes(&t.ctx, mdn).await?;
+        assert_eq!(mimeparser.mdn_reports.len(), 1);
+        assert_eq!(
+            mimeparser.mdn_reports[0].original_message_id.as_deref(),
+            Some("d5904dc344eeb5deaf9bb44603f0c716@posteo.de")
+        );
+        assert!(mimeparser.mdn_reports[0].additional_message_ids.is_empty());
+
+        // 2. Test that marking the original msg as read works
+        dc_receive_imf(&t, mdn, "INBOX", false).await?;
+
+        assert_eq!(
+            original_msg_id.get_state(&t).await?,
+            MessageState::OutMdnRcvd
+        );
+
         Ok(())
     }
 }

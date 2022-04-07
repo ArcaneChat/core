@@ -1,7 +1,6 @@
 //! # Messages and their identifiers.
 
 use std::collections::BTreeSet;
-use std::convert::TryInto;
 
 use anyhow::{ensure, format_err, Context as _, Result};
 use async_std::path::{Path, PathBuf};
@@ -11,17 +10,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::chat::{self, Chat, ChatId};
 use crate::constants::{
-    Blocked, Chattype, VideochatType, Viewtype, DC_CHAT_ID_TRASH, DC_CONTACT_ID_INFO,
-    DC_CONTACT_ID_SELF, DC_DESIRED_TEXT_LEN, DC_MSG_ID_LAST_SPECIAL,
+    Blocked, Chattype, VideochatType, DC_CHAT_ID_TRASH, DC_DESIRED_TEXT_LEN, DC_MSG_ID_LAST_SPECIAL,
 };
-use crate::contact::{Contact, Origin};
+use crate::contact::{Contact, ContactId, Origin};
 use crate::context::Context;
 use crate::dc_tools::{
     dc_create_smeared_timestamp, dc_get_filebytes, dc_get_filemeta, dc_gm2local_offset,
     dc_read_file, dc_timestamp_to_str, dc_truncate, time,
 };
 use crate::download::DownloadState;
-use crate::ephemeral::Timer as EphemeralTimer;
+use crate::ephemeral::{start_ephemeral_timers_msgids, Timer as EphemeralTimer};
 use crate::events::EventType;
 use crate::job::{self, Action};
 use crate::log::LogExt;
@@ -29,6 +27,7 @@ use crate::mimeparser::{parse_message_id, FailureReport, SystemMessage};
 use crate::param::{Param, Params};
 use crate::pgp::split_armored_data;
 use crate::scheduler::InterruptInfo;
+use crate::sql;
 use crate::stock_str;
 use crate::summary::Summary;
 
@@ -180,10 +179,10 @@ impl rusqlite::types::ToSql for MsgId {
     fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput> {
         if self.0 <= DC_MSG_ID_LAST_SPECIAL {
             return Err(rusqlite::Error::ToSqlConversionFailure(
-                format_err!("Invalid MsgId").into(),
+                format_err!("Invalid MsgId {}", self.0).into(),
             ));
         }
-        let val = rusqlite::types::Value::Integer(self.0 as i64);
+        let val = rusqlite::types::Value::Integer(i64::from(self.0));
         let out = rusqlite::types::ToSqlOutput::Owned(val);
         Ok(out)
     }
@@ -194,7 +193,7 @@ impl rusqlite::types::FromSql for MsgId {
     fn column_result(value: rusqlite::types::ValueRef) -> rusqlite::types::FromSqlResult<Self> {
         // Would be nice if we could use match here, but alas.
         i64::column_result(value).and_then(|val| {
-            if 0 <= val && val <= std::u32::MAX as i64 {
+            if 0 <= val && val <= i64::from(std::u32::MAX) {
                 Ok(MsgId::new(val as u32))
             } else {
                 Err(rusqlite::types::FromSqlError::OutOfRange(val))
@@ -240,8 +239,8 @@ impl Default for MessengerMessage {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Message {
     pub(crate) id: MsgId,
-    pub(crate) from_id: u32,
-    pub(crate) to_id: u32,
+    pub(crate) from_id: ContactId,
+    pub(crate) to_id: ContactId,
     pub(crate) chat_id: ChatId,
     pub(crate) viewtype: Viewtype,
     pub(crate) state: MessageState,
@@ -387,7 +386,7 @@ impl Message {
     }
 
     pub async fn try_calc_and_set_dimensions(&mut self, context: &Context) -> Result<()> {
-        if chat::msgtype_has_file(self.viewtype) {
+        if self.viewtype.has_file() {
             let file_param = self.param.get_path(Param::File, context)?;
             if let Some(path_and_filename) = file_param {
                 if (self.viewtype == Viewtype::Image || self.viewtype == Viewtype::Gif)
@@ -431,7 +430,7 @@ impl Message {
     /// this is done by dc_set_location() and dc_send_locations_to_chat().
     ///
     /// Typically results in the event #DC_EVENT_LOCATION_CHANGED with
-    /// contact_id set to DC_CONTACT_ID_SELF.
+    /// contact_id set to ContactId::SELF.
     ///
     /// @param latitude North-south position of the location.
     /// @param longitude East-west position of the location.
@@ -456,7 +455,7 @@ impl Message {
         self.id
     }
 
-    pub fn get_from_id(&self) -> u32 {
+    pub fn get_from_id(&self) -> ContactId {
         self.from_id
     }
 
@@ -544,7 +543,7 @@ impl Message {
             &chat_loaded
         };
 
-        let contact = if self.from_id != DC_CONTACT_ID_SELF {
+        let contact = if self.from_id != ContactId::SELF {
             match chat.typ {
                 Chattype::Group | Chattype::Broadcast | Chattype::Mailinglist => {
                     Some(Contact::get_by_id(context, self.from_id).await?)
@@ -597,8 +596,8 @@ impl Message {
 
     pub fn is_info(&self) -> bool {
         let cmd = self.param.get_cmd();
-        self.from_id == DC_CONTACT_ID_INFO
-            || self.to_id == DC_CONTACT_ID_INFO
+        self.from_id == ContactId::INFO
+            || self.to_id == ContactId::INFO
             || cmd != SystemMessage::Unknown && cmd != SystemMessage::AutocryptSetupMessage
     }
 
@@ -620,7 +619,7 @@ impl Message {
     /// copied to the blobdir.  Thus those attachments need to be
     /// created immediately in the blobdir with a valid filename.
     pub fn is_increation(&self) -> bool {
-        chat::msgtype_has_file(self.viewtype) && self.state == MessageState::OutPreparing
+        self.viewtype.has_file() && self.state == MessageState::OutPreparing
     }
 
     pub fn is_setupmessage(&self) -> bool {
@@ -1017,7 +1016,7 @@ pub async fn get_msg_info(context: &Context, msg_id: MsgId) -> Result<String> {
     ret += &format!(" by {}", name);
     ret += "\n";
 
-    if msg.from_id != DC_CONTACT_ID_SELF {
+    if msg.from_id != ContactId::SELF {
         let s = dc_timestamp_to_str(if 0 != msg.timestamp_rcvd {
             msg.timestamp_rcvd
         } else {
@@ -1038,7 +1037,7 @@ pub async fn get_msg_info(context: &Context, msg_id: MsgId) -> Result<String> {
         );
     }
 
-    if msg.from_id == DC_CONTACT_ID_INFO || msg.to_id == DC_CONTACT_ID_INFO {
+    if msg.from_id == ContactId::INFO || msg.to_id == ContactId::INFO {
         // device-internal message, no further details needed
         return Ok(ret);
     }
@@ -1049,7 +1048,7 @@ pub async fn get_msg_info(context: &Context, msg_id: MsgId) -> Result<String> {
             "SELECT contact_id, timestamp_sent FROM msgs_mdns WHERE msg_id=?;",
             paramsv![msg_id],
             |row| {
-                let contact_id: i32 = row.get(0)?;
+                let contact_id: ContactId = row.get(0)?;
                 let ts: i64 = row.get(1)?;
                 Ok((contact_id, ts))
             },
@@ -1061,7 +1060,7 @@ pub async fn get_msg_info(context: &Context, msg_id: MsgId) -> Result<String> {
             let fts = dc_timestamp_to_str(ts);
             ret += &format!("Read: {}", fts);
 
-            let name = Contact::load_from_db(context, contact_id.try_into()?)
+            let name = Contact::load_from_db(context, contact_id)
                 .await
                 .map(|contact| contact.get_name_n_addr())
                 .unwrap_or_default();
@@ -1237,7 +1236,7 @@ pub async fn delete_msgs(context: &Context, msg_ids: &[MsgId]) -> Result<()> {
     for msg_id in msg_ids.iter() {
         let msg = Message::load_from_db(context, *msg_id).await?;
         if msg.location_id > 0 {
-            delete_poi_location(context, msg.location_id).await;
+            delete_poi_location(context, msg.location_id).await?;
         }
         msg_id
             .trash(context)
@@ -1270,15 +1269,15 @@ pub async fn delete_msgs(context: &Context, msg_ids: &[MsgId]) -> Result<()> {
     Ok(())
 }
 
-async fn delete_poi_location(context: &Context, location_id: u32) -> bool {
+async fn delete_poi_location(context: &Context, location_id: u32) -> Result<()> {
     context
         .sql
         .execute(
             "DELETE FROM locations WHERE independent = 1 AND id=?;",
             paramsv![location_id as i32],
         )
-        .await
-        .is_ok()
+        .await?;
+    Ok(())
 }
 
 pub async fn markseen_msgs(context: &Context, msg_ids: Vec<MsgId>) -> Result<()> {
@@ -1286,50 +1285,52 @@ pub async fn markseen_msgs(context: &Context, msg_ids: Vec<MsgId>) -> Result<()>
         return Ok(());
     }
 
-    let conn = context.sql.get_conn().await?;
-    let msgs = async_std::task::spawn_blocking(move || -> Result<_> {
-        let mut stmt = conn.prepare_cached(concat!(
-            "SELECT",
-            "    m.chat_id AS chat_id,",
-            "    m.state AS state,",
-            "    c.blocked AS blocked",
-            " FROM msgs m LEFT JOIN chats c ON c.id=m.chat_id",
-            " WHERE m.id=? AND m.chat_id>9"
-        ))?;
-
-        let mut msgs = Vec::with_capacity(msg_ids.len());
-        for id in msg_ids.into_iter() {
-            let query_res = stmt.query_row(paramsv![id], |row| {
+    let msgs = context
+        .sql
+        .query_map(
+            format!(
+                "SELECT
+                    m.id AS id,
+                    m.chat_id AS chat_id,
+                    m.state AS state,
+                    m.ephemeral_timer AS ephemeral_timer,
+                    c.blocked AS blocked
+                 FROM msgs m LEFT JOIN chats c ON c.id=m.chat_id
+                 WHERE m.id IN ({}) AND m.chat_id>9",
+                sql::repeat_vars(msg_ids.len())?
+            ),
+            rusqlite::params_from_iter(&msg_ids),
+            |row| {
+                let id: MsgId = row.get("id")?;
+                let chat_id: ChatId = row.get("chat_id")?;
+                let state: MessageState = row.get("state")?;
+                let blocked: Option<Blocked> = row.get("blocked")?;
+                let ephemeral_timer: EphemeralTimer = row.get("ephemeral_timer")?;
                 Ok((
-                    row.get::<_, ChatId>("chat_id")?,
-                    row.get::<_, MessageState>("state")?,
-                    row.get::<_, Option<Blocked>>("blocked")?
-                        .unwrap_or_default(),
+                    id,
+                    chat_id,
+                    state,
+                    blocked.unwrap_or_default(),
+                    ephemeral_timer,
                 ))
-            });
-            if let Err(rusqlite::Error::QueryReturnedNoRows) = query_res {
-                continue;
-            }
-            let (chat_id, state, blocked) = query_res.map_err(Into::<anyhow::Error>::into)?;
-            msgs.push((id, chat_id, state, blocked));
-        }
-        drop(stmt);
-        drop(conn);
-        Ok(msgs)
-    })
-    .await?;
+            },
+            |rows| rows.collect::<Result<Vec<_>, _>>().map_err(Into::into),
+        )
+        .await?;
+
+    if msgs
+        .iter()
+        .any(|(_id, _chat_id, _state, _blocked, ephemeral_timer)| {
+            *ephemeral_timer != EphemeralTimer::Disabled
+        })
+    {
+        start_ephemeral_timers_msgids(context, &msg_ids)
+            .await
+            .context("failed to start ephemeral timers")?;
+    }
 
     let mut updated_chat_ids = BTreeSet::new();
-
-    for (id, curr_chat_id, curr_state, curr_blocked) in msgs.into_iter() {
-        if let Err(err) = id.start_ephemeral_timer(context).await {
-            error!(
-                context,
-                "Failed to start ephemeral timer for message {}: {}", id, err
-            );
-            continue;
-        }
-
+    for (id, curr_chat_id, curr_state, curr_blocked, _curr_ephemeral_timer) in msgs.into_iter() {
         if curr_blocked == Blocked::Not
             && (curr_state == MessageState::InFresh || curr_state == MessageState::InNoticed)
         {
@@ -1426,11 +1427,11 @@ pub async fn set_msg_failed(context: &Context, msg_id: MsgId, error: Option<impl
 /// returns Some if an event should be send
 pub async fn handle_mdn(
     context: &Context,
-    from_id: u32,
+    from_id: ContactId,
     rfc724_mid: &str,
     timestamp_sent: i64,
 ) -> Result<Option<(ChatId, MsgId)>> {
-    if from_id == DC_CONTACT_ID_SELF {
+    if from_id == ContactId::SELF {
         warn!(
             context,
             "ignoring MDN sent to self, this is a bug on the sender device"
@@ -1479,7 +1480,7 @@ pub async fn handle_mdn(
         .sql
         .exists(
             "SELECT COUNT(*) FROM msgs_mdns WHERE msg_id=? AND contact_id=?;",
-            paramsv![msg_id, from_id as i32,],
+            paramsv![msg_id, from_id],
         )
         .await?
     {
@@ -1487,7 +1488,7 @@ pub async fn handle_mdn(
             .sql
             .execute(
                 "INSERT INTO msgs_mdns (msg_id, contact_id, timestamp_sent) VALUES (?, ?, ?);",
-                paramsv![msg_id, from_id as i32, timestamp_sent],
+                paramsv![msg_id, from_id, timestamp_sent],
             )
             .await?;
     }
@@ -1635,7 +1636,7 @@ pub async fn estimate_deletion_cnt(
     from_server: bool,
     seconds: i64,
 ) -> Result<usize> {
-    let self_chat_id = ChatId::lookup_by_contact(context, DC_CONTACT_ID_SELF)
+    let self_chat_id = ChatId::lookup_by_contact(context, ContactId::SELF)
         .await?
         .unwrap_or_default();
     let threshold_timestamp = time() - seconds;
@@ -1701,15 +1702,113 @@ pub(crate) async fn rfc724_mid_exists(
     Ok(res)
 }
 
+/// How a message is primarily displayed.
+#[derive(
+    Debug,
+    Display,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    FromPrimitive,
+    ToPrimitive,
+    FromSql,
+    ToSql,
+    Serialize,
+    Deserialize,
+)]
+#[repr(u32)]
+pub enum Viewtype {
+    Unknown = 0,
+
+    /// Text message.
+    /// The text of the message is set using dc_msg_set_text()
+    /// and retrieved with dc_msg_get_text().
+    Text = 10,
+
+    /// Image message.
+    /// If the image is an animated GIF, the type DC_MSG_GIF should be used.
+    /// File, width and height are set via dc_msg_set_file(), dc_msg_set_dimension
+    /// and retrieved via dc_msg_set_file(), dc_msg_set_dimension().
+    Image = 20,
+
+    /// Animated GIF message.
+    /// File, width and height are set via dc_msg_set_file(), dc_msg_set_dimension()
+    /// and retrieved via dc_msg_get_file(), dc_msg_get_width(), dc_msg_get_height().
+    Gif = 21,
+
+    /// Message containing a sticker, similar to image.
+    /// If possible, the ui should display the image without borders in a transparent way.
+    /// A click on a sticker will offer to install the sticker set in some future.
+    Sticker = 23,
+
+    /// Message containing an Audio file.
+    /// File and duration are set via dc_msg_set_file(), dc_msg_set_duration()
+    /// and retrieved via dc_msg_get_file(), dc_msg_get_duration().
+    Audio = 40,
+
+    /// A voice message that was directly recorded by the user.
+    /// For all other audio messages, the type #DC_MSG_AUDIO should be used.
+    /// File and duration are set via dc_msg_set_file(), dc_msg_set_duration()
+    /// and retrieved via dc_msg_get_file(), dc_msg_get_duration()
+    Voice = 41,
+
+    /// Video messages.
+    /// File, width, height and durarion
+    /// are set via dc_msg_set_file(), dc_msg_set_dimension(), dc_msg_set_duration()
+    /// and retrieved via
+    /// dc_msg_get_file(), dc_msg_get_width(),
+    /// dc_msg_get_height(), dc_msg_get_duration().
+    Video = 50,
+
+    /// Message containing any file, eg. a PDF.
+    /// The file is set via dc_msg_set_file()
+    /// and retrieved via dc_msg_get_file().
+    File = 60,
+
+    /// Message is an invitation to a videochat.
+    VideochatInvitation = 70,
+
+    /// Message is an webxdc instance.
+    Webxdc = 80,
+}
+
+impl Default for Viewtype {
+    fn default() -> Self {
+        Viewtype::Unknown
+    }
+}
+
+impl Viewtype {
+    /// Whether a message with this [`Viewtype`] should have a file attachment.
+    pub fn has_file(&self) -> bool {
+        match self {
+            Viewtype::Unknown => false,
+            Viewtype::Text => false,
+            Viewtype::Image => true,
+            Viewtype::Gif => true,
+            Viewtype::Sticker => true,
+            Viewtype::Audio => true,
+            Viewtype::Voice => true,
+            Viewtype::Video => true,
+            Viewtype::File => true,
+            Viewtype::VideochatInvitation => false,
+            Viewtype::Webxdc => true,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use num_traits::FromPrimitive;
+
     use crate::chat::{marknoticed_chat, ChatItem};
     use crate::chatlist::Chatlist;
-    use crate::constants::DC_CONTACT_ID_DEVICE;
     use crate::dc_receive_imf::dc_receive_imf;
     use crate::test_utils as test;
     use crate::test_utils::TestContext;
+
+    use super::*;
 
     #[test]
     fn test_guess_msgtype_from_suffix() {
@@ -1844,7 +1943,7 @@ mod tests {
         // test that get_width() and get_height() are returning some dimensions for images;
         // (as the device-chat contains a welcome-images, we check that)
         t.update_device_chats().await.ok();
-        let device_chat_id = ChatId::get_for_contact(&t, DC_CONTACT_ID_DEVICE)
+        let device_chat_id = ChatId::get_for_contact(&t, ContactId::DEVICE)
             .await
             .unwrap();
 
@@ -2154,5 +2253,30 @@ mod tests {
         assert!(!msg.is_bot());
 
         Ok(())
+    }
+
+    #[test]
+    fn test_viewtype_derive_display_works_as_expected() {
+        assert_eq!(format!("{}", Viewtype::Audio), "Audio");
+    }
+
+    #[test]
+    fn test_viewtype_values() {
+        // values may be written to disk and must not change
+        assert_eq!(Viewtype::Unknown, Viewtype::default());
+        assert_eq!(Viewtype::Unknown, Viewtype::from_i32(0).unwrap());
+        assert_eq!(Viewtype::Text, Viewtype::from_i32(10).unwrap());
+        assert_eq!(Viewtype::Image, Viewtype::from_i32(20).unwrap());
+        assert_eq!(Viewtype::Gif, Viewtype::from_i32(21).unwrap());
+        assert_eq!(Viewtype::Sticker, Viewtype::from_i32(23).unwrap());
+        assert_eq!(Viewtype::Audio, Viewtype::from_i32(40).unwrap());
+        assert_eq!(Viewtype::Voice, Viewtype::from_i32(41).unwrap());
+        assert_eq!(Viewtype::Video, Viewtype::from_i32(50).unwrap());
+        assert_eq!(Viewtype::File, Viewtype::from_i32(60).unwrap());
+        assert_eq!(
+            Viewtype::VideochatInvitation,
+            Viewtype::from_i32(70).unwrap()
+        );
+        assert_eq!(Viewtype::Webxdc, Viewtype::from_i32(80).unwrap());
     }
 }

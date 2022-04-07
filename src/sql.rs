@@ -3,7 +3,7 @@
 use async_std::path::Path;
 use async_std::sync::RwLock;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
 use std::time::Duration;
 
@@ -15,11 +15,11 @@ use rusqlite::{config::DbConfig, Connection, OpenFlags};
 use crate::blob::BlobObject;
 use crate::chat::{add_device_msg, update_device_icon, update_saved_messages_icon};
 use crate::config::Config;
-use crate::constants::{Viewtype, DC_CHAT_ID_TRASH};
+use crate::constants::DC_CHAT_ID_TRASH;
 use crate::context::Context;
 use crate::dc_tools::{dc_delete_file, time};
 use crate::ephemeral::start_ephemeral_timers;
-use crate::message::Message;
+use crate::message::{Message, Viewtype};
 use crate::param::{Param, Params};
 use crate::peerstate::{deduplicate_peerstates, Peerstate};
 use crate::stock_str;
@@ -47,6 +47,8 @@ pub struct Sql {
     /// None if the database is not open, true if it is open with passphrase and false if it is
     /// open without a passphrase.
     is_encrypted: RwLock<Option<bool>>,
+
+    pub(crate) config_cache: RwLock<HashMap<String, Option<String>>>,
 }
 
 impl Sql {
@@ -55,6 +57,7 @@ impl Sql {
             dbfile,
             pool: Default::default(),
             is_encrypted: Default::default(),
+            config_cache: Default::default(),
         }
     }
 
@@ -497,6 +500,8 @@ impl Sql {
     /// will already have been logged.
     pub async fn set_raw_config(&self, key: impl AsRef<str>, value: Option<&str>) -> Result<()> {
         let key = key.as_ref();
+
+        let mut lock = self.config_cache.write().await;
         if let Some(value) = value {
             let exists = self
                 .exists(
@@ -522,12 +527,23 @@ impl Sql {
             self.execute("DELETE FROM config WHERE keyname=?;", paramsv![key])
                 .await?;
         }
+        lock.insert(key.to_string(), value.map(|s| s.to_string()));
+        drop(lock);
 
         Ok(())
     }
 
     /// Get configuration options from the database.
     pub async fn get_raw_config(&self, key: impl AsRef<str>) -> Result<Option<String>> {
+        let lock = self.config_cache.read().await;
+        let cached = lock.get(key.as_ref()).cloned();
+        drop(lock);
+
+        if let Some(c) = cached {
+            return Ok(c);
+        }
+
+        let mut lock = self.config_cache.write().await;
         let value = self
             .query_get_value(
                 "SELECT value FROM config WHERE keyname=?;",
@@ -535,6 +551,8 @@ impl Sql {
             )
             .await
             .context(format!("failed to fetch raw config: {}", key.as_ref()))?;
+        lock.insert(key.as_ref().to_string(), value.clone());
+        drop(lock);
 
         Ok(value)
     }
@@ -573,6 +591,11 @@ impl Sql {
             .await
             .map(|s| s.and_then(|r| r.parse().ok()))
     }
+
+    #[cfg(feature = "internals")]
+    pub fn config_cache(&self) -> &RwLock<HashMap<String, Option<String>>> {
+        &self.config_cache
+    }
 }
 
 pub async fn housekeeping(context: &Context) -> Result<()> {
@@ -580,6 +603,55 @@ pub async fn housekeeping(context: &Context) -> Result<()> {
         warn!(context, "Failed to delete expired messages: {}", err);
     }
 
+    if let Err(err) = remove_unused_files(context).await {
+        warn!(
+            context,
+            "Housekeeping: cannot remove unusued files: {}", err
+        );
+    }
+
+    if let Err(err) = start_ephemeral_timers(context).await {
+        warn!(
+            context,
+            "Housekeeping: cannot start ephemeral timers: {}", err
+        );
+    }
+
+    if let Err(err) = prune_tombstones(&context.sql).await {
+        warn!(
+            context,
+            "Housekeeping: Cannot prune message tombstones: {}", err
+        );
+    }
+
+    if let Err(err) = deduplicate_peerstates(&context.sql).await {
+        warn!(context, "Failed to deduplicate peerstates: {}", err)
+    }
+
+    context.schedule_quota_update().await?;
+
+    // Try to clear the freelist to free some space on the disk. This
+    // only works if auto_vacuum is enabled.
+    if let Err(err) = context
+        .sql
+        .execute("PRAGMA incremental_vacuum", paramsv![])
+        .await
+    {
+        warn!(context, "Failed to run incremental vacuum: {}", err);
+    }
+
+    if let Err(e) = context
+        .set_config(Config::LastHousekeeping, Some(&time().to_string()))
+        .await
+    {
+        warn!(context, "Can't set config: {}", e);
+    }
+
+    info!(context, "Housekeeping done.");
+    Ok(())
+}
+
+pub async fn remove_unused_files(context: &Context) -> Result<()> {
     let mut files_in_use = HashSet::new();
     let mut unreferenced_count = 0;
 
@@ -694,44 +766,6 @@ pub async fn housekeeping(context: &Context) -> Result<()> {
         }
     }
 
-    if let Err(err) = start_ephemeral_timers(context).await {
-        warn!(
-            context,
-            "Housekeeping: cannot start ephemeral timers: {}", err
-        );
-    }
-
-    if let Err(err) = prune_tombstones(&context.sql).await {
-        warn!(
-            context,
-            "Housekeeping: Cannot prune message tombstones: {}", err
-        );
-    }
-
-    if let Err(err) = deduplicate_peerstates(&context.sql).await {
-        warn!(context, "Failed to deduplicate peerstates: {}", err)
-    }
-
-    context.schedule_quota_update().await?;
-
-    // Try to clear the freelist to free some space on the disk. This
-    // only works if auto_vacuum is enabled.
-    if let Err(err) = context
-        .sql
-        .execute("PRAGMA incremental_vacuum", paramsv![])
-        .await
-    {
-        warn!(context, "Failed to run incremental vacuum: {}", err);
-    }
-
-    if let Err(e) = context
-        .set_config(Config::LastHousekeeping, Some(&time().to_string()))
-        .await
-    {
-        warn!(context, "Can't set config: {}", e);
-    }
-
-    info!(context, "Housekeeping done.");
     Ok(())
 }
 
@@ -787,7 +821,7 @@ async fn maybe_add_from_param(
 async fn prune_tombstones(sql: &Sql) -> Result<()> {
     sql.execute(
         "DELETE FROM msgs
-         WHERE (chat_id=? OR hidden)
+         WHERE chat_id=?
          AND NOT EXISTS (
          SELECT * FROM imap WHERE msgs.rfc724_mid=rfc724_mid AND target!=''
          )",
@@ -795,6 +829,19 @@ async fn prune_tombstones(sql: &Sql) -> Result<()> {
     )
     .await?;
     Ok(())
+}
+
+/// Helper function to return comma-separated sequence of `?` chars.
+///
+/// Use this together with [`rusqlite::ParamsFromIter`] to use dynamically generated
+/// parameter lists.
+pub fn repeat_vars(count: usize) -> Result<String> {
+    if count == 0 {
+        bail!("Must have at least one repeat variable");
+    }
+    let mut s = "?,".repeat(count);
+    s.pop(); // Remove trailing comma
+    Ok(s)
 }
 
 #[cfg(test)]
@@ -904,6 +951,23 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    /// Regression test for a bug where housekeeping deleted drafts since their
+    /// `hidden` flag is set.
+    #[async_std::test]
+    async fn test_housekeeping_dont_delete_drafts() {
+        let t = TestContext::new_alice().await;
+
+        let chat = t.create_chat_with_contact("bob", "bob@example.com").await;
+        let mut new_draft = Message::new(Viewtype::Text);
+        new_draft.set_text(Some("This is my draft".to_string()));
+        chat.id.set_draft(&t, Some(&mut new_draft)).await.unwrap();
+
+        housekeeping(&t).await.unwrap();
+
+        let loaded_draft = chat.id.get_draft(&t).await.unwrap();
+        assert_eq!(loaded_draft.unwrap().text.unwrap(), "This is my draft");
     }
 
     /// Regression test.

@@ -279,9 +279,9 @@ mod tests {
     use crate::chat;
     use crate::chat::forward_msgs;
     use crate::config::Config;
-    use crate::constants::{Viewtype, DC_CONTACT_ID_SELF};
+    use crate::contact::ContactId;
     use crate::dc_receive_imf::dc_receive_imf;
-    use crate::message::MessengerMessage;
+    use crate::message::{MessengerMessage, Viewtype};
     use crate::test_utils::TestContext;
 
     #[async_std::test]
@@ -365,7 +365,7 @@ test some special html-characters as &lt; &gt; and &amp; but also &quot; and &#x
         // however, rust multiline-strings use just `\n`;
         // therefore, we just remove `\r` before comparison.
         assert_eq!(
-            parser.html.replace("\r", ""),
+            parser.html.replace('\r', ""),
             r##"
 <html>
   <p>mime-modified <b>set</b>; simplify is always regarded as lossy.</p>
@@ -379,7 +379,7 @@ test some special html-characters as &lt; &gt; and &amp; but also &quot; and &#x
         let raw = include_bytes!("../test-data/message/text_alt_html.eml");
         let parser = HtmlMsgParser::from_bytes(&t.ctx, raw).await.unwrap();
         assert_eq!(
-            parser.html.replace("\r", ""), // see comment in test_htmlparse_html()
+            parser.html.replace('\r', ""), // see comment in test_htmlparse_html()
             r##"<html>
   <p>mime-modified <b>set</b>; simplify is always regarded as lossy.</p>
 </html>
@@ -394,7 +394,7 @@ test some special html-characters as &lt; &gt; and &amp; but also &quot; and &#x
         let raw = include_bytes!("../test-data/message/text_alt_plain_html.eml");
         let parser = HtmlMsgParser::from_bytes(&t.ctx, raw).await.unwrap();
         assert_eq!(
-            parser.html.replace("\r", ""), // see comment in test_htmlparse_html()
+            parser.html.replace('\r', ""), // see comment in test_htmlparse_html()
             r##"<html>
   <p>
     this is <b>html</b>
@@ -442,7 +442,7 @@ test some special html-characters as &lt; &gt; and &amp; but also &quot; and &#x
         let raw = include_bytes!("../test-data/message/text_alt_plain_html.eml");
         dc_receive_imf(&alice, raw, "INBOX", false).await.unwrap();
         let msg = alice.get_last_msg_in(chat.get_id()).await;
-        assert_ne!(msg.get_from_id(), DC_CONTACT_ID_SELF);
+        assert_ne!(msg.get_from_id(), ContactId::SELF);
         assert_eq!(msg.is_dc_message, MessengerMessage::No);
         assert!(!msg.is_forwarded());
         assert!(msg.get_text().unwrap().contains("this is plain"));
@@ -456,7 +456,7 @@ test some special html-characters as &lt; &gt; and &amp; but also &quot; and &#x
             .await
             .unwrap();
         let msg = alice.get_last_msg_in(chat.get_id()).await;
-        assert_eq!(msg.get_from_id(), DC_CONTACT_ID_SELF);
+        assert_eq!(msg.get_from_id(), ContactId::SELF);
         assert_eq!(msg.is_dc_message, MessengerMessage::Yes);
         assert!(msg.is_forwarded());
         assert!(msg.get_text().unwrap().contains("this is plain"));
@@ -469,7 +469,7 @@ test some special html-characters as &lt; &gt; and &amp; but also &quot; and &#x
         let chat = bob.create_chat_with_contact("", "alice@example.org").await;
         bob.recv_msg(&alice.pop_sent_msg().await).await;
         let msg = bob.get_last_msg_in(chat.get_id()).await;
-        assert_ne!(msg.get_from_id(), DC_CONTACT_ID_SELF);
+        assert_ne!(msg.get_from_id(), ContactId::SELF);
         assert_eq!(msg.is_dc_message, MessengerMessage::Yes);
         assert!(msg.is_forwarded());
         assert!(msg.get_text().unwrap().contains("this is plain"));
@@ -506,7 +506,7 @@ test some special html-characters as &lt; &gt; and &amp; but also &quot; and &#x
         alice.recv_msg(&msg).await;
         let chat = alice.get_self_chat().await;
         let msg = alice.get_last_msg_in(chat.get_id()).await;
-        assert_eq!(msg.get_from_id(), DC_CONTACT_ID_SELF);
+        assert_eq!(msg.get_from_id(), ContactId::SELF);
         assert_eq!(msg.is_dc_message, MessengerMessage::Yes);
         assert!(msg.get_showpadlock());
         assert!(msg.is_forwarded());

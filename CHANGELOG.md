@@ -1,5 +1,97 @@
 # Changelog
 
+## Unreleased
+
+### API changes
+- change semantics of `dc_get_webxdc_status_updates()` second parameter
+  and remove update-id from `DC_EVENT_WEBXDC_STATUS_UPDATE` #3081
+
+### Fixes
+- Hopefully fix a bug where outgoing messages appear twice with Amazon SES #3077
+- do not delete messages without Message-IDs as duplicates #3095
+- Assign replies from a different email address to the correct chat #3119
+- Assing outgoing private replies to the correct chat #3177
+- start ephemeral timer when seen status is synchronized via IMAP #3122
+- do not delete duplicate messages on IMAP immediately to accidentally deleting
+  the last copy #3138
+- speed up loading of chat messages #3171
+- clear more columns when message expires due to `delete_device_after` setting #3181
+- do not try to use stale SMTP connections #3180
+- retry message sending automatically if loop is not interrupted #3183
+
+### Changes
+- add more SMTP logging #3093
+- place common headers like `From:` before the large `Autocrypt:` header #3079
+- keep track of securejoin joiner status in database to survive restarts #2920
+- remove never used `SentboxMove` option #3111
+- improve speed by caching config values #3131 #3145
+- optimize `markseen_msgs` #3141
+- automatically accept chats with outgoing messages #3143
+- `dc_receive_imf` refactorings #3154 #3156
+- add index to speedup deletion of expired ephemeral messages #3155
+- muted chats stay archived on new messages #3184
+
+
+### Fixes
+- Fix a bug where sometimes the file extension of a long filename containing a dot was cropped #3098
+
+## 1.76.0
+
+### Changes
+- move messages in batches #3058
+- delete messages in batches #3060
+- python: remove arbitrary timeouts from tests #3059
+- refactorings #3026
+
+### Fixes
+- avoid archived, fresh chats #3053
+- Also resync UIDs in folders that are not configured #2289
+- treat "NO" IMAP response to MOVE and COPY commands as an error #3058
+- Fix a bug where messages in the Spam folder created contact requests #3015
+- Fix a bug where drafts disappeared after some days #3067
+- Parse MS Exchange read receipts and mark the original message as read #3075
+- do not retry message sending infinitely in case of permanent SMTP failure #3070
+- set message state to failed when retry limit is exceeded #3072
+
+
+## 1.75.0
+
+### Changes
+- optimize `delete_expired_imap_messages()` #3047
+
+
+## 1.74.0
+
+### Fixes
+- avoid reconnection loop when message without Message-ID is marked as seen #3044
+
+
+## 1.73.0
+
+### API changes
+- added `only_fetch_mvbox` config #3028
+
+### Changes
+- don't watch Sent folder by default #3025
+- use webxdc app name in chatlist/quotes/replies etc. #3027
+- make it possible to cancel message sending by removing the message #3034,
+  this was previosuly removed in 1.71.0 #2939
+- synchronize Seen flags only on watched folders to speed up
+  folder scanning #3041
+- remove direct dependency on `byteorder` crate #3031
+- refactorings #3023 #3013
+- update provider database #3043
+- improve documentation #3017 #3018 #3021
+
+### Fixes
+- fix splitting off text from webxdc messages #3032
+- call slow `delete_expired_imap_messages()` less often #3037
+- make synchronization of Seen status more robust in case unsolicited FETCH
+  result without UID is returned #3022
+- fetch Inbox before scanning folders to ensure iOS does
+  not kill the app before it gets to fetch the Inbox in background #3040
+
+
 ## 1.72.0
 
 ### Fixes

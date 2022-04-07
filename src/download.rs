@@ -3,14 +3,14 @@
 use anyhow::{anyhow, Result};
 use deltachat_derive::{FromSql, ToSql};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use crate::config::Config;
-use crate::constants::Viewtype;
 use crate::context::Context;
 use crate::dc_tools::time;
 use crate::imap::{Imap, ImapActionResult};
 use crate::job::{self, Action, Job, Status};
-use crate::message::{Message, MsgId};
+use crate::message::{Message, MsgId, Viewtype};
 use crate::mimeparser::{MimeMessage, Part};
 use crate::param::Params;
 use crate::{job_try, stock_str, EventType};
@@ -146,7 +146,7 @@ impl Job {
 
         if let Some((server_uid, server_folder)) = row {
             match imap
-                .fetch_single_msg(context, &server_folder, server_uid)
+                .fetch_single_msg(context, &server_folder, server_uid, msg.rfc724_mid.clone())
                 .await
             {
                 ImapActionResult::RetryLater | ImapActionResult::Failed => {
@@ -185,6 +185,7 @@ impl Imap {
         context: &Context,
         folder: &str,
         uid: u32,
+        rfc724_mid: String,
     ) -> ImapActionResult {
         if let Some(imapresult) = self
             .prepare_imap_operation_on_msg(context, folder, uid)
@@ -196,8 +197,10 @@ impl Imap {
         // we are connected, and the folder is selected
         info!(context, "Downloading message {}/{} fully...", folder, uid);
 
+        let mut uid_message_ids: BTreeMap<u32, String> = BTreeMap::new();
+        uid_message_ids.insert(uid, rfc724_mid);
         let (last_uid, _received) = match self
-            .fetch_many_msgs(context, folder, vec![uid], false, false)
+            .fetch_many_msgs(context, folder, vec![uid], &uid_message_ids, false, false)
             .await
         {
             Ok(res) => res,
@@ -251,13 +254,15 @@ impl MimeMessage {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use num_traits::FromPrimitive;
+
     use crate::chat::send_msg;
-    use crate::constants::Viewtype;
     use crate::dc_receive_imf::dc_receive_imf_inner;
     use crate::ephemeral::Timer;
+    use crate::message::Viewtype;
     use crate::test_utils::TestContext;
-    use num_traits::FromPrimitive;
+
+    use super::*;
 
     #[test]
     fn test_downloadstate_values() {
@@ -337,7 +342,16 @@ mod tests {
              Date: Sun, 22 Mar 2020 22:37:57 +0000\
              Content-Type: text/plain";
 
-        dc_receive_imf_inner(&t, header.as_bytes(), "INBOX", false, Some(100000), false).await?;
+        dc_receive_imf_inner(
+            &t,
+            "Mr.12345678901@example.com",
+            header.as_bytes(),
+            "INBOX",
+            false,
+            Some(100000),
+            false,
+        )
+        .await?;
         let msg = t.get_last_msg().await;
         assert_eq!(msg.download_state(), DownloadState::Available);
         assert_eq!(msg.get_subject(), "foo");
@@ -348,6 +362,7 @@ mod tests {
 
         dc_receive_imf_inner(
             &t,
+            "Mr.12345678901@example.com",
             format!("{}\n\n100k text...", header).as_bytes(),
             "INBOX",
             false,
@@ -377,6 +392,7 @@ mod tests {
         // download message from bob partially, this must not change the ephemeral timer
         dc_receive_imf_inner(
             &t,
+            "first@example.org",
             b"From: Bob <bob@example.org>\n\
                     To: Alice <alice@example.org>\n\
                     Chat-Version: 1.0\n\

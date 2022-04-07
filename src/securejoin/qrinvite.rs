@@ -8,22 +8,23 @@ use std::convert::TryFrom;
 
 use anyhow::{bail, Error, Result};
 
+use crate::contact::ContactId;
 use crate::key::Fingerprint;
 use crate::qr::Qr;
 
 /// Represents the data from a QR-code scan.
 ///
 /// There are methods to conveniently access fields present in both variants.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum QrInvite {
     Contact {
-        contact_id: u32,
+        contact_id: ContactId,
         fingerprint: Fingerprint,
         invitenumber: String,
         authcode: String,
     },
     Group {
-        contact_id: u32,
+        contact_id: ContactId,
         fingerprint: Fingerprint,
         name: String,
         grpid: String,
@@ -37,7 +38,7 @@ impl QrInvite {
     ///
     /// The actual QR-code contains a URL-encoded email address, but upon scanning this is
     /// translated to a contact ID.
-    pub fn contact_id(&self) -> u32 {
+    pub fn contact_id(&self) -> ContactId {
         match self {
             Self::Contact { contact_id, .. } | Self::Group { contact_id, .. } => *contact_id,
         }
@@ -98,5 +99,24 @@ impl TryFrom<Qr> for QrInvite {
             }),
             _ => bail!("Unsupported QR type {:?}", qr),
         }
+    }
+}
+
+impl rusqlite::types::ToSql for QrInvite {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        let json = serde_json::to_string(self)
+            .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
+        let val = rusqlite::types::Value::Text(json);
+        let out = rusqlite::types::ToSqlOutput::Owned(val);
+        Ok(out)
+    }
+}
+
+impl rusqlite::types::FromSql for QrInvite {
+    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        String::column_result(value).and_then(|val| {
+            serde_json::from_str(&val)
+                .map_err(|err| rusqlite::types::FromSqlError::Other(Box::new(err)))
+        })
     }
 }

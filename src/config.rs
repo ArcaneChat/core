@@ -71,8 +71,12 @@ pub enum Config {
     #[strum(props(default = "1"))]
     MvboxMove,
 
+    /// Watch for new messages in the "Mvbox" (aka DeltaChat folder) only.
+    ///
+    /// This will not entirely disable other folders, e.g. the spam folder will also still
+    /// be watched for new messages.
     #[strum(props(default = "0"))]
-    SentboxMove, // If `MvboxMove` is true, this config is ignored. Currently only used in tests.
+    OnlyFetchMvbox,
 
     #[strum(props(default = "2"))] // also change ShowEmails.default() on changes
     ShowEmails,
@@ -225,6 +229,11 @@ impl Context {
         Ok(self.get_config_int(key).await? != 0)
     }
 
+    pub(crate) async fn should_watch_mvbox(&self) -> Result<bool> {
+        Ok(self.get_config_bool(Config::MvboxMove).await?
+            || self.get_config_bool(Config::OnlyFetchMvbox).await?)
+    }
+
     /// Gets configured "delete_server_after" value.
     ///
     /// `None` means never delete the message, `Some(0)` means delete
@@ -233,7 +242,7 @@ impl Context {
         match self.get_config_int(Config::DeleteServerAfter).await? {
             0 => Ok(None),
             1 => Ok(Some(0)),
-            x => Ok(Some(x as i64)),
+            x => Ok(Some(i64::from(x))),
         }
     }
 
@@ -255,7 +264,7 @@ impl Context {
     pub async fn get_config_delete_device_after(&self) -> Result<Option<i64>> {
         match self.get_config_int(Config::DeleteDeviceAfter).await? {
             0 => Ok(None),
-            x => Ok(Some(x as i64)),
+            x => Ok(Some(i64::from(x))),
         }
     }
 
@@ -281,31 +290,25 @@ impl Context {
                     }
                 }
                 self.emit_event(EventType::SelfavatarChanged);
-                Ok(())
             }
             Config::DeleteDeviceAfter => {
-                let ret = self
-                    .sql
-                    .set_raw_config(key, value)
-                    .await
-                    .map_err(Into::into);
+                let ret = self.sql.set_raw_config(key, value).await;
                 // Force chatlist reload to delete old messages immediately.
                 self.emit_event(EventType::MsgsChanged {
                     msg_id: MsgId::new(0),
                     chat_id: ChatId::new(0),
                 });
-                ret
+                ret?
             }
             Config::Displayname => {
                 let value = value.map(improve_single_line_input);
                 self.sql.set_raw_config(key, value.as_deref()).await?;
-                Ok(())
             }
             _ => {
                 self.sql.set_raw_config(key, value).await?;
-                Ok(())
             }
         }
+        Ok(())
     }
 
     pub async fn set_config_bool(&self, key: Config, value: bool) -> Result<()> {

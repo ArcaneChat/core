@@ -16,7 +16,7 @@ use rand::{thread_rng, Rng};
 use crate::blob::BlobObject;
 use crate::chat::{self, delete_and_reset_all_device_msgs, ChatId};
 use crate::config::Config;
-use crate::constants::{Viewtype, DC_CONTACT_ID_SELF};
+use crate::contact::ContactId;
 use crate::context::Context;
 use crate::dc_tools::{
     dc_create_folder, dc_delete_file, dc_delete_files_in_dir, dc_get_filesuffix_lc,
@@ -26,7 +26,7 @@ use crate::e2ee;
 use crate::events::EventType;
 use crate::key::{self, DcKey, DcSecretKey, SignedPublicKey, SignedSecretKey};
 use crate::log::LogExt;
-use crate::message::{Message, MsgId};
+use crate::message::{Message, MsgId, Viewtype};
 use crate::mimeparser::SystemMessage;
 use crate::param::Param;
 use crate::pgp;
@@ -165,7 +165,6 @@ pub async fn initiate_key_transfer(context: &Context) -> Result<String> {
 }
 
 async fn do_initiate_key_transfer(context: &Context) -> Result<String> {
-    let mut msg: Message;
     let setup_code = create_setup_code(context);
     /* this may require a keypair to be created. this may take a second ... */
     let setup_file_content = render_setup_file(context, &setup_code).await?;
@@ -177,9 +176,11 @@ async fn do_initiate_key_transfer(context: &Context) -> Result<String> {
     )
     .await?;
 
-    let chat_id = ChatId::create_for_contact(context, DC_CONTACT_ID_SELF).await?;
-    msg = Message::default();
-    msg.viewtype = Viewtype::File;
+    let chat_id = ChatId::create_for_contact(context, ContactId::SELF).await?;
+    let mut msg = Message {
+        viewtype: Viewtype::File,
+        ..Default::default()
+    };
     msg.param.set(Param::File, setup_file_blob.as_name());
     msg.subject = stock_str::ac_setup_msg_subject(context).await;
     msg.param
@@ -236,7 +237,7 @@ pub async fn render_setup_file(context: &Context, passphrase: &str) -> Result<St
 
     let msg_subj = stock_str::ac_setup_msg_subject(context).await;
     let msg_body = stock_str::ac_setup_msg_body(context).await;
-    let msg_body_html = msg_body.replace("\r", "").replace("\n", "<br>");
+    let msg_body_html = msg_body.replace('\r', "").replace('\n', "<br>");
     Ok(format!(
         concat!(
             "<!DOCTYPE html>\r\n",
@@ -440,13 +441,6 @@ async fn import_backup(
     backup_to_import: &Path,
     passphrase: String,
 ) -> Result<()> {
-    info!(
-        context,
-        "Import \"{}\" to \"{}\".",
-        backup_to_import.display(),
-        context.get_dbfile().display()
-    );
-
     ensure!(
         !context.is_configured().await?,
         "Cannot import backups to accounts in use."
@@ -458,6 +452,16 @@ async fn import_backup(
 
     let backup_file = File::open(backup_to_import).await?;
     let file_size = backup_file.metadata().await?.len();
+    info!(
+        context,
+        "Import \"{}\" ({} bytes) to \"{}\".",
+        backup_to_import.display(),
+        file_size,
+        context.get_dbfile().display()
+    );
+
+    context.sql.config_cache.write().await.clear();
+
     let archive = Archive::new(backup_file);
 
     let mut entries = archive.entries()?;
@@ -897,6 +901,54 @@ mod tests {
         if let Err(err) = imex(&context2.ctx, ImexMode::ImportSelfKeys, blobdir, None).await {
             panic!("got error on import: {:?}", err);
         }
+    }
+
+    #[async_std::test]
+    async fn test_export_and_import_backup() -> Result<()> {
+        let backup_dir = tempfile::tempdir().unwrap();
+
+        let context1 = TestContext::new_alice().await;
+        assert!(context1.is_configured().await?);
+
+        let context2 = TestContext::new().await;
+        assert!(!context2.is_configured().await?);
+        assert!(has_backup(&context2, backup_dir.path().as_ref())
+            .await
+            .is_err());
+
+        // export from context1
+        assert!(imex(
+            &context1,
+            ImexMode::ExportBackup,
+            backup_dir.path().as_ref(),
+            None,
+        )
+        .await
+        .is_ok());
+        let _event = context1
+            .evtracker
+            .get_matching(|evt| matches!(evt, EventType::ImexProgress(1000)))
+            .await;
+
+        // import to context2
+        let backup = has_backup(&context2, backup_dir.path().as_ref()).await?;
+        assert!(
+            imex(&context2, ImexMode::ImportBackup, backup.as_ref(), None)
+                .await
+                .is_ok()
+        );
+        let _event = context2
+            .evtracker
+            .get_matching(|evt| matches!(evt, EventType::ImexProgress(1000)))
+            .await;
+
+        assert!(context2.is_configured().await?);
+        assert_eq!(
+            context2.get_config(Config::Addr).await?,
+            Some("alice@example.org".to_string())
+        );
+
+        Ok(())
     }
 
     #[test]

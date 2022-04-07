@@ -2,15 +2,18 @@ use std::{collections::BTreeMap, time::Instant};
 
 use anyhow::{Context as _, Result};
 
+use crate::config::Config;
 use crate::imap::Imap;
-use crate::{config::Config, log::LogExt};
+use crate::log::LogExt;
 use crate::{context::Context, imap::FolderMeaning};
-use async_std::prelude::*;
+
+use async_std::stream::StreamExt;
 
 use super::{get_folder_meaning, get_folder_meaning_by_name};
 
 impl Imap {
-    pub(crate) async fn scan_folders(&mut self, context: &Context) -> Result<()> {
+    /// Returns true if folders were scanned, false if scanning was postponed.
+    pub(crate) async fn scan_folders(&mut self, context: &Context) -> Result<bool> {
         // First of all, debounce to once per minute:
         let mut last_scan = context.last_full_folder_scan.lock().await;
         if let Some(last_scan) = *last_scan {
@@ -20,28 +23,18 @@ impl Imap {
                 .await?;
 
             if elapsed_secs < debounce_secs {
-                return Ok(());
+                return Ok(false);
             }
         }
         info!(context, "Starting full folder scan");
 
         self.prepare(context).await?;
-        let session = self.session.as_mut();
-        let session = session.context("scan_folders(): IMAP No Connection established")?;
-        let folders: Vec<_> = session.list(Some(""), Some("*")).await?.collect().await;
+        let folders = self.list_folders(context).await?;
         let watched_folders = get_watched_folders(context).await?;
 
         let mut folder_configs = BTreeMap::new();
 
         for folder in folders {
-            let folder = match folder {
-                Ok(f) => f,
-                Err(e) => {
-                    warn!(context, "Can't get folder: {}", e);
-                    continue;
-                }
-            };
-
             // Gmail labels are not folders and should be skipped. For example,
             // emails appear in the inbox and under "All Mail" as soon as it is
             // received. The code used to wrongly conclude that the email had
@@ -98,24 +91,40 @@ impl Imap {
         }
 
         last_scan.replace(Instant::now());
-        Ok(())
+        Ok(true)
     }
+
+    /// Returns the names of all folders on the IMAP server.
+    pub async fn list_folders(
+        self: &mut Imap,
+        context: &Context,
+    ) -> Result<Vec<async_imap::types::Name>> {
+        let session = self.session.as_mut();
+        let session = session.context("No IMAP connection")?;
+        let list = session
+            .list(Some(""), Some("*"))
+            .await?
+            .filter_map(|f| f.ok_or_log_msg(context, "list_folders() can't get folder"));
+        Ok(list.collect().await)
+    }
+}
+
+pub(crate) async fn get_watched_folder_configs(context: &Context) -> Result<Vec<Config>> {
+    let mut res = vec![Config::ConfiguredInboxFolder];
+    if context.get_config_bool(Config::SentboxWatch).await? {
+        res.push(Config::ConfiguredSentboxFolder);
+    }
+    if context.should_watch_mvbox().await? {
+        res.push(Config::ConfiguredMvboxFolder);
+    }
+    Ok(res)
 }
 
 pub(crate) async fn get_watched_folders(context: &Context) -> Result<Vec<String>> {
     let mut res = Vec::new();
-    if let Some(inbox_folder) = context.get_config(Config::ConfiguredInboxFolder).await? {
-        res.push(inbox_folder);
-    }
-    let folder_watched_configured = &[
-        (Config::SentboxWatch, Config::ConfiguredSentboxFolder),
-        (Config::MvboxMove, Config::ConfiguredMvboxFolder),
-    ];
-    for (watched, configured) in folder_watched_configured {
-        if context.get_config_bool(*watched).await? {
-            if let Some(folder) = context.get_config(*configured).await? {
-                res.push(folder);
-            }
+    for folder_config in get_watched_folder_configs(context).await? {
+        if let Some(folder) = context.get_config(folder_config).await? {
+            res.push(folder);
         }
     }
     Ok(res)

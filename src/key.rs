@@ -297,8 +297,8 @@ pub async fn store_self_keypair(
             .context("failed to clear default")?;
     }
     let is_default = match default {
-        KeyPairUse::Default => true as i32,
-        KeyPairUse::ReadOnly => false as i32,
+        KeyPairUse::Default => i32::from(true),
+        KeyPairUse::ReadOnly => i32::from(false),
     };
 
     let addr = keypair.addr.to_string();
@@ -318,7 +318,7 @@ pub async fn store_self_keypair(
 }
 
 /// A key fingerprint
-#[derive(Clone, Eq, PartialEq, Hash)]
+#[derive(Clone, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Fingerprint(Vec<u8>);
 
 impl Fingerprint {

@@ -652,8 +652,6 @@ class TestOnlineAccount:
             pre_generated_key=False,
             config={"key_gen_type": str(const.DC_KEY_GEN_ED25519)}
         )
-        # rsa key gen can be slow especially on CI, adjust timeout
-        ac1._evtracker.set_timeout(240)
         acfactory.wait_configure_and_start_io()
         chat = acfactory.get_accepted_chat(ac1, ac2)
 
@@ -892,10 +890,10 @@ class TestOnlineAccount:
 
         chat = acfactory.get_accepted_chat(ac1, ac2)
         chat.send_text("message1")
+        ac1._evtracker.get_matching("DC_EVENT_IMAP_MESSAGE_MOVED")
         chat.send_text("message2")
+        ac1._evtracker.get_matching("DC_EVENT_IMAP_MESSAGE_MOVED")
         chat.send_text("message3")
-        ac1._evtracker.get_matching("DC_EVENT_IMAP_MESSAGE_MOVED")
-        ac1._evtracker.get_matching("DC_EVENT_IMAP_MESSAGE_MOVED")
         ac1._evtracker.get_matching("DC_EVENT_IMAP_MESSAGE_MOVED")
 
     def test_forward_messages(self, acfactory, lp):
@@ -1100,6 +1098,30 @@ class TestOnlineAccount:
         ev = ac1_clone._evtracker.get_matching("DC_EVENT_MSGS_NOTICED")
         assert ev.data1 == ac1_clone_chat.id
         assert ac1_clone_message.is_in_seen
+
+        lp.sec("Send an ephemeral message from ac2 to ac1")
+        ac2_chat.set_ephemeral_timer(60)
+        ac1._evtracker.get_matching("DC_EVENT_CHAT_EPHEMERAL_TIMER_MODIFIED")
+        ac1._evtracker.wait_next_incoming_message()
+        ac1_clone._evtracker.get_matching("DC_EVENT_CHAT_EPHEMERAL_TIMER_MODIFIED")
+        ac1_clone._evtracker.wait_next_incoming_message()
+
+        ac2_chat.send_text("Foobar")
+        ac1_message = ac1._evtracker.wait_next_incoming_message()
+        ac1_clone_message = ac1_clone._evtracker.wait_next_incoming_message()
+        assert "Ephemeral timer: 60\n" in ac1_message.get_message_info()
+        assert "Expires: " not in ac1_clone_message.get_message_info()
+        assert "Ephemeral timer: 60\n" in ac1_message.get_message_info()
+        assert "Expires: " not in ac1_clone_message.get_message_info()
+
+        ac1.mark_seen_messages([ac1_message])
+        assert ac1_message.is_in_seen
+        assert "Expires: " in ac1_message.get_message_info()
+        ev = ac1_clone._evtracker.get_matching("DC_EVENT_MSGS_NOTICED")
+        assert ev.data1 == ac1_clone_chat.id
+        assert ac1_clone_message.is_in_seen
+        # Test that the timer is started on the second device after synchronizing the seen status.
+        assert "Expires: " in ac1_clone_message.get_message_info()
 
     def test_message_override_sender_name(self, acfactory, lp):
         ac1, ac2 = acfactory.get_two_online_accounts()
@@ -1400,11 +1422,13 @@ class TestOnlineAccount:
         assert not device_chat.can_send()
         assert device_chat.get_draft() is None
 
-    def test_dont_show_emails_in_draft_folder(self, acfactory, lp):
+    def test_dont_show_emails(self, acfactory, lp):
         """Most mailboxes have a "Drafts" folder where constantly new emails appear but we don't actually want to show them.
         So: If it's outgoing AND there is no Received header AND it's not in the sentbox, then ignore the email.
 
-        If the draft email is sent out later (i.e. moved to "Sent"), it must be shown."""
+        If the draft email is sent out later (i.e. moved to "Sent"), it must be shown.
+
+        Also, test that unknown emails in the Spam folder are not shown."""
         ac1 = acfactory.get_online_configuring_account()
         ac1.set_config("show_emails", "2")
         ac1.create_contact("alice@example.org").create_chat()
@@ -1412,6 +1436,7 @@ class TestOnlineAccount:
         acfactory.wait_configure(ac1)
         ac1.direct_imap.create_folder("Drafts")
         ac1.direct_imap.create_folder("Sent")
+        ac1.direct_imap.create_folder("Spam")
 
         acfactory.wait_configure_and_start_io()
         # Wait until each folder was selected once and we are IDLEing again:
@@ -1436,6 +1461,15 @@ class TestOnlineAccount:
 
             message in Sent
         """.format(ac1.get_config("configured_addr")))
+        ac1.direct_imap.append("Spam", """
+            From: unknown.address@junk.org
+            Subject: subj
+            To: {}
+            Message-ID: <spam.message@junk.org>
+            Content-Type: text/plain; charset=utf-8
+
+            Unknown message in Spam
+        """.format(ac1.get_config("configured_addr")))
 
         ac1.set_config("scan_all_folders_debounce_secs", "0")
         lp.sec("All prepared, now let DC find the message")
@@ -1448,6 +1482,10 @@ class TestOnlineAccount:
 
         assert msg.text == "subj – message in Sent"
         assert len(msg.chat.get_messages()) == 1
+
+        assert not any("unknown.address" in c.get_name() for c in ac1.get_chats())
+        ac1.direct_imap.select_folder("Spam")
+        assert ac1.direct_imap.get_uid_by_message_id("spam.message@junk.org")
 
         ac1.stop_io()
         lp.sec("'Send out' the draft, i.e. move it to the Sent folder, and wait for DC to display it this time")
@@ -1834,7 +1872,6 @@ class TestOnlineAccount:
         lp.sec("trigger ac setup message and return setupcode")
         assert ac1.get_info()["fingerprint"] != ac2.get_info()["fingerprint"]
         setup_code = ac1.initiate_key_transfer()
-        ac2._evtracker.set_timeout(30)
         ev = ac2._evtracker.get_matching("DC_EVENT_INCOMING_MSG|DC_EVENT_MSGS_CHANGED")
         msg = ac2.get_message_by_id(ev.data2)
         assert msg.is_setup_message()
@@ -1851,7 +1888,6 @@ class TestOnlineAccount:
     def test_ac_setup_message_twice(self, acfactory, lp):
         ac1 = acfactory.get_online_configuring_account()
         ac2 = acfactory.clone_online_account(ac1)
-        ac2._evtracker.set_timeout(30)
         acfactory.wait_configure_and_start_io()
 
         lp.sec("trigger ac setup message but ignore")
@@ -2025,7 +2061,7 @@ class TestOnlineAccount:
 
         lp.sec("ac1: send a message to group chat to promote the group")
         chat.send_text("afterwards promoted")
-        ev = in_list.get(timeout=10)
+        ev = in_list.get()
         assert ev.action == "chat-modified"
         assert chat.is_promoted()
         assert sorted(x.addr for x in chat.get_contacts()) == \
@@ -2035,29 +2071,29 @@ class TestOnlineAccount:
         # note that if the above create_chat() would not
         # happen we would not receive a proper member_added event
         contact2 = chat.add_contact("devnull@testrun.org")
-        ev = in_list.get(timeout=10)
+        ev = in_list.get()
         assert ev.action == "chat-modified"
-        ev = in_list.get(timeout=10)
+        ev = in_list.get()
         assert ev.action == "chat-modified"
-        ev = in_list.get(timeout=10)
+        ev = in_list.get()
         assert ev.action == "added"
         assert ev.message.get_sender_contact().addr == ac1_addr
         assert ev.contact.addr == "devnull@testrun.org"
 
         lp.sec("ac1: remove address2")
         chat.remove_contact(contact2)
-        ev = in_list.get(timeout=10)
+        ev = in_list.get()
         assert ev.action == "chat-modified"
-        ev = in_list.get(timeout=10)
+        ev = in_list.get()
         assert ev.action == "removed"
         assert ev.contact.addr == contact2.addr
         assert ev.message.get_sender_contact().addr == ac1_addr
 
         lp.sec("ac1: remove ac2 contact from chat")
         chat.remove_contact(ac2)
-        ev = in_list.get(timeout=10)
+        ev = in_list.get()
         assert ev.action == "chat-modified"
-        ev = in_list.get(timeout=10)
+        ev = in_list.get()
         assert ev.action == "removed"
         assert ev.message.get_sender_contact().addr == ac1_addr
 
@@ -2504,8 +2540,7 @@ class TestOnlineAccount:
         lp.sec("ac2: deleting all messages except third")
         assert len(to_delete) == len(texts) - 1
         ac2.delete_messages(to_delete)
-        for msg in to_delete:
-            ac2._evtracker.get_matching("DC_EVENT_IMAP_MESSAGE_DELETED")
+        ac2._evtracker.get_matching("DC_EVENT_IMAP_MESSAGE_DELETED")
 
         ac2._evtracker.get_info_contains("close/expunge succeeded")
 
@@ -2682,7 +2717,13 @@ class TestOnlineAccount:
         ac1.direct_imap.select_config_folder("inbox")
         ac1.direct_imap.idle_start()
         acfactory.get_accepted_chat(ac2, ac1).send_text("hello")
-        ac1.direct_imap.idle_check(terminate=True)
+        while True:
+            if len(ac1.direct_imap.idle_check(terminate=True)) > 1:
+                # If length is 1, it's [(b'OK', b'Still here')]
+                # Could happen on very slow network.
+                #
+                # More is usually [(1, b'EXISTS'), (1, b'RECENT')]
+                break
         ac1.direct_imap.conn.move(["*"], folder)  # "*" means "biggest UID in mailbox"
 
         lp.sec("Everything prepared, now see if DeltaChat finds the message (" + variant + ")")
@@ -2715,7 +2756,6 @@ class TestOnlineAccount:
                 assert ac.get_config("configured_mvbox_folder")
 
         ac1 = acfactory.get_online_configuring_account(move=mvbox_move)
-        ac1.set_config("sentbox_move", "1")
         ac2 = acfactory.get_online_configuring_account()
 
         acfactory.wait_configure(ac1)
@@ -2735,7 +2775,7 @@ class TestOnlineAccount:
         if mvbox_move:
             ac1.direct_imap.select_config_folder("mvbox")
         else:
-            ac1.direct_imap.select_config_folder("sentbox")
+            ac1.direct_imap.select_folder("INBOX")
         ac1.direct_imap.idle_start()
 
         lp.sec("send out message with bcc to ourselves")

@@ -17,7 +17,7 @@ use deltachat::download::DownloadState;
 use deltachat::imex::*;
 use deltachat::location;
 use deltachat::log::LogExt;
-use deltachat::message::{self, Message, MessageState, MsgId};
+use deltachat::message::{self, Message, MessageState, MsgId, Viewtype};
 use deltachat::peerstate::*;
 use deltachat::qr::*;
 use deltachat::sql;
@@ -84,6 +84,7 @@ async fn reset_tables(context: &Context, bits: i32) {
             )
             .await
             .unwrap();
+        context.sql().config_cache().write().await.clear();
         context
             .sql()
             .execute("DELETE FROM leftgrps;", paramsv![])
@@ -209,7 +210,7 @@ async fn log_msg(context: &Context, prefix: impl AsRef<str>, msg: &Message) {
         contact_id,
         msgtext.unwrap_or_default(),
         if msg.has_html() { "[HAS-HTML]️" } else { "" },
-        if msg.get_from_id() == 1 {
+        if msg.get_from_id() == ContactId::SELF {
             ""
         } else if msg.get_state() == MessageState::InSeen {
             "[SEEN]"
@@ -267,9 +268,8 @@ async fn log_msglist(context: &Context, msglist: &[MsgId]) -> Result<()> {
     Ok(())
 }
 
-async fn log_contactlist(context: &Context, contacts: &[u32]) -> Result<()> {
+async fn log_contactlist(context: &Context, contacts: &[ContactId]) -> Result<()> {
     for contact_id in contacts {
-        let line;
         let mut line2 = "".to_string();
         let contact = Contact::get_by_id(context, *contact_id).await?;
         let name = contact.get_display_name();
@@ -284,24 +284,20 @@ async fn log_contactlist(context: &Context, contacts: &[u32]) -> Result<()> {
         } else {
             ""
         };
-        line = format!(
+        let line = format!(
             "{}{} <{}>",
             if !name.is_empty() {
-                &name
+                name
             } else {
                 "<name unset>"
             },
             verified_str,
-            if !addr.is_empty() {
-                &addr
-            } else {
-                "addr unset"
-            }
+            if !addr.is_empty() { addr } else { "addr unset" }
         );
-        let peerstate = Peerstate::from_addr(context, &addr)
+        let peerstate = Peerstate::from_addr(context, addr)
             .await
             .expect("peerstate error");
-        if peerstate.is_some() && *contact_id != 1 {
+        if peerstate.is_some() && *contact_id != ContactId::SELF {
             line2 = format!(
                 ", prefer-encrypt={}",
                 peerstate.as_ref().unwrap().prefer_encrypt
@@ -430,7 +426,6 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
                  joinqr <qr-content>\n\
                  setqr <qr-content>\n\
                  providerinfo <addr>\n\
-                 event <event-id to test>\n\
                  fileinfo <file>\n\
                  estimatedeletion <seconds>\n\
                  clear -- clear screen\n\
@@ -719,7 +714,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
         }
         "createchat" => {
             ensure!(!arg1.is_empty(), "Argument <contact-id> missing.");
-            let contact_id: u32 = arg1.parse()?;
+            let contact_id = ContactId::new(arg1.parse()?);
             let chat_id = ChatId::create_for_contact(&context, contact_id).await?;
 
             println!("Single#{} created successfully.", chat_id,);
@@ -747,7 +742,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             ensure!(sel_chat.is_some(), "No chat selected");
             ensure!(!arg1.is_empty(), "Argument <contact-id> missing.");
 
-            let contact_id_0: u32 = arg1.parse()?;
+            let contact_id_0 = ContactId::new(arg1.parse()?);
             chat::add_contact_to_chat(&context, sel_chat.as_ref().unwrap().get_id(), contact_id_0)
                 .await?;
             println!("Contact added to chat.");
@@ -755,7 +750,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
         "removemember" => {
             ensure!(sel_chat.is_some(), "No chat selected.");
             ensure!(!arg1.is_empty(), "Argument <contact-id> missing.");
-            let contact_id_1: u32 = arg1.parse()?;
+            let contact_id_1 = ContactId::new(arg1.parse()?);
             chat::remove_contact_from_chat(
                 &context,
                 sel_chat.as_ref().unwrap().get_id(),
@@ -771,7 +766,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             chat::set_chat_name(
                 &context,
                 sel_chat.as_ref().unwrap().get_id(),
-                &format!("{} {}", arg1, arg2).trim(),
+                format!("{} {}", arg1, arg2).trim(),
             )
             .await?;
 
@@ -937,13 +932,24 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
         "listmsgs" => {
             ensure!(!arg1.is_empty(), "Argument <query> missing.");
 
+            let query = format!("{} {}", arg1, arg2).trim().to_string();
             let chat = sel_chat.as_ref().map(|sel_chat| sel_chat.get_id());
             let time_start = std::time::SystemTime::now();
-            let msglist = context.search_msgs(chat, arg1).await?;
+            let msglist = context.search_msgs(chat, &query).await?;
             let time_needed = time_start.elapsed().unwrap_or_default();
 
             log_msglist(&context, &msglist).await?;
-            println!("{} messages.", msglist.len());
+            println!(
+                "{}{} messages for {}search of \"{}\"",
+                msglist.len(),
+                if msglist.len() == 1000 { "+" } else { "" },
+                if chat.is_none() {
+                    "global "
+                } else {
+                    "in-chat-"
+                },
+                query,
+            );
             println!("{:?} to create this list", time_needed);
         }
         "draft" => {
@@ -1139,7 +1145,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
         "contactinfo" => {
             ensure!(!arg1.is_empty(), "Argument <contact-id> missing.");
 
-            let contact_id: u32 = arg1.parse()?;
+            let contact_id = ContactId::new(arg1.parse()?);
             let contact = Contact::get_by_id(&context, contact_id).await?;
             let name_n_addr = contact.get_name_n_addr();
 
@@ -1174,16 +1180,16 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
         }
         "delcontact" => {
             ensure!(!arg1.is_empty(), "Argument <contact-id> missing.");
-            Contact::delete(&context, arg1.parse()?).await?;
+            Contact::delete(&context, ContactId::new(arg1.parse()?)).await?;
         }
         "block" => {
             ensure!(!arg1.is_empty(), "Argument <contact-id> missing.");
-            let contact_id = arg1.parse()?;
+            let contact_id = ContactId::new(arg1.parse()?);
             Contact::block(&context, contact_id).await?;
         }
         "unblock" => {
             ensure!(!arg1.is_empty(), "Argument <contact-id> missing.");
-            let contact_id = arg1.parse()?;
+            let contact_id = ContactId::new(arg1.parse()?);
             Contact::unblock(&context, contact_id).await?;
         }
         "listblocked" => {
@@ -1224,17 +1230,6 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
                 }
             }
         }
-        // TODO: implement this again, unclear how to match this through though, without writing a parser.
-        // "event" => {
-        //     ensure!(!arg1.is_empty(), "Argument <id> missing.");
-        //     let event = arg1.parse()?;
-        //     let event = EventType::from_u32(event).ok_or(format_err!("EventType::from_u32({})", event))?;
-        //     let r = context.emit_event(event, 0 as libc::uintptr_t, 0 as libc::uintptr_t);
-        //     println!(
-        //         "Sending event {:?}({}), received value {}.",
-        //         event, event as usize, r,
-        //     );
-        // }
         "fileinfo" => {
             ensure!(!arg1.is_empty(), "Argument <file> missing.");
 
