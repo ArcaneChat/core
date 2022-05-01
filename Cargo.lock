@@ -210,7 +210,7 @@ dependencies = [
 [[package]]
 name = "async-imap"
 version = "0.5.0"
-source = "git+https://github.com/async-email/async-imap#7ddd1c1c7d5013a4b3369235f9f9bc233e9d7398"
+source = "git+https://github.com/async-email/async-imap#d07ea4019f2ca724244f7a4503a8ac4946a722b3"
 dependencies = [
  "async-native-tls",
  "async-std",
@@ -3600,11 +3600,13 @@ checksum = "213701ba3370744dcd1a12960caa4843b3d68b4d1c0a5d575e0d65b2ee9d16c0"
 
 [[package]]
 name = "stop-token"
-version = "0.2.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d5e0f9b25bdd9bf18e33d1f4dd0194c77034b66b4a4842b0bf7f5cf53ca733a"
+checksum = "af91f480ee899ab2d9f8435bfdfc14d08a5754bd9d3fef1f1a1c23336aad6c8b"
 dependencies = [
- "async-std",
+ "async-channel",
+ "cfg-if 1.0.0",
+ "futures-core",
  "pin-project-lite",
 ]
 
