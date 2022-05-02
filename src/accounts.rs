@@ -54,7 +54,11 @@ impl Accounts {
         ensure!(dir.exists().await, "directory does not exist");
 
         let config_file = dir.join(CONFIG_NAME);
-        ensure!(config_file.exists().await, "accounts.toml does not exist");
+        ensure!(
+            config_file.exists().await,
+            "{:?} does not exist",
+            config_file
+        );
 
         let config = Config::from_file(config_file)
             .await
@@ -144,9 +148,27 @@ impl Accounts {
         drop(ctx);
 
         if let Some(cfg) = self.config.get_account(id).await {
-            fs::remove_dir_all(async_std::path::PathBuf::from(&cfg.dir))
-                .await
-                .context("failed to remove account data")?;
+            // Spend up to 1 minute trying to remove the files.
+            // Files may remain locked up to 30 seconds due to r2d2 bug:
+            // https://github.com/sfackler/r2d2/issues/99
+            let mut counter = 0;
+            loop {
+                counter += 1;
+
+                if let Err(err) = fs::remove_dir_all(async_std::path::PathBuf::from(&cfg.dir))
+                    .await
+                    .context("failed to remove account data")
+                {
+                    if counter > 60 {
+                        return Err(err);
+                    }
+
+                    // Wait 1 second and try again.
+                    async_std::task::sleep(std::time::Duration::from_millis(1000)).await;
+                } else {
+                    break;
+                }
+            }
         }
         self.config.remove_account(id).await?;
 

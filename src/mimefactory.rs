@@ -133,11 +133,7 @@ impl<'a> MimeFactory<'a> {
     ) -> Result<MimeFactory<'a>> {
         let chat = Chat::load_from_db(context, msg.chat_id).await?;
 
-        let from_addr = context
-            .get_config(Config::ConfiguredAddr)
-            .await?
-            .unwrap_or_default();
-
+        let from_addr = context.get_primary_self_addr().await?;
         let config_displayname = context
             .get_config(Config::Displayname)
             .await?
@@ -237,10 +233,7 @@ impl<'a> MimeFactory<'a> {
         ensure!(!msg.chat_id.is_special(), "Invalid chat id");
 
         let contact = Contact::load_from_db(context, msg.from_id).await?;
-        let from_addr = context
-            .get_config(Config::ConfiguredAddr)
-            .await?
-            .unwrap_or_default();
+        let from_addr = context.get_primary_self_addr().await?;
         let from_displayname = context
             .get_config(Config::Displayname)
             .await?
@@ -278,10 +271,7 @@ impl<'a> MimeFactory<'a> {
         &self,
         context: &Context,
     ) -> Result<Vec<(Option<Peerstate>, &str)>> {
-        let self_addr = context
-            .get_config(Config::ConfiguredAddr)
-            .await?
-            .context("not configured")?;
+        let self_addr = context.get_primary_self_addr().await?;
 
         let mut res = Vec::new();
         for (_, addr) in self
@@ -838,9 +828,12 @@ impl<'a> MimeFactory<'a> {
         }
 
         if chat.typ == Chattype::Group {
-            headers
-                .protected
-                .push(Header::new("Chat-Group-ID".into(), chat.grpid.clone()));
+            // Send group ID unless it is an ad hoc group that has no ID.
+            if !chat.grpid.is_empty() {
+                headers
+                    .protected
+                    .push(Header::new("Chat-Group-ID".into(), chat.grpid.clone()));
+            }
 
             let encoded = encode_words(&chat.name);
             headers
@@ -1650,7 +1643,6 @@ mod tests {
             Date: Sun, 22 Mar 2020 22:37:56 +0000\n\
             \n\
             hello\n",
-            "INBOX",
             false,
         )
         .await
@@ -1743,7 +1735,6 @@ mod tests {
                 t.get_last_msg().await.rfc724_mid
             )
             .as_bytes(),
-            "INBOX",
             false,
         )
         .await?;
@@ -1854,7 +1845,6 @@ mod tests {
                     Date: Sun, 22 Mar 2020 22:37:56 +0000\n\
                     \n\
                     Some other, completely unrelated content\n",
-                "INBOX",
                 false,
             )
             .await
@@ -1879,9 +1869,7 @@ mod tests {
             .await
             .unwrap();
 
-        dc_receive_imf(context, imf_raw, "INBOX", false)
-            .await
-            .unwrap();
+        dc_receive_imf(context, imf_raw, false).await.unwrap();
 
         let chats = Chatlist::try_load(context, 0, None, None).await.unwrap();
 

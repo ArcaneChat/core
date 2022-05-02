@@ -1802,6 +1802,25 @@ void            dc_forward_msgs              (dc_context_t* context, const uint3
 
 
 /**
+ * Resend messages and make information available for newly added chat members.
+ * Resending sends out the original message, however, recipients and webxdc-status may differ.
+ * Clients that already have the original message can still ignore the resent message as
+ * they have tracked the state by dedicated updates.
+ *
+ * Some messages cannot be resent, eg. info-messages, drafts, already pending messages or messages that are not sent by SELF.
+ * In this case, the return value indicates an error and the error string from dc_get_last_error() should be shown to the user.
+ *
+ * @memberof dc_context_t
+ * @param context The context object.
+ * @param msg_ids An array of uint32_t containing all message IDs that should be resend.
+ *     All messages must belong to the same chat.
+ * @param msg_cnt The number of messages IDs in the msg_ids array.
+ * @return 1=all messages are queued for resending, 0=error
+ */
+int             dc_resend_msgs               (dc_context_t* context, const uint32_t* msg_ids, int msg_cnt);
+
+
+/**
  * Mark messages as presented to the user.
  * Typically, UIs call this function on scrolling through the message list,
  * when the messages are presented at least for a little moment.
@@ -4629,9 +4648,10 @@ int             dc_contact_is_verified       (dc_contact_t* contact);
 
 
 /**
- * Create a provider struct for the given e-mail address.
+ * Create a provider struct for the given e-mail address by local lookup.
  *
- * The provider is extracted from the e-mail address and it's information is returned.
+ * Lookup is done from the local database by extracting the domain from the e-mail address.
+ * Therefore the provider for custom domains cannot be identified.
  *
  * @memberof dc_provider_t
  * @param context The context object.
@@ -4641,6 +4661,23 @@ int             dc_contact_is_verified       (dc_contact_t* contact);
  *     returned.
  */
 dc_provider_t*  dc_provider_new_from_email            (const dc_context_t* context, const char* email);
+
+
+/**
+ * Create a provider struct for the given e-mail address by local and DNS lookup.
+ *
+ * First lookup is done from the local database as of dc_provider_new_from_email().
+ * If the first lookup fails, an additional DNS lookup is done,
+ * trying to figure out the provider belonging to custom domains.
+ *
+ * @memberof dc_provider_t
+ * @param context The context object.
+ * @param email The user's e-mail address to extract the provider info form.
+ * @return A dc_provider_t struct which can be used with the dc_provider_get_*
+ *     accessor functions. If no provider info is found, NULL will be
+ *     returned.
+ */
+dc_provider_t*  dc_provider_new_from_email_with_dns    (const dc_context_t* context, const char* email);
 
 
 /**
@@ -5606,11 +5643,16 @@ void dc_event_unref(dc_event_t* event);
 /**
  * webxdc status update received.
  * To get the received status update, use dc_get_webxdc_status_updates() with
- * `serial` set to the last known update.
+ * `serial` set to the last known update
+ * (in case of special bots, `status_update_serial` from `data2`
+ * may help to calculate the last known update for dc_get_webxdc_status_updates();
+ * UIs must not peek at this parameter to avoid races in the status replication
+ * eg. when events arrive while initial updates are played back).
+ *
  * To send status updates, use dc_send_webxdc_status_update().
  *
  * @param data1 (int) msg_id
- * @param data2 (int) 0
+ * @param data2 (int) status_update_serial - must not be used by UI implementations.
  */
 #define DC_EVENT_WEBXDC_STATUS_UPDATE                2120
 
@@ -6218,9 +6260,7 @@ void dc_event_unref(dc_event_t* event);
 /// `%1$s` will be replaced by the domain of the configured e-mail address.
 #define DC_STR_STORAGE_ON_DOMAIN          105
 
-/// "One moment…"
-///
-/// Used in the connectivity view when some information are not yet there.
+/// @deprecated Deprecated 2022-04-16, this string is no longer needed.
 #define DC_STR_ONE_MOMENT                 106
 
 /// "Connected"
@@ -6308,6 +6348,11 @@ void dc_event_unref(dc_event_t* event);
 ///
 /// `%1$s` will be replaced with the group name.
 #define DC_STR_SECURE_JOIN_GROUP_QR_DESC  120
+
+/// "Not connected"
+///
+/// Used as status in the connectivity view.
+#define DC_STR_NOT_CONNECTED              121
 
 /**
  * @}

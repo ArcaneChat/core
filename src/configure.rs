@@ -85,7 +85,7 @@ impl Context {
     async fn inner_configure(&self) -> Result<()> {
         info!(self, "Configure ...");
 
-        let mut param = LoginParam::from_database(self, "").await?;
+        let mut param = LoginParam::load_candidate_params(self).await?;
         let success = configure(self, &mut param).await;
         self.set_config(Config::NotifyAboutWrongPw, None).await?;
 
@@ -453,8 +453,14 @@ async fn configure(ctx: &Context, param: &mut LoginParam) -> Result<()> {
     drop(imap);
 
     progress!(ctx, 910);
+
+    if ctx.get_config(Config::ConfiguredAddr).await?.as_deref() != Some(&param.addr) {
+        // Switched account, all server UIDs we know are invalid
+        job::schedule_resync(ctx).await?;
+    }
+
     // the trailing underscore is correct
-    param.save_to_database(ctx, "configured_").await?;
+    param.save_as_configured_params(ctx).await?;
     ctx.set_config(Config::ConfiguredTimestamp, Some(&time().to_string()))
         .await?;
 
@@ -699,11 +705,11 @@ pub enum Error {
         error: quick_xml::Error,
     },
 
-    #[error("Failed to get URL: {0}")]
-    ReadUrl(#[from] self::read_url::Error),
-
     #[error("Number of redirection is exceeded")]
     Redirection,
+
+    #[error("{0:#}")]
+    Other(#[from] anyhow::Error),
 }
 
 #[cfg(test)]

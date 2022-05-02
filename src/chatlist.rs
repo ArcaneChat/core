@@ -9,7 +9,6 @@ use crate::constants::{
 };
 use crate::contact::{Contact, ContactId};
 use crate::context::Context;
-use crate::ephemeral::delete_expired_messages;
 use crate::message::{Message, MessageState, MsgId};
 use crate::stock_str;
 use crate::summary::Summary;
@@ -90,12 +89,6 @@ impl Chatlist {
         let flag_for_forwarding = 0 != listflags & DC_GCL_FOR_FORWARDING;
         let flag_no_specials = 0 != listflags & DC_GCL_NO_SPECIALS;
         let flag_add_alldone_hint = 0 != listflags & DC_GCL_ADD_ALLDONE_HINT;
-
-        // Note that we do not emit DC_EVENT_MSGS_MODIFIED here even if some
-        // messages get deleted to avoid reloading the same chatlist.
-        if let Err(err) = delete_expired_messages(context).await {
-            warn!(context, "Failed to hide expired messages: {}", err);
-        }
 
         let mut add_archived_link_item = false;
 
@@ -355,6 +348,10 @@ impl Chatlist {
     pub fn get_index_for_id(&self, id: ChatId) -> Option<usize> {
         self.ids.iter().position(|(chat_id, _)| chat_id == &id)
     }
+
+    pub fn iter(&self) -> impl Iterator<Item = &(ChatId, Option<MsgId>)> {
+        self.ids.iter()
+    }
 }
 
 /// Returns the number of archived chats
@@ -506,7 +503,6 @@ mod tests {
                  Date: Sun, 22 Mar 2021 22:37:57 +0000\n\
                  \n\
                  hello foo\n",
-            "INBOX",
             false,
         )
         .await?;
@@ -567,7 +563,6 @@ mod tests {
                  Date: Sun, 22 Mar 2021 22:38:57 +0000\n\
                  \n\
                  hello foo\n",
-            "INBOX",
             false,
         )
         .await?;

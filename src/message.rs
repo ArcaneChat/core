@@ -9,6 +9,7 @@ use rusqlite::types::ValueRef;
 use serde::{Deserialize, Serialize};
 
 use crate::chat::{self, Chat, ChatId};
+use crate::config::Config;
 use crate::constants::{
     Blocked, Chattype, VideochatType, DC_CHAT_ID_TRASH, DC_DESIRED_TEXT_LEN, DC_MSG_ID_LAST_SPECIAL,
 };
@@ -21,7 +22,8 @@ use crate::dc_tools::{
 use crate::download::DownloadState;
 use crate::ephemeral::{start_ephemeral_timers_msgids, Timer as EphemeralTimer};
 use crate::events::EventType;
-use crate::job::{self, Action};
+use crate::imap::markseen_on_imap_table;
+use crate::job;
 use crate::log::LogExt;
 use crate::mimeparser::{parse_message_id, FailureReport, SystemMessage};
 use crate::param::{Param, Params};
@@ -1252,19 +1254,13 @@ pub async fn delete_msgs(context: &Context, msg_ids: &[MsgId]) -> Result<()> {
     }
 
     if !msg_ids.is_empty() {
-        context.emit_event(EventType::MsgsChanged {
-            chat_id: ChatId::new(0),
-            msg_id: MsgId::new(0),
-        });
-        job::kill_action(context, Action::Housekeeping).await?;
-        job::add(
-            context,
-            job::Job::new(Action::Housekeeping, 0, Params::new(), 10),
-        )
-        .await?;
+        context.emit_msgs_changed_without_ids();
+
+        // Run housekeeping to delete unused blobs.
+        context.set_config(Config::LastHousekeeping, None).await?;
     }
 
-    // Interrupt Inbox loop to start message deletion.
+    // Interrupt Inbox loop to start message deletion and run housekeeping.
     context.interrupt_inbox(InterruptInfo::new(false)).await;
     Ok(())
 }
@@ -1294,22 +1290,31 @@ pub async fn markseen_msgs(context: &Context, msg_ids: Vec<MsgId>) -> Result<()>
                     m.chat_id AS chat_id,
                     m.state AS state,
                     m.ephemeral_timer AS ephemeral_timer,
+                    m.param AS param,
+                    m.from_id AS from_id,
+                    m.rfc724_mid AS rfc724_mid,
                     c.blocked AS blocked
                  FROM msgs m LEFT JOIN chats c ON c.id=m.chat_id
                  WHERE m.id IN ({}) AND m.chat_id>9",
-                sql::repeat_vars(msg_ids.len())?
+                sql::repeat_vars(msg_ids.len())
             ),
             rusqlite::params_from_iter(&msg_ids),
             |row| {
                 let id: MsgId = row.get("id")?;
                 let chat_id: ChatId = row.get("chat_id")?;
                 let state: MessageState = row.get("state")?;
+                let param: Params = row.get::<_, String>("param")?.parse().unwrap_or_default();
+                let from_id: ContactId = row.get("from_id")?;
+                let rfc724_mid: String = row.get("rfc724_mid")?;
                 let blocked: Option<Blocked> = row.get("blocked")?;
                 let ephemeral_timer: EphemeralTimer = row.get("ephemeral_timer")?;
                 Ok((
                     id,
                     chat_id,
                     state,
+                    param,
+                    from_id,
+                    rfc724_mid,
                     blocked.unwrap_or_default(),
                     ephemeral_timer,
                 ))
@@ -1318,30 +1323,55 @@ pub async fn markseen_msgs(context: &Context, msg_ids: Vec<MsgId>) -> Result<()>
         )
         .await?;
 
-    if msgs
-        .iter()
-        .any(|(_id, _chat_id, _state, _blocked, ephemeral_timer)| {
+    if msgs.iter().any(
+        |(_id, _chat_id, _state, _param, _from_id, _rfc724_mid, _blocked, ephemeral_timer)| {
             *ephemeral_timer != EphemeralTimer::Disabled
-        })
-    {
+        },
+    ) {
         start_ephemeral_timers_msgids(context, &msg_ids)
             .await
             .context("failed to start ephemeral timers")?;
     }
 
     let mut updated_chat_ids = BTreeSet::new();
-    for (id, curr_chat_id, curr_state, curr_blocked, _curr_ephemeral_timer) in msgs.into_iter() {
+    for (
+        id,
+        curr_chat_id,
+        curr_state,
+        curr_param,
+        curr_from_id,
+        curr_rfc724_mid,
+        curr_blocked,
+        _curr_ephemeral_timer,
+    ) in msgs.into_iter()
+    {
         if curr_blocked == Blocked::Not
             && (curr_state == MessageState::InFresh || curr_state == MessageState::InNoticed)
         {
             update_msg_state(context, id, MessageState::InSeen).await?;
             info!(context, "Seen message {}.", id);
 
-            job::add(
-                context,
-                job::Job::new(Action::MarkseenMsgOnImap, id.to_u32(), Params::new(), 0),
-            )
-            .await?;
+            markseen_on_imap_table(context, &curr_rfc724_mid).await?;
+
+            // Read receipts for system messages are never sent. These messages have no place to
+            // display received read receipt anyway.  And since their text is locally generated,
+            // quoting them is dangerous as it may contain contact names. E.g., for original message
+            // "Group left by me", a read receipt will quote "Group left by <name>", and the name can
+            // be a display name stored in address book rather than the name sent in the From field by
+            // the user.
+            if curr_param.get_bool(Param::WantsMdn).unwrap_or_default()
+                && curr_param.get_cmd() == SystemMessage::Unknown
+            {
+                let mdns_enabled = context.get_config_bool(Config::MdnsEnabled).await?;
+                if mdns_enabled {
+                    let chat = Chat::load_from_db(context, curr_chat_id).await?;
+                    if chat.typ != Chattype::Group {
+                        if let Err(err) = job::send_mdn(context, id, curr_from_id).await {
+                            warn!(context, "could not send out mdn for {}: {}", id, err);
+                        }
+                    }
+                }
+            }
             updated_chat_ids.insert(curr_chat_id);
         }
     }
@@ -2017,7 +2047,6 @@ mod tests {
                     Date: Fri, 29 Jan 2021 21:37:55 +0000\n\
                     \n\
                     hello\n",
-            "INBOX",
             false,
         )
         .await
@@ -2226,7 +2255,6 @@ mod tests {
                     Date: Fri, 29 Jan 2021 21:37:55 +0000\n\
                     \n\
                     hello\n",
-            "INBOX",
             false,
         )
         .await?;
@@ -2244,7 +2272,6 @@ mod tests {
                     Date: Fri, 29 Jan 2021 21:37:55 +0000\n\
                     \n\
                     hello again\n",
-            "INBOX",
             false,
         )
         .await?;

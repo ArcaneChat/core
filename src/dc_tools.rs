@@ -86,7 +86,7 @@ pub(crate) fn dc_gm2local_offset() -> i64 {
 //   `last_smeared_timestamp` is again in sync with the normal time.
 // - however, we do not do all this for the far future,
 //   but at max `MAX_SECONDS_TO_LEND_FROM_FUTURE`
-const MAX_SECONDS_TO_LEND_FROM_FUTURE: i64 = 5;
+pub(crate) const MAX_SECONDS_TO_LEND_FROM_FUTURE: i64 = 5;
 
 /// Returns the current smeared timestamp,
 ///
@@ -214,7 +214,10 @@ pub(crate) fn dc_create_id() -> String {
     rng.fill(&mut arr[..]);
 
     // Take 11 base64 characters containing 66 random bits.
-    base64::encode(&arr).chars().take(11).collect()
+    base64::encode_config(&arr, base64::URL_SAFE)
+        .chars()
+        .take(11)
+        .collect()
 }
 
 /// Function generates a Message-ID that can be used for a new outgoing message.
@@ -700,7 +703,7 @@ Hop: From: hq5.example.org; By: hq5.example.org; Date: Mon, 27 Dec 2021 11:21:22
     async fn check_parse_receive_headers_integration(raw: &[u8], expected: &str) {
         let t = TestContext::new_alice().await;
         t.set_config(Config::ShowEmails, Some("2")).await.unwrap();
-        dc_receive_imf(&t, raw, "INBOX", false).await.unwrap();
+        dc_receive_imf(&t, raw, false).await.unwrap();
         let msg = t.get_last_msg().await;
         let msg_info = get_msg_info(&t, msg.id).await.unwrap();
 
@@ -760,6 +763,15 @@ Hop: From: hq5.example.org; By: hq5.example.org; Date: Mon, 27 Dec 2021 11:21:22
     fn test_dc_create_id() {
         let buf = dc_create_id();
         assert_eq!(buf.len(), 11);
+    }
+
+    #[test]
+    fn test_dc_create_id_invalid_chars() {
+        for _ in 1..1000 {
+            let buf = dc_create_id();
+            assert!(!buf.contains('/')); // `/` must not be used to be URL-safe
+            assert!(!buf.contains('.')); // `.` is used as a delimiter when extracting grpid from Message-ID
+        }
     }
 
     #[test]

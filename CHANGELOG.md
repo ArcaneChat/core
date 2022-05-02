@@ -2,22 +2,48 @@
 
 ## Unreleased
 
+### Fixes
+
+- simplify `dc_stop_io()` and remove potential panics and race conditions #3273
+
+## 1.78.0
+
+### API-Changes
+- replaced stock string `DC_STR_ONE_MOMENT` by `DC_STR_NOT_CONNECTED` #3222
+- add `dc_resend_msgs()` #3238
+- `dc_provider_new_from_email()` does no longer do an DNS lookup for checking custom domains,
+  this is done by `dc_provider_new_from_email_with_dns()` now #3256
+
+### Changes
+- introduce multiple self addresses with the "configured" address always being the primary one #2896
+- Further improve finding the correct server after logging in #3208
+- `get_connectivity_html()` returns HTML as non-scalable #3213
+- add update-serial to `DC_EVENT_WEBXDC_STATUS_UPDATE` #3215
+- Speed up message receiving via IMAP a bit #3225
+- mark messages as seen on IMAP in batches #3223
+- remove Received: based draft detection heuristic #3230
+- Use pkgconfig for building Python package #2590
+- don't start io on unconfigured context #2664
+- do not assign group IDs to ad-hoc groups #2798
+- dynamic libraries use dylib extension on Darwin #3226
+- refactorings #3217 #3219 #3224 #3235 #3239 #3244 #3254
+- improve documentation #3214 #3220 #3237
+- improve tests and ci #3212 #3233 #3241 #3242 #3252 #3250 #3255 #3260
+
+### Fixes
+- Take `delete_device_after` into account when calculating ephemeral loop timeout #3211 #3221
+- Fix a bug where a blocked contact could send a contact request #3218
+- Make sure, videochat-room-names are always URL-safe #3231
+- Try removing account folder multiple times in case of failure #3229
+- Ignore messages from all spam folders if there are many #3246
+- Hide location-only messages instead of displaying empty bubbles #3248
+
+
+## 1.77.0
+
 ### API changes
 - change semantics of `dc_get_webxdc_status_updates()` second parameter
   and remove update-id from `DC_EVENT_WEBXDC_STATUS_UPDATE` #3081
-
-### Fixes
-- Hopefully fix a bug where outgoing messages appear twice with Amazon SES #3077
-- do not delete messages without Message-IDs as duplicates #3095
-- Assign replies from a different email address to the correct chat #3119
-- Assing outgoing private replies to the correct chat #3177
-- start ephemeral timer when seen status is synchronized via IMAP #3122
-- do not delete duplicate messages on IMAP immediately to accidentally deleting
-  the last copy #3138
-- speed up loading of chat messages #3171
-- clear more columns when message expires due to `delete_device_after` setting #3181
-- do not try to use stale SMTP connections #3180
-- retry message sending automatically if loop is not interrupted #3183
 
 ### Changes
 - add more SMTP logging #3093
@@ -27,13 +53,32 @@
 - improve speed by caching config values #3131 #3145
 - optimize `markseen_msgs` #3141
 - automatically accept chats with outgoing messages #3143
-- `dc_receive_imf` refactorings #3154 #3156
+- `dc_receive_imf` refactorings #3154 #3156 #3159
 - add index to speedup deletion of expired ephemeral messages #3155
 - muted chats stay archived on new messages #3184
-
+- support `min_api` from Webxdc manifests #3206
+- do not read whole webxdc file into memory #3109
+- improve tests, refactorings #3073 #3096 #3102 #3108 #3139 #3128 #3133 #3142 #3153 #3151 #3174 #3170 #3148 #3179 #3185
+- improve documentation #2983 #3112 #3103 #3118 #3120
 
 ### Fixes
-- Fix a bug where sometimes the file extension of a long filename containing a dot was cropped #3098
+- speed up loading of chat messages by a factor of 20 #3171 #3194 #3173
+- fix an issue where the app crashes when trying to export a backup #3195
+- hopefully fix a bug where outgoing messages appear twice with Amazon SES #3077
+- do not delete messages without Message-IDs as duplicates #3095
+- assign replies from a different email address to the correct chat #3119
+- assing outgoing private replies to the correct chat #3177
+- start ephemeral timer when seen status is synchronized via IMAP #3122
+- do not create empty contact requests with "setup changed" messages;
+  instead, send a "setup changed" message into all chats we share with the peer #3187
+- do not delete duplicate messages on IMAP immediately to accidentally deleting
+  the last copy #3138
+- clear more columns when message expires due to `delete_device_after` setting #3181
+- do not try to use stale SMTP connections #3180
+- slightly improve finding the correct server after logging in #3207
+- retry message sending automatically if loop is not interrupted #3183
+- fix a bug where sometimes the file extension of a long filename containing a dot was cropped #3098
+
 
 ## 1.76.0
 

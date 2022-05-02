@@ -21,7 +21,6 @@ use deltachat::message::{self, Message, MessageState, MsgId, Viewtype};
 use deltachat::peerstate::*;
 use deltachat::qr::*;
 use deltachat::sql;
-use deltachat::EventType;
 use deltachat::{config, provider};
 use std::fs;
 use std::time::{Duration, SystemTime};
@@ -93,16 +92,13 @@ async fn reset_tables(context: &Context, bits: i32) {
         println!("(8) Rest but server config reset.");
     }
 
-    context.emit_event(EventType::MsgsChanged {
-        chat_id: ChatId::new(0),
-        msg_id: MsgId::new(0),
-    });
+    context.emit_msgs_changed_without_ids();
 }
 
 async fn poke_eml_file(context: &Context, filename: impl AsRef<Path>) -> Result<()> {
     let data = dc_read_file(context, filename).await?;
 
-    if let Err(err) = dc_receive_imf(context, &data, "import", false).await {
+    if let Err(err) = dc_receive_imf(context, &data, false).await {
         println!("dc_receive_imf errored: {:?}", err);
     }
     Ok(())
@@ -164,10 +160,7 @@ async fn poke_spec(context: &Context, spec: Option<&str>) -> bool {
     }
     println!("Import: {} items read from \"{}\".", read_cnt, &real_spec);
     if read_cnt > 0 {
-        context.emit_event(EventType::MsgsChanged {
-            chat_id: ChatId::new(0),
-            msg_id: MsgId::new(0),
-        });
+        context.emit_msgs_changed_without_ids();
     }
     true
 }
@@ -406,6 +399,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
                  html <msg-id>\n\
                  listfresh\n\
                  forward <msg-id> <chat-id>\n\
+                 resend <msg-id>\n\
                  markseen <msg-id>\n\
                  delmsg <msg-id>\n\
                  ===========================Contact commands==\n\
@@ -1105,6 +1099,13 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             let chat_id = ChatId::new(arg2.parse()?);
             msg_ids[0] = MsgId::new(arg1.parse()?);
             chat::forward_msgs(&context, &msg_ids, chat_id).await?;
+        }
+        "resend" => {
+            ensure!(!arg1.is_empty(), "Arguments <msg-id> expected");
+
+            let mut msg_ids = [MsgId::new(0); 1];
+            msg_ids[0] = MsgId::new(arg1.parse()?);
+            chat::resend_msgs(&context, &msg_ids).await?;
         }
         "markseen" => {
             ensure!(!arg1.is_empty(), "Argument <msg-id> missing.");

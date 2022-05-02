@@ -34,6 +34,17 @@ macro_rules! paramsv {
     };
 }
 
+#[macro_export]
+macro_rules! params_iterv {
+    ($($param:expr),+ $(,)?) => {
+        vec![$(&$param as &dyn $crate::ToSql),+]
+    };
+}
+
+pub(crate) fn params_iter(iter: &[impl crate::ToSql]) -> impl Iterator<Item = &dyn crate::ToSql> {
+    iter.iter().map(|item| item as &dyn crate::ToSql)
+}
+
 mod migrations;
 
 /// A wrapper around the underlying Sqlite3 object.
@@ -181,6 +192,7 @@ impl Sql {
                      PRAGMA secure_delete=on;
                      PRAGMA busy_timeout = {};
                      PRAGMA temp_store=memory; -- Avoid SQLITE_IOERR_GETTEMPPATH errors on Android
+                     PRAGMA foreign_keys=on;
                      ",
                     Duration::from_secs(10).as_millis()
                 ))?;
@@ -599,10 +611,6 @@ impl Sql {
 }
 
 pub async fn housekeeping(context: &Context) -> Result<()> {
-    if let Err(err) = crate::ephemeral::delete_expired_messages(context).await {
-        warn!(context, "Failed to delete expired messages: {}", err);
-    }
-
     if let Err(err) = remove_unused_files(context).await {
         warn!(
             context,
@@ -835,13 +843,10 @@ async fn prune_tombstones(sql: &Sql) -> Result<()> {
 ///
 /// Use this together with [`rusqlite::ParamsFromIter`] to use dynamically generated
 /// parameter lists.
-pub fn repeat_vars(count: usize) -> Result<String> {
-    if count == 0 {
-        bail!("Must have at least one repeat variable");
-    }
+pub fn repeat_vars(count: usize) -> String {
     let mut s = "?,".repeat(count);
     s.pop(); // Remove trailing comma
-    Ok(s)
+    s
 }
 
 #[cfg(test)]

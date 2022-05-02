@@ -7,6 +7,7 @@ use std::{
     cmp,
     cmp::max,
     collections::{BTreeMap, BTreeSet},
+    iter::Peekable,
 };
 
 use anyhow::{bail, format_err, Context as _, Result};
@@ -31,14 +32,13 @@ use crate::dc_receive_imf::{
 use crate::dc_tools::dc_create_id;
 use crate::events::EventType;
 use crate::headerdef::{HeaderDef, HeaderDefMap};
-use crate::job::{self, Action};
+use crate::job;
 use crate::login_param::{
     CertificateChecks, LoginParam, ServerAddress, ServerLoginParam, Socks5Config,
 };
 use crate::message::{self, Message, MessageState, MessengerMessage, MsgId, Viewtype};
 use crate::mimeparser;
 use crate::oauth2::dc_get_oauth2_access_token;
-use crate::param::Params;
 use crate::provider::Socket;
 use crate::scheduler::connectivity::ConnectivityStore;
 use crate::scheduler::InterruptInfo;
@@ -131,7 +131,7 @@ impl FolderMeaning {
     fn to_config(self) -> Option<Config> {
         match self {
             FolderMeaning::Unknown => None,
-            FolderMeaning::Spam => Some(Config::ConfiguredSpamFolder),
+            FolderMeaning::Spam => None,
             FolderMeaning::Sent => Some(Config::ConfiguredSentboxFolder),
             FolderMeaning::Drafts => None,
             FolderMeaning::Other => None,
@@ -163,6 +163,67 @@ struct ImapConfig {
     /// True if the server has CONDSTORE capability as defined in
     /// <https://tools.ietf.org/html/rfc7162>
     pub can_condstore: bool,
+}
+
+struct UidGrouper<T: Iterator<Item = (i64, u32, String)>> {
+    inner: Peekable<T>,
+}
+
+impl<T, I> From<I> for UidGrouper<T>
+where
+    T: Iterator<Item = (i64, u32, String)>,
+    I: IntoIterator<IntoIter = T>,
+{
+    fn from(inner: I) -> Self {
+        Self {
+            inner: inner.into_iter().peekable(),
+        }
+    }
+}
+
+impl<T: Iterator<Item = (i64, u32, String)>> Iterator for UidGrouper<T> {
+    // Tuple of folder, row IDs, and UID range as a string.
+    type Item = (String, Vec<i64>, String);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (_, _, folder) = self.inner.peek().cloned()?;
+
+        let mut uid_set = String::new();
+        let mut rowid_set = Vec::new();
+
+        while uid_set.len() < 1000 {
+            // Construct a new range.
+            if let Some((start_rowid, start_uid, _)) = self
+                .inner
+                .next_if(|(_, _, start_folder)| start_folder == &folder)
+            {
+                rowid_set.push(start_rowid);
+                let mut end_uid = start_uid;
+
+                while let Some((next_rowid, next_uid, _)) =
+                    self.inner.next_if(|(_, next_uid, next_folder)| {
+                        next_folder == &folder && *next_uid == end_uid + 1
+                    })
+                {
+                    end_uid = next_uid;
+                    rowid_set.push(next_rowid);
+                }
+
+                let uid_range = UidRange {
+                    start: start_uid,
+                    end: end_uid,
+                };
+                if !uid_set.is_empty() {
+                    uid_set.push(',');
+                }
+                uid_set.push_str(&uid_range.to_string());
+            } else {
+                break;
+            }
+        }
+
+        Some((folder, rowid_set, uid_set))
+    }
 }
 
 impl Imap {
@@ -224,7 +285,7 @@ impl Imap {
             bail!("IMAP Connect without configured params");
         }
 
-        let param = LoginParam::from_database(context, "configured_").await?;
+        let param = LoginParam::load_configured_params(context).await?;
         // the trailing underscore is correct
 
         let imap = Self::new(
@@ -451,16 +512,29 @@ impl Imap {
     ///
     /// Prefetches headers and downloads new message from the folder, moves messages away from the
     /// folder and deletes messages in the folder.
-    pub async fn fetch_move_delete(&mut self, context: &Context, watch_folder: &str) -> Result<()> {
+    pub async fn fetch_move_delete(
+        &mut self,
+        context: &Context,
+        watch_folder: &str,
+        is_spam_folder: bool,
+    ) -> Result<()> {
         if !context.sql.is_open().await {
             // probably shutdown
             bail!("IMAP operation attempted while it is torn down");
         }
         self.prepare(context).await?;
 
-        self.fetch_new_messages(context, watch_folder, false)
+        let msgs_fetched = self
+            .fetch_new_messages(context, watch_folder, is_spam_folder, false)
             .await
             .context("fetch_new_messages")?;
+        if msgs_fetched && context.get_config_delete_device_after().await?.is_some() {
+            // New messages were fetched and shall be deleted later, restart ephemeral loop.
+            // Note that the `Config::DeleteDeviceAfter` timer starts as soon as the messages are
+            // fetched while the per-chat ephemeral timers start as soon as the messages are marked
+            // as noticed.
+            context.interrupt_ephemeral_task().await;
+        }
 
         self.move_delete_messages(context, watch_folder)
             .await
@@ -658,13 +732,17 @@ impl Imap {
         Ok(false)
     }
 
+    /// Fetches new messages.
+    ///
+    /// Returns true if at least one message was fetched.
     pub(crate) async fn fetch_new_messages(
         &mut self,
         context: &Context,
         folder: &str,
+        is_spam_folder: bool,
         fetch_existing_msgs: bool,
     ) -> Result<bool> {
-        if should_ignore_folder(context, folder).await? {
+        if should_ignore_folder(context, folder, is_spam_folder).await? {
             info!(context, "Not fetching from {}", folder);
             return Ok(false);
         }
@@ -707,7 +785,7 @@ impl Imap {
             // Get the Message-ID or generate a fake one to identify the message in the database.
             let message_id = prefetch_get_message_id(&headers).unwrap_or_else(dc_create_id);
 
-            let target = match target_folder(context, folder, &headers).await? {
+            let target = match target_folder(context, folder, is_spam_folder, &headers).await? {
                 Some(config) => match context.get_config(config).await? {
                     Some(target) => target,
                     None => folder.to_string(),
@@ -738,7 +816,7 @@ impl Imap {
                 // If the sender is known, the message will be moved to the Inbox or Mvbox
                 // and then we download the message from there.
                 // Also see `spam_target_folder()`.
-                && !context.is_spam_folder(folder).await?
+                && !is_spam_folder
                 && prefetch_should_download(
                     context,
                     &headers,
@@ -834,7 +912,7 @@ impl Imap {
             .execute(
                 format!(
                     "DELETE FROM imap WHERE id IN ({})",
-                    sql::repeat_vars(row_ids.len())?
+                    sql::repeat_vars(row_ids.len())
                 ),
                 rusqlite::params_from_iter(row_ids),
             )
@@ -871,7 +949,7 @@ impl Imap {
                         .execute(
                             format!(
                                 "DELETE FROM imap WHERE id IN ({})",
-                                sql::repeat_vars(row_ids.len())?
+                                sql::repeat_vars(row_ids.len())
                             ),
                             rusqlite::params_from_iter(row_ids),
                         )
@@ -913,7 +991,7 @@ impl Imap {
                     .execute(
                         format!(
                             "UPDATE imap SET target='' WHERE id IN ({})",
-                            sql::repeat_vars(row_ids.len())?
+                            sql::repeat_vars(row_ids.len())
                         ),
                         rusqlite::params_from_iter(row_ids),
                     )
@@ -933,7 +1011,7 @@ impl Imap {
     ///
     /// This is the only place where messages are moved or deleted on the IMAP server.
     async fn move_delete_messages(&mut self, context: &Context, folder: &str) -> Result<()> {
-        let mut rows = context
+        let rows = context
             .sql
             .query_map(
                 "SELECT id, uid, target FROM imap
@@ -949,48 +1027,12 @@ impl Imap {
                 },
                 |rows| rows.collect::<Result<Vec<_>, _>>().map_err(Into::into),
             )
-            .await?
-            .into_iter()
-            .peekable();
+            .await?;
 
         self.prepare(context).await?;
         self.select_folder(context, Some(folder)).await?;
 
-        while let Some((_, _, target)) = rows.peek().cloned() {
-            // Construct next request for the target folder.
-            let mut uid_set = String::new();
-            let mut rowid_set = Vec::new();
-
-            while uid_set.len() < 1000 {
-                // Construct a new range.
-                if let Some((start_rowid, start_uid, _)) =
-                    rows.next_if(|(_, _, start_target)| start_target == &target)
-                {
-                    rowid_set.push(start_rowid);
-                    let mut end_uid = start_uid;
-
-                    while let Some((next_rowid, next_uid, _)) =
-                        rows.next_if(|(_, next_uid, next_target)| {
-                            next_target == &target && *next_uid == end_uid + 1
-                        })
-                    {
-                        end_uid = next_uid;
-                        rowid_set.push(next_rowid);
-                    }
-
-                    let uid_range = UidRange {
-                        start: start_uid,
-                        end: end_uid,
-                    };
-                    if !uid_set.is_empty() {
-                        uid_set.push(',');
-                    }
-                    uid_set.push_str(&uid_range.to_string());
-                } else {
-                    break;
-                }
-            }
-
+        for (target, rowid_set, uid_set) in UidGrouper::from(rows) {
             // Empty target folder name means messages should be deleted.
             if target.is_empty() {
                 self.delete_message_batch(context, &uid_set, rowid_set)
@@ -1012,6 +1054,62 @@ impl Imap {
         // deleted messages on the server.
         if let Err(err) = self.maybe_close_folder(context).await {
             warn!(context, "failed to close folder: {:?}", err);
+        }
+
+        Ok(())
+    }
+
+    /// Stores pending `\Seen` flags for messages in `imap_markseen` table.
+    pub(crate) async fn store_seen_flags_on_imap(&mut self, context: &Context) -> Result<()> {
+        self.prepare(context).await?;
+
+        let rows = context
+            .sql
+            .query_map(
+                "SELECT imap.id, uid, folder FROM imap, imap_markseen
+                 WHERE imap.id = imap_markseen.id AND target = folder
+                 ORDER BY folder, uid",
+                [],
+                |row| {
+                    let rowid: i64 = row.get(0)?;
+                    let uid: u32 = row.get(1)?;
+                    let folder: String = row.get(2)?;
+                    Ok((rowid, uid, folder))
+                },
+                |rows| rows.collect::<Result<Vec<_>, _>>().map_err(Into::into),
+            )
+            .await?;
+
+        for (folder, rowid_set, uid_set) in UidGrouper::from(rows) {
+            self.select_folder(context, Some(&folder))
+                .await
+                .context("failed to select folder")?;
+
+            if let Err(err) = self.add_flag_finalized_with_set(&uid_set, "\\Seen").await {
+                warn!(
+                    context,
+                    "Cannot mark messages {} in folder {} as seen, will retry later: {}.",
+                    uid_set,
+                    folder,
+                    err
+                );
+            } else {
+                info!(
+                    context,
+                    "Marked messages {} in folder {} as seen.", uid_set, folder
+                );
+                context
+                    .sql
+                    .execute(
+                        format!(
+                            "DELETE FROM imap_markseen WHERE id IN ({})",
+                            sql::repeat_vars(rowid_set.len())
+                        ),
+                        rusqlite::params_from_iter(rowid_set),
+                    )
+                    .await
+                    .context("cannot remove messages marked as seen from imap_markseen table")?;
+            }
         }
 
         Ok(())
@@ -1108,14 +1206,9 @@ impl Imap {
             .session
             .as_mut()
             .context("IMAP No Connection established")?;
-        let self_addr = context
-            .get_config(Config::ConfiguredAddr)
-            .await?
-            .context("not configured")?;
 
-        let search_command = format!("FROM \"{}\"", self_addr);
         let uids = session
-            .uid_search(search_command)
+            .uid_search(get_imap_self_sent_search_command(context).await?)
             .await?
             .into_iter()
             .collect();
@@ -1262,8 +1355,6 @@ impl Imap {
                 }
             };
 
-            let folder = folder.to_string();
-
             while let Some(Ok(msg)) = msgs.next().await {
                 let server_uid = msg.uid.unwrap_or_default();
 
@@ -1297,7 +1388,6 @@ impl Imap {
 
                 // XXX put flags into a set and pass them to dc_receive_imf
                 let context = context.clone();
-                let folder = folder.clone();
 
                 // safe, as we checked above that there is a body.
                 let body = body
@@ -1318,7 +1408,6 @@ impl Imap {
                     &context,
                     rfc724_mid,
                     body,
-                    &folder,
                     is_seen,
                     partial,
                     fetching_existing_messages,
@@ -1357,11 +1446,6 @@ impl Imap {
     /// the flag, or other imap-errors, returns true as well.
     ///
     /// Returning error means that the operation can be retried.
-    async fn add_flag_finalized(&mut self, server_uid: u32, flag: &str) -> Result<()> {
-        let s = server_uid.to_string();
-        self.add_flag_finalized_with_set(&s, flag).await
-    }
-
     async fn add_flag_finalized_with_set(&mut self, uid_set: &str, flag: &str) -> Result<()> {
         if self.should_reconnect() {
             bail!("Can't set flag, should reconnect");
@@ -1379,7 +1463,7 @@ impl Imap {
         Ok(())
     }
 
-    pub async fn prepare_imap_operation_on_msg(
+    pub(crate) async fn prepare_imap_operation_on_msg(
         &mut self,
         context: &Context,
         folder: &str,
@@ -1416,32 +1500,6 @@ impl Imap {
                 warn!(context, "failed to select folder: {:?}: {:?}", folder, err);
                 Some(ImapActionResult::RetryLater)
             }
-        }
-    }
-
-    pub(crate) async fn set_seen(
-        &mut self,
-        context: &Context,
-        folder: &str,
-        uid: u32,
-    ) -> ImapActionResult {
-        if let Some(imapresult) = self
-            .prepare_imap_operation_on_msg(context, folder, uid)
-            .await
-        {
-            return imapresult;
-        }
-        // we are connected, and the folder is selected
-        info!(context, "Marking message {}/{} as seen...", folder, uid,);
-
-        if let Err(err) = self.add_flag_finalized(uid, "\\Seen").await {
-            warn!(
-                context,
-                "Cannot mark message {} in folder {} as seen, ignoring: {}.", uid, folder, err
-            );
-            ImapActionResult::Failed
-        } else {
-            ImapActionResult::Success
         }
     }
 
@@ -1677,13 +1735,14 @@ async fn spam_target_folder(
 pub async fn target_folder(
     context: &Context,
     folder: &str,
+    is_spam_folder: bool,
     headers: &[mailparse::MailHeader<'_>],
 ) -> Result<Option<Config>> {
     if context.is_mvbox(folder).await? {
         return Ok(None);
     }
 
-    if context.is_spam_folder(folder).await? {
+    if is_spam_folder {
         spam_target_folder(context, headers).await
     } else if needs_move_to_mvbox(context, headers).await? {
         Ok(Some(Config::ConfiguredMvboxFolder))
@@ -1875,13 +1934,11 @@ pub(crate) async fn prefetch_should_download(
     mut flags: impl Iterator<Item = Flag<'_>>,
     show_emails: ShowEmails,
 ) -> Result<bool> {
-    if let Some(msg_id) = message::rfc724_mid_exists(context, message_id).await? {
-        // We know the Message-ID already, it must be a Bcc: to self.
-        job::add(
-            context,
-            job::Job::new(Action::MarkseenMsgOnImap, msg_id.to_u32(), Params::new(), 0),
-        )
-        .await?;
+    if message::rfc724_mid_exists(context, message_id)
+        .await?
+        .is_some()
+    {
+        markseen_on_imap_table(context, message_id).await?;
         return Ok(false);
     }
 
@@ -2015,6 +2072,22 @@ async fn mark_seen_by_uid(
     }
 }
 
+/// Schedule marking the message as Seen on IMAP by adding all known IMAP messages corresponding to
+/// the given Message-ID to `imap_markseen` table.
+pub(crate) async fn markseen_on_imap_table(context: &Context, message_id: &str) -> Result<()> {
+    context
+        .sql
+        .execute(
+            "INSERT OR IGNORE INTO imap_markseen (id)
+             SELECT id FROM imap WHERE rfc724_mid=?",
+            paramsv![message_id],
+        )
+        .await?;
+    context.interrupt_inbox(InterruptInfo::new(false)).await;
+
+    Ok(())
+}
+
 /// uid_next is the next unique identifier value from the last time we fetched a folder
 /// See <https://tools.ietf.org/html/rfc3501#section-2.3.1.1>
 /// This function is used to update our uid_next after fetching messages.
@@ -2096,6 +2169,18 @@ async fn get_modseq(context: &Context, folder: &str) -> Result<u64> {
         .unwrap_or(0))
 }
 
+/// Compute the imap search expression for all self-sent mails (for all self addresses)
+pub(crate) async fn get_imap_self_sent_search_command(context: &Context) -> Result<String> {
+    // See https://www.rfc-editor.org/rfc/rfc3501#section-6.4.4 for syntax of SEARCH and OR
+    let mut search_command = format!("FROM \"{}\"", context.get_primary_self_addr().await?);
+
+    for item in context.get_secondary_self_addrs().await? {
+        search_command = format!("OR ({}) (FROM \"{}\")", search_command, item);
+    }
+
+    Ok(search_command)
+}
+
 /// Deprecated, use get_uid_next() and get_uidvalidity()
 pub async fn get_config_last_seen_uid(context: &Context, folder: &str) -> Result<(u32, u32)> {
     let key = format!("imap.mailbox.{}", folder);
@@ -2115,7 +2200,11 @@ pub async fn get_config_last_seen_uid(context: &Context, folder: &str) -> Result
 ///
 /// This caters for the [`Config::OnlyFetchMvbox`] setting which means mails from folders
 /// not explicitly watched should not be fetched.
-async fn should_ignore_folder(context: &Context, folder: &str) -> Result<bool> {
+async fn should_ignore_folder(
+    context: &Context,
+    folder: &str,
+    is_spam_folder: bool,
+) -> Result<bool> {
     if !context.get_config_bool(Config::OnlyFetchMvbox).await? {
         return Ok(false);
     }
@@ -2123,7 +2212,7 @@ async fn should_ignore_folder(context: &Context, folder: &str) -> Result<bool> {
         // Still respect the SentboxWatch setting.
         return Ok(!context.get_config_bool(Config::SentboxWatch).await?);
     }
-    Ok(!(context.is_mvbox(folder).await? || context.is_spam_folder(folder).await?))
+    Ok(!(context.is_mvbox(folder).await? || is_spam_folder))
 }
 
 /// Builds a list of sequence/uid sets. The returned sets have each no more than around 1000
@@ -2300,9 +2389,6 @@ mod tests {
 
         let t = TestContext::new_alice().await;
         t.ctx
-            .set_config(Config::ConfiguredSpamFolder, Some("Spam"))
-            .await?;
-        t.ctx
             .set_config(Config::ConfiguredMvboxFolder, Some("DeltaChat"))
             .await?;
         t.ctx
@@ -2343,11 +2429,13 @@ mod tests {
 
         let (headers, _) = mailparse::parse_headers(bytes)?;
 
-        let actual = if let Some(config) = target_folder(&t, folder, &headers).await? {
-            t.get_config(config).await?
-        } else {
-            None
-        };
+        let is_spam_folder = folder == "Spam";
+        let actual =
+            if let Some(config) = target_folder(&t, folder, is_spam_folder, &headers).await? {
+                t.get_config(config).await?
+            } else {
+                None
+            };
 
         let expected = if expected_destination == folder {
             None
@@ -2459,6 +2547,29 @@ mod tests {
             )
             .await?;
         }
+        Ok(())
+    }
+
+    #[async_std::test]
+    async fn test_get_imap_search_command() -> Result<()> {
+        let t = TestContext::new_alice().await;
+        assert_eq!(
+            get_imap_self_sent_search_command(&t.ctx).await?,
+            r#"FROM "alice@example.org""#
+        );
+
+        t.ctx.set_primary_self_addr("alice@another.com").await?;
+        assert_eq!(
+            get_imap_self_sent_search_command(&t.ctx).await?,
+            r#"OR (FROM "alice@another.com") (FROM "alice@example.org")"#
+        );
+
+        t.ctx.set_primary_self_addr("alice@third.com").await?;
+        assert_eq!(
+            get_imap_self_sent_search_command(&t.ctx).await?,
+            r#"OR (OR (FROM "alice@third.com") (FROM "alice@another.com")) (FROM "alice@example.org")"#
+        );
+
         Ok(())
     }
 }

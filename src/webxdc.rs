@@ -19,6 +19,12 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use zip::ZipArchive;
 
+/// The current API version.
+/// If `min_api` in manifest.toml is set to a larger value,
+/// the Webxdc's index.html is replaced by an error message.
+/// In the future, that may be useful to avoid new Webxdc being loaded on old Delta Chats.
+const WEBXDC_API_VERSION: u32 = 1;
+
 pub const WEBXDC_SUFFIX: &str = "xdc";
 const WEBXDC_DEFAULT_ICON: &str = "__webxdc__/default-icon.png";
 
@@ -44,6 +50,7 @@ const WEBXDC_RECEIVING_LIMIT: u64 = 4194304;
 #[non_exhaustive]
 struct WebxdcManifest {
     name: Option<String>,
+    min_api: Option<u32>,
 }
 
 /// Parsed information from WebxdcManifest and fallbacks.
@@ -219,6 +226,7 @@ impl Context {
                 info.as_str(),
                 SystemMessage::Unknown,
                 timestamp,
+                None,
                 Some(instance),
             )
             .await?;
@@ -231,10 +239,7 @@ impl Context {
             {
                 instance.param.set(Param::WebxdcSummary, summary);
                 instance.update_param(self).await;
-                self.emit_event(EventType::MsgsChanged {
-                    chat_id: instance.chat_id,
-                    msg_id: instance.id,
-                });
+                self.emit_msgs_changed(instance.chat_id, instance.id);
             }
         }
 
@@ -246,9 +251,14 @@ impl Context {
             )
             .await?;
 
-        self.emit_event(EventType::WebxdcStatusUpdate(instance.id));
+        let status_update_serial = StatusUpdateSerial(u32::try_from(rowid)?);
 
-        Ok(StatusUpdateSerial(u32::try_from(rowid)?))
+        self.emit_event(EventType::WebxdcStatusUpdate {
+            msg_id: instance.id,
+            status_update_serial,
+        });
+
+        Ok(status_update_serial)
     }
 
     /// Sends a status update for an webxdc instance.
@@ -498,6 +508,21 @@ impl Message {
         };
 
         let mut archive = self.get_webxdc_archive(context).await?;
+
+        if name == "index.html" {
+            if let Ok(bytes) = get_blob(&mut archive, "manifest.toml").await {
+                if let Ok(manifest) = parse_webxdc_manifest(&bytes).await {
+                    if let Some(min_api) = manifest.min_api {
+                        if min_api > WEBXDC_API_VERSION {
+                            return Ok(Vec::from(
+                                "<!DOCTYPE html>This Webxdc requires a newer Delta Chat version.",
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
         get_blob(&mut archive, name).await
     }
 
@@ -510,10 +535,16 @@ impl Message {
             if let Ok(manifest) = parse_webxdc_manifest(&bytes).await {
                 manifest
             } else {
-                WebxdcManifest { name: None }
+                WebxdcManifest {
+                    name: None,
+                    min_api: None,
+                }
             }
         } else {
-            WebxdcManifest { name: None }
+            WebxdcManifest {
+                name: None,
+                min_api: None,
+            }
         };
 
         if let Some(ref name) = manifest.name {
@@ -740,7 +771,6 @@ mod tests {
         dc_receive_imf(
             &t,
             include_bytes!("../test-data/message/webxdc_good_extension.eml"),
-            "INBOX",
             false,
         )
         .await?;
@@ -751,7 +781,6 @@ mod tests {
         dc_receive_imf(
             &t,
             include_bytes!("../test-data/message/webxdc_bad_extension.eml"),
-            "INBOX",
             false,
         )
         .await?;
@@ -987,7 +1016,10 @@ mod tests {
             .get_matching(|evt| matches!(evt, EventType::WebxdcStatusUpdate { .. }))
             .await;
         match event {
-            EventType::WebxdcStatusUpdate(msg_id) => {
+            EventType::WebxdcStatusUpdate {
+                msg_id,
+                status_update_serial: _,
+            } => {
                 assert_eq!(msg_id, instance_id);
             }
             _ => unreachable!(),
@@ -1294,6 +1326,38 @@ sth_for_the = "future""#
         )
         .await?;
         assert_eq!(manifest.name, Some("foz".to_string()));
+        Ok(())
+    }
+
+    #[async_std::test]
+    async fn test_parse_webxdc_manifest_min_api() -> Result<()> {
+        let manifest = parse_webxdc_manifest(r#"min_api = 3"#.as_bytes()).await?;
+        assert_eq!(manifest.min_api, Some(3));
+
+        let result = parse_webxdc_manifest(r#"min_api = "1""#.as_bytes()).await;
+        assert!(result.is_err());
+
+        let result = parse_webxdc_manifest(r#"min_api = 1.2"#.as_bytes()).await;
+        assert!(result.is_err());
+
+        Ok(())
+    }
+
+    #[async_std::test]
+    async fn test_webxdc_min_api_too_large() -> Result<()> {
+        let t = TestContext::new_alice().await;
+        let chat_id = create_group_chat(&t, ProtectionStatus::Unprotected, "chat").await?;
+        let mut instance = create_webxdc_instance(
+            &t,
+            "with-min-api-1001.xdc",
+            include_bytes!("../test-data/webxdc/with-min-api-1001.xdc"),
+        )
+        .await?;
+        send_msg(&t, chat_id, &mut instance).await?;
+
+        let instance = t.get_last_msg().await;
+        let html = instance.get_webxdc_blob(&t, "index.html").await?;
+        assert!(String::from_utf8_lossy(&*html).contains("requires a newer Delta Chat version"));
 
         Ok(())
     }

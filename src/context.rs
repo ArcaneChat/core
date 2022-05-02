@@ -10,7 +10,6 @@ use async_std::{
     channel::{self, Receiver, Sender},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, RwLock},
-    task,
 };
 
 use crate::chat::{get_chat_cnt, ChatId};
@@ -56,7 +55,6 @@ pub struct InnerContext {
     pub(crate) events: Events,
 
     pub(crate) scheduler: RwLock<Scheduler>,
-    pub(crate) ephemeral_task: RwLock<Option<task::JoinHandle<()>>>,
 
     /// Recently loaded quota information, if any.
     /// Set to `None` if quota was never tried to load.
@@ -176,7 +174,6 @@ impl Context {
             translated_stockstrings: RwLock::new(HashMap::new()),
             events: Events::default(),
             scheduler: RwLock::new(Scheduler::Stopped),
-            ephemeral_task: RwLock::new(None),
             quota: RwLock::new(None),
             creation_time: std::time::SystemTime::now(),
             last_full_folder_scan: Mutex::new(None),
@@ -192,17 +189,14 @@ impl Context {
 
     /// Starts the IO scheduler.
     pub async fn start_io(&self) {
-        info!(self, "starting IO");
-        if self.inner.is_io_running().await {
-            info!(self, "IO is already running");
+        if let Ok(false) = self.is_configured().await {
+            warn!(self, "can not start io on a context that is not configured");
             return;
         }
 
-        {
-            let l = &mut *self.inner.scheduler.write().await;
-            if let Err(err) = l.start(self.clone()).await {
-                error!(self, "Failed to start IO: {}", err)
-            }
+        info!(self, "starting IO");
+        if let Err(err) = self.inner.scheduler.write().await.start(self.clone()).await {
+            error!(self, "Failed to start IO: {}", err)
         }
     }
 
@@ -210,7 +204,9 @@ impl Context {
     pub async fn stop_io(&self) {
         info!(self, "stopping IO");
 
-        self.inner.stop_io().await;
+        if let Err(err) = self.inner.stop_io().await {
+            warn!(self, "failed to stop IO: {}", err);
+        }
     }
 
     /// Returns a reference to the underlying SQL instance.
@@ -237,6 +233,24 @@ impl Context {
             id: self.id,
             typ: event,
         });
+    }
+
+    /// Emits a generic MsgsChanged event (without chat or message id)
+    pub fn emit_msgs_changed_without_ids(&self) {
+        self.emit_event(EventType::MsgsChanged {
+            chat_id: ChatId::new(0),
+            msg_id: MsgId::new(0),
+        });
+    }
+
+    /// Emits a MsgsChanged event with specified chat and message ids
+    pub fn emit_msgs_changed(&self, chat_id: ChatId, msg_id: MsgId) {
+        self.emit_event(EventType::MsgsChanged { chat_id, msg_id });
+    }
+
+    /// Emits an IncomingMsg event with specified chat and message ids
+    pub fn emit_incoming_msg(&self, chat_id: ChatId, msg_id: MsgId) {
+        self.emit_event(EventType::IncomingMsg { chat_id, msg_id });
     }
 
     /// Returns a receiver for emitted events.
@@ -314,8 +328,9 @@ impl Context {
 
     pub async fn get_info(&self) -> Result<BTreeMap<&'static str, String>> {
         let unset = "0";
-        let l = LoginParam::from_database(self, "").await?;
-        let l2 = LoginParam::from_database(self, "configured_").await?;
+        let l = LoginParam::load_candidate_params(self).await?;
+        let l2 = LoginParam::load_configured_params(self).await?;
+        let secondary_addrs = self.get_secondary_self_addrs().await?.join(", ");
         let displayname = self.get_config(Config::Displayname).await?;
         let chats = get_chat_cnt(self).await? as usize;
         let unblocked_msgs = message::get_unblocked_msg_cnt(self).await as usize;
@@ -400,6 +415,7 @@ impl Context {
         res.insert("socks5_enabled", socks5_enabled.to_string());
         res.insert("entered_account_settings", l.to_string());
         res.insert("used_account_settings", l2.to_string());
+        res.insert("secondary_addrs", secondary_addrs);
         res.insert(
             "fetch_existing_msgs",
             self.get_config_int(Config::FetchExistingMsgs)
@@ -606,11 +622,6 @@ impl Context {
         Ok(mvbox.as_deref() == Some(folder_name))
     }
 
-    pub async fn is_spam_folder(&self, folder_name: &str) -> Result<bool> {
-        let spam = self.get_config(Config::ConfiguredSpamFolder).await?;
-        Ok(spam.as_deref() == Some(folder_name))
-    }
-
     pub(crate) fn derive_blobdir(dbfile: &PathBuf) -> PathBuf {
         let mut blob_fname = OsString::new();
         blob_fname.push(dbfile.file_name().unwrap_or_default());
@@ -627,25 +638,9 @@ impl Context {
 }
 
 impl InnerContext {
-    async fn is_io_running(&self) -> bool {
-        self.scheduler.read().await.is_running()
-    }
-
-    async fn stop_io(&self) {
-        if self.is_io_running().await {
-            let token = {
-                let lock = &*self.scheduler.read().await;
-                lock.pre_stop().await
-            };
-            {
-                let lock = &mut *self.scheduler.write().await;
-                lock.stop(token).await;
-            }
-        }
-
-        if let Some(ephemeral_task) = self.ephemeral_task.write().await.take() {
-            ephemeral_task.cancel().await;
-        }
+    async fn stop_io(&self) -> Result<()> {
+        self.scheduler.write().await.stop().await?;
+        Ok(())
     }
 }
 
@@ -716,9 +711,7 @@ mod tests {
             dc_create_outgoing_rfc724_mid(None, contact.get_addr())
         );
         println!("{}", msg);
-        dc_receive_imf(t, msg.as_bytes(), "INBOX", false)
-            .await
-            .unwrap();
+        dc_receive_imf(t, msg.as_bytes(), false).await.unwrap();
     }
 
     #[async_std::test]

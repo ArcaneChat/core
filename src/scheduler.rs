@@ -8,17 +8,17 @@ use async_std::{
 use crate::config::Config;
 use crate::context::Context;
 use crate::dc_tools::maybe_add_time_based_warnings;
-use crate::ephemeral::delete_expired_imap_messages;
+use crate::dc_tools::time;
+use crate::ephemeral::{self, delete_expired_imap_messages};
 use crate::imap::Imap;
 use crate::job::{self, Thread};
 use crate::log::LogExt;
 use crate::smtp::{send_smtp_messages, Smtp};
+use crate::sql;
 
 use self::connectivity::ConnectivityStore;
 
 pub(crate) mod connectivity;
-
-pub(crate) struct StopToken;
 
 /// Job and connection scheduler.
 #[derive(Debug)]
@@ -34,6 +34,8 @@ pub(crate) enum Scheduler {
         sentbox_handle: Option<task::JoinHandle<()>>,
         smtp: SmtpConnectionState,
         smtp_handle: Option<task::JoinHandle<()>>,
+        ephemeral_handle: Option<task::JoinHandle<()>>,
+        ephemeral_interrupt_send: Sender<()>,
     },
 }
 
@@ -59,6 +61,10 @@ impl Context {
     pub(crate) async fn interrupt_smtp(&self, info: InterruptInfo) {
         self.scheduler.read().await.interrupt_smtp(info).await;
     }
+
+    pub(crate) async fn interrupt_ephemeral_task(&self) {
+        self.scheduler.read().await.interrupt_ephemeral_task().await;
+    }
 }
 
 async fn inbox_loop(ctx: Context, started: Sender<()>, inbox_handlers: ImapConnectionHandlers) {
@@ -68,19 +74,16 @@ async fn inbox_loop(ctx: Context, started: Sender<()>, inbox_handlers: ImapConne
     let ImapConnectionHandlers {
         mut connection,
         stop_receiver,
-        shutdown_sender,
     } = inbox_handlers;
 
     let ctx1 = ctx.clone();
     let fut = async move {
-        started
-            .send(())
-            .await
-            .expect("inbox loop, missing started receiver");
         let ctx = ctx1;
+        if let Err(err) = started.send(()).await {
+            warn!(ctx, "inbox loop, missing started receiver: {}", err);
+            return;
+        };
 
-        // track number of continously executed jobs
-        let mut jobs_loaded = 0;
         let mut info = InterruptInfo::default();
         loop {
             let job = match job::load_next(&ctx, Thread::Imap, &info).await {
@@ -92,21 +95,25 @@ async fn inbox_loop(ctx: Context, started: Sender<()>, inbox_handlers: ImapConne
             };
 
             match job {
-                Some(job) if jobs_loaded <= 20 => {
-                    jobs_loaded += 1;
+                Some(job) => {
                     job::perform_job(&ctx, job::Connection::Inbox(&mut connection), job).await;
                     info = Default::default();
                 }
-                Some(job) => {
-                    // Let the fetch run, but return back to the job afterwards.
-                    jobs_loaded = 0;
-                    info!(ctx, "postponing imap-job {} to run fetch...", job);
-                    fetch(&ctx, &mut connection).await;
-                }
                 None => {
-                    jobs_loaded = 0;
-
                     maybe_add_time_based_warnings(&ctx).await;
+
+                    match ctx.get_config_i64(Config::LastHousekeeping).await {
+                        Ok(last_housekeeping_time) => {
+                            let next_housekeeping_time =
+                                last_housekeeping_time.saturating_add(60 * 60 * 24);
+                            if next_housekeeping_time <= time() {
+                                sql::housekeeping(&ctx).await.ok_or_log(&ctx);
+                            }
+                        }
+                        Err(err) => {
+                            warn!(ctx, "Failed to get last housekeeping time: {}", err);
+                        }
+                    };
 
                     info = fetch_idle(&ctx, &mut connection, Config::ConfiguredInboxFolder).await;
                 }
@@ -121,36 +128,6 @@ async fn inbox_loop(ctx: Context, started: Sender<()>, inbox_handlers: ImapConne
         })
         .race(fut)
         .await;
-    shutdown_sender
-        .send(())
-        .await
-        .expect("inbox loop, missing shutdown receiver");
-}
-
-async fn fetch(ctx: &Context, connection: &mut Imap) {
-    match ctx.get_config(Config::ConfiguredInboxFolder).await {
-        Ok(Some(watch_folder)) => {
-            if let Err(err) = connection.prepare(ctx).await {
-                warn!(ctx, "Could not connect: {}", err);
-                return;
-            }
-
-            // fetch
-            if let Err(err) = connection.fetch_move_delete(ctx, &watch_folder).await {
-                connection.trigger_reconnect(ctx).await;
-                warn!(ctx, "{:#}", err);
-            }
-        }
-        Ok(None) => {
-            info!(ctx, "Can not fetch inbox folder, not set");
-        }
-        Err(err) => {
-            warn!(
-                ctx,
-                "Can not fetch inbox folder, failed to get config: {:?}", err
-            );
-        }
-    }
 }
 
 async fn fetch_idle(ctx: &Context, connection: &mut Imap, folder: Config) -> InterruptInfo {
@@ -162,19 +139,35 @@ async fn fetch_idle(ctx: &Context, connection: &mut Imap, folder: Config) -> Int
                 return connection.fake_idle(ctx, Some(watch_folder)).await;
             }
 
-            // Mark expired messages for deletion.
+            if folder == Config::ConfiguredInboxFolder {
+                if let Err(err) = connection
+                    .store_seen_flags_on_imap(ctx)
+                    .await
+                    .context("store_seen_flags_on_imap failed")
+                {
+                    warn!(ctx, "{:#}", err);
+                }
+            }
+
+            // Fetch the watched folder.
+            if let Err(err) = connection
+                .fetch_move_delete(ctx, &watch_folder, false)
+                .await
+            {
+                connection.trigger_reconnect(ctx).await;
+                warn!(ctx, "{:#}", err);
+                return InterruptInfo::new(false);
+            }
+
+            // Mark expired messages for deletion. Marked messages will be deleted from the server
+            // on the next iteration of `fetch_move_delete`. `delete_expired_imap_messages` is not
+            // called right before `fetch_move_delete` because it is not well optimized and would
+            // otherwise slow down message fetching.
             if let Err(err) = delete_expired_imap_messages(ctx)
                 .await
                 .context("delete_expired_imap_messages failed")
             {
                 warn!(ctx, "{:#}", err);
-            }
-
-            // Fetch the watched folder.
-            if let Err(err) = connection.fetch_move_delete(ctx, &watch_folder).await {
-                connection.trigger_reconnect(ctx).await;
-                warn!(ctx, "{:#}", err);
-                return InterruptInfo::new(false);
             }
 
             // Scan additional folders only after finishing fetching the watched folder.
@@ -196,7 +189,10 @@ async fn fetch_idle(ctx: &Context, connection: &mut Imap, folder: Config) -> Int
                         // In most cases this will select the watched folder and return because there are
                         // no new messages. We want to select the watched folder anyway before going IDLE
                         // there, so this does not take additional protocol round-trip.
-                        if let Err(err) = connection.fetch_move_delete(ctx, &watch_folder).await {
+                        if let Err(err) = connection
+                            .fetch_move_delete(ctx, &watch_folder, false)
+                            .await
+                        {
                             connection.trigger_reconnect(ctx).await;
                             warn!(ctx, "{:#}", err);
                             return InterruptInfo::new(false);
@@ -256,17 +252,16 @@ async fn simple_imap_loop(
     let ImapConnectionHandlers {
         mut connection,
         stop_receiver,
-        shutdown_sender,
     } = inbox_handlers;
 
     let ctx1 = ctx.clone();
 
     let fut = async move {
-        started
-            .send(())
-            .await
-            .expect("simple imap loop, missing started receive");
         let ctx = ctx1;
+        if let Err(err) = started.send(()).await {
+            warn!(&ctx, "simple imap loop, missing started receiver: {}", err);
+            return;
+        }
 
         loop {
             fetch_idle(&ctx, &mut connection, folder).await;
@@ -280,10 +275,6 @@ async fn simple_imap_loop(
         })
         .race(fut)
         .await;
-    shutdown_sender
-        .send(())
-        .await
-        .expect("simple imap loop, missing shutdown receiver");
 }
 
 async fn smtp_loop(ctx: Context, started: Sender<()>, smtp_handlers: SmtpConnectionHandlers) {
@@ -293,17 +284,16 @@ async fn smtp_loop(ctx: Context, started: Sender<()>, smtp_handlers: SmtpConnect
     let SmtpConnectionHandlers {
         mut connection,
         stop_receiver,
-        shutdown_sender,
         idle_interrupt_receiver,
     } = smtp_handlers;
 
     let ctx1 = ctx.clone();
     let fut = async move {
-        started
-            .send(())
-            .await
-            .expect("smtp loop, missing started receiver");
         let ctx = ctx1;
+        if let Err(err) = started.send(()).await {
+            warn!(&ctx, "smtp loop, missing started receiver: {}", err);
+            return;
+        }
 
         let mut timeout = None;
         let mut interrupt_info = Default::default();
@@ -375,15 +365,15 @@ async fn smtp_loop(ctx: Context, started: Sender<()>, smtp_handlers: SmtpConnect
         })
         .race(fut)
         .await;
-    shutdown_sender
-        .send(())
-        .await
-        .expect("smtp loop, missing shutdown receiver");
 }
 
 impl Scheduler {
-    /// Start the scheduler, panics if it is already running.
+    /// Start the scheduler, returns error if it is already running.
     pub async fn start(&mut self, ctx: Context) -> Result<()> {
+        if self.is_running() {
+            bail!("scheduler is already stopped");
+        }
+
         let (mvbox, mvbox_handlers) = ImapConnectionState::new(&ctx).await?;
         let (sentbox, sentbox_handlers) = ImapConnectionState::new(&ctx).await?;
         let (smtp, smtp_handlers) = SmtpConnectionState::new();
@@ -395,6 +385,7 @@ impl Scheduler {
         let (sentbox_start_send, sentbox_start_recv) = channel::bounded(1);
         let mut sentbox_handle = None;
         let (smtp_start_send, smtp_start_recv) = channel::bounded(1);
+        let (ephemeral_interrupt_send, ephemeral_interrupt_recv) = channel::bounded(1);
 
         let inbox_handle = {
             let ctx = ctx.clone();
@@ -418,7 +409,7 @@ impl Scheduler {
             mvbox_start_send
                 .send(())
                 .await
-                .expect("mvbox start send, missing receiver");
+                .context("mvbox start send, missing receiver")?;
             mvbox_handlers
                 .connection
                 .connectivity
@@ -441,7 +432,7 @@ impl Scheduler {
             sentbox_start_send
                 .send(())
                 .await
-                .expect("sentbox start send, missing receiver");
+                .context("sentbox start send, missing receiver")?;
             sentbox_handlers
                 .connection
                 .connectivity
@@ -456,6 +447,13 @@ impl Scheduler {
             }))
         };
 
+        let ephemeral_handle = {
+            let ctx = ctx.clone();
+            Some(task::spawn(async move {
+                ephemeral::ephemeral_loop(&ctx, ephemeral_interrupt_recv).await;
+            }))
+        };
+
         *self = Scheduler::Running {
             inbox,
             mvbox,
@@ -465,6 +463,8 @@ impl Scheduler {
             mvbox_handle,
             sentbox_handle,
             smtp_handle,
+            ephemeral_handle,
+            ephemeral_interrupt_send,
         };
 
         // wait for all loops to be started
@@ -530,11 +530,21 @@ impl Scheduler {
         }
     }
 
-    /// Halts the scheduler, must be called first, and then `stop`.
-    pub(crate) async fn pre_stop(&self) -> StopToken {
+    async fn interrupt_ephemeral_task(&self) {
+        if let Scheduler::Running {
+            ref ephemeral_interrupt_send,
+            ..
+        } = self
+        {
+            ephemeral_interrupt_send.try_send(()).ok();
+        }
+    }
+
+    /// Halt the scheduler.
+    pub(crate) async fn stop(&mut self) -> Result<()> {
         match self {
             Scheduler::Stopped => {
-                panic!("WARN: already stopped");
+                bail!("scheduler is already stopped");
             }
             Scheduler::Running {
                 inbox,
@@ -545,39 +555,22 @@ impl Scheduler {
                 sentbox_handle,
                 smtp,
                 smtp_handle,
+                ephemeral_handle,
                 ..
             } => {
                 if inbox_handle.is_some() {
-                    inbox.stop().await;
+                    inbox.stop().await?;
                 }
                 if mvbox_handle.is_some() {
-                    mvbox.stop().await;
+                    mvbox.stop().await?;
                 }
                 if sentbox_handle.is_some() {
-                    sentbox.stop().await;
+                    sentbox.stop().await?;
                 }
                 if smtp_handle.is_some() {
-                    smtp.stop().await;
+                    smtp.stop().await?;
                 }
 
-                StopToken
-            }
-        }
-    }
-
-    /// Halt the scheduler, must only be called after pre_stop.
-    pub(crate) async fn stop(&mut self, _t: StopToken) {
-        match self {
-            Scheduler::Stopped => {
-                panic!("WARN: already stopped");
-            }
-            Scheduler::Running {
-                inbox_handle,
-                mvbox_handle,
-                sentbox_handle,
-                smtp_handle,
-                ..
-            } => {
                 if let Some(handle) = inbox_handle.take() {
                     handle.await;
                 }
@@ -590,8 +583,12 @@ impl Scheduler {
                 if let Some(handle) = smtp_handle.take() {
                     handle.await;
                 }
+                if let Some(handle) = ephemeral_handle.take() {
+                    handle.cancel().await;
+                }
 
                 *self = Scheduler::Stopped;
+                Ok(())
             }
         }
     }
@@ -605,8 +602,6 @@ impl Scheduler {
 /// Connection state logic shared between imap and smtp connections.
 #[derive(Debug)]
 struct ConnectionState {
-    /// Channel to notify that shutdown has completed.
-    shutdown_receiver: Receiver<()>,
     /// Channel to interrupt the whole connection.
     stop_sender: Sender<()>,
     /// Channel to interrupt idle.
@@ -617,14 +612,13 @@ struct ConnectionState {
 
 impl ConnectionState {
     /// Shutdown this connection completely.
-    async fn stop(&self) {
+    async fn stop(&self) -> Result<()> {
         // Trigger shutdown of the run loop.
         self.stop_sender
             .send(())
             .await
-            .expect("stop, missing receiver");
-        // Wait for a notification that the run loop has been shutdown.
-        self.shutdown_receiver.recv().await.ok();
+            .context("failed to stop, missing receiver")?;
+        Ok(())
     }
 
     async fn interrupt(&self, info: InterruptInfo) {
@@ -641,18 +635,15 @@ pub(crate) struct SmtpConnectionState {
 impl SmtpConnectionState {
     fn new() -> (Self, SmtpConnectionHandlers) {
         let (stop_sender, stop_receiver) = channel::bounded(1);
-        let (shutdown_sender, shutdown_receiver) = channel::bounded(1);
         let (idle_interrupt_sender, idle_interrupt_receiver) = channel::bounded(1);
 
         let handlers = SmtpConnectionHandlers {
             connection: Smtp::new(),
             stop_receiver,
-            shutdown_sender,
             idle_interrupt_receiver,
         };
 
         let state = ConnectionState {
-            shutdown_receiver,
             stop_sender,
             idle_interrupt_sender,
             connectivity: handlers.connection.connectivity.clone(),
@@ -669,15 +660,15 @@ impl SmtpConnectionState {
     }
 
     /// Shutdown this connection completely.
-    async fn stop(&self) {
-        self.state.stop().await;
+    async fn stop(&self) -> Result<()> {
+        self.state.stop().await?;
+        Ok(())
     }
 }
 
 struct SmtpConnectionHandlers {
     connection: Smtp,
     stop_receiver: Receiver<()>,
-    shutdown_sender: Sender<()>,
     idle_interrupt_receiver: Receiver<InterruptInfo>,
 }
 
@@ -690,17 +681,14 @@ impl ImapConnectionState {
     /// Construct a new connection.
     async fn new(context: &Context) -> Result<(Self, ImapConnectionHandlers)> {
         let (stop_sender, stop_receiver) = channel::bounded(1);
-        let (shutdown_sender, shutdown_receiver) = channel::bounded(1);
         let (idle_interrupt_sender, idle_interrupt_receiver) = channel::bounded(1);
 
         let handlers = ImapConnectionHandlers {
             connection: Imap::new_configured(context, idle_interrupt_receiver).await?,
             stop_receiver,
-            shutdown_sender,
         };
 
         let state = ConnectionState {
-            shutdown_receiver,
             stop_sender,
             idle_interrupt_sender,
             connectivity: handlers.connection.connectivity.clone(),
@@ -717,8 +705,9 @@ impl ImapConnectionState {
     }
 
     /// Shutdown this connection completely.
-    async fn stop(&self) {
-        self.state.stop().await;
+    async fn stop(&self) -> Result<()> {
+        self.state.stop().await?;
+        Ok(())
     }
 }
 
@@ -726,7 +715,6 @@ impl ImapConnectionState {
 struct ImapConnectionHandlers {
     connection: Imap,
     stop_receiver: Receiver<()>,
-    shutdown_sender: Sender<()>,
 }
 
 #[derive(Default, Debug)]

@@ -11,6 +11,7 @@ from deltachat.hookspec import account_hookimpl
 from deltachat.capi import ffi, lib
 from deltachat.cutil import iter_array
 from datetime import datetime, timedelta, timezone
+from imap_tools import AND, U
 
 
 @pytest.mark.parametrize("msgtext,res", [
@@ -959,6 +960,18 @@ class TestOnlineAccount:
         chat.send_text("hello")
         ac1._evtracker.get_matching("DC_EVENT_SMTP_MESSAGE_SENT")
 
+    def test_send_dot(self, acfactory, lp):
+        """Test that a single dot is properly escaped in SMTP protocol"""
+        ac1, ac2 = acfactory.get_two_online_accounts()
+        chat = acfactory.get_accepted_chat(ac1, ac2)
+
+        lp.sec("sending message")
+        msg_out = chat.send_text(".")
+
+        lp.sec("receiving message")
+        msg_in = ac2._evtracker.wait_next_incoming_message()
+        assert msg_in.text == msg_out.text
+
     def test_send_and_receive_message_markseen(self, acfactory, lp):
         ac1, ac2 = acfactory.get_two_online_accounts()
 
@@ -1013,7 +1026,7 @@ class TestOnlineAccount:
         assert ev.data1 == msg2.chat.id
         assert ev.data2 == 0
 
-        ac2.direct_imap.idle_check(terminate=True)
+        ac2.direct_imap.idle_wait_for_new_message(terminate=True)
         lp.step("1")
         for i in range(2):
             ev = ac1._evtracker.get_matching("DC_EVENT_MSG_READ")
@@ -1044,8 +1057,7 @@ class TestOnlineAccount:
 
         ac1.create_chat(ac2).send_text("Hello!")
 
-        # Wait for the message to arrive.
-        ac2.direct_imap.idle_check(terminate=True)
+        ac2.direct_imap.idle_wait_for_new_message(terminate=True)
 
         # Emulate moving of the message to DeltaChat folder by Sieve rule.
         # mailcow server contains this rule by default.
@@ -1059,13 +1071,9 @@ class TestOnlineAccount:
         # Accept the contact request.
         msg.chat.accept()
         ac2.mark_seen_messages([msg])
-        ac2.direct_imap.idle_wait_for_seen()
-        ac2.direct_imap.idle_done()
+        uid = ac2.direct_imap.idle_wait_for_seen(terminate=True)
 
-        fetch = list(ac2.direct_imap.conn.fetch("*", b'FLAGS').values())
-        flags = fetch[-1][b'FLAGS']
-        is_seen = b'\\Seen' in flags
-        assert is_seen
+        assert len([a for a in ac2.direct_imap.conn.fetch(AND(seen=True, uid=U(uid, "*")))]) == 1
 
     def test_multidevice_sync_seen(self, acfactory, lp):
         """Test that message marked as seen on one device is marked as seen on another."""
@@ -1437,6 +1445,7 @@ class TestOnlineAccount:
         ac1.direct_imap.create_folder("Drafts")
         ac1.direct_imap.create_folder("Sent")
         ac1.direct_imap.create_folder("Spam")
+        ac1.direct_imap.create_folder("Junk")
 
         acfactory.wait_configure_and_start_io()
         # Wait until each folder was selected once and we are IDLEing again:
@@ -1469,6 +1478,15 @@ class TestOnlineAccount:
             Content-Type: text/plain; charset=utf-8
 
             Unknown message in Spam
+        """.format(ac1.get_config("configured_addr")))
+        ac1.direct_imap.append("Junk", """
+            From: unknown.address@junk.org
+            Subject: subj
+            To: {}
+            Message-ID: <spam.message@junk.org>
+            Content-Type: text/plain; charset=utf-8
+
+            Unknown message in Junk
         """.format(ac1.get_config("configured_addr")))
 
         ac1.set_config("scan_all_folders_debounce_secs", "0")
@@ -2211,7 +2229,7 @@ class TestOnlineAccount:
         ac1.direct_imap.idle_start()
         ac2.create_chat(ac1).send_text("Hi")
 
-        ac1.direct_imap.idle_check(terminate=False)
+        ac1.direct_imap.idle_wait_for_new_message(terminate=True)
         ac1.maybe_network()
 
         ac1._evtracker.wait_for_all_work_done()
@@ -2223,8 +2241,6 @@ class TestOnlineAccount:
 
         ac2.create_chat(ac1).send_text("Hi 2")
 
-        ac1.direct_imap.idle_check(terminate=True)
-        ac1.maybe_network()
         ac1._evtracker.wait_for_connectivity_change(const.DC_CONNECTIVITY_CONNECTED, const.DC_CONNECTIVITY_WORKING)
         ac1._evtracker.wait_for_connectivity_change(const.DC_CONNECTIVITY_WORKING, const.DC_CONNECTIVITY_CONNECTED)
 
@@ -2248,7 +2264,7 @@ class TestOnlineAccount:
         ac1.direct_imap.idle_start()
         ac2.create_chat(ac1).send_text("Hi")
 
-        ac1.direct_imap.idle_check(terminate=True)
+        ac1.direct_imap.idle_wait_for_new_message(terminate=True)
         ac1.maybe_network()
 
         while 1:
@@ -2438,25 +2454,23 @@ class TestOnlineAccount:
 
         acfactory.wait_configure_and_start_io()
 
-        imap2 = ac2.direct_imap
-        imap2.idle_start()
-
         lp.sec("ac1: create chat with ac2")
         chat1 = ac1.create_chat(ac2)
         ac2.create_chat(ac1)
 
+        lp.sec("ac1: send message to ac2")
         sent_msg = chat1.send_text("hello")
-        imap2.idle_check(terminate=False)
 
         msg = ac2._evtracker.wait_next_incoming_message()
         assert msg.text == "hello"
 
-        imap2.idle_check(terminate=True)
+        lp.sec("ac2: wait for close/expunge on autodelete")
         ac2._evtracker.get_info_contains("close/expunge succeeded")
 
-        assert len(imap2.get_all_messages()) == 0
+        lp.sec("ac2: check that message was autodeleted on server")
+        assert len(ac2.direct_imap.get_all_messages()) == 0
 
-        # Mark deleted message as seen and check that read receipt arrives
+        lp.sec("ac2: Mark deleted message as seen and check that read receipt arrives")
         msg.mark_seen()
         ev = ac1._evtracker.get_matching("DC_EVENT_MSG_READ")
         assert ev.data1 == chat1.id
@@ -2544,10 +2558,9 @@ class TestOnlineAccount:
 
         ac2._evtracker.get_info_contains("close/expunge succeeded")
 
-        lp.sec("imap2: test that only one message is left")
-        imap2 = ac2.direct_imap
-
-        assert len(imap2.get_all_messages()) == 1
+        lp.sec("ac2: test that only one message is left")
+        ac2.direct_imap.select_config_folder("inbox")
+        assert len(ac2.direct_imap.get_all_messages()) == 1
 
     def test_configure_error_msgs(self, acfactory):
         ac1, configdict = acfactory.get_online_config()
@@ -2717,13 +2730,7 @@ class TestOnlineAccount:
         ac1.direct_imap.select_config_folder("inbox")
         ac1.direct_imap.idle_start()
         acfactory.get_accepted_chat(ac2, ac1).send_text("hello")
-        while True:
-            if len(ac1.direct_imap.idle_check(terminate=True)) > 1:
-                # If length is 1, it's [(b'OK', b'Still here')]
-                # Could happen on very slow network.
-                #
-                # More is usually [(1, b'EXISTS'), (1, b'RECENT')]
-                break
+        ac1.direct_imap.idle_wait_for_new_message(terminate=True)
         ac1.direct_imap.conn.move(["*"], folder)  # "*" means "biggest UID in mailbox"
 
         lp.sec("Everything prepared, now see if DeltaChat finds the message (" + variant + ")")
@@ -2772,10 +2779,7 @@ class TestOnlineAccount:
         acfactory.wait_configure_and_start_io()
         assert_folders_configured(ac1)
 
-        if mvbox_move:
-            ac1.direct_imap.select_config_folder("mvbox")
-        else:
-            ac1.direct_imap.select_folder("INBOX")
+        assert ac1.direct_imap.select_config_folder("mvbox" if mvbox_move else "inbox")
         ac1.direct_imap.idle_start()
 
         lp.sec("send out message with bcc to ourselves")
@@ -2784,22 +2788,24 @@ class TestOnlineAccount:
         chat.send_text("message text")
         assert_folders_configured(ac1)
 
-        # now wait until the bcc_self message arrives
-        # Also test that bcc_self messages moved to the mvbox are marked as read.
+        lp.sec("wait until the bcc_self message arrives in correct folder and is marked seen")
         assert ac1.direct_imap.idle_wait_for_seen()
         assert_folders_configured(ac1)
 
+        lp.sec("create a cloned ac1 and fetch contact history during configure")
         ac1_clone = acfactory.clone_online_account(ac1)
         ac1_clone.set_config("fetch_existing_msgs", "1")
         ac1_clone._configtracker.wait_finish()
         ac1_clone.start_io()
         assert_folders_configured(ac1_clone)
 
+        lp.sec("check that ac2 contact was fetchted during configure")
         ac1_clone._evtracker.get_matching("DC_EVENT_CONTACTS_CHANGED")
         ac2_addr = ac2.get_config("addr")
         assert any(c.addr == ac2_addr for c in ac1_clone.get_contacts())
         assert_folders_configured(ac1_clone)
 
+        lp.sec("check that messages changed events arrive for the correct message")
         msg = ac1_clone._evtracker.wait_next_messages_changed()
         assert msg.text == "message text"
         assert_folders_configured(ac1)
@@ -2858,15 +2864,15 @@ class TestOnlineAccount:
         ac2 = acfactory.get_online_configuring_account()
         acfactory.wait_configure(ac1)
 
-        ac1.direct_imap.conn.delete_folder("DeltaChat")
-        assert len(ac1.direct_imap.conn.list_folders(pattern="DeltaChat")) == 0
+        ac1.direct_imap.conn.folder.delete("DeltaChat")
+        assert "DeltaChat" not in ac1.direct_imap.list_folders()
         acfactory.wait_configure_and_start_io()
 
         ac2.create_chat(ac1).send_text("hello")
         msg = ac1._evtracker.wait_next_incoming_message()
         assert msg.text == "hello"
 
-        assert len(ac1.direct_imap.conn.list_folders(pattern="DeltaChat")) == 1
+        assert "DeltaChat" in ac1.direct_imap.list_folders()
 
 
 class TestGroupStressTests:
