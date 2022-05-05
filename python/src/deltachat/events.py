@@ -1,5 +1,8 @@
 import threading
+import sys
+import traceback
 import time
+import io
 import re
 import os
 from queue import Queue, Empty
@@ -29,10 +32,12 @@ class FFIEventLogger:
     # to prevent garbled logging
     _loglock = threading.RLock()
 
-    def __init__(self, account) -> None:
+    def __init__(self, account, logid=None, init_time=None) -> None:
         self.account = account
-        self.logid = self.account.get_config("displayname")
-        self.init_time = time.time()
+        self.logid = logid or self.account.get_config("displayname")
+        if init_time is None:
+            init_time = time.time()
+        self.init_time = init_time
 
     @account_hookimpl
     def ac_process_ffi_event(self, ffi_event: FFIEvent) -> None:
@@ -156,14 +161,14 @@ class FFIEventTracker:
                 print("** SECUREJOINT-INVITER PROGRESS {}".format(target), self.account)
                 break
 
-    def wait_all_initial_fetches(self):
+    def wait_idle_inbox_ready(self):
         """Has to be called after start_io() to wait for fetch_existing_msgs to run
         so that new messages are not mistaken for old ones:
         - ac1 and ac2 are created
         - ac1 sends a message to ac2
         - ac2 is still running FetchExsistingMsgs job and thinks it's an existing, old message
         - therefore no DC_EVENT_INCOMING_MSG is sent"""
-        self.get_info_contains("Done fetching existing messages")
+        self.get_info_contains("INBOX: Idle entering")
 
     def wait_next_incoming_message(self):
         """ wait for and return next incoming message. """
@@ -225,9 +230,7 @@ class EventThread(threading.Thread):
         )
         while not self._marked_for_shutdown:
             event = lib.dc_get_next_event(event_emitter)
-            if event == ffi.NULL:
-                break
-            if self._marked_for_shutdown:
+            if event == ffi.NULL or self._marked_for_shutdown:
                 break
             evt = lib.dc_event_get_id(event)
             data1 = lib.dc_event_get_data1_int(event)
@@ -241,15 +244,23 @@ class EventThread(threading.Thread):
 
             lib.dc_event_unref(event)
             ffi_event = FFIEvent(name=evt_name, data1=data1, data2=data2)
-            try:
+            with self.swallow_and_log_exception("ac_process_ffi_event {}".format(ffi_event)):
                 self.account._pm.hook.ac_process_ffi_event(account=self, ffi_event=ffi_event)
-                for name, kwargs in self._map_ffi_event(ffi_event):
-                    self.account.log("calling hook name={} kwargs={}".format(name, kwargs))
-                    hook = getattr(self.account._pm.hook, name)
+            for name, kwargs in self._map_ffi_event(ffi_event):
+                hook = getattr(self.account._pm.hook, name)
+                info = "call {} kwargs={} failed".format(name, kwargs)
+                with self.swallow_and_log_exception(info):
                     hook(**kwargs)
-            except Exception:
-                if self.account._dc_context is not None:
-                    raise
+
+    @contextmanager
+    def swallow_and_log_exception(self, info):
+        try:
+            yield
+        except Exception as ex:
+            logfile = io.StringIO()
+            traceback.print_exception(*sys.exc_info(), file=logfile)
+            self.account.log("{}\nException {}\nTraceback:\n{}"
+                             .format(info, ex, logfile.getvalue()))
 
     def _map_ffi_event(self, ffi_event: FFIEvent):
         name = ffi_event.name

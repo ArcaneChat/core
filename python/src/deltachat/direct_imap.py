@@ -6,9 +6,9 @@ and for cleaning up inbox/mvbox for each test function run.
 import io
 import ssl
 import pathlib
+from contextlib import contextmanager
 from imap_tools import MailBox, MailBoxTls, errors, AND, Header, MailMessageFlags, MailMessage
 import imaplib
-import deltachat
 from deltachat import const, Account
 from typing import List
 
@@ -16,44 +16,6 @@ from typing import List
 FLAGS = b'FLAGS'
 FETCH = b'FETCH'
 ALL = "1:*"
-
-
-@deltachat.global_hookimpl
-def dc_account_extra_configure(account: Account):
-    """ Reset the account (we reuse accounts across tests)
-    and make 'account.direct_imap' available for direct IMAP ops.
-    """
-    try:
-
-        if not hasattr(account, "direct_imap"):
-            imap = DirectImap(account)
-
-            for folder in imap.list_folders():
-                if folder.lower() == "inbox" or folder.lower() == "deltachat":
-                    assert imap.select_folder(folder)
-                    imap.delete(ALL, expunge=True)
-                else:
-                    imap.conn.folder.delete(folder)
-                    # We just deleted the folder, so we have to make DC forget about it, too
-                    if account.get_config("configured_sentbox_folder") == folder:
-                        account.set_config("configured_sentbox_folder", None)
-
-            setattr(account, "direct_imap", imap)
-
-    except Exception as e:
-        # Uncaught exceptions here would lead to a timeout without any note written to the log
-        # start with DC_EVENT_WARNING so that the line is printed in yellow and won't be overlooked when reading
-        account.log("DC_EVENT_WARNING =================== DIRECT_IMAP CAN'T RESET ACCOUNT: ===================")
-        account.log("DC_EVENT_WARNING =================== " + str(e) + " ===================")
-
-
-@deltachat.global_hookimpl
-def dc_account_after_shutdown(account):
-    """ shutdown the imap connection if there is one. """
-    imap = getattr(account, "direct_imap", None)
-    if imap is not None:
-        imap.shutdown()
-        del account.direct_imap
 
 
 class DirectImap:
@@ -91,10 +53,6 @@ class DirectImap:
         self.select_folder("INBOX")
 
     def shutdown(self):
-        try:
-            self.idle_done()
-        except (OSError, imaplib.IMAP4.abort):
-            pass
         try:
             self.conn.logout()
         except (OSError, imaplib.IMAP4.abort):
@@ -190,49 +148,14 @@ class DirectImap:
 
         print(stream.getvalue(), file=logfile)
 
-    def idle_start(self):
-        """ switch this connection to idle mode. non-blocking. """
-        assert not self._idling
-        res = self.conn.idle.start()
-        self._idling = True
-        return res
-
-    def idle_check(self, terminate=False, timeout=None) -> List[bytes]:
-        """ (blocking) wait for next idle message from server. """
-        assert self._idling
-        self.account.log("imap-direct: calling idle_check")
-        res = self.conn.idle.poll(timeout=timeout)
-        if terminate:
-            self.idle_done()
-        self.account.log("imap-direct: idle_check returned {!r}".format(res))
-        return res
-
-    def idle_wait_for_new_message(self, terminate=False, timeout=None) -> bytes:
-        while 1:
-            for item in self.idle_check(timeout=timeout):
-                if b'EXISTS' in item or b'RECENT' in item:
-                    if terminate:
-                        self.idle_done()
-                    return item
-
-    def idle_wait_for_seen(self, terminate=False, timeout=None) -> int:
-        """ Return first message with SEEN flag from a running idle-stream.
-        """
-        while 1:
-            for item in self.idle_check(timeout=timeout):
-                if FETCH in item:
-                    self.account.log(str(item))
-                    if FLAGS in item and rb'\Seen' in item:
-                        if terminate:
-                            self.idle_done()
-                        return int(item.split(b' ')[1])
-
-    def idle_done(self):
-        """ send idle-done to server if we are currently in idle mode. """
-        if self._idling:
-            res = self.conn.idle.stop()
-            self._idling = False
-            return res
+    @contextmanager
+    def idle(self):
+        """ return Idle ContextManager. """
+        idle_manager = IdleManager(self)
+        try:
+            yield idle_manager
+        finally:
+            idle_manager.done()
 
     def append(self, folder: str, msg: str):
         """Upload a message to *folder*.
@@ -248,3 +171,38 @@ class DirectImap:
         if len(msgs) == 0:
             raise Exception("Did not find message " + message_id + ", maybe you forgot to select the correct folder?")
         return msgs[0]
+
+
+class IdleManager:
+    def __init__(self, direct_imap):
+        self.direct_imap = direct_imap
+        self.log = direct_imap.account.log
+        self.direct_imap.conn.idle.start()
+
+    def check(self, timeout=None) -> List[bytes]:
+        """ (blocking) wait for next idle message from server. """
+        self.log("imap-direct: calling idle_check")
+        res = self.direct_imap.conn.idle.poll(timeout=timeout)
+        self.log("imap-direct: idle_check returned {!r}".format(res))
+        return res
+
+    def wait_for_new_message(self, timeout=None) -> bytes:
+        while 1:
+            for item in self.check(timeout=timeout):
+                if b'EXISTS' in item or b'RECENT' in item:
+                    return item
+
+    def wait_for_seen(self, timeout=None) -> int:
+        """ Return first message with SEEN flag from a running idle-stream.
+        """
+        while 1:
+            for item in self.check(timeout=timeout):
+                if FETCH in item:
+                    self.log(str(item))
+                    if FLAGS in item and rb'\Seen' in item:
+                        return int(item.split(b' ')[1])
+
+    def done(self):
+        """ send idle-done to server if we are currently in idle mode. """
+        res = self.direct_imap.conn.idle.stop()
+        return res

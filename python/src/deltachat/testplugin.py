@@ -8,34 +8,41 @@ import threading
 import fnmatch
 import time
 import weakref
-import tempfile
-from typing import List, Dict, Callable
+from queue import Queue
+from typing import List, Callable
 
 import pytest
 import requests
 
-from . import Account, const
-from .capi import lib
+from . import Account, const, account_hookimpl, get_core_info
 from .events import FFIEventLogger, FFIEventTracker
 from _pytest._code import Source
-from deltachat import direct_imap
 
 import deltachat
 
 
 def pytest_addoption(parser):
-    parser.addoption(
+    group = parser.getgroup("deltachat testplugin options")
+    group.addoption(
         "--liveconfig", action="store", default=None,
         help="a file with >=2 lines where each line "
              "contains NAME=VALUE config settings for one account"
     )
-    parser.addoption(
+    group.addoption(
         "--ignored", action="store_true",
         help="Also run tests marked with the ignored marker",
     )
-    parser.addoption(
+    group.addoption(
         "--strict-tls", action="store_true",
         help="Never accept invalid TLS certificates for test accounts",
+    )
+    group.addoption(
+        "--extra-info", action="store_true",
+        help="show more info on failures (imap server state, config)"
+    )
+    group.addoption(
+        "--debug-setup", action="store_true",
+        help="show events during configure and start io phases of online accounts"
     )
 
 
@@ -91,9 +98,12 @@ def pytest_configure(config):
 
         @pytest.hookimpl(hookwrapper=True)
         def pytest_runtest_teardown(self, item):
-            self.enable_logging(item)
+            logging = item.config.getoption("--extra-info")
+            if logging:
+                self.enable_logging(item)
             yield
-            self.disable_logging(item)
+            if logging:
+                self.disable_logging(item)
 
     la = LoggingAspect()
     config.pluginmanager.register(la)
@@ -101,20 +111,12 @@ def pytest_configure(config):
 
 
 def pytest_report_header(config, startdir):
-    summary = []
-
-    t = tempfile.mktemp()
-    try:
-        ac = Account(t)
-        info = ac.get_info()
-        ac.shutdown()
-    finally:
-        os.remove(t)
-    summary.extend(['Deltachat core={} sqlite={} journal_mode={}'.format(
-         info['deltachat_core_version'],
-         info['sqlite_version'],
-         info['journal_mode'],
-     )])
+    info = get_core_info()
+    summary = ['Deltachat core={} sqlite={} journal_mode={}'.format(
+        info['deltachat_core_version'],
+        info['sqlite_version'],
+        info['journal_mode'],
+    )]
 
     cfg = config.option.liveconfig
     if cfg:
@@ -126,57 +128,54 @@ def pytest_report_header(config, startdir):
     return summary
 
 
-class SessionLiveConfigFromFile:
-    def __init__(self, fn) -> None:
-        self.fn = fn
-        self.configlist = []
-        for line in open(fn):
-            if line.strip() and not line.strip().startswith('#'):
-                d = {}
-                for part in line.split():
-                    name, value = part.split("=")
-                    d[name] = value
-                self.configlist.append(d)
-
-    def get(self, index: int):
-        return self.configlist[index]
-
-    def exists(self) -> bool:
-        return bool(self.configlist)
-
-
-class SessionLiveConfigFromURL:
-    configlist: List[Dict[str, str]]
-
-    def __init__(self, url: str) -> None:
-        self.configlist = []
-        self.url = url
-
-    def get(self, index: int):
-        try:
-            return self.configlist[index]
-        except IndexError:
-            assert index == len(self.configlist), index
-            res = requests.post(self.url)
-            if res.status_code != 200:
-                pytest.skip("creating newtmpuser failed with code {}: '{}'".format(res.status_code, res.text))
-            d = res.json()
-            config = dict(addr=d["email"], mail_pw=d["password"])
-            self.configlist.append(config)
-            return config
-
-    def exists(self) -> bool:
-        return bool(self.configlist)
-
-
 @pytest.fixture(scope="session")
-def session_liveconfig(request):
-    liveconfig_opt = request.config.option.liveconfig
-    if liveconfig_opt:
-        if liveconfig_opt.startswith("http"):
-            return SessionLiveConfigFromURL(liveconfig_opt)
+def testprocess(request):
+    return TestProcess(pytestconfig=request.config)
+
+
+class TestProcess:
+    """ A pytest session-scoped instance to help with managing "live" account configurations.
+    """
+    def __init__(self, pytestconfig):
+        self.pytestconfig = pytestconfig
+
+    def get_liveconfig_producer(self):
+        """ provide live account configs, cached on a per-test-process scope
+        so that test functions can re-use already known live configs.
+        Depending on the --liveconfig option this comes from
+        a HTTP provider or a file with a line specifying each accounts config.
+        """
+        liveconfig_opt = self.pytestconfig.getoption("--liveconfig")
+        if not liveconfig_opt:
+            pytest.skip("specify DCC_NEW_TMP_EMAIL or --liveconfig to provide live accounts")
+
+        configlist = []
+        if not liveconfig_opt.startswith("http"):
+            for line in open(liveconfig_opt):
+                if line.strip() and not line.strip().startswith('#'):
+                    d = {}
+                    for part in line.split():
+                        name, value = part.split("=")
+                        d[name] = value
+                    configlist.append(d)
+
+            yield from iter(configlist)
         else:
-            return SessionLiveConfigFromFile(liveconfig_opt)
+            MAX_LIVE_CREATED_ACCOUNTS = 10
+            for index in range(MAX_LIVE_CREATED_ACCOUNTS):
+                try:
+                    yield configlist[index]
+                except IndexError:
+                    res = requests.post(liveconfig_opt)
+                    if res.status_code != 200:
+                        pytest.fail("newtmpuser count={} code={}: '{}'".format(
+                                    index, res.status_code, res.text))
+                    d = res.json()
+                    config = dict(addr=d["email"], mail_pw=d["password"])
+                    print("newtmpuser {}: addr={}".format(index, config["addr"]))
+                    configlist.append(config)
+                    yield config
+            pytest.fail("more than {} live accounts requested.".format(MAX_LIVE_CREATED_ACCOUNTS))
 
 
 @pytest.fixture
@@ -209,256 +208,320 @@ def data(request):
     return Data()
 
 
-@pytest.fixture
-def acfactory(pytestconfig, tmpdir, request, session_liveconfig, data):
+class ACSetup:
+    """ accounts setup helper to deal with multiple configure-process
+    and io & imap initialization phases. From tests, use the higher level
+    public ACFactory methods instead of its private helper class.
+    """
+    CONFIGURING = "CONFIGURING"
+    CONFIGURED = "CONFIGURED"
+    IDLEREADY = "IDLEREADY"
 
-    class AccountMaker:
-        _finalizers: List[Callable[[], None]]
-        _accounts: List[Account]
+    def __init__(self, init_time):
+        self._configured_events = Queue()
+        self._account2state = {}
+        self._imap_cleaned = set()
+        self.init_time = init_time
 
-        def __init__(self) -> None:
-            self.live_count = 0
-            self.offline_count = 0
-            self._finalizers = []
-            self._accounts = []
-            self.init_time = time.time()
-            self._generated_keys = ["alice", "bob", "charlie",
+    def start_configure(self, account, reconfigure=False):
+        """ add an account and start its configure process. """
+        class PendingTracker:
+            @account_hookimpl
+            def ac_configure_completed(this, success):
+                self._configured_events.put((account, success))
+
+        account.add_account_plugin(PendingTracker(), name="pending_tracker")
+        self._account2state[account] = self.CONFIGURING
+        account.configure(reconfigure=reconfigure)
+        print("started configure on pending", account)
+
+    def wait_one_configured(self, account):
+        """ wait until this account has successfully configured. """
+        if self._account2state[account] == self.CONFIGURING:
+            while 1:
+                acc = self._pop_config_success()
+                if acc == account:
+                    break
+            self.init_direct_imap_and_logging(acc)
+            acc._evtracker.consume_events()
+
+    def bring_online(self):
+        """ Wait for all accounts to become ready to receive messages.
+
+        This will initialize logging, start IO and the direct_imap attribute
+        for each account which either is CONFIGURED already or which is CONFIGURING
+        and successfully completing the configuration process.
+        """
+        print("wait_all_configured finds accounts=", self._account2state)
+        for acc, state in self._account2state.items():
+            if state == self.CONFIGURED:
+                self._onconfigure_start_io(acc)
+                self._account2state[acc] = self.IDLEREADY
+
+        while self.CONFIGURING in self._account2state.values():
+            acc = self._pop_config_success()
+            self._onconfigure_start_io(acc)
+            self._account2state[acc] = self.IDLEREADY
+        print("finished, account2state", self._account2state)
+
+    def _pop_config_success(self):
+        acc, success = self._configured_events.get()
+        if not success:
+            pytest.fail("configuring online account failed: {}".format(acc))
+        self._account2state[acc] = self.CONFIGURED
+        return acc
+
+    def _onconfigure_start_io(self, acc):
+        acc.start_io()
+        print(acc._logid, "waiting for inbox IDLE to become ready")
+        acc._evtracker.wait_idle_inbox_ready()
+        self.init_direct_imap_and_logging(acc)
+        acc._evtracker.consume_events()
+        acc.log("inbox IDLE ready")
+
+    def init_direct_imap_and_logging(self, acc):
+        """ idempotent function for initializing direct_imap and logging for an account. """
+        self.init_direct_imap(acc)
+        self.init_logging(acc)
+
+    def init_logging(self, acc):
+        logger = FFIEventLogger(acc, logid=acc._logid, init_time=self.init_time)
+        acc.add_account_plugin(logger, name=acc._logid)
+
+    def init_direct_imap(self, acc):
+        """ idempotent function for initializing direct_imap."""
+        from deltachat.direct_imap import DirectImap
+        if not hasattr(acc, "direct_imap"):
+            acc.direct_imap = DirectImap(acc)
+        addr = acc.get_config("addr")
+        if addr not in self._imap_cleaned:
+            imap = acc.direct_imap
+            for folder in imap.list_folders():
+                if folder.lower() == "inbox" or folder.lower() == "deltachat":
+                    assert imap.select_folder(folder)
+                    imap.delete("1:*", expunge=True)
+                else:
+                    imap.conn.folder.delete(folder)
+            acc.log("imap cleaned for addr {}".format(addr))
+            self._imap_cleaned.add(addr)
+
+
+class ACFactory:
+    _finalizers: List[Callable[[], None]]
+    _accounts: List[Account]
+
+    def __init__(self, request, testprocess, tmpdir, data) -> None:
+        self.init_time = time.time()
+        self.tmpdir = tmpdir
+        self.pytestconfig = request.config
+        self.data = data
+        self._liveconfig_producer = testprocess.get_liveconfig_producer()
+
+        self._finalizers = []
+        self._accounts = []
+        self._acsetup = ACSetup(self.init_time)
+        self._preconfigured_keys = ["alice", "bob", "charlie",
                                     "dom", "elena", "fiona"]
-            self.set_logging_default(False)
-            deltachat.register_global_plugin(direct_imap)
+        self.set_logging_default(False)
+        request.addfinalizer(self.finalize)
 
-        def finalize(self):
-            while self._finalizers:
-                fin = self._finalizers.pop()
-                fin()
+    def finalize(self):
+        while self._finalizers:
+            fin = self._finalizers.pop()
+            fin()
 
-            while self._accounts:
-                acc = self._accounts.pop()
+        while self._accounts:
+            acc = self._accounts.pop()
+            if acc is not None:
+                imap = getattr(acc, "direct_imap", None)
+                if imap is not None:
+                    imap.shutdown()
+                    del acc.direct_imap
                 acc.shutdown()
                 acc.disable_logging()
-            deltachat.unregister_global_plugin(direct_imap)
 
-        def make_account(self, path, logid, quiet=False):
-            ac = Account(path, logging=self._logging)
-            ac._evtracker = ac.add_account_plugin(FFIEventTracker(ac))
-            ac.addr = ac.get_self_contact().addr
-            ac.set_config("displayname", logid)
-            if not quiet:
-                logger = FFIEventLogger(ac)
-                logger.init_time = self.init_time
-                ac.add_account_plugin(logger)
-            self._accounts.append(ac)
-            return ac
+    def get_next_liveconfig(self):
+        """ Base function to get functional online configurations
+        where we can make valid SMTP and IMAP connections with.
+        """
+        configdict = next(self._liveconfig_producer)
+        if "e2ee_enabled" not in configdict:
+            configdict["e2ee_enabled"] = "1"
 
-        def set_logging_default(self, logging):
-            self._logging = bool(logging)
+        if self.pytestconfig.getoption("--strict-tls"):
+            # Enable strict certificate checks for online accounts
+            configdict["imap_certificate_checks"] = str(const.DC_CERTCK_STRICT)
+            configdict["smtp_certificate_checks"] = str(const.DC_CERTCK_STRICT)
 
-        def get_unconfigured_account(self):
-            self.offline_count += 1
-            tmpdb = tmpdir.join("offlinedb%d" % self.offline_count)
-            return self.make_account(tmpdb.strpath, logid="ac{}".format(self.offline_count))
+        assert "addr" in configdict and "mail_pw" in configdict
+        return configdict
 
-        def _preconfigure_key(self, account, addr):
-            # Only set a key if we haven't used it yet for another account.
-            if self._generated_keys:
-                keyname = self._generated_keys.pop(0)
-                fname_pub = data.read_path("key/{name}-public.asc".format(name=keyname))
-                fname_sec = data.read_path("key/{name}-secret.asc".format(name=keyname))
-                if fname_pub and fname_sec:
-                    account._preconfigure_keypair(addr, fname_pub, fname_sec)
-                    return True
-                else:
-                    print("WARN: could not use preconfigured keys for {!r}".format(addr))
+    def get_unconfigured_account(self):
+        logid = "ac{}".format(len(self._accounts) + 1)
+        path = self.tmpdir.join(logid)
+        ac = Account(path.strpath, logging=self._logging)
+        ac._logid = logid  # later instantiated FFIEventLogger needs this
+        ac._evtracker = ac.add_account_plugin(FFIEventTracker(ac))
+        if self.pytestconfig.getoption("--debug-setup"):
+            self._acsetup.init_logging(ac)
+        self._accounts.append(ac)
+        return ac
 
-        def get_configured_offline_account(self):
-            ac = self.get_unconfigured_account()
+    def set_logging_default(self, logging):
+        self._logging = bool(logging)
 
-            # do a pseudo-configured account
-            addr = "addr{}@offline.org".format(self.offline_count)
-            ac.set_config("addr", addr)
-            self._preconfigure_key(ac, addr)
-            lib.dc_set_config(ac._dc_context, b"configured_addr", addr.encode("ascii"))
-            ac.set_config("mail_pw", "123")
-            lib.dc_set_config(ac._dc_context, b"configured_mail_pw", b"123")
-            lib.dc_set_config(ac._dc_context, b"configured", b"1")
-            return ac
+    def remove_preconfigured_keys(self):
+        self._preconfigured_keys = []
 
-        def get_online_config(self, pre_generated_key=True, quiet=False):
-            if not session_liveconfig:
-                pytest.skip("specify DCC_NEW_TMP_EMAIL or --liveconfig")
-            configdict = session_liveconfig.get(self.live_count)
-            self.live_count += 1
-            if "e2ee_enabled" not in configdict:
-                configdict["e2ee_enabled"] = "1"
+    def _preconfigure_key(self, account, addr):
+        # Only set a preconfigured key if we haven't used it yet for another account.
+        try:
+            keyname = self._preconfigured_keys.pop(0)
+        except IndexError:
+            pass
+        else:
+            fname_pub = self.data.read_path("key/{name}-public.asc".format(name=keyname))
+            fname_sec = self.data.read_path("key/{name}-secret.asc".format(name=keyname))
+            if fname_pub and fname_sec:
+                account._preconfigure_keypair(addr, fname_pub, fname_sec)
+                return True
+            else:
+                print("WARN: could not use preconfigured keys for {!r}".format(addr))
 
-            if pytestconfig.getoption("--strict-tls"):
-                # Enable strict certificate checks for online accounts
-                configdict["imap_certificate_checks"] = str(const.DC_CERTCK_STRICT)
-                configdict["smtp_certificate_checks"] = str(const.DC_CERTCK_STRICT)
+    def get_pseudo_configured_account(self):
+        # do a pseudo-configured account
+        ac = self.get_unconfigured_account()
+        acname = os.path.basename(ac.db_path)
+        addr = "{}@offline.org".format(acname)
+        ac.update_config(dict(
+            addr=addr, displayname=acname, mail_pw="123",
+            configured_addr=addr, configured_mail_pw="123",
+            configured="1",
+        ))
+        self._preconfigure_key(ac, addr)
+        self._acsetup.init_logging(ac)
+        return ac
 
-            tmpdb = tmpdir.join("livedb%d" % self.live_count)
-            ac = self.make_account(tmpdb.strpath, logid="ac{}".format(self.live_count), quiet=quiet)
-            if pre_generated_key:
-                self._preconfigure_key(ac, configdict['addr'])
-            return ac, dict(configdict)
-
-        def get_online_configuring_account(self, sentbox=False, move=False,
-                                           pre_generated_key=True, quiet=False, config={}):
-            ac, configdict = self.get_online_config(
-                pre_generated_key=pre_generated_key, quiet=quiet)
-            configdict.update(config)
-            configdict["mvbox_move"] = str(int(move))
-            configdict["sentbox_watch"] = str(int(sentbox))
-            ac.update_config(configdict)
-            ac._configtracker = ac.configure()
-            return ac
-
-        def get_one_online_account(self, pre_generated_key=True, move=False):
-            ac1 = self.get_online_configuring_account(
-                pre_generated_key=pre_generated_key, move=move)
-            self.wait_configure_and_start_io([ac1])
-            return ac1
-
-        def get_two_online_accounts(self, move=False, quiet=False):
-            ac1 = self.get_online_configuring_account(move=move, quiet=quiet)
-            ac2 = self.get_online_configuring_account(quiet=quiet)
-            self.wait_configure_and_start_io([ac1, ac2])
-            return ac1, ac2
-
-        def get_many_online_accounts(self, num, move=True):
-            accounts = [self.get_online_configuring_account(move=move, quiet=True)
-                        for i in range(num)]
-            self.wait_configure_and_start_io(accounts)
-            for acc in accounts:
-                acc.add_account_plugin(FFIEventLogger(acc))
-            return accounts
-
-        def clone_online_account(self, account, pre_generated_key=True):
-            """ Clones addr, mail_pw, mvbox_move, sentbox_watch and the
-            direct_imap object of an online account. This simulates the user setting
-            up a new device without importing a backup.
-
-            `pre_generated_key` only means that a key from python/tests/data/key is
-            used in order to speed things up.
-            """
-            self.live_count += 1
-            tmpdb = tmpdir.join("livedb%d" % self.live_count)
-            ac = self.make_account(tmpdb.strpath, logid="ac{}".format(self.live_count))
-            if pre_generated_key:
-                self._preconfigure_key(ac, account.get_config("addr"))
-            ac.update_config(dict(
-                addr=account.get_config("addr"),
-                mail_pw=account.get_config("mail_pw"),
-                mvbox_move=account.get_config("mvbox_move"),
-                sentbox_watch=account.get_config("sentbox_watch"),
-            ))
-            if hasattr(account, "direct_imap"):
-                # Attach the existing direct_imap. If we did not do this, a new one would be created and
-                # delete existing messages (see dc_account_extra_configure(configure))
-                ac.direct_imap = account.direct_imap
-            ac._configtracker = ac.configure()
-            return ac
-
-        def wait_configure_and_start_io(self, accounts=None):
-            if accounts is None:
-                accounts = self._accounts[:]
-            started_accounts = []
-            for acc in accounts:
-                if acc not in started_accounts:
-                    self.wait_configure(acc)
-                    acc.set_config("bcc_self", "0")
-                    if acc.is_configured():
-                        acc.start_io()
-                        started_accounts.append(acc)
-                    print("{}: {} account was started".format(
-                        acc.get_config("displayname"), acc.get_config("addr")))
-            for acc in started_accounts:
-                acc._evtracker.wait_all_initial_fetches()
-
-        def wait_configure(self, acc):
-            if hasattr(acc, "_configtracker"):
-                acc._configtracker.wait_finish()
-                acc._evtracker.consume_events()
-                acc.get_device_chat().mark_noticed()
-                del acc._configtracker
-
-        def run_bot_process(self, module, ffi=True):
-            fn = module.__file__
-
-            bot_ac, bot_cfg = self.get_online_config()
-
-            # Avoid starting ac so we don't interfere with the bot operating on
-            # the same database.
-            self._accounts.remove(bot_ac)
-
-            args = [
-                sys.executable,
-                "-u",
-                fn,
-                "--email", bot_cfg["addr"],
-                "--password", bot_cfg["mail_pw"],
-                bot_ac.db_path,
-            ]
-            if ffi:
-                args.insert(-1, "--show-ffi")
-            print("$", " ".join(args))
-            popen = subprocess.Popen(
-                args=args,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,  # combine stdout/stderr in one stream
-                bufsize=0,                 # line buffering
-                close_fds=True,            # close all FDs other than 0/1/2
-                universal_newlines=True    # give back text
+    def new_online_configuring_account(self, cloned_from=None, **kwargs):
+        if cloned_from is None:
+            configdict = self.get_next_liveconfig()
+        else:
+            # XXX we might want to transfer the key to the new account
+            configdict = dict(
+                addr=cloned_from.get_config("addr"),
+                mail_pw=cloned_from.get_config("mail_pw"),
             )
-            bot = BotProcess(popen, bot_cfg)
-            self._finalizers.append(bot.kill)
-            return bot
+        configdict.update(kwargs)
+        ac = self.prepare_account_from_liveconfig(configdict)
+        self._acsetup.start_configure(ac)
+        return ac
 
-        def dump_imap_summary(self, logfile):
-            for ac in self._accounts:
-                ac.dump_account_info(logfile=logfile)
-                imap = getattr(ac, "direct_imap", None)
-                if imap is not None:
-                    try:
-                        imap.idle_done()
-                    except Exception:
-                        pass
-                    imap.dump_imap_structures(tmpdir, logfile=logfile)
+    def prepare_account_from_liveconfig(self, configdict):
+        ac = self.get_unconfigured_account()
+        assert "addr" in configdict and "mail_pw" in configdict, configdict
+        configdict.setdefault("bcc_self", False)
+        configdict.setdefault("mvbox_move", False)
+        configdict.setdefault("sentbox_watch", False)
+        ac.update_config(configdict)
+        self._preconfigure_key(ac, configdict["addr"])
+        return ac
 
-        def get_accepted_chat(self, ac1: Account, ac2: Account):
-            ac2.create_chat(ac1)
-            return ac1.create_chat(ac2)
+    def wait_configured(self, account):
+        """ Wait until the specified account has successfully completed configure. """
+        self._acsetup.wait_one_configured(account)
 
-        def introduce_each_other(self, accounts, sending=True):
-            to_wait = []
-            for i, acc in enumerate(accounts):
-                for acc2 in accounts[i + 1:]:
-                    chat = self.get_accepted_chat(acc, acc2)
-                    if sending:
-                        chat.send_text("hi")
-                        to_wait.append(acc2)
-                        acc2.create_chat(acc).send_text("hi back")
-                        to_wait.append(acc)
-            for acc in to_wait:
-                acc._evtracker.wait_next_incoming_message()
+    def bring_accounts_online(self):
+        print("bringing accounts online")
+        self._acsetup.bring_online()
+        print("all accounts online")
 
-    am = AccountMaker()
-    request.addfinalizer(am.finalize)
+    def get_online_accounts(self, num):
+        # to reduce number of log events logging starts after accounts can receive
+        accounts = [self.new_online_configuring_account() for i in range(num)]
+        self.bring_accounts_online()
+        return accounts
+
+    def run_bot_process(self, module, ffi=True):
+        fn = module.__file__
+
+        bot_cfg = self.get_next_liveconfig()
+        bot_ac = self.prepare_account_from_liveconfig(bot_cfg)
+
+        # Forget ac as it will be opened by the bot subprocess
+        # but keep something in the list to not confuse account generation
+        self._accounts[self._accounts.index(bot_ac)] = None
+
+        args = [
+            sys.executable,
+            "-u",
+            fn,
+            "--email", bot_cfg["addr"],
+            "--password", bot_cfg["mail_pw"],
+            bot_ac.db_path,
+        ]
+        if ffi:
+            args.insert(-1, "--show-ffi")
+        print("$", " ".join(args))
+        popen = subprocess.Popen(
+            args=args,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,  # combine stdout/stderr in one stream
+            bufsize=0,                 # line buffering
+            close_fds=True,            # close all FDs other than 0/1/2
+            universal_newlines=True    # give back text
+        )
+        bot = BotProcess(popen, addr=bot_cfg["addr"])
+        self._finalizers.append(bot.kill)
+        return bot
+
+    def dump_imap_summary(self, logfile):
+        for ac in self._accounts:
+            ac.dump_account_info(logfile=logfile)
+            imap = getattr(ac, "direct_imap", None)
+            if imap is not None:
+                try:
+                    imap.idle_done()
+                except Exception:
+                    pass
+                imap.dump_imap_structures(self.tmpdir, logfile=logfile)
+
+    def get_accepted_chat(self, ac1: Account, ac2: Account):
+        ac2.create_chat(ac1)
+        return ac1.create_chat(ac2)
+
+    def introduce_each_other(self, accounts, sending=True):
+        to_wait = []
+        for i, acc in enumerate(accounts):
+            for acc2 in accounts[i + 1:]:
+                chat = self.get_accepted_chat(acc, acc2)
+                if sending:
+                    chat.send_text("hi")
+                    to_wait.append(acc2)
+                    acc2.create_chat(acc).send_text("hi back")
+                    to_wait.append(acc)
+        for acc in to_wait:
+            acc._evtracker.wait_next_incoming_message()
+
+
+@pytest.fixture
+def acfactory(request, tmpdir, testprocess, data):
+    am = ACFactory(request=request, tmpdir=tmpdir, testprocess=testprocess, data=data)
     yield am
     if hasattr(request.node, "rep_call") and request.node.rep_call.failed:
-        logfile = io.StringIO()
-        am.dump_imap_summary(logfile=logfile)
-        print(logfile.getvalue())
-        # request.node.add_report_section("call", "imap-server-state", s)
+        if testprocess.pytestconfig.getoption("--extra-info"):
+            logfile = io.StringIO()
+            am.dump_imap_summary(logfile=logfile)
+            print(logfile.getvalue())
+            # request.node.add_report_section("call", "imap-server-state", s)
 
 
 class BotProcess:
     stdout_queue: queue.Queue
 
-    def __init__(self, popen, bot_cfg) -> None:
+    def __init__(self, popen, addr) -> None:
         self.popen = popen
-        self.addr = bot_cfg["addr"]
+        self.addr = addr
 
         # we read stdout as quickly as we can in a thread and make
         # the (unicode) lines available for readers through a queue.
