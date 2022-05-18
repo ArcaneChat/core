@@ -1,5 +1,46 @@
 # Changelog
 
+## 1.81.0
+
+### API-Changes
+- deprecate unused `marker1before` argument of `dc_get_chat_msgs`
+  and remove `DC_MSG_ID_MARKER1` constant #3274
+
+### Changes
+- now the node-bindings are also part of this repository 🎉 #3283
+- support `source_code_url` from Webxdc manifests #3314
+- support Webxdc document names and add `document` to `dc_msg_get_webxdc_info()` #3317 #3324
+- improve chat encryption info, make it easier to find contacts without keys #3318
+- improve error reporting when creating a folder fails #3325
+- node: remove unmaintained coverage scripts
+- send normal messages with higher priority than MDNs #3243
+- make Scheduler stateless #3302
+- abort instead of unwinding on panic #3259
+- improve python bindings #3297 #3298
+- improve documentation #3307 #3306 #3309 #3319 #3321
+- refactorings #3304 #3303 #3323
+
+### Fixes
+- node: throw error when getting context with an invalid account id
+- node: throw error when instanciating a wrapper class on `null` (Context, Message, Chat, ChatList and so on)
+- use same contact-color if email address differ only in upper-/lowercase #3327
+- fix race condition in ongoing process (import/export, configuration) allocation
+- repair encrypted mails "mixed up" by Google Workspace "Append footer" function #3315
+
+### Removed
+- node: remove unmaintained coverage scripts
+
+
+## 1.80.0
+
+### Changes
+- update provider database #3284
+- improve python bindings, tests and ci #3287 #3286 #3287 #3289 #3290 #3292
+
+### Fixes
+- fix escaping in generated QR-code-SVG #3295
+
+
 ## 1.79.0
 
 ### Changes

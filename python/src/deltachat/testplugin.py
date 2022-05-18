@@ -13,6 +13,7 @@ from typing import List, Callable
 
 import pytest
 import requests
+import pathlib
 
 from . import Account, const, account_hookimpl, get_core_info
 from .events import FFIEventLogger, FFIEventTracker
@@ -138,6 +139,8 @@ class TestProcess:
     """
     def __init__(self, pytestconfig):
         self.pytestconfig = pytestconfig
+        self._addr2files = {}
+        self._configlist = []
 
     def get_liveconfig_producer(self):
         """ provide live account configs, cached on a per-test-process scope
@@ -149,7 +152,6 @@ class TestProcess:
         if not liveconfig_opt:
             pytest.skip("specify DCC_NEW_TMP_EMAIL or --liveconfig to provide live accounts")
 
-        configlist = []
         if not liveconfig_opt.startswith("http"):
             for line in open(liveconfig_opt):
                 if line.strip() and not line.strip().startswith('#'):
@@ -157,14 +159,14 @@ class TestProcess:
                     for part in line.split():
                         name, value = part.split("=")
                         d[name] = value
-                    configlist.append(d)
+                    self._configlist.append(d)
 
-            yield from iter(configlist)
+            yield from iter(self._configlist)
         else:
             MAX_LIVE_CREATED_ACCOUNTS = 10
             for index in range(MAX_LIVE_CREATED_ACCOUNTS):
                 try:
-                    yield configlist[index]
+                    yield self._configlist[index]
                 except IndexError:
                     res = requests.post(liveconfig_opt)
                     if res.status_code != 200:
@@ -173,9 +175,51 @@ class TestProcess:
                     d = res.json()
                     config = dict(addr=d["email"], mail_pw=d["password"])
                     print("newtmpuser {}: addr={}".format(index, config["addr"]))
-                    configlist.append(config)
+                    self._configlist.append(config)
                     yield config
             pytest.fail("more than {} live accounts requested.".format(MAX_LIVE_CREATED_ACCOUNTS))
+
+    def cache_maybe_retrieve_configured_db_files(self, cache_addr, db_target_path):
+        db_target_path = pathlib.Path(db_target_path)
+        assert not db_target_path.exists()
+
+        try:
+            filescache = self._addr2files[cache_addr]
+        except KeyError:
+            print("CACHE FAIL for", cache_addr)
+            return False
+        else:
+            print("CACHE HIT for", cache_addr)
+            targetdir = db_target_path.parent
+            write_dict_to_dir(filescache, targetdir)
+            return True
+
+    def cache_maybe_store_configured_db_files(self, acc):
+        addr = acc.get_config("addr")
+        assert acc.is_configured()
+        # don't overwrite existing entries
+        if addr not in self._addr2files:
+            print("storing cache for", addr)
+            basedir = pathlib.Path(acc.get_blobdir()).parent
+            self._addr2files[addr] = create_dict_from_files_in_path(basedir)
+            return True
+
+
+def create_dict_from_files_in_path(base):
+    cachedict = {}
+    for path in base.glob("**/*"):
+        if path.is_file():
+            cachedict[path.relative_to(base)] = path.read_bytes()
+    return cachedict
+
+
+def write_dict_to_dir(dic, target_dir):
+    assert dic
+    for relpath, content in dic.items():
+        path = target_dir.joinpath(relpath)
+        if not path.parent.exists():
+            os.makedirs(path.parent)
+        path.write_bytes(content)
 
 
 @pytest.fixture
@@ -217,11 +261,21 @@ class ACSetup:
     CONFIGURED = "CONFIGURED"
     IDLEREADY = "IDLEREADY"
 
-    def __init__(self, init_time):
+    def __init__(self, testprocess, init_time):
         self._configured_events = Queue()
         self._account2state = {}
         self._imap_cleaned = set()
+        self.testprocess = testprocess
         self.init_time = init_time
+
+    def log(self, *args):
+        print("[acsetup]", "{:.3f}".format(time.time() - self.init_time), *args)
+
+    def add_configured(self, account):
+        """ add an already configured account. """
+        assert account.is_configured()
+        self._account2state[account] = self.CONFIGURED
+        self.log("added already configured account", account, account.get_config("addr"))
 
     def start_configure(self, account, reconfigure=False):
         """ add an account and start its configure process. """
@@ -233,7 +287,7 @@ class ACSetup:
         account.add_account_plugin(PendingTracker(), name="pending_tracker")
         self._account2state[account] = self.CONFIGURING
         account.configure(reconfigure=reconfigure)
-        print("started configure on pending", account)
+        self.log("started configure on", account)
 
     def wait_one_configured(self, account):
         """ wait until this account has successfully configured. """
@@ -242,7 +296,8 @@ class ACSetup:
                 acc = self._pop_config_success()
                 if acc == account:
                     break
-            self.init_direct_imap_and_logging(acc)
+            self.init_imap(acc)
+            self.init_logging(acc)
             acc._evtracker.consume_events()
 
     def bring_online(self):
@@ -272,25 +327,24 @@ class ACSetup:
         return acc
 
     def _onconfigure_start_io(self, acc):
+        self.init_imap(acc)
+        self.init_logging(acc)
         acc.start_io()
         print(acc._logid, "waiting for inbox IDLE to become ready")
         acc._evtracker.wait_idle_inbox_ready()
-        self.init_direct_imap_and_logging(acc)
         acc._evtracker.consume_events()
         acc.log("inbox IDLE ready")
 
-    def init_direct_imap_and_logging(self, acc):
-        """ idempotent function for initializing direct_imap and logging for an account. """
-        self.init_direct_imap(acc)
-        self.init_logging(acc)
-
     def init_logging(self, acc):
+        """ idempotent function for initializing logging (will replace existing logger). """
         logger = FFIEventLogger(acc, logid=acc._logid, init_time=self.init_time)
-        acc.add_account_plugin(logger, name=acc._logid)
+        acc.add_account_plugin(logger, name="logger-" + acc._logid)
 
-    def init_direct_imap(self, acc):
-        """ idempotent function for initializing direct_imap."""
+    def init_imap(self, acc):
+        """ initialize direct_imap and cleanup server state. """
         from deltachat.direct_imap import DirectImap
+
+        assert acc.is_configured()
         if not hasattr(acc, "direct_imap"):
             acc.direct_imap = DirectImap(acc)
         addr = acc.get_config("addr")
@@ -315,15 +369,19 @@ class ACFactory:
         self.tmpdir = tmpdir
         self.pytestconfig = request.config
         self.data = data
+        self.testprocess = testprocess
         self._liveconfig_producer = testprocess.get_liveconfig_producer()
 
         self._finalizers = []
         self._accounts = []
-        self._acsetup = ACSetup(self.init_time)
+        self._acsetup = ACSetup(testprocess, self.init_time)
         self._preconfigured_keys = ["alice", "bob", "charlie",
                                     "dom", "elena", "fiona"]
         self.set_logging_default(False)
         request.addfinalizer(self.finalize)
+
+    def log(self, *args):
+        print("[acfactory]", "{:.3f}".format(time.time() - self.init_time), *args)
 
     def finalize(self):
         while self._finalizers:
@@ -344,7 +402,7 @@ class ACFactory:
         """ Base function to get functional online configurations
         where we can make valid SMTP and IMAP connections with.
         """
-        configdict = next(self._liveconfig_producer)
+        configdict = next(self._liveconfig_producer).copy()
         if "e2ee_enabled" not in configdict:
             configdict["e2ee_enabled"] = "1"
 
@@ -356,9 +414,19 @@ class ACFactory:
         assert "addr" in configdict and "mail_pw" in configdict
         return configdict
 
+    def _get_cached_account(self, addr):
+        if addr in self.testprocess._addr2files:
+            return self._getaccount(addr)
+
     def get_unconfigured_account(self):
+        return self._getaccount()
+
+    def _getaccount(self, try_cache_addr=None):
         logid = "ac{}".format(len(self._accounts) + 1)
-        path = self.tmpdir.join(logid)
+        # we need to use fixed database basename for maybe_cache_* functions to work
+        path = self.tmpdir.mkdir(logid).join("dc.db")
+        if try_cache_addr:
+            self.testprocess.cache_maybe_retrieve_configured_db_files(try_cache_addr, path)
         ac = Account(path.strpath, logging=self._logging)
         ac._logid = logid  # later instantiated FFIEventLogger needs this
         ac._evtracker = ac.add_account_plugin(FFIEventTracker(ac))
@@ -391,7 +459,7 @@ class ACFactory:
     def get_pseudo_configured_account(self):
         # do a pseudo-configured account
         ac = self.get_unconfigured_account()
-        acname = os.path.basename(ac.db_path)
+        acname = ac._logid
         addr = "{}@offline.org".format(acname)
         ac.update_config(dict(
             addr=addr, displayname=acname, mail_pw="123",
@@ -402,7 +470,7 @@ class ACFactory:
         self._acsetup.init_logging(ac)
         return ac
 
-    def new_online_configuring_account(self, cloned_from=None, **kwargs):
+    def new_online_configuring_account(self, cloned_from=None, cache=False, **kwargs):
         if cloned_from is None:
             configdict = self.get_next_liveconfig()
         else:
@@ -412,6 +480,12 @@ class ACFactory:
                 mail_pw=cloned_from.get_config("mail_pw"),
             )
         configdict.update(kwargs)
+        ac = self._get_cached_account(addr=configdict["addr"]) if cache else None
+        if ac is not None:
+            # make sure we consume a preconfig key, as if we had created a fresh account
+            self._preconfigured_keys.pop(0)
+            self._acsetup.add_configured(ac)
+            return ac
         ac = self.prepare_account_from_liveconfig(configdict)
         self._acsetup.start_configure(ac)
         return ac
@@ -436,9 +510,11 @@ class ACFactory:
         print("all accounts online")
 
     def get_online_accounts(self, num):
-        # to reduce number of log events logging starts after accounts can receive
-        accounts = [self.new_online_configuring_account() for i in range(num)]
+        accounts = [self.new_online_configuring_account(cache=True) for i in range(num)]
         self.bring_accounts_online()
+        # we cache fully configured and started accounts
+        for acc in accounts:
+            self.testprocess.cache_maybe_store_configured_db_files(acc)
         return accounts
 
     def run_bot_process(self, module, ffi=True):
@@ -480,10 +556,6 @@ class ACFactory:
             ac.dump_account_info(logfile=logfile)
             imap = getattr(ac, "direct_imap", None)
             if imap is not None:
-                try:
-                    imap.idle_done()
-                except Exception:
-                    pass
                 imap.dump_imap_structures(self.tmpdir, logfile=logfile)
 
     def get_accepted_chat(self, ac1: Account, ac2: Account):
@@ -501,6 +573,7 @@ class ACFactory:
                     acc2.create_chat(acc).send_text("hi back")
                     to_wait.append(acc)
         for acc in to_wait:
+            acc.log("waiting for incoming message")
             acc._evtracker.wait_next_incoming_message()
 
 

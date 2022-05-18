@@ -23,7 +23,6 @@ use crate::download::DownloadState;
 use crate::ephemeral::{start_ephemeral_timers_msgids, Timer as EphemeralTimer};
 use crate::events::EventType;
 use crate::imap::markseen_on_imap_table;
-use crate::job;
 use crate::log::LogExt;
 use crate::mimeparser::{parse_message_id, FailureReport, SystemMessage};
 use crate::param::{Param, Params};
@@ -1366,9 +1365,15 @@ pub async fn markseen_msgs(context: &Context, msg_ids: Vec<MsgId>) -> Result<()>
                 if mdns_enabled {
                     let chat = Chat::load_from_db(context, curr_chat_id).await?;
                     if chat.typ != Chattype::Group {
-                        if let Err(err) = job::send_mdn(context, id, curr_from_id).await {
-                            warn!(context, "could not send out mdn for {}: {}", id, err);
-                        }
+                        context
+                            .sql
+                            .execute(
+                                "INSERT INTO smtp_mdns (msg_id, from_id, rfc724_mid) VALUES(?, ?, ?)",
+                                paramsv![id, curr_from_id, curr_rfc724_mid],
+                            )
+                            .await
+                            .context("failed to insert into smtp_mdns")?;
+                        context.interrupt_smtp(InterruptInfo::new(false)).await;
                     }
                 }
             }
@@ -1978,9 +1983,7 @@ mod tests {
             .unwrap();
 
         let mut has_image = false;
-        let chatitems = chat::get_chat_msgs(&t, device_chat_id, 0, None)
-            .await
-            .unwrap();
+        let chatitems = chat::get_chat_msgs(&t, device_chat_id, 0).await.unwrap();
         for chatitem in chatitems {
             if let ChatItem::Message { msg_id } = chatitem {
                 if let Ok(msg) = Message::load_from_db(&t, msg_id).await {
@@ -2126,7 +2129,7 @@ mod tests {
         assert_eq!(msg1.chat_id, msg2.chat_id);
         let chats = Chatlist::try_load(&bob, 0, None, None).await?;
         assert_eq!(chats.len(), 1);
-        let msgs = chat::get_chat_msgs(&bob, bob_chat_id, 0, None).await?;
+        let msgs = chat::get_chat_msgs(&bob, bob_chat_id, 0).await?;
         assert_eq!(msgs.len(), 2);
         assert_eq!(bob.get_fresh_msgs().await?.len(), 0);
 
@@ -2137,7 +2140,7 @@ mod tests {
         let bob_chat = Chat::load_from_db(&bob, bob_chat_id).await?;
         assert_eq!(bob_chat.blocked, Blocked::Request);
 
-        let msgs = chat::get_chat_msgs(&bob, bob_chat_id, 0, None).await?;
+        let msgs = chat::get_chat_msgs(&bob, bob_chat_id, 0).await?;
         assert_eq!(msgs.len(), 2);
         bob_chat_id.accept(&bob).await.unwrap();
 

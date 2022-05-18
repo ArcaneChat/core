@@ -1174,8 +1174,7 @@ dc_msg_t*       dc_get_draft                 (dc_context_t* context, uint32_t ch
  *     be added before each day (regarding the local timezone). Set this to 0 if you do not want this behaviour.
  *     To get the concrete time of the marker, use dc_array_get_timestamp().
  *     If set to DC_GCM_INFO_ONLY, only system messages will be returned, can be combined with DC_GCM_ADDDAYMARKER.
- * @param marker1before An optional message ID. If set, the ID DC_MSG_ID_MARKER1 will be added just
- *   before the given ID in the returned array. Set this to 0 if you do not want this behaviour.
+ * @param marker1before Deprecated, set this to 0.
  * @return Array of message IDs, must be dc_array_unref()'d when no longer used.
  */
 dc_array_t*     dc_get_chat_msgs             (dc_context_t* context, uint32_t chat_id, uint32_t flags, uint32_t marker1before);
@@ -3447,7 +3446,7 @@ int64_t          dc_chat_get_remaining_mute_duration (const dc_chat_t* chat);
  */
 
 
-#define         DC_MSG_ID_MARKER1            1
+#define         DC_MSG_ID_MARKER1            1 // this is used by iOS to mark things in the message list
 #define         DC_MSG_ID_DAYMARKER          9
 #define         DC_MSG_ID_LAST_SPECIAL       9
 
@@ -3730,9 +3729,15 @@ char*             dc_msg_get_webxdc_blob      (const dc_msg_t* msg, const char* 
  *   To get the file, use dc_msg_get_webxdc_blob().
  *   App icons should should be square,
  *   the implementations will add round corners etc. as needed.
+ * - document: if the Webxdc represents a document, this is the name of the document,
+ *   otherwise, this is an empty string.
  * - summary: short string describing the state of the app,
  *   sth. as "2 votes", "Highscore: 123",
  *   can be changed by the apps and defaults to an empty string.
+ * - source_code_url:
+ *   URL where the source code of the Webxdc and other information can be found;
+ *   defaults to an empty string.
+ *   Implementations may offer an menu or a button to open this URL.
  *
  * @memberof dc_msg_t
  * @param msg The webxdc instance.

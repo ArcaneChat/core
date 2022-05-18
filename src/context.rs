@@ -54,7 +54,7 @@ pub struct InnerContext {
     pub(crate) translated_stockstrings: RwLock<HashMap<usize, String>>,
     pub(crate) events: Events,
 
-    pub(crate) scheduler: RwLock<Scheduler>,
+    pub(crate) scheduler: RwLock<Option<Scheduler>>,
 
     /// Recently loaded quota information, if any.
     /// Set to `None` if quota was never tried to load.
@@ -173,7 +173,7 @@ impl Context {
             wrong_pw_warning_mutex: Mutex::new(()),
             translated_stockstrings: RwLock::new(HashMap::new()),
             events: Events::default(),
-            scheduler: RwLock::new(Scheduler::Stopped),
+            scheduler: RwLock::new(None),
             quota: RwLock::new(None),
             creation_time: std::time::SystemTime::now(),
             last_full_folder_scan: Mutex::new(None),
@@ -195,8 +195,12 @@ impl Context {
         }
 
         info!(self, "starting IO");
-        if let Err(err) = self.inner.scheduler.write().await.start(self.clone()).await {
-            error!(self, "Failed to start IO: {}", err)
+        let mut lock = self.inner.scheduler.write().await;
+        if lock.is_none() {
+            match Scheduler::start(self.clone()).await {
+                Err(err) => error!(self, "Failed to start IO: {}", err),
+                Ok(scheduler) => *lock = Some(scheduler),
+            }
         }
     }
 
@@ -209,8 +213,8 @@ impl Context {
         // which will emit the below event(s)
         info!(self, "stopping IO");
 
-        if let Err(err) = self.inner.stop_io().await {
-            warn!(self, "failed to stop IO: {}", err);
+        if let Some(scheduler) = self.inner.scheduler.write().await.take() {
+            scheduler.stop(self).await;
         }
     }
 
@@ -274,12 +278,10 @@ impl Context {
     // Ongoing process allocation/free/check
 
     pub(crate) async fn alloc_ongoing(&self) -> Result<Receiver<()>> {
-        if self.has_ongoing().await {
+        let mut s = self.running_state.write().await;
+        if s.ongoing_running || !s.shall_stop_ongoing {
             bail!("There is already another ongoing process running.");
         }
-
-        let s_a = &self.running_state;
-        let mut s = s_a.write().await;
 
         s.ongoing_running = true;
         s.shall_stop_ongoing = false;
@@ -290,25 +292,16 @@ impl Context {
     }
 
     pub(crate) async fn free_ongoing(&self) {
-        let s_a = &self.running_state;
-        let mut s = s_a.write().await;
+        let mut s = self.running_state.write().await;
 
         s.ongoing_running = false;
         s.shall_stop_ongoing = true;
         s.cancel_sender.take();
     }
 
-    pub(crate) async fn has_ongoing(&self) -> bool {
-        let s_a = &self.running_state;
-        let s = s_a.read().await;
-
-        s.ongoing_running || !s.shall_stop_ongoing
-    }
-
     /// Signal an ongoing process to stop.
     pub async fn stop_ongoing(&self) {
-        let s_a = &self.running_state;
-        let mut s = s_a.write().await;
+        let mut s = self.running_state.write().await;
         if let Some(cancel) = s.cancel_sender.take() {
             if let Err(err) = cancel.send(()).await {
                 warn!(self, "could not cancel ongoing: {:?}", err);
@@ -320,7 +313,7 @@ impl Context {
             s.shall_stop_ongoing = true;
         } else {
             info!(self, "No ongoing process to stop.",);
-        };
+        }
     }
 
     pub(crate) async fn shall_stop_ongoing(&self) -> bool {
@@ -642,13 +635,6 @@ impl Context {
     }
 }
 
-impl InnerContext {
-    async fn stop_io(&self) -> Result<()> {
-        self.scheduler.write().await.stop().await?;
-        Ok(())
-    }
-}
-
 impl Default for RunningState {
     fn default() -> Self {
         RunningState {
@@ -729,23 +715,20 @@ mod tests {
         assert_eq!(t.get_fresh_msgs().await.unwrap().len(), 0);
 
         receive_msg(&t, &bob).await;
-        assert_eq!(get_chat_msgs(&t, bob.id, 0, None).await.unwrap().len(), 1);
+        assert_eq!(get_chat_msgs(&t, bob.id, 0).await.unwrap().len(), 1);
         assert_eq!(bob.id.get_fresh_msg_cnt(&t).await.unwrap(), 1);
         assert_eq!(t.get_fresh_msgs().await.unwrap().len(), 1);
 
         receive_msg(&t, &claire).await;
         receive_msg(&t, &claire).await;
-        assert_eq!(
-            get_chat_msgs(&t, claire.id, 0, None).await.unwrap().len(),
-            2
-        );
+        assert_eq!(get_chat_msgs(&t, claire.id, 0).await.unwrap().len(), 2);
         assert_eq!(claire.id.get_fresh_msg_cnt(&t).await.unwrap(), 2);
         assert_eq!(t.get_fresh_msgs().await.unwrap().len(), 3);
 
         receive_msg(&t, &dave).await;
         receive_msg(&t, &dave).await;
         receive_msg(&t, &dave).await;
-        assert_eq!(get_chat_msgs(&t, dave.id, 0, None).await.unwrap().len(), 3);
+        assert_eq!(get_chat_msgs(&t, dave.id, 0).await.unwrap().len(), 3);
         assert_eq!(dave.id.get_fresh_msg_cnt(&t).await.unwrap(), 3);
         assert_eq!(t.get_fresh_msgs().await.unwrap().len(), 6);
 
@@ -760,10 +743,7 @@ mod tests {
         receive_msg(&t, &bob).await;
         receive_msg(&t, &claire).await;
         receive_msg(&t, &dave).await;
-        assert_eq!(
-            get_chat_msgs(&t, claire.id, 0, None).await.unwrap().len(),
-            3
-        );
+        assert_eq!(get_chat_msgs(&t, claire.id, 0).await.unwrap().len(), 3);
         assert_eq!(claire.id.get_fresh_msg_cnt(&t).await.unwrap(), 3);
         assert_eq!(t.get_fresh_msgs().await.unwrap().len(), 6); // muted claire is not counted
 
@@ -780,7 +760,7 @@ mod tests {
         let t = TestContext::new_alice().await;
         let bob = t.create_chat_with_contact("", "bob@g.it").await;
         receive_msg(&t, &bob).await;
-        assert_eq!(get_chat_msgs(&t, bob.id, 0, None).await.unwrap().len(), 1);
+        assert_eq!(get_chat_msgs(&t, bob.id, 0).await.unwrap().len(), 1);
 
         // chat is unmuted by default, here and in the following assert(),
         // we check mainly that the SQL-statements in is_muted() and get_fresh_msgs()

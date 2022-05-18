@@ -51,6 +51,7 @@ const WEBXDC_RECEIVING_LIMIT: u64 = 4194304;
 struct WebxdcManifest {
     name: Option<String>,
     min_api: Option<u32>,
+    source_code_url: Option<String>,
 }
 
 /// Parsed information from WebxdcManifest and fallbacks.
@@ -58,7 +59,9 @@ struct WebxdcManifest {
 pub struct WebxdcInfo {
     pub name: String,
     pub icon: String,
+    pub document: String,
     pub summary: String,
+    pub source_code_url: String,
 }
 
 /// Status Update ID.
@@ -113,6 +116,9 @@ pub(crate) struct StatusUpdateItem {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     info: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    document: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     summary: Option<String>,
@@ -189,8 +195,8 @@ impl Context {
         Ok(())
     }
 
-    /// Takes an update-json as `{payload: PAYLOAD}` (or legacy `PAYLOAD`)
-    /// writes it to the database and handles events, info-messages and summary.
+    /// Takes an update-json as `{payload: PAYLOAD}`
+    /// writes it to the database and handles events, info-messages, document name and summary.
     async fn create_status_update_record(
         &self,
         instance: &mut Message,
@@ -210,6 +216,7 @@ impl Context {
                     | MessageState::OutDraft => StatusUpdateItem {
                         payload: item.payload,
                         info: None, // no info-messages in draft mode
+                        document: item.document,
                         summary: item.summary,
                     },
                     _ => item,
@@ -232,15 +239,31 @@ impl Context {
             .await?;
         }
 
+        let mut param_changed = false;
+
+        if let Some(ref document) = status_update_item.document {
+            if instance
+                .param
+                .update_timestamp(Param::WebxdcDocumentTimestamp, timestamp)?
+            {
+                instance.param.set(Param::WebxdcDocument, document);
+                param_changed = true;
+            }
+        }
+
         if let Some(ref summary) = status_update_item.summary {
             if instance
                 .param
                 .update_timestamp(Param::WebxdcSummaryTimestamp, timestamp)?
             {
                 instance.param.set(Param::WebxdcSummary, summary);
-                instance.update_param(self).await;
-                self.emit_msgs_changed(instance.chat_id, instance.id);
+                param_changed = true;
             }
+        }
+
+        if param_changed {
+            instance.update_param(self).await;
+            self.emit_msgs_changed(instance.chat_id, instance.id);
         }
 
         let rowid = self
@@ -538,12 +561,14 @@ impl Message {
                 WebxdcManifest {
                     name: None,
                     min_api: None,
+                    source_code_url: None,
                 }
             }
         } else {
             WebxdcManifest {
                 name: None,
                 min_api: None,
+                source_code_url: None,
             }
         };
 
@@ -568,11 +593,21 @@ impl Message {
             } else {
                 WEBXDC_DEFAULT_ICON.to_string()
             },
+            document: self
+                .param
+                .get(Param::WebxdcDocument)
+                .unwrap_or_default()
+                .to_string(),
             summary: self
                 .param
                 .get(Param::WebxdcSummary)
                 .unwrap_or_default()
                 .to_string(),
+            source_code_url: if let Some(url) = manifest.source_code_url {
+                url
+            } else {
+                "".to_string()
+            },
         })
     }
 }
@@ -1344,6 +1379,21 @@ sth_for_the = "future""#
     }
 
     #[async_std::test]
+    async fn test_parse_webxdc_manifest_source_code_url() -> Result<()> {
+        let result = parse_webxdc_manifest(r#"source_code_url = 3"#.as_bytes()).await;
+        assert!(result.is_err());
+
+        let manifest =
+            parse_webxdc_manifest(r#"source_code_url = "https://foo.bar""#.as_bytes()).await?;
+        assert_eq!(
+            manifest.source_code_url,
+            Some("https://foo.bar".to_string())
+        );
+
+        Ok(())
+    }
+
+    #[async_std::test]
     async fn test_webxdc_min_api_too_large() -> Result<()> {
         let t = TestContext::new_alice().await;
         let chat_id = create_group_chat(&t, ProtectionStatus::Unprotected, "chat").await?;
@@ -1508,6 +1558,48 @@ sth_for_the = "future""#
             .get_webxdc_info(&alice2)
             .await?;
         assert_eq!(info.summary, "sum: 2".to_string());
+
+        Ok(())
+    }
+
+    #[async_std::test]
+    async fn test_webxdc_document_name() -> Result<()> {
+        let alice = TestContext::new_alice().await;
+        let bob = TestContext::new_bob().await;
+
+        // Alice creates an webxdc instance and updates document name
+        let alice_chat = alice.create_chat(&bob).await;
+        let alice_instance = send_webxdc_instance(&alice, alice_chat.id).await?;
+        let sent_instance = &alice.pop_sent_msg().await;
+        let info = alice_instance.get_webxdc_info(&alice).await?;
+        assert_eq!(info.document, "".to_string());
+        assert_eq!(info.summary, "".to_string());
+
+        alice
+            .send_webxdc_status_update(
+                alice_instance.id,
+                r#"{"document":"my file", "payload":1337}"#,
+                "descr",
+            )
+            .await?;
+        let sent_update1 = &alice.pop_sent_msg().await;
+        let info = Message::load_from_db(&alice, alice_instance.id)
+            .await?
+            .get_webxdc_info(&alice)
+            .await?;
+        assert_eq!(info.document, "my file".to_string());
+        assert_eq!(info.summary, "".to_string());
+
+        // Bob receives the updates
+        bob.recv_msg(sent_instance).await;
+        let bob_instance = bob.get_last_msg().await;
+        bob.recv_msg(sent_update1).await;
+        let info = Message::load_from_db(&bob, bob_instance.id)
+            .await?
+            .get_webxdc_info(&bob)
+            .await?;
+        assert_eq!(info.document, "my file".to_string());
+        assert_eq!(info.summary, "".to_string());
 
         Ok(())
     }

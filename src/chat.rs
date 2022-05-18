@@ -47,10 +47,6 @@ pub enum ChatItem {
         msg_id: MsgId,
     },
 
-    /// A marker without inherent meaning. It is inserted before user
-    /// supplied MsgId.
-    Marker1,
-
     /// Day marker, separating messages that correspond to different
     /// days according to local time.
     DayMarker {
@@ -846,7 +842,9 @@ impl ChatId {
     ///
     /// To get more verbose summary for a contact, including its key fingerprint, use [`Contact::get_encrinfo`].
     pub async fn get_encryption_info(self, context: &Context) -> Result<String> {
-        let mut ret = String::new();
+        let mut ret_mutual = String::new();
+        let mut ret_nopreference = String::new();
+        let mut ret_reset = String::new();
 
         for contact_id in get_chat_contacts(context, self)
             .await?
@@ -857,7 +855,7 @@ impl ChatId {
             let addr = contact.get_addr();
             let peerstate = Peerstate::from_addr(context, addr).await?;
 
-            let stock_message = match peerstate
+            match peerstate
                 .filter(|peerstate| {
                     peerstate
                         .peek_key(PeerstateVerifiedStatus::Unverified)
@@ -865,15 +863,36 @@ impl ChatId {
                 })
                 .map(|peerstate| peerstate.prefer_encrypt)
             {
-                Some(EncryptPreference::Mutual) => stock_str::e2e_preferred(context).await,
-                Some(EncryptPreference::NoPreference) => stock_str::e2e_available(context).await,
-                Some(EncryptPreference::Reset) => stock_str::encr_none(context).await,
-                None => stock_str::encr_none(context).await,
+                Some(EncryptPreference::Mutual) => ret_mutual += &format!("{}\n", addr),
+                Some(EncryptPreference::NoPreference) => ret_nopreference += &format!("{}\n", addr),
+                Some(EncryptPreference::Reset) | None => ret_reset += &format!("{}\n", addr),
             };
+        }
+
+        let mut ret = String::new();
+        if !ret_reset.is_empty() {
+            ret += &stock_str::encr_none(context).await;
+            ret.push(':');
+            ret.push('\n');
+            ret += &ret_reset;
+        }
+        if !ret_nopreference.is_empty() {
             if !ret.is_empty() {
-                ret.push('\n')
+                ret.push('\n');
             }
-            ret += &format!("{} {}", addr, stock_message);
+            ret += &stock_str::e2e_available(context).await;
+            ret.push(':');
+            ret.push('\n');
+            ret += &ret_nopreference;
+        }
+        if !ret_mutual.is_empty() {
+            if !ret.is_empty() {
+                ret.push('\n');
+            }
+            ret += &stock_str::e2e_preferred(context).await;
+            ret.push(':');
+            ret.push('\n');
+            ret += &ret_mutual;
         }
 
         Ok(ret)
@@ -2176,7 +2195,6 @@ pub async fn get_chat_msgs(
     context: &Context,
     chat_id: ChatId,
     flags: u32,
-    marker1before: Option<MsgId>,
 ) -> Result<Vec<ChatItem>> {
     let process_row = if (flags & DC_GCM_INFO_ONLY) != 0 {
         |row: &rusqlite::Row| {
@@ -2226,12 +2244,8 @@ pub async fn get_chat_msgs(
         let mut ret = Vec::new();
         let mut last_day = 0;
         let cnv_to_local = dc_gm2local_offset();
-        let marker1 = marker1before.unwrap_or_else(MsgId::new_unset);
 
         for (ts, curr_id) in sorted_rows {
-            if curr_id == marker1 {
-                ret.push(ChatItem::Marker1);
-            }
             if (flags & DC_GCM_ADDDAYMARKER) != 0 {
                 let curr_local_timestamp = ts + cnv_to_local;
                 let curr_day = curr_local_timestamp / 86400;
@@ -4547,7 +4561,7 @@ mod tests {
         assert!(chat.is_protected());
         assert!(chat.is_unpromoted());
 
-        let msgs = get_chat_msgs(&t, chat_id, 0, None).await.unwrap();
+        let msgs = get_chat_msgs(&t, chat_id, 0).await.unwrap();
         assert_eq!(msgs.len(), 1);
 
         let msg = t.get_last_msg_in(chat_id).await;
@@ -4577,7 +4591,7 @@ mod tests {
         assert!(!chat.is_protected());
         assert!(!chat.is_unpromoted());
 
-        let msgs = get_chat_msgs(&t, chat_id, 0, None).await.unwrap();
+        let msgs = get_chat_msgs(&t, chat_id, 0).await.unwrap();
         assert_eq!(msgs.len(), 3);
 
         // enable protection on promoted chat, the info-message is sent via send_msg() this time
@@ -4674,10 +4688,7 @@ mod tests {
         add_contact_to_chat(&alice, alice_chat_id, contact_id).await?;
         assert_eq!(get_chat_contacts(&alice, alice_chat_id).await?.len(), 2);
         send_text_msg(&alice, alice_chat_id, "hi!".to_string()).await?;
-        assert_eq!(
-            get_chat_msgs(&alice, alice_chat_id, 0, None).await?.len(),
-            1
-        );
+        assert_eq!(get_chat_msgs(&alice, alice_chat_id, 0).await?.len(), 1);
 
         // Alice has an SMTP-server replacing the `Message-ID:`-header (as done eg. by outlook.com).
         let sent_msg = alice.pop_sent_msg().await;
@@ -4710,10 +4721,7 @@ mod tests {
         let msg = alice.get_last_msg().await;
         assert_eq!(msg.chat_id, alice_chat_id);
         assert_eq!(msg.text, Some("ho!".to_string()));
-        assert_eq!(
-            get_chat_msgs(&alice, alice_chat_id, 0, None).await?.len(),
-            2
-        );
+        assert_eq!(get_chat_msgs(&alice, alice_chat_id, 0).await?.len(), 2);
         Ok(())
     }
 
@@ -4741,7 +4749,7 @@ mod tests {
         assert_eq!(chat.id.get_fresh_msg_cnt(&t).await?, 1);
         assert_eq!(t.get_fresh_msgs().await?.len(), 1);
 
-        let msgs = get_chat_msgs(&t, chat.id, 0, None).await?;
+        let msgs = get_chat_msgs(&t, chat.id, 0).await?;
         assert_eq!(msgs.len(), 1);
         let msg_id = match msgs.first().unwrap() {
             ChatItem::Message { msg_id } => *msg_id,
@@ -4791,7 +4799,7 @@ mod tests {
             .is_contact_request());
         assert_eq!(chat_id.get_msg_cnt(&t).await?, 1);
         assert_eq!(chat_id.get_fresh_msg_cnt(&t).await?, 1);
-        let msgs = get_chat_msgs(&t, chat_id, 0, None).await?;
+        let msgs = get_chat_msgs(&t, chat_id, 0).await?;
         assert_eq!(msgs.len(), 1);
         let msg_id = match msgs.first().unwrap() {
             ChatItem::Message { msg_id } => *msg_id,
@@ -4879,7 +4887,7 @@ mod tests {
         let chat_id = msg.chat_id;
         assert_eq!(chat_id.get_fresh_msg_cnt(&alice).await?, 1);
 
-        let msgs = get_chat_msgs(&alice, chat_id, 0, None).await?;
+        let msgs = get_chat_msgs(&alice, chat_id, 0).await?;
         assert_eq!(msgs.len(), 1);
 
         // Alice disables receiving classic emails.
@@ -4891,9 +4899,25 @@ mod tests {
         // Already received classic email should still be in the chat.
         assert_eq!(chat_id.get_fresh_msg_cnt(&alice).await?, 1);
 
-        let msgs = get_chat_msgs(&alice, chat_id, 0, None).await?;
+        let msgs = get_chat_msgs(&alice, chat_id, 0).await?;
         assert_eq!(msgs.len(), 1);
 
+        Ok(())
+    }
+
+    #[async_std::test]
+    async fn test_chat_get_color() -> Result<()> {
+        let t = TestContext::new().await;
+        let chat_id = create_group_chat(&t, ProtectionStatus::Unprotected, "a chat").await?;
+        let color1 = Chat::load_from_db(&t, chat_id).await?.get_color(&t).await?;
+        assert_eq!(color1, 0x008772);
+
+        // upper-/lowercase makes a difference for the colors, these are different groups
+        // (in contrast to email addresses, where upper-/lowercase is ignored in practise)
+        let t = TestContext::new().await;
+        let chat_id = create_group_chat(&t, ProtectionStatus::Unprotected, "A CHAT").await?;
+        let color2 = Chat::load_from_db(&t, chat_id).await?.get_color(&t).await?;
+        assert_ne!(color2, color1);
         Ok(())
     }
 
@@ -5180,13 +5204,13 @@ mod tests {
         let msg = bob.get_last_msg().await;
         assert_eq!(msg.get_text().unwrap(), "alice->bob");
         assert_eq!(get_chat_contacts(&bob, msg.chat_id).await?.len(), 2);
-        assert_eq!(get_chat_msgs(&bob, msg.chat_id, 0, None).await?.len(), 1);
+        assert_eq!(get_chat_msgs(&bob, msg.chat_id, 0).await?.len(), 1);
         bob.recv_msg(&sent2).await;
         assert_eq!(get_chat_contacts(&bob, msg.chat_id).await?.len(), 3);
-        assert_eq!(get_chat_msgs(&bob, msg.chat_id, 0, None).await?.len(), 2);
+        assert_eq!(get_chat_msgs(&bob, msg.chat_id, 0).await?.len(), 2);
         bob.recv_msg(&sent3).await;
         assert_eq!(get_chat_contacts(&bob, msg.chat_id).await?.len(), 3);
-        assert_eq!(get_chat_msgs(&bob, msg.chat_id, 0, None).await?.len(), 2);
+        assert_eq!(get_chat_msgs(&bob, msg.chat_id, 0).await?.len(), 2);
 
         // Claire does not receive the first message, however, due to resending, she has a similar view as Alice and Bob
         let claire = TestContext::new().await;
@@ -5196,7 +5220,7 @@ mod tests {
         let msg = claire.get_last_msg().await;
         assert_eq!(msg.get_text().unwrap(), "alice->bob");
         assert_eq!(get_chat_contacts(&claire, msg.chat_id).await?.len(), 3);
-        assert_eq!(get_chat_msgs(&claire, msg.chat_id, 0, None).await?.len(), 2);
+        assert_eq!(get_chat_msgs(&claire, msg.chat_id, 0).await?.len(), 2);
         let msg_from = Contact::get_by_id(&claire, msg.get_from_id()).await?;
         assert_eq!(msg_from.get_addr(), "alice@example.org");
 
@@ -5386,6 +5410,61 @@ mod tests {
         assert_eq!(chat_id, chat_id_orig);
         let chat = Chat::load_from_db(&t, chat_id).await?;
         assert_eq!(chat.blocked, Blocked::Not);
+
+        Ok(())
+    }
+
+    #[async_std::test]
+    async fn test_chat_get_encryption_info() -> Result<()> {
+        let alice = TestContext::new_alice().await;
+        let bob = TestContext::new_bob().await;
+
+        let contact_bob = Contact::create(&alice, "Bob", "bob@example.net").await?;
+        let contact_fiona = Contact::create(&alice, "", "fiona@example.net").await?;
+
+        let chat_id = create_group_chat(&alice, ProtectionStatus::Unprotected, "Group").await?;
+        assert_eq!(chat_id.get_encryption_info(&alice).await?, "");
+
+        add_contact_to_chat(&alice, chat_id, contact_bob).await?;
+        assert_eq!(
+            chat_id.get_encryption_info(&alice).await?,
+            "No encryption:\n\
+            bob@example.net\n"
+        );
+
+        add_contact_to_chat(&alice, chat_id, contact_fiona).await?;
+        assert_eq!(
+            chat_id.get_encryption_info(&alice).await?,
+            "No encryption:\n\
+            bob@example.net\n\
+            fiona@example.net\n"
+        );
+
+        let direct_chat = bob.create_chat(&alice).await;
+        send_text_msg(&bob, direct_chat.id, "Hello!".to_string()).await?;
+        alice.recv_msg(&bob.pop_sent_msg().await).await;
+
+        assert_eq!(
+            chat_id.get_encryption_info(&alice).await?,
+            "No encryption:\n\
+            fiona@example.net\n\
+            \n\
+            End-to-end encryption preferred:\n\
+            bob@example.net\n"
+        );
+
+        bob.set_config(Config::E2eeEnabled, Some("0")).await?;
+        send_text_msg(&bob, direct_chat.id, "Hello!".to_string()).await?;
+        alice.recv_msg(&bob.pop_sent_msg().await).await;
+
+        assert_eq!(
+            chat_id.get_encryption_info(&alice).await?,
+            "No encryption:\n\
+            fiona@example.net\n\
+            \n\
+            End-to-end encryption available:\n\
+            bob@example.net\n"
+        );
 
         Ok(())
     }

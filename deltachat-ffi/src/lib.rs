@@ -1027,22 +1027,17 @@ pub unsafe extern "C" fn dc_get_chat_msgs(
     context: *mut dc_context_t,
     chat_id: u32,
     flags: u32,
-    marker1before: u32,
+    _marker1before: u32,
 ) -> *mut dc_array::dc_array_t {
     if context.is_null() {
         eprintln!("ignoring careless call to dc_get_chat_msgs()");
         return ptr::null_mut();
     }
     let ctx = &*context;
-    let marker_flag = if marker1before <= DC_MSG_ID_LAST_SPECIAL {
-        None
-    } else {
-        Some(MsgId::new(marker1before))
-    };
 
     block_on(async move {
         Box::into_raw(Box::new(
-            chat::get_chat_msgs(ctx, ChatId::new(chat_id), flags, marker_flag)
+            chat::get_chat_msgs(ctx, ChatId::new(chat_id), flags)
                 .await
                 .unwrap_or_log_default(ctx, "failed to get chat msgs")
                 .into(),
@@ -1919,7 +1914,7 @@ pub unsafe extern "C" fn dc_get_contacts(
     let query = to_opt_string_lossy(query);
 
     block_on(async move {
-        match Contact::get_all(ctx, flags, query).await {
+        match Contact::get_all(ctx, flags, query.as_deref()).await {
             Ok(contacts) => Box::into_raw(Box::new(dc_array_t::from(
                 contacts.iter().map(|id| id.to_u32()).collect::<Vec<u32>>(),
             ))),

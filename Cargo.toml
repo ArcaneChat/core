@@ -1,6 +1,6 @@
 [package]
 name = "deltachat"
-version = "1.79.0"
+version = "1.81.0"
 authors = ["Delta Chat Developers (ML) <delta@codespeak.net>"]
 edition = "2021"
 license = "MPL-2.0"
@@ -8,9 +8,11 @@ rust-version = "1.56"
 
 [profile.dev]
 debug = 0
+panic = 'abort'
 
 [profile.release]
 lto = true
+panic = 'abort'
 
 [dependencies]
 deltachat_derive = { path = "./deltachat_derive" }
