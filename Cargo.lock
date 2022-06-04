@@ -212,7 +212,7 @@ name = "async-imap"
 version = "0.5.0"
 source = "git+https://github.com/async-email/async-imap#d07ea4019f2ca724244f7a4503a8ac4946a722b3"
 dependencies = [
- "async-native-tls",
+ "async-native-tls 0.3.3",
  "async-std",
  "base64 0.13.0",
  "byte-pool",
@@ -278,6 +278,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-native-tls"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d57d4cec3c647232e1094dc013546c0b33ce785d8aeb251e1f20dfaf8a9a13fe"
+dependencies = [
+ "futures-util",
+ "native-tls",
+ "thiserror",
+ "url",
+]
+
+[[package]]
 name = "async-process"
 version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -299,7 +311,7 @@ name = "async-smtp"
 version = "0.4.0"
 source = "git+https://github.com/async-email/async-smtp?branch=master#d6b947cf2a104183fb1634dd885fc0abc2cc1f59"
 dependencies = [
- "async-native-tls",
+ "async-native-tls 0.3.3",
  "async-std",
  "async-trait",
  "base64 0.13.0",
@@ -1072,7 +1084,7 @@ dependencies = [
  "ansi_term",
  "anyhow",
  "async-imap",
- "async-native-tls",
+ "async-native-tls 0.4.0",
  "async-smtp",
  "async-std",
  "async-std-resolver",
@@ -1844,7 +1856,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e023af341b797ce2c039f7c6e1d347b68d0f7fd0bc7ac234fe69cfadcca1f89a"
 dependencies = [
  "async-h1",
- "async-native-tls",
+ "async-native-tls 0.3.3",
  "async-std",
  "async-trait",
  "cfg-if 1.0.0",
@@ -3641,7 +3653,7 @@ version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "718b1ae6b50351982dedff021db0def601677f2120938b070eadb10ba4038dd7"
 dependencies = [
- "async-native-tls",
+ "async-native-tls 0.3.3",
  "async-std",
  "async-trait",
  "cfg-if 1.0.0",
