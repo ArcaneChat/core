@@ -1306,8 +1306,8 @@ dependencies = [
 
 [[package]]
 name = "encoded-words"
-version = "0.1.0"
-source = "git+https://github.com/async-email/encoded-words?branch=master#e878b6929ef6aee2909c4c096a0e143a38b8ff8d"
+version = "0.2.0"
+source = "git+https://github.com/async-email/encoded-words?branch=master#d55366b36f96e383f39c432aedce42ee8b43f796"
 dependencies = [
  "base64 0.12.3",
  "charset",
