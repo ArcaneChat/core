@@ -11,25 +11,20 @@ use std::{
 };
 
 use anyhow::{bail, format_err, Context as _, Result};
+use async_channel::Receiver;
 use async_imap::types::{
     Fetch, Flag, Mailbox, Name, NameAttribute, Quota, QuotaRoot, UnsolicitedResponse,
 };
-use async_std::channel::Receiver;
-use async_std::prelude::*;
+use futures::StreamExt;
 use num_traits::FromPrimitive;
 
 use crate::chat::{self, ChatId, ChatIdBlocked};
 use crate::config::Config;
 use crate::constants::{
     Blocked, Chattype, ShowEmails, DC_FETCH_EXISTING_MSGS_COUNT, DC_FOLDERS_CONFIGURED_VERSION,
-    DC_LP_AUTH_OAUTH2,
 };
-use crate::contact::ContactId;
+use crate::contact::{normalize_name, Contact, ContactId, Modifier, Origin};
 use crate::context::Context;
-use crate::dc_receive_imf::{
-    dc_receive_imf_inner, from_field_to_contact_id, get_prefetch_parent_message, ReceivedMsg,
-};
-use crate::dc_tools::dc_create_id;
 use crate::events::EventType;
 use crate::headerdef::{HeaderDef, HeaderDefMap};
 use crate::job;
@@ -38,12 +33,16 @@ use crate::login_param::{
 };
 use crate::message::{self, Message, MessageState, MessengerMessage, MsgId, Viewtype};
 use crate::mimeparser;
-use crate::oauth2::dc_get_oauth2_access_token;
+use crate::oauth2::get_oauth2_access_token;
 use crate::provider::Socket;
+use crate::receive_imf::{
+    from_field_to_contact_id, get_prefetch_parent_message, receive_imf_inner, ReceivedMsg,
+};
 use crate::scheduler::connectivity::ConnectivityStore;
 use crate::scheduler::InterruptInfo;
 use crate::sql;
 use crate::stock_str;
+use crate::tools::create_id;
 
 mod client;
 mod idle;
@@ -125,6 +124,14 @@ enum FolderMeaning {
     Sent,
     Drafts,
     Other,
+
+    /// Virtual folders.
+    ///
+    /// On Gmail there are virtual folders marked as \\All, \\Important and \\Flagged.
+    /// Delta Chat ignores these folders because the same messages can be fetched
+    /// from the real folder and the result of moving and deleting messages via
+    /// virtual folder is unclear.
+    Virtual,
 }
 
 impl FolderMeaning {
@@ -135,6 +142,7 @@ impl FolderMeaning {
             FolderMeaning::Sent => Some(Config::ConfiguredSentboxFolder),
             FolderMeaning::Drafts => None,
             FolderMeaning::Other => None,
+            FolderMeaning::Virtual => None,
         }
     }
 }
@@ -145,7 +153,6 @@ struct ImapConfig {
     pub lp: ServerLoginParam,
     pub socks5_config: Option<Socks5Config>,
     pub strict_tls: bool,
-    pub oauth2: bool,
     pub selected_folder: Option<String>,
     pub selected_mailbox: Option<Mailbox>,
     pub selected_folder_needs_expunge: bool,
@@ -234,7 +241,6 @@ impl Imap {
         lp: &ServerLoginParam,
         socks5_config: Option<Socks5Config>,
         addr: &str,
-        oauth2: bool,
         provider_strict_tls: bool,
         idle_interrupt: Receiver<InterruptInfo>,
     ) -> Result<Self> {
@@ -253,7 +259,6 @@ impl Imap {
             lp: lp.clone(),
             socks5_config,
             strict_tls,
-            oauth2,
             selected_folder: None,
             selected_mailbox: None,
             selected_folder_needs_expunge: false,
@@ -292,7 +297,6 @@ impl Imap {
             &param.imap,
             param.socks5_config.clone(),
             &param.addr,
-            param.server_flags & DC_LP_AUTH_OAUTH2 != 0,
             param
                 .provider
                 .map_or(param.socks5_config.is_some(), |provider| {
@@ -325,7 +329,7 @@ impl Imap {
 
         self.connectivity.set_connecting(context).await;
 
-        let oauth2 = self.config.oauth2;
+        let oauth2 = self.config.lp.oauth2;
 
         let connection_res: Result<Client> = if self.config.lp.security == Socket::Starttls
             || self.config.lp.security == Socket::Plain
@@ -386,7 +390,7 @@ impl Imap {
         let login_res = if oauth2 {
             let addr: &str = config.addr.as_ref();
 
-            let token = dc_get_oauth2_access_token(context, addr, imap_pw, true)
+            let token = get_oauth2_access_token(context, addr, imap_pw, true)
                 .await?
                 .context("IMAP could not get OAUTH token")?;
             let auth = OAuth2 {
@@ -447,7 +451,9 @@ impl Imap {
     }
 
     /// Determine server capabilities if not done yet.
-    async fn determine_capabilities(&mut self) -> Result<()> {
+    ///
+    /// If server supports ID capability, send our client ID.
+    pub(crate) async fn determine_capabilities(&mut self, context: &Context) -> Result<()> {
         if self.capabilities_determined {
             return Ok(());
         }
@@ -459,6 +465,12 @@ impl Imap {
             .capabilities()
             .await
             .context("CAPABILITY command error")?;
+        if caps.has_str("ID") {
+            let server_id = session.id([("name", Some("Delta Chat"))]).await?;
+            info!(context, "Server ID: {:?}", server_id);
+            let mut lock = context.server_id.write().await;
+            *lock = server_id;
+        }
         self.config.can_idle = caps.has_str("IDLE");
         self.config.can_move = caps.has_str("MOVE");
         self.config.can_check_quota = caps.has_str("QUOTA");
@@ -477,8 +489,8 @@ impl Imap {
             return Err(err);
         }
 
+        self.determine_capabilities(context).await?;
         self.ensure_configured_folders(context, true).await?;
-        self.determine_capabilities().await?;
         Ok(())
     }
 
@@ -783,7 +795,7 @@ impl Imap {
             };
 
             // Get the Message-ID or generate a fake one to identify the message in the database.
-            let message_id = prefetch_get_message_id(&headers).unwrap_or_else(dc_create_id);
+            let message_id = prefetch_get_message_id(&headers).unwrap_or_else(create_id);
 
             let target = match target_folder(context, folder, is_spam_folder, &headers).await? {
                 Some(config) => match context.get_config(config).await? {
@@ -871,8 +883,8 @@ impl Imap {
         received_msgs.extend(received_msgs_2);
 
         // determine which uid_next to use to update to
-        // dc_receive_imf() returns an `Err` value only on recoverable errors, otherwise it just logs an error.
-        // `largest_uid_processed` is the largest uid where dc_receive_imf() did NOT return an error.
+        // receive_imf() returns an `Err` value only on recoverable errors, otherwise it just logs an error.
+        // `largest_uid_processed` is the largest uid where receive_imf() did NOT return an error.
 
         // So: Update the uid_next to the largest uid that did NOT recoverably fail. Not perfect because if there was
         // another message afterwards that succeeded, we will not retry. The upside is that we will not retry an infinite amount of times.
@@ -896,6 +908,42 @@ impl Imap {
         Ok(read_cnt > 0)
     }
 
+    /// Read the recipients from old emails sent by the user and add them as contacts.
+    /// This way, we can already offer them some email addresses they can write to.
+    ///
+    /// Then, Fetch the last messages DC_FETCH_EXISTING_MSGS_COUNT emails from the server
+    /// and show them in the chat list.
+    pub(crate) async fn fetch_existing_msgs(&mut self, context: &Context) -> Result<()> {
+        if context.get_config_bool(Config::Bot).await? {
+            return Ok(()); // Bots don't want those messages
+        }
+        self.prepare(context).await.context("could not connect")?;
+
+        add_all_recipients_as_contacts(context, self, Config::ConfiguredSentboxFolder).await;
+        add_all_recipients_as_contacts(context, self, Config::ConfiguredMvboxFolder).await;
+        add_all_recipients_as_contacts(context, self, Config::ConfiguredInboxFolder).await;
+
+        if context.get_config_bool(Config::FetchExistingMsgs).await? {
+            for config in &[
+                Config::ConfiguredMvboxFolder,
+                Config::ConfiguredInboxFolder,
+                Config::ConfiguredSentboxFolder,
+            ] {
+                if let Some(folder) = context.get_config(*config).await? {
+                    self.fetch_new_messages(context, &folder, false, true)
+                        .await
+                        .context("could not fetch messages")?;
+                }
+            }
+        }
+
+        info!(context, "Done fetching existing messages.");
+        context
+            .set_config_bool(Config::FetchedExistingMsgs, true)
+            .await?;
+        Ok(())
+    }
+
     /// Deletes batch of messages identified by their UID from the currently
     /// selected folder.
     async fn delete_message_batch(
@@ -910,7 +958,7 @@ impl Imap {
         context
             .sql
             .execute(
-                format!(
+                &format!(
                     "DELETE FROM imap WHERE id IN ({})",
                     sql::repeat_vars(row_ids.len())
                 ),
@@ -947,7 +995,7 @@ impl Imap {
                     context
                         .sql
                         .execute(
-                            format!(
+                            &format!(
                                 "DELETE FROM imap WHERE id IN ({})",
                                 sql::repeat_vars(row_ids.len())
                             ),
@@ -989,7 +1037,7 @@ impl Imap {
                 context
                     .sql
                     .execute(
-                        format!(
+                        &format!(
                             "UPDATE imap SET target='' WHERE id IN ({})",
                             sql::repeat_vars(row_ids.len())
                         ),
@@ -1030,9 +1078,14 @@ impl Imap {
             .await?;
 
         self.prepare(context).await?;
-        self.select_folder(context, Some(folder)).await?;
 
         for (target, rowid_set, uid_set) in UidGrouper::from(rows) {
+            // Select folder inside the loop to avoid selecting it if there are no pending
+            // MOVE/DELETE operations. This does not result in multiple SELECT commands
+            // being sent because `select_folder()` does nothing if the folder is already
+            // selected.
+            self.select_folder(context, Some(folder)).await?;
+
             // Empty target folder name means messages should be deleted.
             if target.is_empty() {
                 self.delete_message_batch(context, &uid_set, rowid_set)
@@ -1101,7 +1154,7 @@ impl Imap {
                 context
                     .sql
                     .execute(
-                        format!(
+                        &format!(
                             "DELETE FROM imap_markseen WHERE id IN ({})",
                             sql::repeat_vars(rowid_set.len())
                         ),
@@ -1386,7 +1439,7 @@ impl Imap {
                     continue;
                 }
 
-                // XXX put flags into a set and pass them to dc_receive_imf
+                // XXX put flags into a set and pass them to receive_imf
                 let context = context.clone();
 
                 // safe, as we checked above that there is a body.
@@ -1404,7 +1457,7 @@ impl Imap {
                     );
                     ""
                 };
-                match dc_receive_imf_inner(
+                match receive_imf_inner(
                     &context,
                     rfc724_mid,
                     body,
@@ -1421,7 +1474,7 @@ impl Imap {
                         last_uid = Some(server_uid)
                     }
                     Err(err) => {
-                        warn!(context, "dc_receive_imf error: {:#}", err);
+                        warn!(context, "receive_imf error: {:#}", err);
                     }
                 };
             }
@@ -1516,6 +1569,59 @@ impl Imap {
         self.configure_folders(context, create_mvbox).await
     }
 
+    /// Attempts to configure mvbox.
+    ///
+    /// Tries to find any folder in the given list of `folders`. If none is found, tries to create
+    /// any of them in the same order. This method does not use LIST command to ensure that
+    /// configuration works even if mailbox lookup is forbidden via Access Control List (see
+    /// <https://datatracker.ietf.org/doc/html/rfc4314>).
+    ///
+    /// Returns first found or created folder name.
+    async fn configure_mvbox<'a>(
+        &mut self,
+        context: &Context,
+        folders: &[&'a str],
+        create_mvbox: bool,
+    ) -> Result<Option<&'a str>> {
+        // Close currently selected folder if needed.
+        // We are going to select folders using low-level EXAMINE operations below.
+        self.select_folder(context, None).await?;
+
+        let session = self
+            .session
+            .as_mut()
+            .context("no IMAP connection established")?;
+
+        for folder in folders {
+            info!(context, "Looking for MVBOX-folder \"{}\"...", &folder);
+            let res = session.examine(&folder).await;
+            if res.is_ok() {
+                info!(
+                    context,
+                    "MVBOX-folder {:?} successfully selected, using it.", &folder
+                );
+                session.close().await?;
+                return Ok(Some(folder));
+            }
+        }
+
+        if create_mvbox {
+            for folder in folders {
+                match session.create(&folder).await {
+                    Ok(_) => {
+                        info!(context, "MVBOX-folder {} created.", &folder);
+                        return Ok(Some(folder));
+                    }
+                    Err(err) => {
+                        warn!(context, "Cannot create MVBOX-folder {:?}: {}", &folder, err);
+                    }
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
     pub async fn configure_folders(&mut self, context: &Context, create_mvbox: bool) -> Result<()> {
         let session = self
             .session
@@ -1528,9 +1634,7 @@ impl Imap {
             .context("list_folders failed")?;
         let mut delimiter = ".".to_string();
         let mut delimiter_is_default = true;
-        let mut mvbox_folder = None;
         let mut folder_configs = BTreeMap::new();
-        let mut fallback_folder = get_fallback_folder(&delimiter);
 
         while let Some(folder) = folders.next().await {
             let folder = folder?;
@@ -1540,22 +1644,13 @@ impl Imap {
             if let Some(d) = folder.delimiter() {
                 if delimiter_is_default && !d.is_empty() && delimiter != d {
                     delimiter = d.to_string();
-                    fallback_folder = get_fallback_folder(&delimiter);
                     delimiter_is_default = false;
                 }
             }
 
             let folder_meaning = get_folder_meaning(&folder);
             let folder_name_meaning = get_folder_meaning_by_name(folder.name());
-            if folder.name() == "DeltaChat" {
-                // Always takes precedence
-                mvbox_folder = Some(folder.name().to_string());
-            } else if folder.name() == fallback_folder {
-                // only set if none has been already set
-                if mvbox_folder.is_none() {
-                    mvbox_folder = Some(folder.name().to_string());
-                }
-            } else if let Some(config) = folder_meaning.to_config() {
+            if let Some(config) = folder_meaning.to_config() {
                 // Always takes precedence
                 folder_configs.insert(config, folder.name().to_string());
             } else if let Some(config) = folder_name_meaning.to_config() {
@@ -1569,47 +1664,17 @@ impl Imap {
 
         info!(context, "Using \"{}\" as folder-delimiter.", delimiter);
 
-        if mvbox_folder.is_none() && create_mvbox {
-            info!(context, "Creating MVBOX-folder \"DeltaChat\"...",);
+        let fallback_folder = format!("INBOX{}DeltaChat", delimiter);
+        let mvbox_folder = self
+            .configure_mvbox(context, &["DeltaChat", &fallback_folder], create_mvbox)
+            .await
+            .context("failed to configure mvbox")?;
 
-            match session.create("DeltaChat").await {
-                Ok(_) => {
-                    mvbox_folder = Some("DeltaChat".into());
-                    info!(context, "MVBOX-folder created.",);
-                }
-                Err(err) => {
-                    warn!(
-                        context,
-                        "Cannot create MVBOX-folder, trying to create INBOX subfolder. ({})", err
-                    );
-
-                    match session.create(&fallback_folder).await {
-                        Ok(_) => {
-                            mvbox_folder = Some(fallback_folder);
-                            info!(
-                                context,
-                                "MVBOX-folder created as INBOX subfolder. ({})", err
-                            );
-                        }
-                        Err(err) => {
-                            warn!(context, "Cannot create MVBOX-folder. ({})", err);
-                        }
-                    }
-                }
-            }
-            // SUBSCRIBE is needed to make the folder visible to the LSUB command
-            // that may be used by other MUAs to list folders.
-            // for the LIST command, the folder is always visible.
-            if let Some(ref mvbox) = mvbox_folder {
-                if let Err(err) = session.subscribe(mvbox).await {
-                    warn!(context, "could not subscribe to {:?}: {:?}", mvbox, err);
-                }
-            }
-        }
         context
             .set_config(Config::ConfiguredInboxFolder, Some("INBOX"))
             .await?;
-        if let Some(ref mvbox_folder) = mvbox_folder {
+        if let Some(mvbox_folder) = mvbox_folder {
+            info!(context, "Setting MVBOX FOLDER TO {}", &mvbox_folder);
             context
                 .set_config(Config::ConfiguredMvboxFolder, Some(mvbox_folder))
                 .await?;
@@ -1672,11 +1737,11 @@ async fn should_move_out_of_spam(
         // the SecureJoin header. So, we always move chat messages out of Spam.
         // Two possibilities to change this would be:
         // 1. Remove the `&& !context.is_spam_folder(folder).await?` check from
-        // `fetch_new_messages()`, and then let `dc_receive_imf()` check
+        // `fetch_new_messages()`, and then let `receive_imf()` check
         // if it's a spam message and should be hidden.
         // 2. Or add a flag to the ChatVersion header that this is a securejoin
         // request, and return `true` here only if the message has this flag.
-        // `dc_receive_imf()` can then check if the securejoin request is valid.
+        // `receive_imf()` can then check if the securejoin request is valid.
         return Ok(true);
     }
 
@@ -1877,12 +1942,13 @@ fn get_folder_meaning_by_name(folder_name: &str) -> FolderMeaning {
 
 fn get_folder_meaning(folder_name: &Name) -> FolderMeaning {
     for attr in folder_name.attributes() {
-        if let NameAttribute::Custom(ref label) = attr {
+        if let NameAttribute::Extension(ref label) = attr {
             match label.as_ref() {
                 "\\Trash" => return FolderMeaning::Other,
                 "\\Sent" => return FolderMeaning::Sent,
                 "\\Spam" | "\\Junk" => return FolderMeaning::Spam,
                 "\\Drafts" => return FolderMeaning::Drafts,
+                "\\All" | "\\Important" | "\\Flagged" => return FolderMeaning::Virtual,
                 _ => {}
             };
         }
@@ -1996,10 +2062,6 @@ pub(crate) async fn prefetch_should_download(
 
     let should_download = (show && !blocked_contact) || maybe_ndn;
     Ok(should_download)
-}
-
-fn get_fallback_folder(delimiter: &str) -> String {
-    format!("INBOX{}DeltaChat", delimiter)
 }
 
 /// Marks messages in `msgs` table as seen, searching for them by UID.
@@ -2272,6 +2334,50 @@ impl std::fmt::Display for UidRange {
         }
     }
 }
+async fn add_all_recipients_as_contacts(context: &Context, imap: &mut Imap, folder: Config) {
+    let mailbox = if let Ok(Some(m)) = context.get_config(folder).await {
+        m
+    } else {
+        return;
+    };
+    if let Err(e) = imap.select_with_uidvalidity(context, &mailbox).await {
+        // We are using Anyhow's .context() and to show the inner error, too, we need the {:#}:
+        warn!(context, "Could not select {}: {:#}", mailbox, e);
+        return;
+    }
+    match imap.get_all_recipients(context).await {
+        Ok(contacts) => {
+            let mut any_modified = false;
+            for contact in contacts {
+                let display_name_normalized = contact
+                    .display_name
+                    .as_ref()
+                    .map(|s| normalize_name(s))
+                    .unwrap_or_default();
+
+                match Contact::add_or_lookup(
+                    context,
+                    &display_name_normalized,
+                    &contact.addr,
+                    Origin::OutgoingTo,
+                )
+                .await
+                {
+                    Ok((_, modified)) => {
+                        if modified != Modifier::None {
+                            any_modified = true;
+                        }
+                    }
+                    Err(e) => warn!(context, "Could not add recipient: {}", e),
+                }
+            }
+            if any_modified {
+                context.emit_event(EventType::ContactsChanged(None));
+            }
+        }
+        Err(e) => warn!(context, "Could not add recipients: {}", e),
+    };
+}
 
 #[cfg(test)]
 mod tests {
@@ -2298,7 +2404,7 @@ mod tests {
         assert_eq!(get_folder_meaning_by_name("SPAM"), FolderMeaning::Spam);
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_set_uid_next_validity() {
         let t = TestContext::new_alice().await;
         assert_eq!(get_uid_next(&t.ctx, "Inbox").await.unwrap(), 0);
@@ -2480,7 +2586,7 @@ mod tests {
         ("Spam", true, true, "DeltaChat"),
     ];
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_target_folder_incoming_accepted() -> Result<()> {
         for (folder, mvbox_move, chat_msg, expected_destination) in COMBINATIONS_ACCEPTED_CHAT {
             check_target_folder_combination(
@@ -2497,7 +2603,7 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_target_folder_incoming_request() -> Result<()> {
         for (folder, mvbox_move, chat_msg, expected_destination) in COMBINATIONS_REQUEST {
             check_target_folder_combination(
@@ -2514,7 +2620,7 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_target_folder_outgoing() -> Result<()> {
         // Test outgoing emails
         for (folder, mvbox_move, chat_msg, expected_destination) in COMBINATIONS_ACCEPTED_CHAT {
@@ -2532,7 +2638,7 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_target_folder_setupmsg() -> Result<()> {
         // Test setupmessages
         for (folder, mvbox_move, chat_msg, _expected_destination) in COMBINATIONS_ACCEPTED_CHAT {
@@ -2550,7 +2656,7 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_get_imap_search_command() -> Result<()> {
         let t = TestContext::new_alice().await;
         assert_eq!(

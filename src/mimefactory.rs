@@ -5,6 +5,7 @@ use std::convert::TryInto;
 use anyhow::{bail, ensure, Context as _, Result};
 use chrono::TimeZone;
 use lettre_email::{mime, Address, Header, MimeMultipartType, PartBuilder};
+use tokio::fs;
 
 use crate::blob::BlobObject;
 use crate::chat::Chat;
@@ -12,11 +13,6 @@ use crate::config::Config;
 use crate::constants::{Chattype, DC_FROM_HANDSHAKE};
 use crate::contact::Contact;
 use crate::context::{get_version_str, Context};
-use crate::dc_tools::IsNoneOrEmpty;
-use crate::dc_tools::{
-    dc_create_outgoing_rfc724_mid, dc_create_smeared_timestamp, dc_get_filebytes,
-    remove_subject_prefix, time,
-};
 use crate::e2ee::EncryptHelper;
 use crate::ephemeral::Timer as EphemeralTimer;
 use crate::format_flowed::{format_flowed, format_flowed_quote};
@@ -28,6 +24,11 @@ use crate::param::Param;
 use crate::peerstate::{Peerstate, PeerstateVerifiedStatus};
 use crate::simplify::escape_message_footer_marks;
 use crate::stock_str;
+use crate::tools::IsNoneOrEmpty;
+use crate::tools::{
+    create_outgoing_rfc724_mid, create_smeared_timestamp, get_filebytes, remove_subject_prefix,
+    time,
+};
 
 // attachments of 25 mb brutto should work on the majority of providers
 // (brutto examples: web.de=50, 1&1=40, t-online.de=32, gmail=25, posteo=50, yahoo=25, all-inkl=100).
@@ -242,7 +243,7 @@ impl<'a> MimeFactory<'a> {
             .get_config(Config::Selfstatus)
             .await?
             .unwrap_or_default();
-        let timestamp = dc_create_smeared_timestamp(context).await;
+        let timestamp = create_smeared_timestamp(context).await;
 
         let res = MimeFactory::<'a> {
             from_addr,
@@ -489,9 +490,9 @@ impl<'a> MimeFactory<'a> {
 
         // Start with Internet Message Format headers in the order of the standard example
         // <https://datatracker.ietf.org/doc/html/rfc5322#appendix-A.1.1>.
-        headers
-            .unprotected
-            .push(Header::new_with_value("From".into(), vec![from]).unwrap());
+        let from_header = Header::new_with_value("From".into(), vec![from]).unwrap();
+        headers.unprotected.push(from_header.clone());
+
         if let Some(sender_displayname) = &self.sender_displayname {
             let sender =
                 Address::new_mailbox_with_name(sender_displayname.clone(), self.from_addr.clone());
@@ -511,7 +512,7 @@ impl<'a> MimeFactory<'a> {
 
         let rfc724_mid = match self.loaded {
             Loaded::Message { .. } => self.msg.rfc724_mid.clone(),
-            Loaded::Mdn { .. } => dc_create_outgoing_rfc724_mid(None, &self.from_addr),
+            Loaded::Mdn { .. } => create_outgoing_rfc724_mid(None, &self.from_addr),
         };
         let rfc724_mid_headervalue = render_rfc724_mid(&rfc724_mid);
 
@@ -644,6 +645,8 @@ impl<'a> MimeFactory<'a> {
         };
 
         let outer_message = if is_encrypted {
+            headers.protected.push(from_header);
+
             // Store protected headers in the inner message.
             let message = headers
                 .protected
@@ -1062,10 +1065,15 @@ impl<'a> MimeFactory<'a> {
             }
         };
 
-        let quoted_text = self
+        let mut quoted_text = self
             .msg
             .quoted_text()
             .map(|quote| format_flowed_quote(&quote) + "\r\n\r\n");
+        if quoted_text.is_none() && final_text.starts_with('>') {
+            // Insert empty line to avoid receiver treating user-sent quote as topquote inserted by
+            // Delta Chat.
+            quoted_text = Some("\r\n".to_string());
+        }
         let flowed_text = format_flowed(final_text);
 
         let footer = &self.selfstatus;
@@ -1106,7 +1114,7 @@ impl<'a> MimeFactory<'a> {
                 main_part = PartBuilder::new()
                     .message_type(MimeMultipartType::Alternative)
                     .child(main_part.build())
-                    .child(new_html_mimepart(html).await.build());
+                    .child(new_html_mimepart(html).build());
             }
         }
 
@@ -1161,7 +1169,7 @@ impl<'a> MimeFactory<'a> {
 
         if self.attach_selfavatar {
             match context.get_config(Config::Selfavatar).await? {
-                Some(path) => match build_selfavatar_file(context, &path) {
+                Some(path) => match build_selfavatar_file(context, &path).await {
                     Ok(avatar) => headers.hidden.push(Header::new(
                         "Chat-User-Avatar".into(),
                         format!("base64:{}", avatar),
@@ -1344,7 +1352,7 @@ async fn build_body_file(
         maybe_encode_words(&filename_to_send)
     );
 
-    let body = std::fs::read(blob.to_abs_path())?;
+    let body = fs::read(blob.to_abs_path()).await?;
     let encoded_body = wrapped_base64_encode(&body);
 
     let mail = PartBuilder::new()
@@ -1356,9 +1364,9 @@ async fn build_body_file(
     Ok((mail, filename_to_send))
 }
 
-fn build_selfavatar_file(context: &Context, path: &str) -> Result<String> {
+async fn build_selfavatar_file(context: &Context, path: &str) -> Result<String> {
     let blob = BlobObject::from_path(context, path.as_ref())?;
-    let body = std::fs::read(blob.to_abs_path())?;
+    let body = fs::read(blob.to_abs_path()).await?;
     let encoded_body = wrapped_base64_encode(&body);
     Ok(encoded_body)
 }
@@ -1373,7 +1381,7 @@ fn recipients_contain_addr(recipients: &[(String, String)], addr: &str) -> bool 
 async fn is_file_size_okay(context: &Context, msg: &Message) -> Result<bool> {
     match msg.param.get_path(Param::File, context)? {
         Some(path) => {
-            let bytes = dc_get_filebytes(context, &path).await;
+            let bytes = get_filebytes(context, &path).await;
             Ok(bytes <= UPPER_LIMIT_FILE_SIZE)
         }
         None => Ok(false),
@@ -1423,8 +1431,6 @@ fn maybe_encode_words(words: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use async_std::fs::File;
-    use async_std::prelude::*;
     use mailparse::{addrparse_header, MailHeaderMap};
 
     use crate::chat::ChatId;
@@ -1434,8 +1440,8 @@ mod tests {
     };
     use crate::chatlist::Chatlist;
     use crate::contact::Origin;
-    use crate::dc_receive_imf::dc_receive_imf;
     use crate::mimeparser::MimeMessage;
+    use crate::receive_imf::receive_imf;
     use crate::test_utils::{get_chat_msg, TestContext};
 
     use super::*;
@@ -1528,7 +1534,7 @@ mod tests {
         assert_eq!(maybe_encode_words("äöü"), "=?utf-8?b?w6TDtsO8?=");
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_subject_from_mua() {
         // 1.: Receive a mail from an MUA
         assert_eq!(
@@ -1562,7 +1568,7 @@ mod tests {
         );
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_subject_from_dc() {
         // 2. Receive a message from Delta Chat
         assert_eq!(
@@ -1582,7 +1588,7 @@ mod tests {
         );
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_subject_outgoing() {
         // 3. Send the first message to a new contact
         let t = TestContext::new_alice().await;
@@ -1596,7 +1602,7 @@ mod tests {
         assert_eq!(first_subject_str(t).await, "Message from Alice");
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_subject_unicode() {
         // 4. Receive messages with unicode characters and make sure that we do not panic (we do not care about the result)
         msg_to_subject_str(
@@ -1628,11 +1634,11 @@ mod tests {
         .await;
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_subject_mdn() {
         // 5. Receive an mdn (read receipt) and make sure the mdn's subject is not used
         let t = TestContext::new_alice().await;
-        dc_receive_imf(
+        receive_imf(
             &t,
             b"Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
             From: alice@example.org\n\
@@ -1678,7 +1684,7 @@ mod tests {
         assert_eq!("Re: Hello, Bob", mf.subject_str(&t).await.unwrap());
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_subject_in_group() -> Result<()> {
         async fn send_msg_get_subject(
             t: &TestContext,
@@ -1720,7 +1726,7 @@ mod tests {
         let subject = send_msg_get_subject(&t, group_id, None).await?;
         assert_eq!(subject, "Re: groupname");
 
-        dc_receive_imf(
+        receive_imf(
             &t,
             format!(
                 "Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
@@ -1835,7 +1841,7 @@ mod tests {
         }
 
         if message_arrives_inbetween {
-            dc_receive_imf(
+            receive_imf(
                 &t,
                 b"Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
                     From: Bob <bob@example.com>\n\
@@ -1869,7 +1875,7 @@ mod tests {
             .await
             .unwrap();
 
-        dc_receive_imf(context, imf_raw, false).await.unwrap();
+        receive_imf(context, imf_raw, false).await.unwrap();
 
         let chats = Chatlist::try_load(context, 0, None, None).await.unwrap();
 
@@ -1886,7 +1892,7 @@ mod tests {
         new_msg
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     // This test could still be extended
     async fn test_render_reply() {
         let t = TestContext::new_alice().await;
@@ -1980,7 +1986,7 @@ mod tests {
         assert!(!headers.lines().any(|l| l.trim().is_empty()));
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_selfavatar_unencrypted() -> anyhow::Result<()> {
         // create chat with bob, set selfavatar
         let t = TestContext::new_alice().await;
@@ -1988,7 +1994,7 @@ mod tests {
 
         let file = t.dir.path().join("avatar.png");
         let bytes = include_bytes!("../test-data/image/avatar64x64.png");
-        File::create(&file).await?.write_all(bytes).await?;
+        tokio::fs::write(&file, bytes).await?;
         t.set_config(Config::Selfavatar, Some(file.to_str().unwrap()))
             .await?;
 
@@ -2037,7 +2043,7 @@ mod tests {
     }
 
     /// Test that removed member address does not go into the `To:` field.
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_remove_member_bcc() -> Result<()> {
         // Alice creates a group with Bob and Claire and then removes Bob.
         let alice = TestContext::new_alice().await;
@@ -2068,7 +2074,7 @@ mod tests {
     }
 
     /// Tests that standard IMF header "From:" comes before non-standard "Autocrypt:" header.
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_from_before_autocrypt() -> Result<()> {
         // create chat with bob
         let t = TestContext::new_alice().await;

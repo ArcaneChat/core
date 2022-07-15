@@ -60,6 +60,19 @@ building from source or clone this repository and follow this steps:
 > not inside this folder. (We need this in order to include the rust source
 > code in the npm package.)
 
+### Use a git branch in deltachat-desktop
+
+You can directly install a core branch, but make sure:
+- that you have typescript in your project dependencies, as it is likely required
+- you know that there are **no prebuilds** and so core is built during installation which is why it takes so long
+
+```
+npm install https://github.com/deltachat/deltachat-core-rust.git#branch
+```
+
+If you want prebuilds for a branch that has a core pr, you might find an npm tar.gz package for that branch at <https://download.delta.chat/node/preview/>.
+The github ci also posts a link to it in the checks for each pr.
+
 ### Use build-from-source in deltachat-desktop
 
 If you want to use the manually built node bindings in the desktop client (for
@@ -104,7 +117,7 @@ $ fnm install 17 --arch x64
 $ fnm use 17
 $ node -p process.arch
 # result should be x64
-$ cd deltachat-core-rust && rustup target add x86_64-apple-darwin && cd -
+$ rustup target add x86_64-apple-darwin
 $ git apply patches/m1_build_use_x86_64.patch
 $ CARGO_BUILD_TARGET=x86_64-apple-darwin npm run build
 $ npm run test
@@ -221,7 +234,7 @@ We have the following scripts for building, testing and coverage:
 The following steps are needed to make a release:
 
 1. Wait until `pack-module` github action is completed
-2. Run `npm publish https://download.delta.chat/node/deltachat-node-v1.x.x.tar.gz` to publish it to npm. You probably need write rights to npm.
+2. Run `npm publish https://download.delta.chat/node/deltachat-node-1.x.x.tar.gz` to publish it to npm. You probably need write rights to npm.
 
 ## License
 

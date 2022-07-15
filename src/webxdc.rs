@@ -1,23 +1,27 @@
 //! # Handle webxdc messages.
 
-use crate::chat::Chat;
-use crate::context::Context;
-use crate::dc_tools::{dc_create_smeared_timestamp, dc_open_file_std};
-use crate::message::{Message, MessageState, MsgId, Viewtype};
-use crate::mimeparser::SystemMessage;
-use crate::param::Param;
-use crate::{chat, EventType};
-use anyhow::{bail, ensure, format_err, Result};
-use async_std::path::PathBuf;
+use std::convert::TryFrom;
+use std::path::PathBuf;
+
+use anyhow::{anyhow, bail, ensure, format_err, Result};
 use deltachat_derive::FromSql;
 use lettre_email::mime;
 use lettre_email::PartBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::convert::TryFrom;
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
-use zip::ZipArchive;
+use tokio::io::AsyncReadExt;
+
+use crate::chat::Chat;
+use crate::contact::ContactId;
+use crate::context::Context;
+use crate::download::DownloadState;
+use crate::message::{Message, MessageState, MsgId, Viewtype};
+use crate::mimeparser::SystemMessage;
+use crate::param::Param;
+use crate::param::Params;
+use crate::scheduler::InterruptInfo;
+use crate::tools::{create_smeared_timestamp, get_abs_path};
+use crate::{chat, EventType};
 
 /// The current API version.
 /// If `min_api` in manifest.toml is set to a larger value,
@@ -136,16 +140,12 @@ pub(crate) struct StatusUpdateItemAndSerial {
 
 impl Context {
     /// check if a file is an acceptable webxdc for sending or receiving.
-    pub(crate) async fn is_webxdc_file<R>(&self, filename: &str, mut reader: R) -> Result<bool>
-    where
-        R: Read + Seek,
-    {
+    pub(crate) async fn is_webxdc_file(&self, filename: &str, file: &[u8]) -> Result<bool> {
         if !filename.ends_with(WEBXDC_SUFFIX) {
             return Ok(false);
         }
 
-        let size = reader.seek(SeekFrom::End(0))?;
-        if size > WEBXDC_RECEIVING_LIMIT {
+        if file.len() as u64 > WEBXDC_RECEIVING_LIMIT {
             info!(
                 self,
                 "{} exceeds receiving limit of {} bytes", &filename, WEBXDC_RECEIVING_LIMIT
@@ -153,8 +153,7 @@ impl Context {
             return Ok(false);
         }
 
-        reader.seek(SeekFrom::Start(0))?;
-        let mut archive = match zip::ZipArchive::new(reader) {
+        let archive = match async_zip::read::mem::ZipFileReader::new(file).await {
             Ok(archive) => archive,
             Err(_) => {
                 info!(self, "{} cannot be opened as zip-file", &filename);
@@ -162,7 +161,7 @@ impl Context {
             }
         };
 
-        if archive.by_name("index.html").is_err() {
+        if archive.entry("index.html").is_none() {
             info!(self, "{} misses index.html", &filename);
             return Ok(false);
         }
@@ -173,18 +172,12 @@ impl Context {
     /// ensure that a file is an acceptable webxdc for sending
     /// (sending has more strict size limits).
     pub(crate) async fn ensure_sendable_webxdc_file(&self, path: &PathBuf) -> Result<()> {
-        let mut file = std::fs::File::open(path)?;
-        if !self
-            .is_webxdc_file(path.to_str().unwrap_or_default(), &mut file)
-            .await?
-        {
-            bail!(
-                "{} is not a valid webxdc file",
-                path.to_str().unwrap_or_default()
-            );
+        let filename = path.to_str().unwrap_or_default();
+        if !filename.ends_with(WEBXDC_SUFFIX) {
+            bail!("{} is not a valid webxdc file", filename);
         }
 
-        let size = file.seek(SeekFrom::End(0))?;
+        let size = tokio::fs::metadata(path).await?.len();
         if size > WEBXDC_SENDING_LIMIT {
             bail!(
                 "webxdc {} exceeds acceptable size of {} bytes",
@@ -192,7 +185,62 @@ impl Context {
                 WEBXDC_SENDING_LIMIT
             );
         }
+
+        let valid = match async_zip::read::fs::ZipFileReader::new(path).await {
+            Ok(archive) => {
+                if archive.entry("index.html").is_none() {
+                    info!(self, "{} misses index.html", filename);
+                    false
+                } else {
+                    true
+                }
+            }
+            Err(_) => {
+                info!(self, "{} cannot be opened as zip-file", filename);
+                false
+            }
+        };
+
+        if !valid {
+            bail!("{} is not a valid webxdc file", filename);
+        }
+
         Ok(())
+    }
+
+    /// Check if the last message of a chat is an info message belonging to the given instance and sender.
+    /// If so, the id of this message is returned.
+    async fn get_overwritable_info_msg_id(
+        &self,
+        instance: &Message,
+        from_id: ContactId,
+    ) -> Result<Option<MsgId>> {
+        if let Some((last_msg_id, last_from_id, last_param, last_in_repl_to)) = self
+            .sql
+            .query_row_optional(
+                r#"SELECT id, from_id, param, mime_in_reply_to
+                    FROM msgs
+                    WHERE chat_id=?1 AND hidden=0
+                    ORDER BY timestamp DESC, id DESC LIMIT 1"#,
+                paramsv![instance.chat_id],
+                |row| {
+                    let last_msg_id: MsgId = row.get(0)?;
+                    let last_from_id: ContactId = row.get(1)?;
+                    let last_param: Params = row.get::<_, String>(2)?.parse().unwrap_or_default();
+                    let last_in_repl_to: String = row.get(3)?;
+                    Ok((last_msg_id, last_from_id, last_param, last_in_repl_to))
+                },
+            )
+            .await?
+        {
+            if last_from_id == from_id
+                && last_param.get_cmd() == SystemMessage::WebxdcInfoMessage
+                && last_in_repl_to == instance.rfc724_mid
+            {
+                return Ok(Some(last_msg_id));
+            }
+        }
+        Ok(None)
     }
 
     /// Takes an update-json as `{payload: PAYLOAD}`
@@ -202,41 +250,48 @@ impl Context {
         instance: &mut Message,
         update_str: &str,
         timestamp: i64,
+        can_info_msg: bool,
+        from_id: ContactId,
     ) -> Result<StatusUpdateSerial> {
         let update_str = update_str.trim();
         if update_str.is_empty() {
             bail!("create_status_update_record: empty update.");
         }
 
-        let status_update_item: StatusUpdateItem = {
+        let status_update_item: StatusUpdateItem =
             if let Ok(item) = serde_json::from_str::<StatusUpdateItem>(update_str) {
-                match instance.state {
-                    MessageState::Undefined
-                    | MessageState::OutPreparing
-                    | MessageState::OutDraft => StatusUpdateItem {
-                        payload: item.payload,
-                        info: None, // no info-messages in draft mode
-                        document: item.document,
-                        summary: item.summary,
-                    },
-                    _ => item,
-                }
+                item
             } else {
                 bail!("create_status_update_record: no valid update item.");
-            }
-        };
+            };
 
-        if let Some(ref info) = status_update_item.info {
-            chat::add_info_msg_with_cmd(
-                self,
-                instance.chat_id,
-                info.as_str(),
-                SystemMessage::Unknown,
-                timestamp,
-                None,
-                Some(instance),
-            )
-            .await?;
+        if can_info_msg {
+            if let Some(ref info) = status_update_item.info {
+                if let Some(info_msg_id) =
+                    self.get_overwritable_info_msg_id(instance, from_id).await?
+                {
+                    chat::update_msg_text_and_timestamp(
+                        self,
+                        instance.chat_id,
+                        info_msg_id,
+                        info.as_str(),
+                        timestamp,
+                    )
+                    .await?;
+                } else {
+                    chat::add_info_msg_with_cmd(
+                        self,
+                        instance.chat_id,
+                        info.as_str(),
+                        SystemMessage::WebxdcInfoMessage,
+                        timestamp,
+                        None,
+                        Some(instance),
+                        Some(from_id),
+                    )
+                    .await?;
+                }
+            }
         }
 
         let mut param_changed = false;
@@ -262,7 +317,7 @@ impl Context {
         }
 
         if param_changed {
-            instance.update_param(self).await;
+            instance.update_param(self).await?;
             self.emit_msgs_changed(instance.chat_id, instance.id);
         }
 
@@ -276,10 +331,12 @@ impl Context {
 
         let status_update_serial = StatusUpdateSerial(u32::try_from(rowid)?);
 
-        self.emit_event(EventType::WebxdcStatusUpdate {
-            msg_id: instance.id,
-            status_update_serial,
-        });
+        if instance.viewtype == Viewtype::Webxdc {
+            self.emit_event(EventType::WebxdcStatusUpdate {
+                msg_id: instance.id,
+                status_update_serial,
+            });
+        }
 
         Ok(status_update_serial)
     }
@@ -288,15 +345,13 @@ impl Context {
     ///
     /// If the instance is a draft,
     /// the status update is sent once the instance is actually sent.
-    ///
-    /// If an update is sent immediately, the message-id of the update-message is returned,
-    /// this update-message is visible in chats, however, the id may be useful.
+    /// Otherwise, the update is sent as soon as possible.
     pub async fn send_webxdc_status_update(
         &self,
         instance_msg_id: MsgId,
         update_str: &str,
         descr: &str,
-    ) -> Result<Option<MsgId>> {
+    ) -> Result<()> {
         let mut instance = Message::load_from_db(self, instance_msg_id).await?;
         if instance.viewtype != Viewtype::Webxdc {
             bail!("send_webxdc_status_update: is no webxdc message");
@@ -305,21 +360,74 @@ impl Context {
         let chat = Chat::load_from_db(self, instance.chat_id).await?;
         ensure!(chat.can_send(self).await?, "cannot send to {}", chat.id);
 
+        let send_now = !matches!(
+            instance.state,
+            MessageState::Undefined | MessageState::OutPreparing | MessageState::OutDraft
+        );
+
         let status_update_serial = self
             .create_status_update_record(
                 &mut instance,
                 update_str,
-                dc_create_smeared_timestamp(self).await,
+                create_smeared_timestamp(self).await,
+                send_now,
+                ContactId::SELF,
             )
             .await?;
-        match instance.state {
-            MessageState::Undefined | MessageState::OutPreparing | MessageState::OutDraft => {
-                // send update once the instance is actually send
-                Ok(None)
-            }
-            _ => {
-                // send update now
-                // (also send updates on MessagesState::Failed, maybe only one member cannot receive)
+
+        if send_now {
+            self.sql.insert(
+                "INSERT INTO smtp_status_updates (msg_id, first_serial, last_serial, descr) VALUES(?, ?, ?, ?)
+                 ON CONFLICT(msg_id)
+                 DO UPDATE SET last_serial=excluded.last_serial, descr=excluded.descr",
+                paramsv![instance.id, status_update_serial, status_update_serial, descr],
+            ).await?;
+            self.interrupt_smtp(InterruptInfo::new(false)).await;
+        }
+        Ok(())
+    }
+
+    /// Pops one record of queued webxdc status updates.
+    /// This function exists to make the sqlite statement testable.
+    async fn pop_smtp_status_update(
+        &self,
+    ) -> Result<Option<(MsgId, StatusUpdateSerial, StatusUpdateSerial, String)>> {
+        let res = self
+            .sql
+            .query_row_optional(
+                "DELETE FROM smtp_status_updates
+                     WHERE msg_id IN (SELECT msg_id FROM smtp_status_updates LIMIT 1)
+                     RETURNING msg_id, first_serial, last_serial, descr",
+                paramsv![],
+                |row| {
+                    let instance_id: MsgId = row.get(0)?;
+                    let first_serial: StatusUpdateSerial = row.get(1)?;
+                    let last_serial: StatusUpdateSerial = row.get(2)?;
+                    let descr: String = row.get(3)?;
+                    Ok((instance_id, first_serial, last_serial, descr))
+                },
+            )
+            .await?;
+        Ok(res)
+    }
+
+    /// Attempts to send queued webxdc status updates.
+    ///
+    /// Returns true if there are more status updates to send, but rate limiter does not
+    /// allow to send them. Returns false if there are no more status updates to send.
+    pub(crate) async fn flush_status_updates(&self) -> Result<bool> {
+        loop {
+            let (instance_id, first_serial, last_serial, descr) =
+                match self.pop_smtp_status_update().await? {
+                    Some(res) => res,
+                    None => return Ok(false),
+                };
+
+            if let Some(json) = self
+                .render_webxdc_status_update_object(instance_id, Some((first_serial, last_serial)))
+                .await?
+            {
+                let instance = Message::load_from_db(self, instance_id).await?;
                 let mut status_update = Message {
                     chat_id: instance.chat_id,
                     viewtype: Viewtype::Text,
@@ -330,20 +438,10 @@ impl Context {
                 status_update
                     .param
                     .set_cmd(SystemMessage::WebxdcStatusUpdate);
-                status_update.param.set(
-                    Param::Arg,
-                    self.render_webxdc_status_update_object(
-                        instance_msg_id,
-                        Some(status_update_serial),
-                    )
-                    .await?
-                    .ok_or_else(|| format_err!("Status object expected."))?,
-                );
+                status_update.param.set(Param::Arg, json);
                 status_update.set_quote(self, Some(&instance)).await?;
                 status_update.param.remove(Param::GuaranteeE2ee); // may be set by set_quote(), if #2985 is done, this line can be removed
-                let status_update_msg_id =
-                    chat::send_msg(self, instance.chat_id, &mut status_update).await?;
-                Ok(Some(status_update_msg_id))
+                chat::send_msg(self, instance.chat_id, &mut status_update).await?;
             }
         }
     }
@@ -361,18 +459,27 @@ impl Context {
     /// Receives status updates from receive_imf to the database
     /// and sends out an event.
     ///
+    /// `from_id` is the sender
+    ///
     /// `msg_id` may be an instance (in case there are initial status updates)
     /// or a reply to an instance (for all other updates).
     ///
     /// `json` is an array containing one or more update items as created by send_webxdc_status_update(),
     /// the array is parsed using serde, the single payloads are used as is.
-    pub(crate) async fn receive_status_update(&self, msg_id: MsgId, json: &str) -> Result<()> {
+    pub(crate) async fn receive_status_update(
+        &self,
+        from_id: ContactId,
+        msg_id: MsgId,
+        json: &str,
+    ) -> Result<()> {
         let msg = Message::load_from_db(self, msg_id).await?;
-        let (timestamp, mut instance) = if msg.viewtype == Viewtype::Webxdc {
-            (msg.timestamp_sort, msg)
+        let (timestamp, mut instance, can_info_msg) = if msg.viewtype == Viewtype::Webxdc {
+            (msg.timestamp_sort, msg, false)
         } else if let Some(parent) = msg.parent(self).await? {
             if parent.viewtype == Viewtype::Webxdc {
-                (msg.timestamp_sort, parent)
+                (msg.timestamp_sort, parent, true)
+            } else if parent.download_state() != DownloadState::Done {
+                (msg.timestamp_sort, parent, false)
             } else {
                 bail!("receive_status_update: message is not the child of a webxdc message.")
             }
@@ -386,6 +493,8 @@ impl Context {
                 &mut instance,
                 &*serde_json::to_string(&update_item)?,
                 timestamp,
+                can_info_msg,
+                from_id,
             )
             .await?;
         }
@@ -452,20 +561,19 @@ impl Context {
     ///
     /// Example: `{"updates": [{"payload":"any update data"},
     ///                        {"payload":"another update data"}]}`
-    /// If `status_update_serial` is set, exactly that update is rendered, otherwise all updates are rendered.
     pub(crate) async fn render_webxdc_status_update_object(
         &self,
         instance_msg_id: MsgId,
-        status_update_serial: Option<StatusUpdateSerial>,
+        range: Option<(StatusUpdateSerial, StatusUpdateSerial)>,
     ) -> Result<Option<String>> {
         let json = self
             .sql
             .query_map(
-                "SELECT update_item FROM msgs_status_updates WHERE msg_id=? AND (1=? OR id=?) ORDER BY id",
+                "SELECT update_item FROM msgs_status_updates WHERE msg_id=? AND id>=? AND id<=? ORDER BY id",
                 paramsv![
                     instance_msg_id,
-                    if status_update_serial.is_some() { 0 } else { 1 },
-                    status_update_serial.unwrap_or(StatusUpdateSerial(0))
+                    range.map(|r|r.0).unwrap_or(StatusUpdateSerial(0)),
+                    range.map(|r|r.1).unwrap_or(StatusUpdateSerial(u32::MAX)),
                 ],
                 |row| row.get::<_, String>(0),
                 |rows| {
@@ -489,27 +597,33 @@ impl Context {
     }
 }
 
-async fn parse_webxdc_manifest(bytes: &[u8]) -> Result<WebxdcManifest> {
+fn parse_webxdc_manifest(bytes: &[u8]) -> Result<WebxdcManifest> {
     let manifest: WebxdcManifest = toml::from_slice(bytes)?;
     Ok(manifest)
 }
 
-async fn get_blob(archive: &mut ZipArchive<File>, name: &str) -> Result<Vec<u8>> {
-    let mut file = archive.by_name(name)?;
+async fn get_blob(archive: &mut async_zip::read::fs::ZipFileReader, name: &str) -> Result<Vec<u8>> {
+    let (i, _) = archive
+        .entry(name)
+        .ok_or_else(|| anyhow!("no entry found for {}", name))?;
+    let mut reader = archive.entry_reader(i).await?;
     let mut buf = Vec::new();
-    file.read_to_end(&mut buf)?;
+    reader.read_to_end(&mut buf).await?;
     Ok(buf)
 }
 
 impl Message {
     /// Get handle to a webxdc ZIP-archive.
     /// To check for file existance use archive.by_name(), to read a file, use get_blob(archive).
-    async fn get_webxdc_archive(&self, context: &Context) -> Result<ZipArchive<File>> {
+    async fn get_webxdc_archive(
+        &self,
+        context: &Context,
+    ) -> Result<async_zip::read::fs::ZipFileReader> {
         let path = self
             .get_file(context)
             .ok_or_else(|| format_err!("No webxdc instance file."))?;
-        let file = dc_open_file_std(context, path)?;
-        let archive = zip::ZipArchive::new(file)?;
+        let path_abs = get_abs_path(context, &path);
+        let archive = async_zip::read::fs::ZipFileReader::new(path_abs).await?;
         Ok(archive)
     }
 
@@ -534,7 +648,7 @@ impl Message {
 
         if name == "index.html" {
             if let Ok(bytes) = get_blob(&mut archive, "manifest.toml").await {
-                if let Ok(manifest) = parse_webxdc_manifest(&bytes).await {
+                if let Ok(manifest) = parse_webxdc_manifest(&bytes) {
                     if let Some(min_api) = manifest.min_api {
                         if min_api > WEBXDC_API_VERSION {
                             return Ok(Vec::from(
@@ -555,7 +669,7 @@ impl Message {
         let mut archive = self.get_webxdc_archive(context).await?;
 
         let mut manifest = if let Ok(bytes) = get_blob(&mut archive, "manifest.toml").await {
-            if let Ok(manifest) = parse_webxdc_manifest(&bytes).await {
+            if let Ok(manifest) = parse_webxdc_manifest(&bytes) {
                 manifest
             } else {
                 WebxdcManifest {
@@ -586,9 +700,9 @@ impl Message {
             } else {
                 self.get_filename().unwrap_or_default()
             },
-            icon: if archive.by_name("icon.png").is_ok() {
+            icon: if archive.entry("icon.png").is_some() {
                 "icon.png".to_string()
-            } else if archive.by_name("icon.jpg").is_ok() {
+            } else if archive.entry("icon.jpg").is_some() {
                 "icon.jpg".to_string()
             } else {
                 WEBXDC_DEFAULT_ICON.to_string()
@@ -614,24 +728,20 @@ impl Message {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
-
-    use async_std::fs::File;
-    use async_std::io::WriteExt;
-
     use crate::chat::{
-        add_contact_to_chat, create_group_chat, forward_msgs, send_msg, send_text_msg, ChatId,
-        ProtectionStatus,
+        add_contact_to_chat, create_group_chat, forward_msgs, resend_msgs, send_msg, send_text_msg,
+        ChatId, ProtectionStatus,
     };
     use crate::chatlist::Chatlist;
+    use crate::config::Config;
     use crate::contact::Contact;
-    use crate::dc_receive_imf::dc_receive_imf;
+    use crate::receive_imf::{receive_imf, receive_imf_inner};
     use crate::test_utils::TestContext;
 
     use super::*;
 
     #[allow(clippy::assertions_on_constants)]
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_webxdc_file_limits() -> Result<()> {
         assert!(WEBXDC_SENDING_LIMIT >= 32768);
         assert!(WEBXDC_SENDING_LIMIT < 16777216);
@@ -640,41 +750,41 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_is_webxdc_file() -> Result<()> {
         let t = TestContext::new().await;
         assert!(
             !t.is_webxdc_file(
                 "bad-ext-no-zip.txt",
-                Cursor::new(include_bytes!("../test-data/message/issue_523.txt"))
+                include_bytes!("../test-data/message/issue_523.txt")
             )
             .await?
         );
         assert!(
             !t.is_webxdc_file(
                 "bad-ext-good-zip.txt",
-                Cursor::new(include_bytes!("../test-data/webxdc/minimal.xdc"))
+                include_bytes!("../test-data/webxdc/minimal.xdc")
             )
             .await?
         );
         assert!(
             !t.is_webxdc_file(
                 "good-ext-no-zip.xdc",
-                Cursor::new(include_bytes!("../test-data/message/issue_523.txt"))
+                include_bytes!("../test-data/message/issue_523.txt")
             )
             .await?
         );
         assert!(
             !t.is_webxdc_file(
                 "good-ext-no-index-html.xdc",
-                Cursor::new(include_bytes!("../test-data/webxdc/no-index-html.xdc"))
+                include_bytes!("../test-data/webxdc/no-index-html.xdc")
             )
             .await?
         );
         assert!(
             t.is_webxdc_file(
                 "good-ext-good-zip.xdc",
-                Cursor::new(include_bytes!("../test-data/webxdc/minimal.xdc"))
+                include_bytes!("../test-data/webxdc/minimal.xdc")
             )
             .await?
         );
@@ -683,7 +793,7 @@ mod tests {
 
     async fn create_webxdc_instance(t: &TestContext, name: &str, bytes: &[u8]) -> Result<Message> {
         let file = t.get_blobdir().join(name);
-        File::create(&file).await?.write_all(bytes).await?;
+        tokio::fs::write(&file, bytes).await?;
         let mut instance = Message::new(Viewtype::File);
         instance.set_file(file.to_str().unwrap(), None);
         Ok(instance)
@@ -701,7 +811,7 @@ mod tests {
         Message::load_from_db(t, instance_msg_id).await
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_send_webxdc_instance() -> Result<()> {
         let t = TestContext::new_alice().await;
         let chat_id = create_group_chat(&t, ProtectionStatus::Unprotected, "foo").await?;
@@ -714,10 +824,7 @@ mod tests {
 
         // sending using bad extension is not working, even when setting Viewtype to webxdc
         let file = t.get_blobdir().join("index.html");
-        File::create(&file)
-            .await?
-            .write_all("<html>ola!</html>".as_ref())
-            .await?;
+        tokio::fs::write(&file, b"<html>ola!</html>").await?;
         let mut instance = Message::new(Viewtype::Webxdc);
         instance.set_file(file.to_str().unwrap(), None);
         assert!(send_msg(&t, chat_id, &mut instance).await.is_err());
@@ -725,7 +832,7 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_send_invalid_webxdc() -> Result<()> {
         let t = TestContext::new_alice().await;
         let chat_id = create_group_chat(&t, ProtectionStatus::Unprotected, "foo").await?;
@@ -744,12 +851,11 @@ mod tests {
 
         // sending invalid .xdc as Viewtype::Webxdc should fail already on sending
         let file = t.get_blobdir().join("invalid2.xdc");
-        File::create(&file)
-            .await?
-            .write_all(include_bytes!(
-                "../test-data/webxdc/invalid-no-zip-but-7z.xdc"
-            ))
-            .await?;
+        tokio::fs::write(
+            &file,
+            include_bytes!("../test-data/webxdc/invalid-no-zip-but-7z.xdc"),
+        )
+        .await?;
         let mut instance = Message::new(Viewtype::Webxdc);
         instance.set_file(file.to_str().unwrap(), None);
         assert!(send_msg(&t, chat_id, &mut instance).await.is_err());
@@ -757,7 +863,29 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_send_special_webxdc_format() -> Result<()> {
+        let t = TestContext::new_alice().await;
+        let chat_id = create_group_chat(&t, ProtectionStatus::Unprotected, "foo").await?;
+
+        // chess.xdc is failing for some zip-versions, see #3476, if we know more details about why, we can have a nicer name for the test :)
+        let mut instance = create_webxdc_instance(
+            &t,
+            "chess.xdc",
+            include_bytes!("../test-data/webxdc/chess.xdc"),
+        )
+        .await?;
+        let instance_id = send_msg(&t, chat_id, &mut instance).await?;
+        let instance = Message::load_from_db(&t, instance_id).await?;
+        assert_eq!(instance.viewtype, Viewtype::Webxdc);
+
+        let info = instance.get_webxdc_info(&t).await?;
+        assert_eq!(info.name, "Chess Board");
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_forward_webxdc_instance() -> Result<()> {
         let t = TestContext::new_alice().await;
         let chat_id = create_group_chat(&t, ProtectionStatus::Unprotected, "foo").await?;
@@ -800,10 +928,55 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_resend_webxdc_instance_and_info() -> Result<()> {
+        // Alice uses webxdc in a group
+        let alice = TestContext::new_alice().await;
+        let alice_grp = create_group_chat(&alice, ProtectionStatus::Unprotected, "grp").await?;
+        let alice_instance = send_webxdc_instance(&alice, alice_grp).await?;
+        assert_eq!(alice_grp.get_msg_cnt(&alice).await?, 1);
+        alice
+            .send_webxdc_status_update(
+                alice_instance.id,
+                r#"{"payload":7,"info": "i","summary":"s"}"#,
+                "d",
+            )
+            .await?;
+        assert_eq!(alice_grp.get_msg_cnt(&alice).await?, 2);
+        assert!(alice.get_last_msg_in(alice_grp).await.is_info());
+
+        // Alice adds Bob and resend already used webxdc
+        add_contact_to_chat(
+            &alice,
+            alice_grp,
+            Contact::create(&alice, "", "bob@example.net").await?,
+        )
+        .await?;
+        assert_eq!(alice_grp.get_msg_cnt(&alice).await?, 3);
+        resend_msgs(&alice, &[alice_instance.id]).await?;
+        let sent1 = alice.pop_sent_msg().await;
+
+        // Bob received webxdc, legacy info-messages updates are received but not added to the chat
+        let bob = TestContext::new_bob().await;
+        let bob_instance = bob.recv_msg(&sent1).await;
+        assert_eq!(bob_instance.viewtype, Viewtype::Webxdc);
+        assert!(!bob_instance.is_info());
+        assert_eq!(
+            bob.get_webxdc_status_updates(bob_instance.id, StatusUpdateSerial(0))
+                .await?,
+            r#"[{"payload":7,"info":"i","summary":"s","serial":1,"max_serial":1}]"#
+        );
+        let bob_grp = bob_instance.chat_id;
+        assert_eq!(bob.get_last_msg_in(bob_grp).await.id, bob_instance.id);
+        assert_eq!(bob_grp.get_msg_cnt(&bob).await?, 1);
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_receive_webxdc_instance() -> Result<()> {
         let t = TestContext::new_alice().await;
-        dc_receive_imf(
+        receive_imf(
             &t,
             include_bytes!("../test-data/message/webxdc_good_extension.eml"),
             false,
@@ -813,7 +986,7 @@ mod tests {
         assert_eq!(instance.viewtype, Viewtype::Webxdc);
         assert_eq!(instance.get_filename(), Some("minimal.xdc".to_string()));
 
-        dc_receive_imf(
+        receive_imf(
             &t,
             include_bytes!("../test-data/message/webxdc_bad_extension.eml"),
             false,
@@ -826,7 +999,7 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_webxdc_contact_request() -> Result<()> {
         let alice = TestContext::new_alice().await;
         let bob = TestContext::new_bob().await;
@@ -870,7 +1043,72 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_webxdc_update_for_not_downloaded_instance() -> Result<()> {
+        // Alice sends a larger instance and an update
+        let alice = TestContext::new_alice().await;
+        let bob = TestContext::new_bob().await;
+        let chat = alice.create_chat(&bob).await;
+        bob.set_config(Config::DownloadLimit, Some("40000")).await?;
+        let mut alice_instance = create_webxdc_instance(
+            &alice,
+            "chess.xdc",
+            include_bytes!("../test-data/webxdc/chess.xdc"),
+        )
+        .await?;
+        let sent1 = alice.send_msg(chat.id, &mut alice_instance).await;
+        let alice_instance = Message::load_from_db(&alice, sent1.sender_msg_id).await?;
+        alice
+            .send_webxdc_status_update(
+                alice_instance.id,
+                r#"{"payload": 7, "summary":"sum", "document":"doc"}"#,
+                "bla",
+            )
+            .await?;
+        alice.flush_status_updates().await?;
+        let sent2 = alice.pop_sent_msg().await;
+
+        // Bob does not download instance but already receives update
+        receive_imf_inner(
+            &bob,
+            &alice_instance.rfc724_mid,
+            sent1.payload().as_bytes(),
+            false,
+            Some(70790),
+            false,
+        )
+        .await?;
+        let bob_instance = bob.get_last_msg().await;
+        bob_instance.chat_id.accept(&bob).await?;
+        bob.recv_msg(&sent2).await;
+        assert_eq!(bob_instance.download_state, DownloadState::Available);
+
+        // Bob downloads instance, updates should be assigned correctly
+        receive_imf_inner(
+            &bob,
+            &alice_instance.rfc724_mid,
+            sent1.payload().as_bytes(),
+            false,
+            None,
+            false,
+        )
+        .await?;
+        let bob_instance = bob.get_last_msg().await;
+        assert_eq!(bob_instance.viewtype, Viewtype::Webxdc);
+        assert_eq!(bob_instance.download_state, DownloadState::Done);
+        assert_eq!(
+            bob.get_webxdc_status_updates(bob_instance.id, StatusUpdateSerial(0))
+                .await?,
+            r#"[{"payload":7,"document":"doc","summary":"sum","serial":1,"max_serial":1}]"#
+        );
+        let info = bob_instance.get_webxdc_info(&bob).await?;
+        assert_eq!(info.document, "doc");
+        assert_eq!(info.summary, "sum");
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_delete_webxdc_instance() -> Result<()> {
         let t = TestContext::new_alice().await;
         let chat_id = create_group_chat(&t, ProtectionStatus::Unprotected, "foo").await?;
@@ -908,7 +1146,7 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_create_status_update_record() -> Result<()> {
         let t = TestContext::new_alice().await;
         let chat_id = create_group_chat(&t, ProtectionStatus::Unprotected, "foo").await?;
@@ -925,6 +1163,8 @@ mod tests {
                 &mut instance,
                 "\n\n{\"payload\": {\"foo\":\"bar\"}}\n",
                 1640178619,
+                true,
+                ContactId::SELF,
             )
             .await?;
         assert_eq!(
@@ -934,11 +1174,17 @@ mod tests {
         );
 
         assert!(t
-            .create_status_update_record(&mut instance, "\n\n\n", 1640178619)
+            .create_status_update_record(&mut instance, "\n\n\n", 1640178619, true, ContactId::SELF)
             .await
             .is_err());
         assert!(t
-            .create_status_update_record(&mut instance, "bad json", 1640178619)
+            .create_status_update_record(
+                &mut instance,
+                "bad json",
+                1640178619,
+                true,
+                ContactId::SELF
+            )
             .await
             .is_err());
         assert_eq!(
@@ -952,14 +1198,22 @@ mod tests {
                 &mut instance,
                 r#"{"payload" : { "foo2":"bar2"}}"#,
                 1640178619,
+                true,
+                ContactId::SELF,
             )
             .await?;
         assert_eq!(
             t.get_webxdc_status_updates(instance.id, update_id1).await?,
             r#"[{"payload":{"foo2":"bar2"},"serial":2,"max_serial":2}]"#
         );
-        t.create_status_update_record(&mut instance, r#"{"payload":true}"#, 1640178619)
-            .await?;
+        t.create_status_update_record(
+            &mut instance,
+            r#"{"payload":true}"#,
+            1640178619,
+            true,
+            ContactId::SELF,
+        )
+        .await?;
         assert_eq!(
             t.get_webxdc_status_updates(instance.id, StatusUpdateSerial(0))
                 .await?,
@@ -973,6 +1227,8 @@ mod tests {
                 &mut instance,
                 r#"{"payload" : 1, "sender": "that is not used"}"#,
                 1640178619,
+                true,
+                ContactId::SELF,
             )
             .await?;
         assert_eq!(
@@ -984,31 +1240,47 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_receive_status_update() -> Result<()> {
         let t = TestContext::new_alice().await;
         let chat_id = create_group_chat(&t, ProtectionStatus::Unprotected, "foo").await?;
         let instance = send_webxdc_instance(&t, chat_id).await?;
 
         assert!(t
-            .receive_status_update(instance.id, r#"foo: bar"#)
+            .receive_status_update(ContactId::SELF, instance.id, r#"foo: bar"#)
             .await
             .is_err()); // no json
         assert!(t
-            .receive_status_update(instance.id, r#"{"updada":[{"payload":{"foo":"bar"}}]}"#)
+            .receive_status_update(
+                ContactId::SELF,
+                instance.id,
+                r#"{"updada":[{"payload":{"foo":"bar"}}]}"#
+            )
             .await
             .is_err()); // "updates" object missing
         assert!(t
-            .receive_status_update(instance.id, r#"{"updates":[{"foo":"bar"}]}"#)
+            .receive_status_update(
+                ContactId::SELF,
+                instance.id,
+                r#"{"updates":[{"foo":"bar"}]}"#
+            )
             .await
             .is_err()); // "payload" field missing
         assert!(t
-            .receive_status_update(instance.id, r#"{"updates":{"payload":{"foo":"bar"}}}"#)
+            .receive_status_update(
+                ContactId::SELF,
+                instance.id,
+                r#"{"updates":{"payload":{"foo":"bar"}}}"#
+            )
             .await
             .is_err()); // not an array
 
-        t.receive_status_update(instance.id, r#"{"updates":[{"payload":{"foo":"bar"}}]}"#)
-            .await?;
+        t.receive_status_update(
+            ContactId::SELF,
+            instance.id,
+            r#"{"updates":[{"payload":{"foo":"bar"}}]}"#,
+        )
+        .await?;
         assert_eq!(
             t.get_webxdc_status_updates(instance.id, StatusUpdateSerial(0))
                 .await?,
@@ -1016,6 +1288,7 @@ mod tests {
         );
 
         t.receive_status_update(
+            ContactId::SELF,
             instance.id,
             r#" {"updates": [ {"payload" :42} , {"payload": 23} ] } "#,
         )
@@ -1029,6 +1302,7 @@ mod tests {
         );
 
         t.receive_status_update(
+            ContactId::SELF,
             instance.id,
             r#" {"updates": [ {"payload" :"ok", "future_item": "test"}  ], "from": "future" } "#,
         )
@@ -1062,9 +1336,10 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_send_webxdc_status_update() -> Result<()> {
         let alice = TestContext::new_alice().await;
+        alice.set_config_bool(Config::BccSelf, true).await?;
         let bob = TestContext::new_bob().await;
 
         // Alice sends an webxdc instance and a status update
@@ -1074,17 +1349,17 @@ mod tests {
         assert_eq!(alice_instance.viewtype, Viewtype::Webxdc);
         assert!(!sent1.payload().contains("report-type=status-update"));
 
-        let status_update_msg_id = alice
+        alice
             .send_webxdc_status_update(
                 alice_instance.id,
                 r#"{"payload" : {"foo":"bar"}}"#,
                 "descr text",
             )
-            .await?
-            .unwrap();
+            .await?;
+        alice.flush_status_updates().await?;
         expect_status_update_event(&alice, alice_instance.id).await?;
         let sent2 = &alice.pop_sent_msg().await;
-        let alice_update = Message::load_from_db(&alice, status_update_msg_id).await?;
+        let alice_update = Message::load_from_db(&alice, sent2.sender_msg_id).await?;
         assert!(alice_update.hidden);
         assert_eq!(alice_update.viewtype, Viewtype::Text);
         assert_eq!(alice_update.get_filename(), None);
@@ -1110,8 +1385,7 @@ mod tests {
                 r#"{"payload":{"snipp":"snapp"}}"#,
                 "bla text",
             )
-            .await?
-            .unwrap();
+            .await?;
         assert_eq!(
             alice
                 .get_webxdc_status_updates(alice_instance.id, StatusUpdateSerial(0))
@@ -1121,8 +1395,7 @@ mod tests {
         );
 
         // Bob receives all messages
-        bob.recv_msg(sent1).await;
-        let bob_instance = bob.get_last_msg().await;
+        let bob_instance = bob.recv_msg(sent1).await;
         let bob_chat_id = bob_instance.chat_id;
         assert_eq!(bob_instance.rfc724_mid, alice_instance.rfc724_mid);
         assert_eq!(bob_instance.viewtype, Viewtype::Webxdc);
@@ -1147,10 +1420,23 @@ mod tests {
         assert_eq!(alice2_instance.viewtype, Viewtype::Webxdc);
         assert_eq!(alice2_chat_id.get_msg_cnt(&alice2).await?, 1);
 
+        // To support the second device, Alice has enabled bcc_self and will receive their own messages;
+        // these messages, however, should be ignored
+        alice.recv_msg_opt(sent1).await;
+        alice.recv_msg_opt(sent2).await;
+        assert_eq!(alice_chat.id.get_msg_cnt(&alice).await?, 1);
+        assert_eq!(
+            alice
+                .get_webxdc_status_updates(alice_instance.id, StatusUpdateSerial(0))
+                .await?,
+            r#"[{"payload":{"foo":"bar"},"serial":1,"max_serial":2},
+{"payload":{"snipp":"snapp"},"serial":2,"max_serial":2}]"#
+        );
+
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_render_webxdc_status_update_object() -> Result<()> {
         let t = TestContext::new_alice().await;
         let chat_id = create_group_chat(&t, ProtectionStatus::Unprotected, "a chat").await?;
@@ -1176,7 +1462,105 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_render_webxdc_status_update_object_range() -> Result<()> {
+        let t = TestContext::new_alice().await;
+        let chat_id = create_group_chat(&t, ProtectionStatus::Unprotected, "a chat").await?;
+        let instance = send_webxdc_instance(&t, chat_id).await?;
+        t.send_webxdc_status_update(instance.id, r#"{"payload": 1}"#, "d")
+            .await?;
+        t.send_webxdc_status_update(instance.id, r#"{"payload": 2}"#, "d")
+            .await?;
+        t.send_webxdc_status_update(instance.id, r#"{"payload": 3}"#, "d")
+            .await?;
+        t.send_webxdc_status_update(instance.id, r#"{"payload": 4}"#, "d")
+            .await?;
+        let json = t
+            .render_webxdc_status_update_object(
+                instance.id,
+                Some((StatusUpdateSerial(2), StatusUpdateSerial(3))),
+            )
+            .await?
+            .unwrap();
+        assert_eq!(json, "{\"updates\":[{\"payload\":2},\n{\"payload\":3}]}");
+
+        assert_eq!(
+            t.sql
+                .count("SELECT COUNT(*) FROM smtp_status_updates", paramsv![],)
+                .await?,
+            1
+        );
+        t.flush_status_updates().await?;
+        assert_eq!(
+            t.sql
+                .count("SELECT COUNT(*) FROM smtp_status_updates", paramsv![],)
+                .await?,
+            0
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_pop_status_update() -> Result<()> {
+        let t = TestContext::new_alice().await;
+        let chat_id = create_group_chat(&t, ProtectionStatus::Unprotected, "a chat").await?;
+        let instance1 = send_webxdc_instance(&t, chat_id).await?;
+        let instance2 = send_webxdc_instance(&t, chat_id).await?;
+        let instance3 = send_webxdc_instance(&t, chat_id).await?;
+        assert!(t.pop_smtp_status_update().await?.is_none());
+
+        t.send_webxdc_status_update(instance1.id, r#"{"payload": "1a"}"#, "descr1a")
+            .await?;
+        t.send_webxdc_status_update(instance2.id, r#"{"payload": "2a"}"#, "descr2a")
+            .await?;
+        t.send_webxdc_status_update(instance2.id, r#"{"payload": "2b"}"#, "descr2b")
+            .await?;
+        t.send_webxdc_status_update(instance3.id, r#"{"payload": "3a"}"#, "descr3a")
+            .await?;
+        t.send_webxdc_status_update(instance3.id, r#"{"payload": "3b"}"#, "descr3b")
+            .await?;
+        t.send_webxdc_status_update(instance3.id, r#"{"payload": "3c"}"#, "descr3c")
+            .await?;
+        assert_eq!(
+            t.sql
+                .count("SELECT COUNT(*) FROM smtp_status_updates", paramsv![],)
+                .await?,
+            3
+        );
+
+        // order of pop_status_update() is not defined, therefore the more complicated test
+        let mut instances_checked = 0;
+        for i in 0..3 {
+            let (instance, min_ser, max_ser, descr) = t.pop_smtp_status_update().await?.unwrap();
+            if instance == instance1.id {
+                assert_eq!(min_ser, max_ser);
+                assert_eq!(descr, "descr1a");
+                instances_checked += 1;
+            } else if instance == instance2.id {
+                assert_eq!(min_ser.to_u32(), max_ser.to_u32() - 1);
+                assert_eq!(descr, "descr2b");
+                instances_checked += 1;
+            } else if instance == instance3.id {
+                assert_eq!(min_ser.to_u32(), max_ser.to_u32() - 2);
+                assert_eq!(descr, "descr3c");
+                instances_checked += 1;
+            } else {
+                bail!("unexpected instance");
+            }
+            assert_eq!(
+                t.sql
+                    .count("SELECT COUNT(*) FROM smtp_status_updates", paramsv![],)
+                    .await?,
+                2 - i
+            );
+        }
+        assert_eq!(instances_checked, 3);
+        assert!(t.pop_smtp_status_update().await?.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_draft_and_send_webxdc_status_update() -> Result<()> {
         let alice = TestContext::new_alice().await;
         let bob = TestContext::new_bob().await;
@@ -1195,15 +1579,22 @@ mod tests {
             .await?;
         let mut alice_instance = alice_chat_id.get_draft(&alice).await?.unwrap();
 
-        let status_update_msg_id = alice
+        alice
             .send_webxdc_status_update(alice_instance.id, r#"{"payload": {"foo":"bar"}}"#, "descr")
             .await?;
-        assert_eq!(status_update_msg_id, None);
+        alice.flush_status_updates().await?;
         expect_status_update_event(&alice, alice_instance.id).await?;
-        let status_update_msg_id = alice
+        alice
             .send_webxdc_status_update(alice_instance.id, r#"{"payload":42, "info":"i"}"#, "descr")
             .await?;
-        assert_eq!(status_update_msg_id, None);
+        alice.flush_status_updates().await?;
+        assert_eq!(
+            alice
+                .sql
+                .count("SELECT COUNT(*) FROM smtp_status_updates", paramsv![],)
+                .await?,
+            0
+        );
         assert!(!alice.get_last_msg().await.is_info()); // 'info: "i"' message not added in draft mode
 
         // send webxdc instance,
@@ -1219,8 +1610,7 @@ mod tests {
         assert_eq!(alice_instance.chat_id, alice_chat_id);
 
         // bob receives the instance together with the initial updates in a single message
-        bob.recv_msg(&sent1).await;
-        let bob_instance = bob.get_last_msg().await;
+        let bob_instance = bob.recv_msg(&sent1).await;
         assert_eq!(bob_instance.viewtype, Viewtype::Webxdc);
         assert_eq!(bob_instance.get_filename(), Some("minimal.xdc".to_string()));
         assert!(sent1.payload().contains("Content-Type: application/json"));
@@ -1230,13 +1620,14 @@ mod tests {
             bob.get_webxdc_status_updates(bob_instance.id, StatusUpdateSerial(0))
                 .await?,
             r#"[{"payload":{"foo":"bar"},"serial":1,"max_serial":2},
-{"payload":42,"serial":2,"max_serial":2}]"# // 'info: "i"' ignored as sent in draft mode
+{"payload":42,"info":"i","serial":2,"max_serial":2}]"#
         );
+        assert!(!bob.get_last_msg().await.is_info()); // 'info: "i"' message not added in draft mode
 
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_send_webxdc_status_update_to_non_webxdc() -> Result<()> {
         let t = TestContext::new_alice().await;
         let chat_id = create_group_chat(&t, ProtectionStatus::Unprotected, "foo").await?;
@@ -1248,7 +1639,7 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_get_webxdc_blob() -> Result<()> {
         let t = TestContext::new_alice().await;
         let chat_id = create_group_chat(&t, ProtectionStatus::Unprotected, "foo").await?;
@@ -1265,7 +1656,7 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_get_webxdc_blob_default_icon() -> Result<()> {
         let t = TestContext::new_alice().await;
         let chat_id = create_group_chat(&t, ProtectionStatus::Unprotected, "foo").await?;
@@ -1277,7 +1668,7 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_get_webxdc_blob_with_absolute_paths() -> Result<()> {
         let t = TestContext::new_alice().await;
         let chat_id = create_group_chat(&t, ProtectionStatus::Unprotected, "foo").await?;
@@ -1290,7 +1681,7 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_get_webxdc_blob_with_subdirs() -> Result<()> {
         let t = TestContext::new_alice().await;
         let chat_id = create_group_chat(&t, ProtectionStatus::Unprotected, "foo").await?;
@@ -1331,23 +1722,22 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_parse_webxdc_manifest() -> Result<()> {
-        let result = parse_webxdc_manifest(r#"key = syntax error"#.as_bytes()).await;
+        let result = parse_webxdc_manifest(r#"key = syntax error"#.as_bytes());
         assert!(result.is_err());
 
-        let manifest = parse_webxdc_manifest(r#"no_name = "no name, no icon""#.as_bytes()).await?;
+        let manifest = parse_webxdc_manifest(r#"no_name = "no name, no icon""#.as_bytes())?;
         assert_eq!(manifest.name, None);
 
-        let manifest = parse_webxdc_manifest(r#"name = "name, no icon""#.as_bytes()).await?;
+        let manifest = parse_webxdc_manifest(r#"name = "name, no icon""#.as_bytes())?;
         assert_eq!(manifest.name, Some("name, no icon".to_string()));
 
         let manifest = parse_webxdc_manifest(
             r#"name = "foo"
 icon = "bar""#
                 .as_bytes(),
-        )
-        .await?;
+        )?;
         assert_eq!(manifest.name, Some("foo".to_string()));
 
         let manifest = parse_webxdc_manifest(
@@ -1358,33 +1748,31 @@ add_item = "that should be just ignored"
 [section]
 sth_for_the = "future""#
                 .as_bytes(),
-        )
-        .await?;
+        )?;
         assert_eq!(manifest.name, Some("foz".to_string()));
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_parse_webxdc_manifest_min_api() -> Result<()> {
-        let manifest = parse_webxdc_manifest(r#"min_api = 3"#.as_bytes()).await?;
+        let manifest = parse_webxdc_manifest(r#"min_api = 3"#.as_bytes())?;
         assert_eq!(manifest.min_api, Some(3));
 
-        let result = parse_webxdc_manifest(r#"min_api = "1""#.as_bytes()).await;
+        let result = parse_webxdc_manifest(r#"min_api = "1""#.as_bytes());
         assert!(result.is_err());
 
-        let result = parse_webxdc_manifest(r#"min_api = 1.2"#.as_bytes()).await;
+        let result = parse_webxdc_manifest(r#"min_api = 1.2"#.as_bytes());
         assert!(result.is_err());
 
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_parse_webxdc_manifest_source_code_url() -> Result<()> {
-        let result = parse_webxdc_manifest(r#"source_code_url = 3"#.as_bytes()).await;
+        let result = parse_webxdc_manifest(r#"source_code_url = 3"#.as_bytes());
         assert!(result.is_err());
 
-        let manifest =
-            parse_webxdc_manifest(r#"source_code_url = "https://foo.bar""#.as_bytes()).await?;
+        let manifest = parse_webxdc_manifest(r#"source_code_url = "https://foo.bar""#.as_bytes())?;
         assert_eq!(
             manifest.source_code_url,
             Some("https://foo.bar".to_string())
@@ -1393,7 +1781,7 @@ sth_for_the = "future""#
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_webxdc_min_api_too_large() -> Result<()> {
         let t = TestContext::new_alice().await;
         let chat_id = create_group_chat(&t, ProtectionStatus::Unprotected, "chat").await?;
@@ -1412,7 +1800,7 @@ sth_for_the = "future""#
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_get_webxdc_info() -> Result<()> {
         let t = TestContext::new_alice().await;
         let chat_id = create_group_chat(&t, ProtectionStatus::Unprotected, "foo").await?;
@@ -1496,7 +1884,7 @@ sth_for_the = "future""#
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_webxdc_info_summary() -> Result<()> {
         let alice = TestContext::new_alice().await;
         let bob = TestContext::new_bob().await;
@@ -1515,6 +1903,7 @@ sth_for_the = "future""#
                 "descr",
             )
             .await?;
+        alice.flush_status_updates().await?;
         let sent_update1 = &alice.pop_sent_msg().await;
         let info = Message::load_from_db(&alice, alice_instance.id)
             .await?
@@ -1529,6 +1918,7 @@ sth_for_the = "future""#
                 "descr",
             )
             .await?;
+        alice.flush_status_updates().await?;
         let sent_update2 = &alice.pop_sent_msg().await;
         let info = Message::load_from_db(&alice, alice_instance.id)
             .await?
@@ -1537,8 +1927,7 @@ sth_for_the = "future""#
         assert_eq!(info.summary, "sum: 2".to_string());
 
         // Bob receives the updates
-        bob.recv_msg(sent_instance).await;
-        let bob_instance = bob.get_last_msg().await;
+        let bob_instance = bob.recv_msg(sent_instance).await;
         bob.recv_msg(sent_update1).await;
         bob.recv_msg(sent_update2).await;
         let info = Message::load_from_db(&bob, bob_instance.id)
@@ -1549,8 +1938,7 @@ sth_for_the = "future""#
 
         // Alice has a second device and also receives the updates there
         let alice2 = TestContext::new_alice().await;
-        alice2.recv_msg(sent_instance).await;
-        let alice2_instance = alice2.get_last_msg().await;
+        let alice2_instance = alice2.recv_msg(sent_instance).await;
         alice2.recv_msg(sent_update1).await;
         alice2.recv_msg(sent_update2).await;
         let info = Message::load_from_db(&alice2, alice2_instance.id)
@@ -1562,7 +1950,7 @@ sth_for_the = "future""#
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_webxdc_document_name() -> Result<()> {
         let alice = TestContext::new_alice().await;
         let bob = TestContext::new_bob().await;
@@ -1582,6 +1970,7 @@ sth_for_the = "future""#
                 "descr",
             )
             .await?;
+        alice.flush_status_updates().await?;
         let sent_update1 = &alice.pop_sent_msg().await;
         let info = Message::load_from_db(&alice, alice_instance.id)
             .await?
@@ -1591,8 +1980,7 @@ sth_for_the = "future""#
         assert_eq!(info.summary, "".to_string());
 
         // Bob receives the updates
-        bob.recv_msg(sent_instance).await;
-        let bob_instance = bob.get_last_msg().await;
+        let bob_instance = bob.recv_msg(sent_instance).await;
         bob.recv_msg(sent_update1).await;
         let info = Message::load_from_db(&bob, bob_instance.id)
             .await?
@@ -1604,7 +1992,7 @@ sth_for_the = "future""#
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_webxdc_info_msg() -> Result<()> {
         let alice = TestContext::new_alice().await;
         let bob = TestContext::new_bob().await;
@@ -1622,10 +2010,13 @@ sth_for_the = "future""#
                 "descr text",
             )
             .await?;
+        alice.flush_status_updates().await?;
         let sent2 = &alice.pop_sent_msg().await;
         assert_eq!(alice_chat.id.get_msg_cnt(&alice).await?, 2);
         let info_msg = alice.get_last_msg().await;
         assert!(info_msg.is_info());
+        assert_eq!(info_msg.get_info_type(), SystemMessage::WebxdcInfoMessage);
+        assert_eq!(info_msg.from_id, ContactId::SELF);
         assert_eq!(
             info_msg.get_text(),
             Some("this appears in-chat".to_string())
@@ -1643,13 +2034,14 @@ sth_for_the = "future""#
         );
 
         // Bob receives all messages
-        bob.recv_msg(sent1).await;
-        let bob_instance = bob.get_last_msg().await;
+        let bob_instance = bob.recv_msg(sent1).await;
         let bob_chat_id = bob_instance.chat_id;
         bob.recv_msg(sent2).await;
         assert_eq!(bob_chat_id.get_msg_cnt(&bob).await?, 2);
         let info_msg = bob.get_last_msg().await;
         assert!(info_msg.is_info());
+        assert_eq!(info_msg.get_info_type(), SystemMessage::WebxdcInfoMessage);
+        assert!(!info_msg.from_id.is_special());
         assert_eq!(
             info_msg.get_text(),
             Some("this appears in-chat".to_string())
@@ -1664,13 +2056,14 @@ sth_for_the = "future""#
 
         // Alice has a second device and also receives the info message there
         let alice2 = TestContext::new_alice().await;
-        alice2.recv_msg(sent1).await;
-        let alice2_instance = alice2.get_last_msg().await;
+        let alice2_instance = alice2.recv_msg(sent1).await;
         let alice2_chat_id = alice2_instance.chat_id;
         alice2.recv_msg(sent2).await;
         assert_eq!(alice2_chat_id.get_msg_cnt(&alice2).await?, 2);
         let info_msg = alice2.get_last_msg().await;
         assert!(info_msg.is_info());
+        assert_eq!(info_msg.get_info_type(), SystemMessage::WebxdcInfoMessage);
+        assert_eq!(info_msg.from_id, ContactId::SELF);
         assert_eq!(
             info_msg.get_text(),
             Some("this appears in-chat".to_string())
@@ -1690,7 +2083,63 @@ sth_for_the = "future""#
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_webxdc_info_msg_cleanup_series() -> Result<()> {
+        let alice = TestContext::new_alice().await;
+        let bob = TestContext::new_bob().await;
+        let alice_chat = alice.create_chat(&bob).await;
+        let alice_instance = send_webxdc_instance(&alice, alice_chat.id).await?;
+        let sent1 = &alice.pop_sent_msg().await;
+
+        // Alice sends two info messages in a row;
+        // the second one removes the first one as there is nothing in between
+        alice
+            .send_webxdc_status_update(alice_instance.id, r#"{"info":"i1", "payload":1}"#, "d")
+            .await?;
+        alice.flush_status_updates().await?;
+        let sent2 = &alice.pop_sent_msg().await;
+        assert_eq!(alice_chat.id.get_msg_cnt(&alice).await?, 2);
+        alice
+            .send_webxdc_status_update(alice_instance.id, r#"{"info":"i2", "payload":2}"#, "d")
+            .await?;
+        alice.flush_status_updates().await?;
+        let sent3 = &alice.pop_sent_msg().await;
+        assert_eq!(alice_chat.id.get_msg_cnt(&alice).await?, 2);
+        let info_msg = alice.get_last_msg().await;
+        assert_eq!(info_msg.get_text(), Some("i2".to_string()));
+
+        // When Bob receives the messages, they should be cleaned up as well
+        let bob_instance = bob.recv_msg(sent1).await;
+        let bob_chat_id = bob_instance.chat_id;
+        bob.recv_msg(sent2).await;
+        assert_eq!(bob_chat_id.get_msg_cnt(&bob).await?, 2);
+        bob.recv_msg(sent3).await;
+        assert_eq!(bob_chat_id.get_msg_cnt(&bob).await?, 2);
+        let info_msg = bob.get_last_msg().await;
+        assert_eq!(info_msg.get_text(), Some("i2".to_string()));
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_webxdc_info_msg_no_cleanup_on_interrupted_series() -> Result<()> {
+        let t = TestContext::new_alice().await;
+        let chat_id = create_group_chat(&t, ProtectionStatus::Unprotected, "c").await?;
+        let instance = send_webxdc_instance(&t, chat_id).await?;
+
+        t.send_webxdc_status_update(instance.id, r#"{"info":"i1", "payload":1}"#, "d")
+            .await?;
+        assert_eq!(chat_id.get_msg_cnt(&t).await?, 2);
+        send_text_msg(&t, chat_id, "msg between info".to_string()).await?;
+        assert_eq!(chat_id.get_msg_cnt(&t).await?, 3);
+        t.send_webxdc_status_update(instance.id, r#"{"info":"i2", "payload":2}"#, "d")
+            .await?;
+        assert_eq!(chat_id.get_msg_cnt(&t).await?, 4);
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_webxdc_opportunistic_encryption() -> Result<()> {
         let alice = TestContext::new_alice().await;
         let bob = TestContext::new_bob().await;
@@ -1711,18 +2160,17 @@ sth_for_the = "future""#
         alice_chat_id.accept(&alice).await?;
         let alice_instance = send_webxdc_instance(&alice, alice_chat_id).await?;
         let sent1 = &alice.pop_sent_msg().await;
-        let update_msg_id = alice
+        alice
             .send_webxdc_status_update(alice_instance.id, r#"{"payload":42}"#, "descr")
-            .await?
-            .unwrap();
-        let update_msg = Message::load_from_db(&alice, update_msg_id).await?;
+            .await?;
+        alice.flush_status_updates().await?;
         let sent2 = &alice.pop_sent_msg().await;
+        let update_msg = Message::load_from_db(&alice, sent2.sender_msg_id).await?;
         assert!(alice_instance.get_showpadlock());
         assert!(update_msg.get_showpadlock());
 
         // Bob receives instance+update
-        bob.recv_msg(sent1).await;
-        let bob_instance = bob.get_last_msg().await;
+        let bob_instance = bob.recv_msg(sent1).await;
         bob.recv_msg(sent2).await;
         assert!(bob_instance.get_showpadlock());
 
@@ -1733,17 +2181,17 @@ sth_for_the = "future""#
             Contact::create(&bob, "", "claire@example.org").await?,
         )
         .await?;
-        let update_msg_id = bob
-            .send_webxdc_status_update(bob_instance.id, r#"{"payload":43}"#, "descr")
-            .await?
-            .unwrap();
-        let update_msg = Message::load_from_db(&bob, update_msg_id).await?;
+        bob.send_webxdc_status_update(bob_instance.id, r#"{"payload":43}"#, "descr")
+            .await?;
+        bob.flush_status_updates().await?;
+        let sent3 = bob.pop_sent_msg().await;
+        let update_msg = Message::load_from_db(&bob, sent3.sender_msg_id).await?;
         assert!(!update_msg.get_showpadlock());
 
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_webxdc_chatlist_summary() -> Result<()> {
         let t = TestContext::new_alice().await;
         let chat_id = create_group_chat(&t, ProtectionStatus::Unprotected, "chat").await?;
@@ -1763,7 +2211,7 @@ sth_for_the = "future""#
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_webxdc_and_text() -> Result<()> {
         let alice = TestContext::new_alice().await;
         let bob = TestContext::new_bob().await;
@@ -1786,14 +2234,12 @@ sth_for_the = "future""#
 
         // Bob receives that instance
         let sent1 = alice.pop_sent_msg().await;
-        bob.recv_msg(&sent1).await;
-        let bob_instance = bob.get_last_msg().await;
+        let bob_instance = bob.recv_msg(&sent1).await;
         assert_eq!(bob_instance.get_text(), Some("user added text".to_string()));
 
         // Alice's second device receives the instance as well
         let alice2 = TestContext::new_alice().await;
-        alice2.recv_msg(&sent1).await;
-        let alice2_instance = alice2.get_last_msg().await;
+        let alice2_instance = alice2.recv_msg(&sent1).await;
         assert_eq!(
             alice2_instance.get_text(),
             Some("user added text".to_string())

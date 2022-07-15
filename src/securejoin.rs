@@ -11,7 +11,6 @@ use crate::config::Config;
 use crate::constants::Blocked;
 use crate::contact::{Contact, ContactId, Origin, VerifiedStatus};
 use crate::context::Context;
-use crate::dc_tools::time;
 use crate::e2ee::ensure_secret_key_exists;
 use crate::events::EventType;
 use crate::headerdef::HeaderDef;
@@ -23,6 +22,7 @@ use crate::peerstate::{Peerstate, PeerstateKeyType, PeerstateVerifiedStatus, ToS
 use crate::qr::check_qr;
 use crate::stock_str;
 use crate::token;
+use crate::tools::time;
 
 mod bob;
 mod bobstate;
@@ -51,7 +51,7 @@ macro_rules! inviter_progress {
 ///
 /// With `group` set to `None` this generates a setup-contact QR code, with `group` set to a
 /// [`ChatId`] generates a join-group QR code for the given chat.
-pub async fn dc_get_securejoin_qr(context: &Context, group: Option<ChatId>) -> Result<String> {
+pub async fn get_securejoin_qr(context: &Context, group: Option<ChatId>) -> Result<String> {
     /*=======================================================
     ====             Alice - the inviter side            ====
     ====   Step 1 in "Setup verified contact" protocol   ====
@@ -137,27 +137,13 @@ async fn get_self_fingerprint(context: &Context) -> Option<Fingerprint> {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum JoinError {
-    #[error("Failed to send handshake message: {0}")]
-    SendMessage(#[from] SendMsgError),
-
-    // Note that this can currently only occur if there is a bug in the QR/Lot code as this
-    // is supposed to create a contact for us.
-    #[error("Unknown contact (this is a bug): {0}")]
-    UnknownContact(#[source] anyhow::Error),
-
-    #[error("Other")]
-    Other(#[from] anyhow::Error),
-}
-
 /// Take a scanned QR-code and do the setup-contact/join-group/invite handshake.
 ///
 /// This is the start of the process for the joiner.  See the module and ffi documentation
 /// for more details.
 ///
 /// The function returns immediately and the handshake will run in background.
-pub async fn dc_join_securejoin(context: &Context, qr: &str) -> Result<ChatId, JoinError> {
+pub async fn join_securejoin(context: &Context, qr: &str) -> Result<ChatId> {
     securejoin(context, qr).await.map_err(|err| {
         warn!(context, "Fatal joiner error: {:#}", err);
         // The user just scanned this QR code so has context on what failed.
@@ -166,7 +152,7 @@ pub async fn dc_join_securejoin(context: &Context, qr: &str) -> Result<ChatId, J
     })
 }
 
-async fn securejoin(context: &Context, qr: &str) -> Result<ChatId, JoinError> {
+async fn securejoin(context: &Context, qr: &str) -> Result<ChatId> {
     /*========================================================
     ====             Bob - the joiner's side             =====
     ====   Step 2 in "Setup verified contact" protocol   =====
@@ -180,14 +166,6 @@ async fn securejoin(context: &Context, qr: &str) -> Result<ChatId, JoinError> {
     bob::start_protocol(context, invite).await
 }
 
-/// Error when failing to send a protocol handshake message.
-///
-/// Wrapping the [anyhow::Error] means we can "impl From" more easily on errors from this
-/// function.
-#[derive(Debug, thiserror::Error)]
-#[error("Failed sending handshake message")]
-pub struct SendMsgError(#[from] anyhow::Error);
-
 /// Send handshake message from Alice's device;
 /// Bob's handshake messages are sent in `BobState::send_handshake_message()`.
 async fn send_alice_handshake_msg(
@@ -195,7 +173,7 @@ async fn send_alice_handshake_msg(
     contact_id: ContactId,
     step: &str,
     fingerprint: Option<Fingerprint>,
-) -> Result<(), SendMsgError> {
+) -> Result<()> {
     let mut msg = Message {
         viewtype: Viewtype::Text,
         text: Some(format!("Secure-Join: {}", step)),
@@ -245,8 +223,11 @@ async fn fingerprint_equals_sender(
     };
 
     if let Some(peerstate) = peerstate {
-        if peerstate.public_key_fingerprint.is_some()
-            && fingerprint == peerstate.public_key_fingerprint.as_ref().unwrap()
+        if peerstate
+            .public_key_fingerprint
+            .as_ref()
+            .filter(|&fp| fp == fingerprint)
+            .is_some()
         {
             return Ok(true);
         }
@@ -257,10 +238,10 @@ async fn fingerprint_equals_sender(
 
 /// What to do with a Secure-Join handshake message after it was handled.
 ///
-/// This status is returned to [`dc_receive_imf`] which will use it to decide what to do
+/// This status is returned to [`receive_imf`] which will use it to decide what to do
 /// next with this incoming setup-contact/secure-join handshake message.
 ///
-/// [`dc_receive_imf`]: crate::dc_receive_imf::dc_receive_imf
+/// [`receive_imf`]: crate::receive_imf::receive_imf
 pub(crate) enum HandshakeMessage {
     /// The message has been fully handled and should be removed/delete.
     ///
@@ -350,7 +331,8 @@ pub(crate) async fn handle_securejoin_handshake(
                 &format!("{}-auth-required", &step[..2]),
                 None,
             )
-            .await?;
+            .await
+            .context("failed sending auth-required handshake message")?;
             Ok(HandshakeMessage::Done)
         }
         "vg-auth-required" | "vc-auth-required" => {
@@ -478,7 +460,8 @@ pub(crate) async fn handle_securejoin_handshake(
                     "vc-contact-confirm",
                     Some(fingerprint),
                 )
-                .await?;
+                .await
+                .context("failed sending vc-contact-confirm message")?;
 
                 inviter_progress!(context, contact_id, 1000);
             }
@@ -650,9 +633,7 @@ async fn could_not_establish_secure_connection(
 }
 
 async fn mark_peer_as_verified(context: &Context, fingerprint: &Fingerprint) -> Result<(), Error> {
-    if let Some(ref mut peerstate) =
-        Peerstate::from_fingerprint(context, &context.sql, fingerprint).await?
-    {
+    if let Some(ref mut peerstate) = Peerstate::from_fingerprint(context, fingerprint).await? {
         if peerstate.set_verified(
             PeerstateKeyType::PublicKey,
             fingerprint,
@@ -709,11 +690,11 @@ mod tests {
     use crate::chat::ProtectionStatus;
     use crate::chatlist::Chatlist;
     use crate::constants::{Chattype, DC_GCM_ADDDAYMARKER};
-    use crate::dc_receive_imf::dc_receive_imf;
     use crate::peerstate::Peerstate;
+    use crate::receive_imf::receive_imf;
     use crate::test_utils::{TestContext, TestContextManager};
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_setup_contact() {
         let mut tcm = TestContextManager::new().await;
         let alice = tcm.alice().await;
@@ -731,10 +712,10 @@ mod tests {
         );
 
         // Step 1: Generate QR-code, ChatId(0) indicates setup-contact
-        let qr = dc_get_securejoin_qr(&alice.ctx, None).await.unwrap();
+        let qr = get_securejoin_qr(&alice.ctx, None).await.unwrap();
 
         // Step 2: Bob scans QR-code, sends vc-request
-        dc_join_securejoin(&bob.ctx, &qr).await.unwrap();
+        join_securejoin(&bob.ctx, &qr).await.unwrap();
         assert_eq!(
             Chatlist::try_load(&bob, 0, None, None).await.unwrap().len(),
             1
@@ -920,14 +901,14 @@ mod tests {
         );
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_setup_contact_bad_qr() {
         let bob = TestContext::new_bob().await;
-        let ret = dc_join_securejoin(&bob.ctx, "not a qr code").await;
+        let ret = join_securejoin(&bob.ctx, "not a qr code").await;
         assert!(ret.is_err());
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_setup_contact_bob_knows_alice() -> Result<()> {
         let mut tcm = TestContextManager::new().await;
         let alice = tcm.alice().await;
@@ -953,10 +934,10 @@ mod tests {
         peerstate.save_to_db(&bob.ctx.sql, true).await?;
 
         // Step 1: Generate QR-code, ChatId(0) indicates setup-contact
-        let qr = dc_get_securejoin_qr(&alice.ctx, None).await?;
+        let qr = get_securejoin_qr(&alice.ctx, None).await?;
 
         // Step 2+4: Bob scans QR-code, sends vc-request-with-auth, skipping vc-request
-        dc_join_securejoin(&bob.ctx, &qr).await.unwrap();
+        join_securejoin(&bob.ctx, &qr).await.unwrap();
 
         // Check Bob emitted the JoinerProgress event.
         let event = bob
@@ -1052,7 +1033,7 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_setup_contact_concurrent_calls() -> Result<()> {
         let mut tcm = TestContextManager::new().await;
         let alice = tcm.alice().await;
@@ -1060,7 +1041,7 @@ mod tests {
 
         // do a scan that is not working as claire is never responding
         let qr_stale = "OPENPGP4FPR:1234567890123456789012345678901234567890#a=claire%40foo.de&n=&i=12345678901&s=23456789012";
-        let claire_id = dc_join_securejoin(&bob, qr_stale).await?;
+        let claire_id = join_securejoin(&bob, qr_stale).await?;
         let chat = Chat::load_from_db(&bob, claire_id).await?;
         assert!(!claire_id.is_special());
         assert_eq!(chat.typ, Chattype::Single);
@@ -1068,8 +1049,8 @@ mod tests {
 
         // subsequent scans shall abort existing ones or run concurrently -
         // but they must not fail as otherwise the whole qr scanning becomes unusable until restart.
-        let qr = dc_get_securejoin_qr(&alice, None).await?;
-        let alice_id = dc_join_securejoin(&bob, &qr).await?;
+        let qr = get_securejoin_qr(&alice, None).await?;
+        let alice_id = join_securejoin(&bob, &qr).await?;
         let chat = Chat::load_from_db(&bob, alice_id).await?;
         assert!(!alice_id.is_special());
         assert_eq!(chat.typ, Chattype::Single);
@@ -1083,7 +1064,7 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_secure_join() -> Result<()> {
         let mut tcm = TestContextManager::new().await;
         let alice = tcm.alice().await;
@@ -1097,12 +1078,12 @@ mod tests {
             chat::create_group_chat(&alice.ctx, ProtectionStatus::Protected, "the chat").await?;
 
         // Step 1: Generate QR-code, secure-join implied by chatid
-        let qr = dc_get_securejoin_qr(&alice.ctx, Some(alice_chatid))
+        let qr = get_securejoin_qr(&alice.ctx, Some(alice_chatid))
             .await
             .unwrap();
 
         // Step 2: Bob scans QR-code, sends vg-request
-        let bob_chatid = dc_join_securejoin(&bob.ctx, &qr).await?;
+        let bob_chatid = join_securejoin(&bob.ctx, &qr).await?;
         assert_eq!(Chatlist::try_load(&bob, 0, None, None).await?.len(), 1);
 
         let sent = bob.pop_sent_msg().await;
@@ -1307,7 +1288,7 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_adhoc_group_no_qr() -> Result<()> {
         let alice = TestContext::new_alice().await;
         alice.set_config(Config::ShowEmails, Some("2")).await?;
@@ -1320,11 +1301,11 @@ Content-Type: text/plain; charset=utf-8; format=flowed; delsp=no
 
 First thread."#;
 
-        dc_receive_imf(&alice, mime, false).await?;
+        receive_imf(&alice, mime, false).await?;
         let msg = alice.get_last_msg().await;
         let chat_id = msg.chat_id;
 
-        assert!(dc_get_securejoin_qr(&alice, Some(chat_id)).await.is_err());
+        assert!(get_securejoin_qr(&alice, Some(chat_id)).await.is_err());
         Ok(())
     }
 }

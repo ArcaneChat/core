@@ -1,9 +1,9 @@
 //! # Messages and their identifiers.
 
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 
 use anyhow::{ensure, format_err, Context as _, Result};
-use async_std::path::{Path, PathBuf};
 use deltachat_derive::{FromSql, ToSql};
 use rusqlite::types::ValueRef;
 use serde::{Deserialize, Serialize};
@@ -15,22 +15,21 @@ use crate::constants::{
 };
 use crate::contact::{Contact, ContactId, Origin};
 use crate::context::Context;
-use crate::dc_tools::{
-    dc_create_smeared_timestamp, dc_get_filebytes, dc_get_filemeta, dc_gm2local_offset,
-    dc_read_file, dc_timestamp_to_str, dc_truncate, time,
-};
 use crate::download::DownloadState;
 use crate::ephemeral::{start_ephemeral_timers_msgids, Timer as EphemeralTimer};
 use crate::events::EventType;
 use crate::imap::markseen_on_imap_table;
-use crate::log::LogExt;
-use crate::mimeparser::{parse_message_id, FailureReport, SystemMessage};
+use crate::mimeparser::{parse_message_id, DeliveryReport, SystemMessage};
 use crate::param::{Param, Params};
 use crate::pgp::split_armored_data;
 use crate::scheduler::InterruptInfo;
 use crate::sql;
 use crate::stock_str;
 use crate::summary::Summary;
+use crate::tools::{
+    create_smeared_timestamp, get_filebytes, get_filemeta, gm2local_offset, read_file, time,
+    timestamp_to_str, truncate,
+};
 
 /// Message ID, including reserved IDs.
 ///
@@ -95,7 +94,7 @@ impl MsgId {
             .sql
             .execute(
                 // If you change which information is removed here, also change delete_expired_messages() and
-                // which information dc_receive_imf::add_parts() still adds to the db if the chat_id is TRASH
+                // which information receive_imf::add_parts() still adds to the db if the chat_id is TRASH
                 r#"
 UPDATE msgs 
 SET 
@@ -233,10 +232,6 @@ impl Default for MessengerMessage {
 /// An object representing a single message in memory.
 /// The message object is not updated.
 /// If you want an update, you have to recreate the object.
-///
-/// to check if a mail was sent, use dc_msg_is_sent()
-/// approx. max. length returned by dc_msg_get_text()
-/// approx. max. length returned by dc_get_msg_info()
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Message {
     pub(crate) id: MsgId,
@@ -396,15 +391,15 @@ impl Message {
                     self.param.set_int(Param::Width, 0);
                     self.param.set_int(Param::Height, 0);
 
-                    if let Ok(buf) = dc_read_file(context, path_and_filename).await {
-                        if let Ok((width, height)) = dc_get_filemeta(&buf) {
+                    if let Ok(buf) = read_file(context, path_and_filename).await {
+                        if let Ok((width, height)) = get_filemeta(&buf) {
                             self.param.set_int(Param::Width, width as i32);
                             self.param.set_int(Param::Height, height as i32);
                         }
                     }
 
                     if !self.id.is_unset() {
-                        self.update_param(context).await;
+                        self.update_param(context).await?;
                     }
                 }
             }
@@ -413,7 +408,7 @@ impl Message {
     }
 
     /// Check if a message has a location bound to it.
-    /// These messages are also returned by dc_get_locations()
+    /// These messages are also returned by get_locations()
     /// and the UI may decide to display a special icon beside such messages,
     ///
     /// @memberof Message
@@ -428,7 +423,7 @@ impl Message {
     /// at a position different from the self-location.
     /// You should not call this function
     /// if you want to bind the current self-location to a message;
-    /// this is done by dc_set_location() and dc_send_locations_to_chat().
+    /// this is done by set_location() and send_locations_to_chat().
     ///
     /// Typically results in the event #DC_EVENT_LOCATION_CHANGED with
     /// contact_id set to ContactId::SELF.
@@ -498,7 +493,7 @@ impl Message {
 
     pub async fn get_filebytes(&self, context: &Context) -> u64 {
         match self.param.get_path(Param::File, context) {
-            Ok(Some(path)) => dc_get_filebytes(context, &path).await,
+            Ok(Some(path)) => get_filebytes(context, &path).await,
             Ok(None) => 0,
             Err(_) => 0,
         }
@@ -558,9 +553,9 @@ impl Message {
         Ok(Summary::new(context, self, chat, contact.as_ref()).await)
     }
 
-    // It's a little unfortunate that the UI has to first call dc_msg_get_override_sender_name() and then if it was NULL, call
-    // dc_contact_get_display_name() but this was the best solution:
-    // - We could load a Contact struct from the db here to call get_display_name() instead of returning None, but then we had a db
+    // It's a little unfortunate that the UI has to first call `dc_msg_get_override_sender_name` and then if it was `NULL`, call
+    // `dc_contact_get_display_name` but this was the best solution:
+    // - We could load a Contact struct from the db here to call `dc_get_display_name` instead of returning `None`, but then we had a db
     //   call everytime (and this fn is called a lot while the user is scrolling through a group), so performance would be bad
     // - We could pass both a Contact struct and a Message struct in the FFI, but at least on Android we would need to handle raw
     //   C-data in the Java code (i.e. a `long` storing a C pointer)
@@ -573,14 +568,14 @@ impl Message {
     }
 
     // Exposing this function over the ffi instead of get_override_sender_name() would mean that at least Android Java code has
-    // to handle raw C-data (as it is done for dc_msg_get_summary())
+    // to handle raw C-data (as it is done for msg_get_summary())
     pub fn get_sender_name(&self, contact: &Contact) -> String {
         self.get_override_sender_name()
             .unwrap_or_else(|| contact.get_display_name().to_string())
     }
 
     pub fn has_deviating_timestamp(&self) -> bool {
-        let cnv_to_local = dc_gm2local_offset();
+        let cnv_to_local = gm2local_offset();
         let sort_timestamp = self.get_sort_timestamp() as i64 + cnv_to_local;
         let send_timestamp = self.get_timestamp() as i64 + cnv_to_local;
 
@@ -637,7 +632,7 @@ impl Message {
         }
 
         if let Some(filename) = self.get_file(context) {
-            if let Ok(ref buf) = dc_read_file(context, filename).await {
+            if let Ok(ref buf) = read_file(context, filename).await {
                 if let Ok((typ, headers, _)) = split_armored_data(buf) {
                     if typ == pgp::armor::BlockType::Message {
                         return headers.get(crate::pgp::HEADER_SETUPCODE).cloned();
@@ -762,7 +757,7 @@ impl Message {
         width: i32,
         height: i32,
         duration: i32,
-    ) {
+    ) -> Result<()> {
         if width > 0 && height > 0 {
             self.param.set_int(Param::Width, width);
             self.param.set_int(Param::Height, height);
@@ -770,7 +765,8 @@ impl Message {
         if duration > 0 {
             self.param.set_int(Param::Duration, duration);
         }
-        self.update_param(context).await;
+        self.update_param(context).await?;
+        Ok(())
     }
 
     /// Sets message quote.
@@ -850,26 +846,26 @@ impl Message {
         self.param.set_int(Param::ForcePlaintext, 1);
     }
 
-    pub async fn update_param(&self, context: &Context) {
+    pub async fn update_param(&self, context: &Context) -> Result<()> {
         context
             .sql
             .execute(
                 "UPDATE msgs SET param=? WHERE id=?;",
                 paramsv![self.param.to_string(), self.id],
             )
-            .await
-            .ok_or_log(context);
+            .await?;
+        Ok(())
     }
 
-    pub(crate) async fn update_subject(&self, context: &Context) {
+    pub(crate) async fn update_subject(&self, context: &Context) -> Result<()> {
         context
             .sql
             .execute(
                 "UPDATE msgs SET subject=? WHERE id=?;",
                 paramsv![self.subject, self.id],
             )
-            .await
-            .ok_or_log(context);
+            .await?;
+        Ok(())
     }
 
     /// Gets the error status of the message.
@@ -1004,9 +1000,9 @@ pub async fn get_msg_info(context: &Context, msg_id: MsgId) -> Result<String> {
         return Ok(ret);
     }
     let rawtxt = rawtxt.unwrap_or_default();
-    let rawtxt = dc_truncate(rawtxt.trim(), DC_DESIRED_TEXT_LEN);
+    let rawtxt = truncate(rawtxt.trim(), DC_DESIRED_TEXT_LEN);
 
-    let fts = dc_timestamp_to_str(msg.get_timestamp());
+    let fts = timestamp_to_str(msg.get_timestamp());
     ret += &format!("Sent: {}", fts);
 
     let name = Contact::load_from_db(context, msg.from_id)
@@ -1018,7 +1014,7 @@ pub async fn get_msg_info(context: &Context, msg_id: MsgId) -> Result<String> {
     ret += "\n";
 
     if msg.from_id != ContactId::SELF {
-        let s = dc_timestamp_to_str(if 0 != msg.timestamp_rcvd {
+        let s = timestamp_to_str(if 0 != msg.timestamp_rcvd {
             msg.timestamp_rcvd
         } else {
             msg.timestamp_sort
@@ -1032,10 +1028,7 @@ pub async fn get_msg_info(context: &Context, msg_id: MsgId) -> Result<String> {
     }
 
     if msg.ephemeral_timestamp != 0 {
-        ret += &format!(
-            "Expires: {}\n",
-            dc_timestamp_to_str(msg.ephemeral_timestamp)
-        );
+        ret += &format!("Expires: {}\n", timestamp_to_str(msg.ephemeral_timestamp));
     }
 
     if msg.from_id == ContactId::INFO || msg.to_id == ContactId::INFO {
@@ -1058,7 +1051,7 @@ pub async fn get_msg_info(context: &Context, msg_id: MsgId) -> Result<String> {
         .await
     {
         for (contact_id, ts) in rows {
-            let fts = dc_timestamp_to_str(ts);
+            let fts = timestamp_to_str(ts);
             ret += &format!("Read: {}", fts);
 
             let name = Contact::load_from_db(context, contact_id)
@@ -1094,7 +1087,7 @@ pub async fn get_msg_info(context: &Context, msg_id: MsgId) -> Result<String> {
     }
 
     if let Some(path) = msg.get_file(context) {
-        let bytes = dc_get_filebytes(context, &path).await;
+        let bytes = get_filebytes(context, &path).await;
         ret += &format!("\nFile: {}, {}, bytes\n", path.display(), bytes);
     }
 
@@ -1208,7 +1201,7 @@ pub fn guess_msgtype_from_suffix(path: &Path) -> Option<(Viewtype, &str)> {
 
 /// Get the raw mime-headers of the given message.
 /// Raw headers are saved for incoming messages
-/// only if `dc_set_config(context, "save_mime_headers", "1")`
+/// only if `set_config(context, "save_mime_headers", "1")`
 /// was called before.
 ///
 /// Returns an empty vector if there are no headers saved for the given message,
@@ -1283,7 +1276,7 @@ pub async fn markseen_msgs(context: &Context, msg_ids: Vec<MsgId>) -> Result<()>
     let msgs = context
         .sql
         .query_map(
-            format!(
+            &format!(
                 "SELECT
                     m.id AS id,
                     m.chat_id AS chat_id,
@@ -1427,9 +1420,8 @@ pub async fn exists(context: &Context, msg_id: MsgId) -> Result<bool> {
     }
 }
 
-pub async fn set_msg_failed(context: &Context, msg_id: MsgId, error: Option<impl AsRef<str>>) {
+pub async fn set_msg_failed(context: &Context, msg_id: MsgId, error: &str) {
     if let Ok(mut msg) = Message::load_from_db(context, msg_id).await {
-        let error = error.map(|e| e.as_ref().to_string()).unwrap_or_default();
         if msg.state.can_fail() {
             msg.state = MessageState::OutFailed;
             warn!(context, "{} failed: {}", msg_id, error);
@@ -1543,8 +1535,8 @@ pub async fn handle_mdn(
 /// Where appropriate, also adds an info message telling the user which of the recipients of a group message failed.
 pub(crate) async fn handle_ndn(
     context: &Context,
-    failed: &FailureReport,
-    error: Option<impl AsRef<str>>,
+    failed: &DeliveryReport,
+    error: Option<String>,
 ) -> Result<()> {
     if failed.rfc724_mid.is_empty() {
         return Ok(());
@@ -1575,10 +1567,18 @@ pub(crate) async fn handle_ndn(
         )
         .await?;
 
+    let error = if let Some(error) = error {
+        error
+    } else if let Some(failed_recipient) = &failed.failed_recipient {
+        format!("Delivery to {} failed.", failed_recipient).clone()
+    } else {
+        "Delivery to at least one recipient failed.".to_string()
+    };
+
     let mut first = true;
     for msg in msgs.into_iter() {
         let (msg_id, chat_id, chat_type) = msg?;
-        set_msg_failed(context, msg_id, error.as_ref()).await;
+        set_msg_failed(context, msg_id, &error).await;
         if first {
             // Add only one info msg for all failed messages
             ndn_maybe_add_info_msg(context, failed, chat_id, chat_type).await?;
@@ -1591,7 +1591,7 @@ pub(crate) async fn handle_ndn(
 
 async fn ndn_maybe_add_info_msg(
     context: &Context,
-    failed: &FailureReport,
+    failed: &DeliveryReport,
     chat_id: ChatId,
     chat_type: Chattype,
 ) -> Result<()> {
@@ -1610,7 +1610,7 @@ async fn ndn_maybe_add_info_msg(
                     context,
                     chat_id,
                     &text,
-                    dc_create_smeared_timestamp(context).await,
+                    create_smeared_timestamp(context).await,
                 )
                 .await?;
                 context.emit_event(EventType::ChatModified(chat_id));
@@ -1640,7 +1640,7 @@ pub async fn get_unblocked_msg_cnt(context: &Context) -> usize {
     {
         Ok(res) => res,
         Err(err) => {
-            error!(context, "dc_get_unblocked_msg_cnt() failed. {}", err);
+            error!(context, "get_unblocked_msg_cnt() failed. {}", err);
             0
         }
     }
@@ -1660,7 +1660,7 @@ pub async fn get_request_msg_cnt(context: &Context) -> usize {
     {
         Ok(res) => res,
         Err(err) => {
-            error!(context, "dc_get_request_msg_cnt() failed. {}", err);
+            error!(context, "get_request_msg_cnt() failed. {}", err);
             0
         }
     }
@@ -1757,8 +1757,7 @@ pub enum Viewtype {
     Unknown = 0,
 
     /// Text message.
-    /// The text of the message is set using dc_msg_set_text()
-    /// and retrieved with dc_msg_get_text().
+    /// The text of the message is set using dc_msg_set_text() and retrieved with dc_msg_get_text().
     Text = 10,
 
     /// Image message.
@@ -1839,7 +1838,7 @@ mod tests {
 
     use crate::chat::{marknoticed_chat, ChatItem};
     use crate::chatlist::Chatlist;
-    use crate::dc_receive_imf::dc_receive_imf;
+    use crate::receive_imf::receive_imf;
     use crate::test_utils as test;
     use crate::test_utils::TestContext;
 
@@ -1861,7 +1860,7 @@ mod tests {
         );
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_prepare_message_and_send() {
         use crate::config::Config;
 
@@ -1883,7 +1882,7 @@ mod tests {
     }
 
     /// Tests that message cannot be prepared if account has no configured address.
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_prepare_not_configured() {
         let d = test::TestContext::new().await;
         let ctx = &d.ctx;
@@ -1895,7 +1894,7 @@ mod tests {
         assert!(chat::prepare_msg(ctx, chat.id, &mut msg).await.is_err());
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_parse_webrtc_instance() {
         let (webrtc_type, url) = Message::parse_webrtc_instance("basicwebrtc:https://foo/bar");
         assert_eq!(webrtc_type, VideochatType::BasicWebrtc);
@@ -1914,7 +1913,7 @@ mod tests {
         assert_eq!(url, "https://j.si/foo");
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_create_webrtc_instance() {
         // webrtc_instance may come from an input field of the ui, be pretty tolerant on input
         let instance = Message::create_webrtc_instance("https://meet.jit.si/", "123");
@@ -1951,7 +1950,7 @@ mod tests {
         assert_eq!(instance, "basicwebrtc:https://basic.stuff/12345ab");
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_create_webrtc_instance_noroom() {
         // webrtc_instance may come from an input field of the ui, be pretty tolerant on input
         let instance = Message::create_webrtc_instance("bla.foo$NOROOM", "123");
@@ -1971,7 +1970,7 @@ mod tests {
         assert_eq!(instance, "https://bla.foo/?$NOROOM=123");
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_get_width_height() {
         let t = test::TestContext::new().await;
 
@@ -2001,7 +2000,7 @@ mod tests {
         assert!(has_image);
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_quote() {
         use crate::config::Config;
 
@@ -2037,11 +2036,11 @@ mod tests {
         assert!(quoted_msg.get_text() == msg2.quoted_text());
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_get_chat_id() {
         // Alice receives a message that pops up as a contact request
         let alice = TestContext::new_alice().await;
-        dc_receive_imf(
+        receive_imf(
             &alice,
             b"From: Bob <bob@example.com>\n\
                     To: alice@example.org\n\
@@ -2061,7 +2060,7 @@ mod tests {
         assert_eq!(msg.get_text().unwrap(), "hello".to_string());
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_set_override_sender_name() {
         // send message with overridden sender name
         let alice = TestContext::new_alice().await;
@@ -2093,8 +2092,8 @@ mod tests {
             .first()
             .unwrap();
         let contact = Contact::load_from_db(&bob, contact_id).await.unwrap();
-        bob.recv_msg(&alice.pop_sent_msg().await).await;
-        let msg = bob.get_last_msg_in(chat.id).await;
+        let msg = bob.recv_msg(&alice.pop_sent_msg().await).await;
+        assert_eq!(msg.chat_id, chat.id);
         assert_eq!(msg.text, Some("bla blubb".to_string()));
         assert_eq!(
             msg.get_override_sender_name(),
@@ -2109,7 +2108,7 @@ mod tests {
         assert_ne!(chat.typ, Chattype::Mailinglist);
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_markseen_msgs() -> Result<()> {
         let alice = TestContext::new_alice().await;
         let bob = TestContext::new_bob().await;
@@ -2119,13 +2118,11 @@ mod tests {
 
         // alice sends to bob,
         assert_eq!(Chatlist::try_load(&bob, 0, None, None).await?.len(), 0);
-        bob.recv_msg(&alice.send_msg(alice_chat.id, &mut msg).await)
-            .await;
-        let msg1 = bob.get_last_msg().await;
+        let sent1 = alice.send_msg(alice_chat.id, &mut msg).await;
+        let msg1 = bob.recv_msg(&sent1).await;
         let bob_chat_id = msg1.chat_id;
-        bob.recv_msg(&alice.send_msg(alice_chat.id, &mut msg).await)
-            .await;
-        let msg2 = bob.get_last_msg().await;
+        let sent2 = alice.send_msg(alice_chat.id, &mut msg).await;
+        let msg2 = bob.recv_msg(&sent2).await;
         assert_eq!(msg1.chat_id, msg2.chat_id);
         let chats = Chatlist::try_load(&bob, 0, None, None).await?;
         assert_eq!(chats.len(), 1);
@@ -2146,14 +2143,12 @@ mod tests {
 
         // bob sends to alice,
         // alice knows bob and messages appear in normal chat
-        alice
+        let msg1 = alice
             .recv_msg(&bob.send_msg(bob_chat_id, &mut msg).await)
             .await;
-        let msg1 = alice.get_last_msg().await;
-        alice
+        let msg2 = alice
             .recv_msg(&bob.send_msg(bob_chat_id, &mut msg).await)
             .await;
-        let msg2 = alice.get_last_msg().await;
         let chats = Chatlist::try_load(&alice, 0, None, None).await?;
         assert_eq!(chats.len(), 1);
         assert_eq!(chats.get_chat_id(0)?, alice_chat.id);
@@ -2186,7 +2181,7 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_get_state() -> Result<()> {
         let alice = TestContext::new_alice().await;
         let bob = TestContext::new_bob().await;
@@ -2225,12 +2220,11 @@ mod tests {
         update_msg_state(&alice, alice_msg.id, MessageState::OutMdnRcvd).await?;
         assert_state(&alice, alice_msg.id, MessageState::OutMdnRcvd).await;
 
-        set_msg_failed(&alice, alice_msg.id, Some("badly failed")).await;
+        set_msg_failed(&alice, alice_msg.id, "badly failed").await;
         assert_state(&alice, alice_msg.id, MessageState::OutFailed).await;
 
         // check incoming message states on receiver side
-        bob.recv_msg(&payload).await;
-        let bob_msg = bob.get_last_msg().await;
+        let bob_msg = bob.recv_msg(&payload).await;
         assert_eq!(bob_chat.id, bob_msg.chat_id);
         assert_state(&bob, bob_msg.id, MessageState::InFresh).await;
 
@@ -2243,12 +2237,12 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_is_bot() -> Result<()> {
         let alice = TestContext::new_alice().await;
 
         // Alice receives a message from Bob the bot.
-        dc_receive_imf(
+        receive_imf(
             &alice,
             b"From: Bob <bob@example.com>\n\
                     To: alice@example.org\n\
@@ -2266,7 +2260,7 @@ mod tests {
         assert!(msg.is_bot());
 
         // Alice receives a message from Bob who is not the bot anymore.
-        dc_receive_imf(
+        receive_imf(
             &alice,
             b"From: Bob <bob@example.com>\n\
                     To: alice@example.org\n\

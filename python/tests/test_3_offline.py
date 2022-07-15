@@ -1,32 +1,51 @@
 from __future__ import print_function
-import pytest
+
 import os
 import time
-from deltachat import const, Account
-from deltachat.message import Message
-from deltachat.hookspec import account_hookimpl
-from deltachat.capi import ffi, lib
-from deltachat.cutil import iter_array
 from datetime import datetime, timedelta, timezone
 
+import pytest
 
-@pytest.mark.parametrize("msgtext,res", [
-    ("Member Me (tmp1@x.org) removed by tmp2@x.org.",
-        ("removed", "tmp1@x.org", "tmp2@x.org")),
-    ("Member With space (tmp1@x.org) removed by tmp2@x.org.",
-        ("removed", "tmp1@x.org", "tmp2@x.org")),
-    ("Member With space (tmp1@x.org) removed by Another member (tmp2@x.org).",
-        ("removed", "tmp1@x.org", "tmp2@x.org")),
-    ("Member With space (tmp1@x.org) removed by me",
-        ("removed", "tmp1@x.org", "me")),
-    ("Group left by some one (tmp1@x.org).",
-        ("removed", "tmp1@x.org", "tmp1@x.org")),
-    ("Group left by tmp1@x.org.",
-        ("removed", "tmp1@x.org", "tmp1@x.org")),
-    ("Member tmp1@x.org added by tmp2@x.org.", ("added", "tmp1@x.org", "tmp2@x.org")),
-    ("Member nothing bla bla", None),
-    ("Another unknown system message", None),
-])
+from deltachat import Account, const
+from deltachat.capi import ffi, lib
+from deltachat.cutil import iter_array
+from deltachat.hookspec import account_hookimpl
+from deltachat.message import Message
+from deltachat.tracker import ImexFailed
+
+
+@pytest.mark.parametrize(
+    "msgtext,res",
+    [
+        (
+            "Member Me (tmp1@x.org) removed by tmp2@x.org.",
+            ("removed", "tmp1@x.org", "tmp2@x.org"),
+        ),
+        (
+            "Member With space (tmp1@x.org) removed by tmp2@x.org.",
+            ("removed", "tmp1@x.org", "tmp2@x.org"),
+        ),
+        (
+            "Member With space (tmp1@x.org) removed by Another member (tmp2@x.org).",
+            ("removed", "tmp1@x.org", "tmp2@x.org"),
+        ),
+        (
+            "Member With space (tmp1@x.org) removed by me",
+            ("removed", "tmp1@x.org", "me"),
+        ),
+        (
+            "Group left by some one (tmp1@x.org).",
+            ("removed", "tmp1@x.org", "tmp1@x.org"),
+        ),
+        ("Group left by tmp1@x.org.", ("removed", "tmp1@x.org", "tmp1@x.org")),
+        (
+            "Member tmp1@x.org added by tmp2@x.org.",
+            ("added", "tmp1@x.org", "tmp2@x.org"),
+        ),
+        ("Member nothing bla bla", None),
+        ("Another unknown system message", None),
+    ],
+)
 def test_parse_system_add_remove(msgtext, res):
     from deltachat.message import parse_system_add_remove
 
@@ -136,9 +155,11 @@ class TestOfflineContact:
         ac1 = acfactory.get_pseudo_configured_account()
         contact1 = ac1.create_contact("some1@example.org", name="some1")
         contact2 = ac1.create_contact("some1@example.org", name="some1")
+        contact3 = None
         str(contact1)
         repr(contact1)
         assert contact1 == contact2
+        assert contact1 != contact3
         assert contact1.id
         assert contact1.addr == "some1@example.org"
         assert contact1.display_name == "some1"
@@ -232,10 +253,12 @@ class TestOfflineChat:
     def test_chat_idempotent(self, chat1, ac1):
         contact1 = chat1.get_contacts()[0]
         chat2 = contact1.create_chat()
+        chat3 = None
         assert chat2.id == chat1.id
         assert chat2.get_name() == chat1.get_name()
         assert chat1 == chat2
         assert not (chat1 != chat2)
+        assert chat1 != chat3
 
         for ichat in ac1.get_chats():
             if ichat.id == chat1.id:
@@ -387,6 +410,8 @@ class TestOfflineChat:
 
     def test_message_eq_contains(self, chat1):
         msg = chat1.send_text("msg1")
+        msg2 = None
+        assert msg != msg2
         assert msg in chat1.get_messages()
         assert not (msg not in chat1.get_messages())
         str(msg)
@@ -424,11 +449,14 @@ class TestOfflineChat:
         assert os.path.exists(msg.filename)
         assert msg.filemime == "image/png"
 
-    @pytest.mark.parametrize("typein,typeout", [
+    @pytest.mark.parametrize(
+        "typein,typeout",
+        [
             (None, "application/octet-stream"),
             ("text/plain", "text/plain"),
             ("image/png", "image/png"),
-    ])
+        ],
+    )
     def test_message_file(self, ac1, chat1, data, lp, typein, typeout):
         lp.sec("sending file")
         fn = data.get_path("r.txt")
@@ -475,7 +503,7 @@ class TestOfflineChat:
         with pytest.raises(ValueError):
             ac1.set_config("addr", "123@example.org")
 
-    def test_import_export_one_contact(self, acfactory, tmpdir):
+    def test_import_export_on_unencrypted_acct(self, acfactory, tmpdir):
         backupdir = tmpdir.mkdir("backup")
         ac1 = acfactory.get_pseudo_configured_account()
         chat = ac1.create_contact("some1 <some1@example.org>").create_chat()
@@ -494,6 +522,162 @@ class TestOfflineChat:
         assert os.path.exists(path)
         ac2 = acfactory.get_unconfigured_account()
         ac2.import_all(path)
+        contacts = ac2.get_contacts(query="some1")
+        assert len(contacts) == 1
+        contact2 = contacts[0]
+        assert contact2.addr == "some1@example.org"
+        chat2 = contact2.create_chat()
+        messages = chat2.get_messages()
+        assert len(messages) == 2
+        assert messages[0].text == "msg1"
+        assert os.path.exists(messages[1].filename)
+
+    def test_import_export_on_encrypted_acct(self, acfactory, tmpdir):
+        passphrase1 = "passphrase1"
+        passphrase2 = "passphrase2"
+        backupdir = tmpdir.mkdir("backup")
+        ac1 = acfactory.get_pseudo_configured_account(passphrase=passphrase1)
+
+        chat = ac1.create_contact("some1 <some1@example.org>").create_chat()
+        # send a text message
+        msg = chat.send_text("msg1")
+        # send a binary file
+        bin = tmpdir.join("some.bin")
+        with bin.open("w") as f:
+            f.write("\00123" * 10000)
+        msg = chat.send_file(bin.strpath)
+        contact = msg.get_sender_contact()
+        assert contact == ac1.get_self_contact()
+
+        assert not backupdir.listdir()
+        ac1.stop_io()
+
+        path = ac1.export_all(backupdir.strpath)
+        assert os.path.exists(path)
+
+        ac2 = acfactory.get_unconfigured_account(closed=True)
+        ac2.open(passphrase2)
+        ac2.import_all(path)
+
+        # check data integrity
+        contacts = ac2.get_contacts(query="some1")
+        assert len(contacts) == 1
+        contact2 = contacts[0]
+        assert contact2.addr == "some1@example.org"
+        chat2 = contact2.create_chat()
+        messages = chat2.get_messages()
+        assert len(messages) == 2
+        assert messages[0].text == "msg1"
+        assert os.path.exists(messages[1].filename)
+
+        ac2.shutdown()
+
+        # check that passphrase is not lost after import:
+        ac2 = Account(ac2.db_path, logging=ac2._logging, closed=True)
+        ac2.open(passphrase2)
+
+        # check data integrity
+        contacts = ac2.get_contacts(query="some1")
+        assert len(contacts) == 1
+        contact2 = contacts[0]
+        assert contact2.addr == "some1@example.org"
+        chat2 = contact2.create_chat()
+        messages = chat2.get_messages()
+        assert len(messages) == 2
+        assert messages[0].text == "msg1"
+        assert os.path.exists(messages[1].filename)
+
+    def test_import_export_with_passphrase(self, acfactory, tmpdir):
+        passphrase = "test_passphrase"
+        wrong_passphrase = "wrong_passprase"
+        backupdir = tmpdir.mkdir("backup")
+        ac1 = acfactory.get_pseudo_configured_account()
+
+        chat = ac1.create_contact("some1 <some1@example.org>").create_chat()
+        # send a text message
+        msg = chat.send_text("msg1")
+        # send a binary file
+        bin = tmpdir.join("some.bin")
+        with bin.open("w") as f:
+            f.write("\00123" * 10000)
+        msg = chat.send_file(bin.strpath)
+        contact = msg.get_sender_contact()
+        assert contact == ac1.get_self_contact()
+
+        assert not backupdir.listdir()
+        ac1.stop_io()
+
+        path = ac1.export_all(backupdir.strpath, passphrase)
+        assert os.path.exists(path)
+
+        ac2 = acfactory.get_unconfigured_account()
+        with pytest.raises(ImexFailed):
+            ac2.import_all(path, wrong_passphrase)
+        ac2.import_all(path, passphrase)
+
+        # check data integrity
+        contacts = ac2.get_contacts(query="some1")
+        assert len(contacts) == 1
+        contact2 = contacts[0]
+        assert contact2.addr == "some1@example.org"
+        chat2 = contact2.create_chat()
+        messages = chat2.get_messages()
+        assert len(messages) == 2
+        assert messages[0].text == "msg1"
+        assert os.path.exists(messages[1].filename)
+
+    def test_import_encrypted_bak_into_encrypted_acct(self, acfactory, tmpdir):
+        """
+        Test that account passphrase isn't lost if backup failed to be imported.
+        See https://github.com/deltachat/deltachat-core-rust/issues/3379
+        """
+        acct_passphrase = "passphrase1"
+        bak_passphrase = "passphrase2"
+        wrong_passphrase = "wrong_passprase"
+        backupdir = tmpdir.mkdir("backup")
+
+        ac1 = acfactory.get_pseudo_configured_account()
+        chat = ac1.create_contact("some1 <some1@example.org>").create_chat()
+        # send a text message
+        msg = chat.send_text("msg1")
+        # send a binary file
+        bin = tmpdir.join("some.bin")
+        with bin.open("w") as f:
+            f.write("\00123" * 10000)
+        msg = chat.send_file(bin.strpath)
+        contact = msg.get_sender_contact()
+        assert contact == ac1.get_self_contact()
+
+        assert not backupdir.listdir()
+        ac1.stop_io()
+
+        path = ac1.export_all(backupdir.strpath, bak_passphrase)
+        assert os.path.exists(path)
+
+        ac2 = acfactory.get_unconfigured_account(closed=True)
+        ac2.open(acct_passphrase)
+        with pytest.raises(ImexFailed):
+            ac2.import_all(path, wrong_passphrase)
+        ac2.import_all(path, bak_passphrase)
+
+        # check data integrity
+        contacts = ac2.get_contacts(query="some1")
+        assert len(contacts) == 1
+        contact2 = contacts[0]
+        assert contact2.addr == "some1@example.org"
+        chat2 = contact2.create_chat()
+        messages = chat2.get_messages()
+        assert len(messages) == 2
+        assert messages[0].text == "msg1"
+        assert os.path.exists(messages[1].filename)
+
+        ac2.shutdown()
+
+        # check that passphrase is not lost after import
+        ac2 = Account(ac2.db_path, logging=ac2._logging, closed=True)
+        ac2.open(acct_passphrase)
+
+        # check data integrity
         contacts = ac2.get_contacts(query="some1")
         assert len(contacts) == 1
         contact2 = contacts[0]
@@ -629,6 +813,6 @@ class TestOfflineChat:
         lp.sec("check message count of only system messages (without daymarkers)")
         dc_array = ffi.gc(
             lib.dc_get_chat_msgs(ac1._dc_context, chat.id, const.DC_GCM_INFO_ONLY, 0),
-            lib.dc_array_unref
+            lib.dc_array_unref,
         )
         assert len(list(iter_array(dc_array, lambda x: x))) == 2

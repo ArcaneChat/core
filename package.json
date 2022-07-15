@@ -2,8 +2,7 @@
   "dependencies": {
     "debug": "^4.1.1",
     "napi-macros": "^2.0.0",
-    "node-gyp-build": "^4.1.0",
-    "split2": "^3.1.1"
+    "node-gyp-build": "^4.1.0"
   },
   "description": "node.js bindings for deltachat-core",
   "devDependencies": {
@@ -42,7 +41,7 @@
     "build": "npm run build:core && npm run build:bindings",
     "build:bindings": "npm run build:bindings:c && npm run build:bindings:ts",
     "build:bindings:c": "npm run build:bindings:c:c && npm run build:bindings:c:postinstall",
-    "build:bindings:c:c": "cd node && npx node-gyp rebuild",
+    "build:bindings:c:c": "cd node && node-gyp rebuild",
     "build:bindings:c:postinstall": "node node/scripts/postinstall.js",
     "build:bindings:ts": "cd node && tsc",
     "build:core": "npm run build:core:rust && npm run build:core:constants",
@@ -58,8 +57,8 @@
     "prebuildify": "cd node && prebuildify -t 16.13.0 --napi --strip --postinstall \"node scripts/postinstall.js --prebuild\"",
     "test": "npm run test:lint && npm run test:mocha",
     "test:lint": "npm run lint",
-    "test:mocha": "mocha -r esm node/test/test.js --growl --reporter=spec"
+    "test:mocha": "mocha -r esm node/test/test.js --growl --reporter=spec --bail"
   },
   "types": "node/dist/index.d.ts",
-  "version": "1.81.0"
+  "version": "1.89.0"
 }

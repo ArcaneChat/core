@@ -1,21 +1,21 @@
 //! Location handling.
 use std::convert::TryFrom;
+use std::time::Duration;
 
 use anyhow::{ensure, Context as _, Result};
-use async_std::channel::Receiver;
-use async_std::future::timeout;
+use async_channel::Receiver;
 use bitflags::bitflags;
 use quick_xml::events::{BytesEnd, BytesStart, BytesText};
-use std::time::Duration;
+use tokio::time::timeout;
 
 use crate::chat::{self, ChatId};
 use crate::contact::ContactId;
 use crate::context::Context;
-use crate::dc_tools::{duration_to_str, time};
 use crate::events::EventType;
 use crate::message::{Message, MsgId, Viewtype};
 use crate::mimeparser::SystemMessage;
 use crate::stock_str;
+use crate::tools::{duration_to_str, time};
 
 /// Location record
 #[derive(Debug, Clone, Default)]
@@ -63,7 +63,7 @@ impl Kml {
         Default::default()
     }
 
-    pub fn parse(context: &Context, to_parse: &[u8]) -> Result<Self> {
+    pub fn parse(to_parse: &[u8]) -> Result<Self> {
         ensure!(to_parse.len() <= 1024 * 1024, "kml-file is too large");
 
         let mut reader = quick_xml::Reader::from_reader(to_parse);
@@ -75,19 +75,16 @@ impl Kml {
         let mut buf = Vec::new();
 
         loop {
-            match reader.read_event(&mut buf) {
-                Ok(quick_xml::events::Event::Start(ref e)) => kml.starttag_cb(e, &reader),
-                Ok(quick_xml::events::Event::End(ref e)) => kml.endtag_cb(e),
-                Ok(quick_xml::events::Event::Text(ref e)) => kml.text_cb(e, &reader),
-                Err(e) => {
-                    error!(
-                        context,
-                        "Location parsing: Error at position {}: {:?}",
-                        reader.buffer_position(),
-                        e
-                    );
-                }
-                Ok(quick_xml::events::Event::Eof) => break,
+            match reader.read_event(&mut buf).with_context(|| {
+                format!(
+                    "location parsing error at position {}",
+                    reader.buffer_position()
+                )
+            })? {
+                quick_xml::events::Event::Start(ref e) => kml.starttag_cb(e, &reader),
+                quick_xml::events::Event::End(ref e) => kml.endtag_cb(e),
+                quick_xml::events::Event::Text(ref e) => kml.text_cb(e, &reader),
+                quick_xml::events::Event::Eof => break,
                 _ => (),
             }
             buf.clear();
@@ -153,12 +150,12 @@ impl Kml {
     ) {
         let tag = String::from_utf8_lossy(event.name()).trim().to_lowercase();
         if tag == "document" {
-            if let Some(addr) = event.attributes().find(|attr| {
-                attr.as_ref()
-                    .map(|a| String::from_utf8_lossy(a.key).trim().to_lowercase() == "addr")
-                    .unwrap_or_default()
-            }) {
-                self.addr = addr.unwrap().unescape_and_decode_value(reader).ok();
+            if let Some(addr) = event
+                .attributes()
+                .filter_map(|a| a.ok())
+                .find(|attr| String::from_utf8_lossy(attr.key).trim().to_lowercase() == "addr")
+            {
+                self.addr = addr.unescape_and_decode_value(reader).ok();
             }
         } else if tag == "placemark" {
             self.tag = KmlTag::PLACEMARK;
@@ -728,17 +725,15 @@ mod tests {
     #![allow(clippy::indexing_slicing)]
 
     use super::*;
-    use crate::dc_receive_imf::dc_receive_imf;
+    use crate::receive_imf::receive_imf;
     use crate::test_utils::TestContext;
 
-    #[async_std::test]
-    async fn test_kml_parse() {
-        let context = TestContext::new().await;
-
+    #[test]
+    fn test_kml_parse() {
         let xml =
             b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<kml xmlns=\"http://www.opengis.net/kml/2.2\">\n<Document addr=\"user@example.org\">\n<Placemark><Timestamp><when>2019-03-06T21:09:57Z</when></Timestamp><Point><coordinates accuracy=\"32.000000\">9.423110,53.790302</coordinates></Point></Placemark>\n<PlaceMARK>\n<Timestamp><WHEN > \n\t2018-12-13T22:11:12Z\t</WHEN></Timestamp><Point><coordinates aCCuracy=\"2.500000\"> 19.423110 \t , \n 63.790302\n </coordinates></Point></PlaceMARK>\n</Document>\n</kml>";
 
-        let kml = Kml::parse(&context.ctx, xml).expect("parsing failed");
+        let kml = Kml::parse(xml).expect("parsing failed");
 
         assert!(kml.addr.is_some());
         assert_eq!(kml.addr.as_ref().unwrap(), "user@example.org",);
@@ -763,13 +758,18 @@ mod tests {
         assert_eq!(locations_ref[1].timestamp, 1544739072);
     }
 
-    #[async_std::test]
-    async fn test_get_message_kml() {
-        let context = TestContext::new().await;
+    #[test]
+    fn test_kml_parse_error() {
+        let xml = b"<?><xmlversi\"\"\">?</document>";
+        assert!(Kml::parse(xml).is_err());
+    }
+
+    #[test]
+    fn test_get_message_kml() {
         let timestamp = 1598490000;
 
         let xml = get_message_kml(timestamp, 51.423723f64, 8.552556f64);
-        let kml = Kml::parse(&context.ctx, xml.as_bytes()).expect("parsing failed");
+        let kml = Kml::parse(xml.as_bytes()).expect("parsing failed");
         let locations_ref = &kml.locations;
         assert_eq!(locations_ref.len(), 1);
 
@@ -791,11 +791,11 @@ mod tests {
     }
 
     /// Tests that location.kml is hidden.
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn receive_location_kml() -> Result<()> {
         let alice = TestContext::new_alice().await;
 
-        dc_receive_imf(
+        receive_imf(
             &alice,
             br#"Subject: Hello
 Message-ID: hello@example.net
@@ -812,7 +812,7 @@ Text message."#,
         let received_msg = alice.get_last_msg().await;
         assert_eq!(received_msg.text.unwrap(), "Text message.");
 
-        dc_receive_imf(
+        receive_imf(
             &alice,
             br#"Subject: locations
 MIME-Version: 1.0

@@ -1,9 +1,10 @@
 extern crate dirs;
 
+use std::path::Path;
 use std::str::FromStr;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{bail, ensure, Result};
-use async_std::path::Path;
 use deltachat::chat::{
     self, Chat, ChatId, ChatItem, ChatVisibility, MuteDuration, ProtectionStatus,
 };
@@ -11,8 +12,6 @@ use deltachat::chatlist::*;
 use deltachat::constants::*;
 use deltachat::contact::*;
 use deltachat::context::*;
-use deltachat::dc_receive_imf::*;
-use deltachat::dc_tools::*;
 use deltachat::download::DownloadState;
 use deltachat::imex::*;
 use deltachat::location;
@@ -20,10 +19,11 @@ use deltachat::log::LogExt;
 use deltachat::message::{self, Message, MessageState, MsgId, Viewtype};
 use deltachat::peerstate::*;
 use deltachat::qr::*;
+use deltachat::receive_imf::*;
 use deltachat::sql;
+use deltachat::tools::*;
 use deltachat::{config, provider};
-use std::fs;
-use std::time::{Duration, SystemTime};
+use tokio::fs;
 
 /// Reset database tables.
 /// Argument is a bitmask, executing single or multiple actions in one call.
@@ -96,10 +96,10 @@ async fn reset_tables(context: &Context, bits: i32) {
 }
 
 async fn poke_eml_file(context: &Context, filename: impl AsRef<Path>) -> Result<()> {
-    let data = dc_read_file(context, filename).await?;
+    let data = read_file(context, filename).await?;
 
-    if let Err(err) = dc_receive_imf(context, &data, false).await {
-        println!("dc_receive_imf errored: {:?}", err);
+    if let Err(err) = receive_imf(context, &data, false).await {
+        println!("receive_imf errored: {:?}", err);
     }
     Ok(())
 }
@@ -128,24 +128,20 @@ async fn poke_spec(context: &Context, spec: Option<&str>) -> bool {
         }
         real_spec = rs.unwrap();
     }
-    if let Some(suffix) = dc_get_filesuffix_lc(&real_spec) {
+    if let Some(suffix) = get_filesuffix_lc(&real_spec) {
         if suffix == "eml" && poke_eml_file(context, &real_spec).await.is_ok() {
             read_cnt += 1
         }
     } else {
         /* import a directory */
         let dir_name = std::path::Path::new(&real_spec);
-        let dir = std::fs::read_dir(dir_name);
+        let dir = fs::read_dir(dir_name).await;
         if dir.is_err() {
             error!(context, "Import: Cannot open directory \"{}\".", &real_spec,);
             return false;
         } else {
-            let dir = dir.unwrap();
-            for entry in dir {
-                if entry.is_err() {
-                    break;
-                }
-                let entry = entry.unwrap();
+            let mut dir = dir.unwrap();
+            while let Ok(Some(entry)) = dir.next_entry().await {
                 let name_f = entry.file_name();
                 let name = name_f.to_string_lossy();
                 if name.ends_with(".eml") {
@@ -191,7 +187,7 @@ async fn log_msg(context: &Context, prefix: impl AsRef<str>, msg: &Message) {
         DownloadState::Failure => " [⬇ Download failed]",
     };
 
-    let temp2 = dc_timestamp_to_str(msg.get_timestamp());
+    let temp2 = timestamp_to_str(msg.get_timestamp());
     let msgtext = msg.get_text();
     println!(
         "{}{}{}{}: {} (Contact#{}): {} {}{}{}{}{}{}{} [{}]",
@@ -219,6 +215,14 @@ async fn log_msg(context: &Context, prefix: impl AsRef<str>, msg: &Message) {
                 msg.get_videochat_url().unwrap_or_default(),
                 msg.get_videochat_type().unwrap_or_default()
             )
+        } else if msg.get_viewtype() == Viewtype::Webxdc {
+            match msg.get_webxdc_info(context).await {
+                Ok(info) => format!(
+                    "[WEBXDC: {}, icon={}, document={}, summary={}, source_code_url={}]",
+                    info.name, info.icon, info.document, info.summary, info.source_code_url
+                ),
+                Err(err) => format!("[get_webxdc_info() failed: {}]", err),
+            }
         } else {
             "".to_string()
         },
@@ -492,7 +496,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             let setup_code = create_setup_code(&context);
             let file_name = blobdir.join("autocrypt-setup-message.html");
             let file_content = render_setup_file(&context, &setup_code).await?;
-            async_std::fs::write(&file_name, file_content).await?;
+            fs::write(&file_name, file_content).await?;
             println!(
                 "Setup message written to: {}\nSetup code: {}",
                 file_name.display(),
@@ -532,7 +536,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
                 .join("connectivity.html");
             match context.get_connectivity_html().await {
                 Ok(html) => {
-                    fs::write(&file, html)?;
+                    fs::write(&file, html).await?;
                     println!("Report written to: {:#?}", file);
                 }
                 Err(err) => {
@@ -597,7 +601,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
                             _ => "",
                         }
                     };
-                    let timestr = dc_timestamp_to_str(summary.timestamp);
+                    let timestr = timestamp_to_str(summary.timestamp);
                     println!(
                         "{}{}{} [{}]{}",
                         summary
@@ -810,7 +814,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
                 println!(
                     "Loc#{}: {}: lat={} lng={} acc={} Chat#{} Contact#{} {} {}",
                     location.location_id,
-                    dc_timestamp_to_str(location.timestamp),
+                    timestamp_to_str(location.timestamp),
                     location.latitude,
                     location.longitude,
                     location.accuracy,
@@ -892,7 +896,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             ensure!(sel_chat.is_some(), "No chat selected.");
             ensure!(!arg1.is_empty(), "No html-file given.");
             let path: &Path = arg1.as_ref();
-            let html = &*fs::read(&path)?;
+            let html = &*fs::read(&path).await?;
             let html = String::from_utf8_lossy(html);
 
             let mut msg = Message::new(Viewtype::Text);
@@ -1079,7 +1083,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
                 .unwrap_or_default()
                 .join(format!("msg-{}.html", id.to_u32()));
             let html = id.get_html(&context).await?.unwrap_or_default();
-            fs::write(&file, html)?;
+            fs::write(&file, html).await?;
             println!("HTML written to: {:#?}", file);
         }
         "listfresh" => {
@@ -1233,8 +1237,8 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
         "fileinfo" => {
             ensure!(!arg1.is_empty(), "Argument <file> missing.");
 
-            if let Ok(buf) = dc_read_file(&context, &arg1).await {
-                let (width, height) = dc_get_filemeta(&buf)?;
+            if let Ok(buf) = read_file(&context, &arg1).await {
+                let (width, height) = get_filemeta(&buf)?;
                 println!("width={}, height={}", width, height);
             } else {
                 bail!("Command failed.");

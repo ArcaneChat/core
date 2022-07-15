@@ -1,4 +1,4 @@
-#![deny(clippy::all)]
+#![warn(unused, clippy::all)]
 #![allow(
     non_camel_case_types,
     non_snake_case,
@@ -11,23 +11,23 @@
 
 #[macro_use]
 extern crate human_panic;
-extern crate num_traits;
-extern crate serde_json;
 
 use std::collections::BTreeMap;
 use std::convert::TryFrom;
 use std::fmt::Write;
+use std::future::Future;
 use std::ops::Deref;
 use std::ptr;
 use std::str::FromStr;
 use std::time::{Duration, SystemTime};
 
 use anyhow::Context as _;
-use async_std::sync::RwLock;
-use async_std::task::{block_on, spawn};
 use deltachat::qr_code_generator::get_securejoin_qr_svg;
 use num_traits::{FromPrimitive, ToPrimitive};
+use once_cell::sync::Lazy;
 use rand::Rng;
+use tokio::runtime::Runtime;
+use tokio::sync::RwLock;
 
 use deltachat::chat::{ChatId, ChatVisibility, MuteDuration, ProtectionStatus};
 use deltachat::constants::DC_MSG_ID_LAST_SPECIAL;
@@ -40,6 +40,7 @@ use deltachat::stock_str::StockMessage;
 use deltachat::webxdc::StatusUpdateSerial;
 use deltachat::*;
 use deltachat::{accounts::Accounts, log::LogExt};
+use tokio::task::JoinHandle;
 
 mod dc_array;
 mod lot;
@@ -63,6 +64,23 @@ use deltachat::chatlist::Chatlist;
 /// Struct representing the deltachat context.
 pub type dc_context_t = Context;
 
+static RT: Lazy<Runtime> = Lazy::new(|| Runtime::new().expect("unable to create tokio runtime"));
+
+fn block_on<T>(fut: T) -> T::Output
+where
+    T: Future,
+{
+    RT.block_on(fut)
+}
+
+fn spawn<T>(fut: T) -> JoinHandle<T::Output>
+where
+    T: Future + Send + 'static,
+    T::Output: Send + 'static,
+{
+    RT.spawn(fut)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn dc_context_new(
     _os_name: *const libc::c_char,
@@ -79,7 +97,7 @@ pub unsafe extern "C" fn dc_context_new(
     let ctx = if blobdir.is_null() || *blobdir == 0 {
         // generate random ID as this functionality is not yet available on the C-api.
         let id = rand::thread_rng().gen();
-        block_on(Context::new(as_path(dbfile).to_path_buf().into(), id))
+        block_on(Context::new(as_path(dbfile), id, Events::new()))
     } else {
         eprintln!("blobdir can not be defined explicitly anymore");
         return ptr::null_mut();
@@ -103,10 +121,7 @@ pub unsafe extern "C" fn dc_context_new_closed(dbfile: *const libc::c_char) -> *
     }
 
     let id = rand::thread_rng().gen();
-    match block_on(Context::new_closed(
-        as_path(dbfile).to_path_buf().into(),
-        id,
-    )) {
+    match block_on(Context::new_closed(as_path(dbfile), id, Events::new())) {
         Ok(context) => Box::into_raw(Box::new(context)),
         Err(err) => {
             eprintln!("failed to create context: {:#}", err);
@@ -380,7 +395,7 @@ pub unsafe extern "C" fn dc_get_oauth2_url(
     let redirect = to_string_lossy(redirect);
 
     block_on(async move {
-        match oauth2::dc_get_oauth2_url(ctx, &addr, &redirect)
+        match oauth2::get_oauth2_url(ctx, &addr, &redirect)
             .await
             .log_err(ctx, "dc_get_oauth2_url failed")
         {
@@ -458,7 +473,37 @@ pub unsafe extern "C" fn dc_event_get_id(event: *mut dc_event_t) -> libc::c_int 
     }
 
     let event = &*event;
-    event.as_id()
+    match event.typ {
+        EventType::Info(_) => 100,
+        EventType::SmtpConnected(_) => 101,
+        EventType::ImapConnected(_) => 102,
+        EventType::SmtpMessageSent(_) => 103,
+        EventType::ImapMessageDeleted(_) => 104,
+        EventType::ImapMessageMoved(_) => 105,
+        EventType::NewBlobFile(_) => 150,
+        EventType::DeletedBlobFile(_) => 151,
+        EventType::Warning(_) => 300,
+        EventType::Error(_) => 400,
+        EventType::ErrorSelfNotInGroup(_) => 410,
+        EventType::MsgsChanged { .. } => 2000,
+        EventType::IncomingMsg { .. } => 2005,
+        EventType::MsgsNoticed { .. } => 2008,
+        EventType::MsgDelivered { .. } => 2010,
+        EventType::MsgFailed { .. } => 2012,
+        EventType::MsgRead { .. } => 2015,
+        EventType::ChatModified(_) => 2020,
+        EventType::ChatEphemeralTimerModified { .. } => 2021,
+        EventType::ContactsChanged(_) => 2030,
+        EventType::LocationChanged(_) => 2035,
+        EventType::ConfigureProgress { .. } => 2041,
+        EventType::ImexProgress(_) => 2051,
+        EventType::ImexFileWritten(_) => 2052,
+        EventType::SecurejoinInviterProgress { .. } => 2060,
+        EventType::SecurejoinJoinerProgress { .. } => 2061,
+        EventType::ConnectivityChanged => 2100,
+        EventType::SelfavatarChanged => 2110,
+        EventType::WebxdcStatusUpdate { .. } => 2120,
+    }
 }
 
 #[no_mangle]
@@ -648,10 +693,13 @@ pub unsafe extern "C" fn dc_get_next_event(events: *mut dc_event_emitter_t) -> *
     }
     let events = &*events;
 
-    events
-        .recv_sync()
-        .map(|ev| Box::into_raw(Box::new(ev)))
-        .unwrap_or_else(ptr::null_mut)
+    block_on(async move {
+        events
+            .recv()
+            .await
+            .map(|ev| Box::into_raw(Box::new(ev)))
+            .unwrap_or_else(ptr::null_mut)
+    })
 }
 
 #[no_mangle]
@@ -691,7 +739,7 @@ pub unsafe extern "C" fn dc_preconfigure_keypair(
     }
     let ctx = &*context;
     block_on(async move {
-        let addr = dc_tools::EmailAddress::new(&to_string_lossy(addr))?;
+        let addr = tools::EmailAddress::new(&to_string_lossy(addr))?;
         let public = key::SignedPublicKey::from_asc(&to_string_lossy(public_data))?.0;
         let secret = key::SignedSecretKey::from_asc(&to_string_lossy(secret_data))?.0;
         let keypair = key::KeyPair {
@@ -2196,7 +2244,7 @@ pub unsafe extern "C" fn dc_get_securejoin_qr(
         Some(ChatId::new(chat_id))
     };
 
-    block_on(securejoin::dc_get_securejoin_qr(ctx, chat_id))
+    block_on(securejoin::get_securejoin_qr(ctx, chat_id))
         .unwrap_or_else(|_| "".to_string())
         .strdup()
 }
@@ -2234,7 +2282,7 @@ pub unsafe extern "C" fn dc_join_securejoin(
     let ctx = &*context;
 
     block_on(async move {
-        securejoin::dc_join_securejoin(ctx, &to_string_lossy(qr))
+        securejoin::join_securejoin(ctx, &to_string_lossy(qr))
             .await
             .map(|chatid| chatid.to_u32())
             .log_err(ctx, "failed dc_join_securejoin() call")
@@ -2360,7 +2408,7 @@ pub unsafe extern "C" fn dc_get_last_error(context: *mut dc_context_t) -> *mut l
         return "".strdup();
     }
     let ctx = &*context;
-    block_on(ctx.get_last_error()).strdup()
+    ctx.get_last_error().strdup()
 }
 
 // dc_array_t
@@ -3546,7 +3594,8 @@ pub unsafe extern "C" fn dc_msg_latefiling_mediasize(
         ffi_msg
             .message
             .latefiling_mediasize(ctx, width, height, duration)
-    });
+    })
+    .ok_or_log_msg(ctx, "Cannot set media size");
 }
 
 #[no_mangle]
@@ -4092,7 +4141,7 @@ pub unsafe extern "C" fn dc_accounts_new(
         return ptr::null_mut();
     }
 
-    let accs = block_on(Accounts::new(as_path(dbfile).to_path_buf().into()));
+    let accs = block_on(Accounts::new(as_path(dbfile).into()));
 
     match accs {
         Ok(accs) => Box::into_raw(Box::new(AccountsWrapper::new(accs))),
@@ -4264,7 +4313,7 @@ pub unsafe extern "C" fn dc_accounts_migrate_account(
     block_on(async move {
         let mut accounts = accounts.write().await;
         match accounts
-            .migrate_account(async_std::path::PathBuf::from(dbfile))
+            .migrate_account(std::path::PathBuf::from(dbfile))
             .await
         {
             Ok(id) => id,
@@ -4347,7 +4396,7 @@ pub unsafe extern "C" fn dc_accounts_maybe_network_lost(accounts: *mut dc_accoun
     block_on(async move { accounts.write().await.maybe_network_lost().await });
 }
 
-pub type dc_accounts_event_emitter_t = deltachat::accounts::EventEmitter;
+pub type dc_accounts_event_emitter_t = EventEmitter;
 
 #[no_mangle]
 pub unsafe extern "C" fn dc_accounts_get_event_emitter(
@@ -4384,9 +4433,7 @@ pub unsafe extern "C" fn dc_accounts_get_next_event(
         return ptr::null_mut();
     }
     let emitter = &mut *emitter;
-
-    emitter
-        .recv_sync()
+    block_on(emitter.recv())
         .map(|ev| Box::into_raw(Box::new(ev)))
         .unwrap_or_else(ptr::null_mut)
 }

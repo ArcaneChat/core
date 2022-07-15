@@ -6,24 +6,23 @@ mod read_url;
 mod server_params;
 
 use anyhow::{bail, ensure, Context as _, Result};
-use async_std::prelude::*;
-use async_std::task;
-use job::Action;
+use futures::FutureExt;
+use futures_lite::FutureExt as _;
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+use tokio::task;
 
 use crate::config::Config;
-use crate::constants::{DC_LP_AUTH_FLAGS, DC_LP_AUTH_NORMAL, DC_LP_AUTH_OAUTH2};
 use crate::context::Context;
-use crate::dc_tools::{time, EmailAddress};
 use crate::imap::Imap;
 use crate::job;
 use crate::login_param::{CertificateChecks, LoginParam, ServerLoginParam, Socks5Config};
 use crate::message::{Message, Viewtype};
-use crate::oauth2::dc_get_oauth2_addr;
-use crate::param::Params;
+use crate::oauth2::get_oauth2_addr;
 use crate::provider::{Protocol, Socket, UsernamePattern};
+use crate::scheduler::InterruptInfo;
 use crate::smtp::Smtp;
 use crate::stock_str;
+use crate::tools::{time, EmailAddress};
 use crate::{chat, e2ee, provider};
 
 use auto_mozilla::moz_autoconfigure;
@@ -57,8 +56,6 @@ impl Context {
 
     /// Configures this account with the currently set parameters.
     pub async fn configure(&self) -> Result<()> {
-        use futures::future::FutureExt;
-
         ensure!(
             self.scheduler.read().await.is_none(),
             "cannot configure, already running"
@@ -78,6 +75,24 @@ impl Context {
             .await;
 
         self.free_ongoing().await;
+
+        if let Err(err) = res.as_ref() {
+            progress!(
+                self,
+                0,
+                Some(
+                    stock_str::configuration_failed(
+                        self,
+                        // We are using Anyhow's .context() and to show the
+                        // inner error, too, we need the {:#}:
+                        format!("{:#}", err),
+                    )
+                    .await
+                )
+            );
+        } else {
+            progress!(self, 1000);
+        }
 
         res
     }
@@ -116,57 +131,15 @@ impl Context {
             }
         }
 
-        match success {
-            Ok(_) => {
-                self.set_config(Config::NotifyAboutWrongPw, Some("1"))
-                    .await?;
-                progress!(self, 1000);
-                Ok(())
-            }
-            Err(err) => {
-                progress!(
-                    self,
-                    0,
-                    Some(
-                        stock_str::configuration_failed(
-                            self,
-                            // We are using Anyhow's .context() and to show the
-                            // inner error, too, we need the {:#}:
-                            format!("{:#}", err),
-                        )
-                        .await
-                    )
-                );
-                Err(err)
-            }
-        }
+        success?;
+        self.set_config(Config::NotifyAboutWrongPw, Some("1"))
+            .await?;
+        Ok(())
     }
 }
 
 async fn configure(ctx: &Context, param: &mut LoginParam) -> Result<()> {
     progress!(ctx, 1);
-
-    // Check basic settings.
-    ensure!(!param.addr.is_empty(), "Please enter an email address.");
-
-    // Only check for IMAP password, SMTP password is an "advanced" setting.
-    ensure!(!param.imap.password.is_empty(), "Please enter a password.");
-    if param.smtp.password.is_empty() {
-        param.smtp.password = param.imap.password.clone()
-    }
-
-    // Normalize authentication flags.
-    let oauth2 = match param.server_flags & DC_LP_AUTH_FLAGS as i32 {
-        DC_LP_AUTH_OAUTH2 => true,
-        DC_LP_AUTH_NORMAL => false,
-        _ => false,
-    };
-    param.server_flags &= !(DC_LP_AUTH_FLAGS as i32);
-    param.server_flags |= if oauth2 {
-        DC_LP_AUTH_OAUTH2 as i32
-    } else {
-        DC_LP_AUTH_NORMAL as i32
-    };
 
     let socks5_config = param.socks5_config.clone();
     let socks5_enabled = socks5_config.is_some();
@@ -177,12 +150,13 @@ async fn configure(ctx: &Context, param: &mut LoginParam) -> Result<()> {
     // Step 1: Load the parameters and check email-address and password
 
     // Do oauth2 only if socks5 is disabled. As soon as we have a http library that can do
-    // socks5 requests, this can work with socks5 too
-    if oauth2 && !socks5_enabled {
+    // socks5 requests, this can work with socks5 too.  OAuth is always set either for both
+    // IMAP and SMTP or not at all.
+    if param.imap.oauth2 && !socks5_enabled {
         // the used oauth2 addr may differ, check this.
-        // if dc_get_oauth2_addr() is not available in the oauth2 implementation, just use the given one.
+        // if get_oauth2_addr() is not available in the oauth2 implementation, just use the given one.
         progress!(ctx, 10);
-        if let Some(oauth2_addr) = dc_get_oauth2_addr(ctx, &param.addr, &param.imap.password)
+        if let Some(oauth2_addr) = get_oauth2_addr(ctx, &param.addr, &param.imap.password)
             .await?
             .and_then(|e| e.parse().ok())
         {
@@ -359,7 +333,6 @@ async fn configure(ctx: &Context, param: &mut LoginParam) -> Result<()> {
                 &smtp_param,
                 &socks5_config,
                 &smtp_addr,
-                oauth2,
                 provider_strict_tls,
                 &mut smtp,
             )
@@ -407,7 +380,6 @@ async fn configure(ctx: &Context, param: &mut LoginParam) -> Result<()> {
             &param.imap,
             &param.socks5_config,
             &param.addr,
-            oauth2,
             provider_strict_tls,
         )
         .await
@@ -431,7 +403,7 @@ async fn configure(ctx: &Context, param: &mut LoginParam) -> Result<()> {
     progress!(ctx, 850);
 
     // Wait for SMTP configuration
-    match smtp_config_task.await {
+    match smtp_config_task.await.unwrap() {
         Ok(smtp_param) => {
             param.smtp = smtp_param;
         }
@@ -443,6 +415,9 @@ async fn configure(ctx: &Context, param: &mut LoginParam) -> Result<()> {
     progress!(ctx, 900);
 
     let create_mvbox = ctx.should_watch_mvbox().await?;
+
+    // Send client ID as soon as possible before doing anything else.
+    imap.determine_capabilities(ctx).await?;
 
     imap.configure_folders(ctx, create_mvbox).await?;
 
@@ -469,14 +444,12 @@ async fn configure(ctx: &Context, param: &mut LoginParam) -> Result<()> {
     e2ee::ensure_secret_key_exists(ctx).await?;
     info!(ctx, "key generation completed");
 
-    job::add(
-        ctx,
-        job::Job::new(Action::FetchExistingMsgs, 0, Params::new(), 0),
-    )
-    .await?;
+    ctx.set_config_bool(Config::FetchedExistingMsgs, false)
+        .await?;
+    ctx.interrupt_inbox(InterruptInfo::new(false)).await;
 
     progress!(ctx, 940);
-    update_device_chats_handle.await?;
+    update_device_chats_handle.await??;
 
     ctx.sql.set_raw_config_bool("configured", true).await?;
 
@@ -565,26 +538,22 @@ async fn try_imap_one_param(
     param: &ServerLoginParam,
     socks5_config: &Option<Socks5Config>,
     addr: &str,
-    oauth2: bool,
     provider_strict_tls: bool,
 ) -> Result<Imap, ConfigurationError> {
     let inf = format!(
         "imap: {}@{}:{} security={} certificate_checks={} oauth2={}",
-        param.user, param.server, param.port, param.security, param.certificate_checks, oauth2
+        param.user,
+        param.server,
+        param.port,
+        param.security,
+        param.certificate_checks,
+        param.oauth2
     );
     info!(context, "Trying: {}", inf);
 
-    let (_s, r) = async_std::channel::bounded(1);
+    let (_s, r) = async_channel::bounded(1);
 
-    let mut imap = match Imap::new(
-        param,
-        socks5_config.clone(),
-        addr,
-        oauth2,
-        provider_strict_tls,
-        r,
-    )
-    .await
+    let mut imap = match Imap::new(param, socks5_config.clone(), addr, provider_strict_tls, r).await
     {
         Err(err) => {
             info!(context, "failure: {}", err);
@@ -616,7 +585,6 @@ async fn try_smtp_one_param(
     param: &ServerLoginParam,
     socks5_config: &Option<Socks5Config>,
     addr: &str,
-    oauth2: bool,
     provider_strict_tls: bool,
     smtp: &mut Smtp,
 ) -> Result<(), ConfigurationError> {
@@ -627,7 +595,7 @@ async fn try_smtp_one_param(
         param.port,
         param.security,
         param.certificate_checks,
-        oauth2,
+        param.oauth2,
         if let Some(socks5_config) = socks5_config {
             socks5_config.to_string()
         } else {
@@ -637,14 +605,7 @@ async fn try_smtp_one_param(
     info!(context, "Trying: {}", inf);
 
     if let Err(err) = smtp
-        .connect(
-            context,
-            param,
-            socks5_config,
-            addr,
-            oauth2,
-            provider_strict_tls,
-        )
+        .connect(context, param, socks5_config, addr, provider_strict_tls)
         .await
     {
         info!(context, "failure: {}", err);
@@ -675,10 +636,16 @@ async fn nicer_configuration_error(context: &Context, errors: Vec<ConfigurationE
         return "no error".to_string();
     };
 
-    if errors
-        .iter()
-        .all(|e| e.msg.to_lowercase().contains("could not resolve"))
-    {
+    if errors.iter().all(|e| {
+        e.msg.to_lowercase().contains("could not resolve")
+            || e.msg
+                .to_lowercase()
+                .contains("temporary failure in name resolution")
+            || e.msg.to_lowercase().contains("name or service not known")
+            || e.msg
+                .to_lowercase()
+                .contains("failed to lookup address information")
+    }) {
         return stock_str::error_no_network(context).await;
     }
 
@@ -719,7 +686,7 @@ mod tests {
     use crate::config::Config;
     use crate::test_utils::TestContext;
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_no_panic_on_bad_credentials() {
         let t = TestContext::new().await;
         t.set_config(Config::Addr, Some("probably@unexistant.addr"))

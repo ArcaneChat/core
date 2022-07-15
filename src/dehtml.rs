@@ -94,7 +94,7 @@ fn dehtml_quick_xml(buf: &str) -> String {
             }
             Ok(quick_xml::events::Event::End(ref e)) => dehtml_endtag_cb(e, &mut dehtml),
             Ok(quick_xml::events::Event::Text(ref e)) => dehtml_text_cb(e, &mut dehtml),
-            Ok(quick_xml::events::Event::CData(ref e)) => dehtml_cdata_cb(e, &mut dehtml),
+            Ok(quick_xml::events::Event::CData(e)) => dehtml_text_cb(&e.escape(), &mut dehtml),
             Ok(quick_xml::events::Event::Empty(ref e)) => {
                 // Handle empty tags as a start tag immediately followed by end tag.
                 // For example, `<p/>` is treated as `<p></p>`.
@@ -118,23 +118,6 @@ fn dehtml_quick_xml(buf: &str) -> String {
 }
 
 fn dehtml_text_cb(event: &BytesText, dehtml: &mut Dehtml) {
-    if dehtml.get_add_text() == AddText::YesPreserveLineEnds
-        || dehtml.get_add_text() == AddText::YesRemoveLineEnds
-    {
-        let last_added = escaper::decode_html_buf_sloppy(event.escaped()).unwrap_or_default();
-
-        if dehtml.get_add_text() == AddText::YesRemoveLineEnds {
-            dehtml.strbuilder += LINE_RE.replace_all(&last_added, "\r").as_ref();
-        } else if !dehtml.line_prefix().is_empty() {
-            let l = dehtml.append_prefix("\n");
-            dehtml.strbuilder += LINE_RE.replace_all(&last_added, l.as_str()).as_ref();
-        } else {
-            dehtml.strbuilder += &last_added;
-        }
-    }
-}
-
-fn dehtml_cdata_cb(event: &BytesText, dehtml: &mut Dehtml) {
     if dehtml.get_add_text() == AddText::YesPreserveLineEnds
         || dehtml.get_add_text() == AddText::YesRemoveLineEnds
     {
@@ -304,7 +287,7 @@ pub fn dehtml_manually(buf: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::simplify::simplify;
+    use crate::simplify::{simplify, SimplifiedText};
 
     #[test]
     fn test_dehtml() {
@@ -328,7 +311,7 @@ mod tests {
             ("<!some invalid html code>\n<b>some text</b>", "some text"),
         ];
         for (input, output) in cases {
-            assert_eq!(simplify(dehtml(input).unwrap(), true).0, output);
+            assert_eq!(simplify(dehtml(input).unwrap(), true).text, output);
         }
         let none_cases = vec!["<html> </html>", ""];
         for input in none_cases {
@@ -399,15 +382,21 @@ mod tests {
         assert_eq!(txt.trim(), "two\nlines");
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_quote_div() {
         let input = include_str!("../test-data/message/gmx-quote-body.eml");
         let dehtml = dehtml(input).unwrap();
         println!("{}", dehtml);
-        let (msg, forwarded, cut, top_quote, footer) = simplify(dehtml, false);
-        assert_eq!(msg, "Test");
-        assert_eq!(forwarded, false);
-        assert_eq!(cut, false);
+        let SimplifiedText {
+            text,
+            is_forwarded,
+            is_cut,
+            top_quote,
+            footer,
+        } = simplify(dehtml, false);
+        assert_eq!(text, "Test");
+        assert_eq!(is_forwarded, false);
+        assert_eq!(is_cut, false);
         assert_eq!(top_quote.as_deref(), Some("test"));
         assert_eq!(footer, None);
     }

@@ -62,22 +62,22 @@ use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{ensure, Context as _, Result};
-use async_std::channel::Receiver;
-use async_std::future::timeout;
+use async_channel::Receiver;
 use serde::{Deserialize, Serialize};
+use tokio::time::timeout;
 
 use crate::chat::{send_msg, ChatId};
 use crate::constants::{DC_CHAT_ID_LAST_SPECIAL, DC_CHAT_ID_TRASH};
 use crate::contact::ContactId;
 use crate::context::Context;
-use crate::dc_tools::{duration_to_str, time};
 use crate::download::MIN_DELETE_SERVER_AFTER;
 use crate::events::EventType;
 use crate::log::LogExt;
 use crate::message::{Message, MessageState, MsgId, Viewtype};
 use crate::mimeparser::SystemMessage;
-use crate::sql;
+use crate::sql::{self, params_iter};
 use crate::stock_str;
+use crate::tools::{duration_to_str, time};
 use std::cmp::max;
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone, Serialize, Deserialize)]
@@ -303,15 +303,11 @@ pub(crate) async fn start_ephemeral_timers_msgids(
     context: &Context,
     msg_ids: &[MsgId],
 ) -> Result<()> {
-    let msg_ids: Vec<&dyn crate::ToSql> = msg_ids
-        .iter()
-        .map(|msg_id| msg_id as &dyn crate::ToSql)
-        .collect();
     let now = time();
     let count = context
         .sql
         .execute(
-            format!(
+            &format!(
                 "UPDATE msgs SET ephemeral_timestamp = ? + ephemeral_timer
          WHERE (ephemeral_timestamp == 0 OR ephemeral_timestamp > ? + ephemeral_timer) AND ephemeral_timer > 0
          AND id IN ({})",
@@ -320,7 +316,7 @@ pub(crate) async fn start_ephemeral_timers_msgids(
             rusqlite::params_from_iter(
                 std::iter::once(&now as &dyn crate::ToSql)
                     .chain(std::iter::once(&now as &dyn crate::ToSql))
-                    .chain(msg_ids),
+                    .chain(params_iter(msg_ids)),
             ),
         )
         .await?;
@@ -343,7 +339,7 @@ pub(crate) async fn delete_expired_messages(context: &Context, now: i64) -> Resu
         .sql
         .execute(
             // If you change which information is removed here, also change MsgId::trash() and
-            // which information dc_receive_imf::add_parts() still adds to the db if the chat_id is TRASH
+            // which information receive_imf::add_parts() still adds to the db if the chat_id is TRASH
             r#"
 UPDATE msgs
 SET 
@@ -576,16 +572,16 @@ pub(crate) async fn start_ephemeral_timers(context: &Context) -> Result<()> {
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::dc_receive_imf::dc_receive_imf;
-    use crate::dc_tools::MAX_SECONDS_TO_LEND_FROM_FUTURE;
     use crate::download::DownloadState;
+    use crate::receive_imf::receive_imf;
     use crate::test_utils::TestContext;
+    use crate::tools::MAX_SECONDS_TO_LEND_FROM_FUTURE;
     use crate::{
         chat::{self, Chat, ChatItem},
-        dc_tools::IsNoneOrEmpty,
+        tools::IsNoneOrEmpty,
     };
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_stock_ephemeral_messages() {
         let context = TestContext::new().await;
 
@@ -715,7 +711,7 @@ mod tests {
     }
 
     /// Test enabling and disabling ephemeral timer remotely.
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_ephemeral_enable_disable() -> Result<()> {
         let alice = TestContext::new_alice().await;
         let bob = TestContext::new_bob().await;
@@ -747,7 +743,7 @@ mod tests {
     }
 
     /// Test that timer is enabled even if the message explicitly enabling the timer is lost.
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_ephemeral_enable_lost() -> Result<()> {
         let alice = TestContext::new_alice().await;
         let bob = TestContext::new_bob().await;
@@ -789,7 +785,7 @@ mod tests {
 
     /// Test that Alice replying to the chat without a timer at the same time as Bob enables the
     /// timer does not result in disabling the timer on the Bob's side.
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_ephemeral_timer_rollback() -> Result<()> {
         let alice = TestContext::new_alice().await;
         let bob = TestContext::new_bob().await;
@@ -863,7 +859,7 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_ephemeral_delete_msgs() -> Result<()> {
         let t = TestContext::new_alice().await;
         let self_chat = t.get_self_chat().await;
@@ -989,7 +985,7 @@ mod tests {
         }
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_delete_expired_imap_messages() -> Result<()> {
         let t = TestContext::new_alice().await;
         const HOUR: i64 = 60 * 60;
@@ -1100,12 +1096,12 @@ mod tests {
     }
 
     // Regression test for a bug in the timer rollback protection.
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_ephemeral_timer_references() -> Result<()> {
         let alice = TestContext::new_alice().await;
 
         // Message with Message-ID <first@example.com> and no timer is received.
-        dc_receive_imf(
+        receive_imf(
             &alice,
             b"From: Bob <bob@example.com>\n\
                     To: Alice <alice@example.org>\n\
@@ -1124,7 +1120,7 @@ mod tests {
         assert_eq!(chat_id.get_ephemeral_timer(&alice).await?, Timer::Disabled);
 
         // Message with Message-ID <second@example.com> is received.
-        dc_receive_imf(
+        receive_imf(
             &alice,
             b"From: Bob <bob@example.com>\n\
                     To: Alice <alice@example.org>\n\
@@ -1159,7 +1155,7 @@ mod tests {
         //
         // The message also contains a quote of the first message to test that only References:
         // header and not In-Reply-To: is consulted by the rollback protection.
-        dc_receive_imf(
+        receive_imf(
             &alice,
             b"From: Bob <bob@example.com>\n\
                     To: Alice <alice@example.org>\n\

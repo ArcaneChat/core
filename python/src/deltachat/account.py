@@ -1,37 +1,46 @@
 """ Account class implementation. """
 
 from __future__ import print_function
+
+import os
+from array import array
 from contextlib import contextmanager
 from email.utils import parseaddr
 from threading import Event
-import os
-from array import array
-from . import const
+from typing import Any, Dict, Generator, List, Optional, Union
+
+from . import const, hookspec
 from .capi import ffi, lib
-from .cutil import as_dc_charpointer, from_dc_charpointer, from_optional_dc_charpointer, iter_array, DCLot
 from .chat import Chat
-from .message import Message
 from .contact import Contact
-from .tracker import ImexTracker, ConfigureTracker
-from . import hookspec
+from .cutil import (
+    DCLot,
+    as_dc_charpointer,
+    from_dc_charpointer,
+    from_optional_dc_charpointer,
+    iter_array,
+)
 from .events import EventThread
-from typing import Union, Any, Dict, Optional, List, Generator
+from .message import Message
+from .tracker import ConfigureTracker, ImexTracker
 
 
 class MissingCredentials(ValueError):
-    """ Account is missing `addr` and `mail_pw` config values. """
+    """Account is missing `addr` and `mail_pw` config values."""
 
 
 def get_core_info():
-    """ get some system info. """
+    """get some system info."""
     from tempfile import NamedTemporaryFile
 
     with NamedTemporaryFile() as path:
         path.close()
-        return get_dc_info_as_dict(ffi.gc(
-            lib.dc_context_new(as_dc_charpointer(""), as_dc_charpointer(path.name), ffi.NULL),
-            lib.dc_context_unref,
-        ))
+        return get_dc_info_as_dict(
+            ffi.gc(
+                lib.dc_context_new(as_dc_charpointer(""), as_dc_charpointer(path.name), ffi.NULL),
+                lib.dc_context_unref,
+            )
+        )
 
 
 def get_dc_info_as_dict(dc_context):
@@ -46,18 +55,22 @@ def get_dc_info_as_dict(dc_context):
 
 
 class Account(object):
-    """ Each account is tied to a sqlite database file which is fully managed
+    """Each account is tied to a sqlite database file which is fully managed
     by the underlying deltachat core library.  All public Account methods are
     meant to be memory-safe and return memory-safe objects.
     """
+
     MissingCredentials = MissingCredentials
 
-    def __init__(self, db_path, os_name=None, logging=True) -> None:
-        """ initialize account object.
+    def __init__(self, db_path, os_name=None, logging=True, closed=False) -> None:
+        """initialize account object.
 
         :param db_path: a path to the account database. The database
                         will be created if it doesn't exist.
-        :param os_name: this will be put to the X-Mailer header in outgoing messages
+        :param os_name: [Deprecated]
+        :param logging: enable logging for this account
+        :param closed: set to True to avoid automatically opening the account
+                       after creation.
         """
         # initialize per-account plugin system
         self._pm = hookspec.PerAccount._make_plugin_manager()
@@ -70,7 +83,7 @@ class Account(object):
             db_path = db_path.encode("utf8")
 
         self._dc_context = ffi.gc(
-            lib.dc_context_new(as_dc_charpointer(os_name), db_path, ffi.NULL),
+            lib.dc_context_new_closed(db_path) if closed else lib.dc_context_new(ffi.NULL, db_path, ffi.NULL),
             lib.dc_context_unref,
         )
         if self._dc_context == ffi.NULL:
@@ -82,12 +95,23 @@ class Account(object):
         hook = hookspec.Global._get_plugin_manager().hook
         hook.dc_account_init(account=self)
 
+    def open(self, passphrase: Optional[str] = None) -> bool:
+        """Open the account's database with the given passphrase.
+        This can only be used on a closed account. If the account is new, this
+        operation sets the database passphrase. For existing databases the passphrase
+        should be the one used to encrypt the database the first time.
+
+        :returns: True if the database is opened with this passphrase, False if the
+                  passphrase is incorrect or an error occurred.
+        """
+        return bool(lib.dc_context_open(self._dc_context, as_dc_charpointer(passphrase)))
+
     def disable_logging(self) -> None:
-        """ disable logging. """
+        """disable logging."""
         self._logging = False
 
     def enable_logging(self) -> None:
-        """ re-enable logging. """
+        """re-enable logging."""
         self._logging = True
 
     def __repr__(self):
@@ -102,11 +126,10 @@ class Account(object):
 
     def _check_config_key(self, name: str) -> None:
         if name not in self._configkeys:
-            raise KeyError("{!r} not a valid config key, existing keys: {!r}".format(
-                           name, self._configkeys))
+            raise KeyError("{!r} not a valid config key, existing keys: {!r}".format(name, self._configkeys))
 
     def get_info(self) -> Dict[str, str]:
-        """ return dictionary of built config parameters. """
+        """return dictionary of built config parameters."""
         return get_dc_info_as_dict(self._dc_context)
 
     def dump_account_info(self, logfile):
@@ -126,7 +149,7 @@ class Account(object):
         log("")
 
     def set_stock_translation(self, id: int, string: str) -> None:
-        """ set stock translation string.
+        """set stock translation string.
 
         :param id: id of stock string (const.DC_STR_*)
         :param value: string to set as new transalation
@@ -138,7 +161,7 @@ class Account(object):
             raise ValueError("could not set translation string")
 
     def set_config(self, name: str, value: Optional[str]) -> None:
-        """ set configuration values.
+        """set configuration values.
 
         :param name: config key name (unicode)
         :param value: value to set (unicode)
@@ -157,7 +180,7 @@ class Account(object):
         lib.dc_set_config(self._dc_context, namebytes, valuebytes)
 
     def get_config(self, name: str) -> str:
-        """ return unicode string value.
+        """return unicode string value.
 
         :param name: configuration key to lookup (eg "addr" or "mail_pw")
         :returns: unicode value
@@ -175,15 +198,17 @@ class Account(object):
 
         In other words, you don't need this.
         """
-        res = lib.dc_preconfigure_keypair(self._dc_context,
-                                          as_dc_charpointer(addr),
-                                          as_dc_charpointer(public),
-                                          as_dc_charpointer(secret))
+        res = lib.dc_preconfigure_keypair(
+            self._dc_context,
+            as_dc_charpointer(addr),
+            as_dc_charpointer(public),
+            as_dc_charpointer(secret),
+        )
         if res == 0:
             raise Exception("Failed to set key")
 
     def update_config(self, kwargs: Dict[str, Any]) -> None:
-        """ update config values.
+        """update config values.
 
         :param kwargs: name=value config settings for this account.
                        values need to be unicode.
@@ -193,18 +218,18 @@ class Account(object):
             self.set_config(key, value)
 
     def is_configured(self) -> bool:
-        """ determine if the account is configured already; an initial connection
+        """determine if the account is configured already; an initial connection
         to SMTP/IMAP has been verified.
 
         :returns: True if account is configured.
         """
-        return True if lib.dc_is_configured(self._dc_context) else False
+        return bool(lib.dc_is_configured(self._dc_context))
 
     def is_open(self) -> bool:
         """Determine if account is open
 
         :returns True if account is open."""
-        return True if lib.dc_context_is_open(self._dc_context) else False
+        return bool(lib.dc_context_is_open(self._dc_context))
 
     def set_avatar(self, img_path: Optional[str]) -> None:
         """Set self avatar.
@@ -219,18 +244,17 @@ class Account(object):
             self.set_config("selfavatar", img_path)
 
     def check_is_configured(self) -> None:
-        """ Raise ValueError if this account is not configured. """
+        """Raise ValueError if this account is not configured."""
         if not self.is_configured():
             raise ValueError("need to configure first")
 
     def get_latest_backupfile(self, backupdir) -> Optional[str]:
-        """ return the latest backup file in a given directory.
-        """
+        """return the latest backup file in a given directory."""
         res = lib.dc_imex_has_backup(self._dc_context, as_dc_charpointer(backupdir))
         return from_optional_dc_charpointer(res)
 
     def get_blobdir(self) -> str:
-        """ return the directory for files.
+        """return the directory for files.
 
         All sent files are copied to this directory if necessary.
         Place files there directly to avoid copying.
@@ -238,7 +262,7 @@ class Account(object):
         return from_dc_charpointer(lib.dc_get_blobdir(self._dc_context))
 
     def get_self_contact(self) -> Contact:
-        """ return this account's identity as a :class:`deltachat.contact.Contact`.
+        """return this account's identity as a :class:`deltachat.contact.Contact`.
 
         :returns: :class:`deltachat.contact.Contact`
         """
@@ -280,14 +304,14 @@ class Account(object):
         elif isinstance(obj, str):
             displayname, addr = parseaddr(obj)
         else:
-            raise TypeError("don't know how to create chat for %r" % (obj, ))
+            raise TypeError("don't know how to create chat for %r" % (obj,))
 
         if name is None and displayname:
             name = displayname
         return (name, addr)
 
     def delete_contact(self, contact: Contact) -> bool:
-        """ delete a Contact.
+        """delete a Contact.
 
         :param contact: contact object obtained
         :returns: True if deletion succeeded (contact was deleted)
@@ -298,7 +322,7 @@ class Account(object):
         return bool(lib.dc_delete_contact(self._dc_context, contact_id))
 
     def get_contact_by_addr(self, email: str) -> Optional[Contact]:
-        """ get a contact for the email address or None if it's blocked or doesn't exist. """
+        """get a contact for the email address or None if it's blocked or doesn't exist."""
         _, addr = parseaddr(email)
         addr = as_dc_charpointer(addr)
         contact_id = lib.dc_lookup_contact_id_by_addr(self._dc_context, addr)
@@ -307,21 +331,18 @@ class Account(object):
         return None
 
     def get_contact_by_id(self, contact_id: int) -> Contact:
-        """ return Contact instance or raise an exception.
+        """return Contact instance or raise an exception.
         :param contact_id: integer id of this contact.
         :returns: :class:`deltachat.contact.Contact` instance.
         """
         return Contact(self, contact_id)
 
     def get_blocked_contacts(self) -> List[Contact]:
-        """ return a list of all blocked contacts.
+        """return a list of all blocked contacts.
 
         :returns: list of :class:`deltachat.contact.Contact` objects.
         """
-        dc_array = ffi.gc(
-            lib.dc_get_blocked_contacts(self._dc_context),
-            lib.dc_array_unref
-        )
+        dc_array = ffi.gc(lib.dc_get_blocked_contacts(self._dc_context), lib.dc_array_unref)
         return list(iter_array(dc_array, lambda x: Contact(self, x)))
 
     def get_contacts(
@@ -344,22 +365,16 @@ class Account(object):
             flags |= const.DC_GCL_VERIFIED_ONLY
         if with_self:
             flags |= const.DC_GCL_ADD_SELF
-        dc_array = ffi.gc(
-            lib.dc_get_contacts(self._dc_context, flags, query),
-            lib.dc_array_unref
-        )
+        dc_array = ffi.gc(lib.dc_get_contacts(self._dc_context, flags, query), lib.dc_array_unref)
         return list(iter_array(dc_array, lambda x: Contact(self, x)))
 
     def get_fresh_messages(self) -> Generator[Message, None, None]:
-        """ yield all fresh messages from all chats. """
-        dc_array = ffi.gc(
-            lib.dc_get_fresh_msgs(self._dc_context),
-            lib.dc_array_unref
-        )
+        """yield all fresh messages from all chats."""
+        dc_array = ffi.gc(lib.dc_get_fresh_msgs(self._dc_context), lib.dc_array_unref)
         yield from iter_array(dc_array, lambda x: Message.from_db(self, x))
 
     def create_chat(self, obj) -> Chat:
-        """ Create a 1:1 chat with Account, Contact or e-mail address. """
+        """Create a 1:1 chat with Account, Contact or e-mail address."""
         return self.create_contact(obj).create_chat()
 
     def create_group_chat(
@@ -385,14 +400,11 @@ class Account(object):
         return chat
 
     def get_chats(self) -> List[Chat]:
-        """ return list of chats.
+        """return list of chats.
 
         :returns: a list of :class:`deltachat.chat.Chat` objects.
         """
-        dc_chatlist = ffi.gc(
-            lib.dc_get_chatlist(self._dc_context, 0, ffi.NULL, 0),
-            lib.dc_chatlist_unref
-        )
+        dc_chatlist = ffi.gc(lib.dc_get_chatlist(self._dc_context, 0, ffi.NULL, 0), lib.dc_chatlist_unref)
 
         assert dc_chatlist != ffi.NULL
         chatlist = []
@@ -405,14 +417,14 @@ class Account(object):
         return Contact(self, const.DC_CONTACT_ID_DEVICE).create_chat()
 
     def get_message_by_id(self, msg_id: int) -> Message:
-        """ return Message instance.
+        """return Message instance.
         :param msg_id: integer id of this message.
         :returns: :class:`deltachat.message.Message` instance.
         """
         return Message.from_db(self, msg_id)
 
     def get_chat_by_id(self, chat_id: int) -> Chat:
-        """ return Chat instance.
+        """return Chat instance.
         :param chat_id: integer id of this chat.
         :returns: :class:`deltachat.chat.Chat` instance.
         :raises: ValueError if chat does not exist.
@@ -424,7 +436,7 @@ class Account(object):
         return Chat(self, chat_id)
 
     def mark_seen_messages(self, messages: List[Union[int, Message]]) -> None:
-        """ mark the given set of messages as seen.
+        """mark the given set of messages as seen.
 
         :param messages: a list of message ids or Message instances.
         """
@@ -438,7 +450,7 @@ class Account(object):
         lib.dc_markseen_msgs(self._dc_context, msg_ids, len(messages))
 
     def forward_messages(self, messages: List[Message], chat: Chat) -> None:
-        """ Forward list of messages to a chat.
+        """Forward list of messages to a chat.
 
         :param messages: list of :class:`deltachat.message.Message` object.
         :param chat: :class:`deltachat.chat.Chat` object.
@@ -448,7 +460,7 @@ class Account(object):
         lib.dc_forward_msgs(self._dc_context, msg_ids, len(msg_ids), chat.id)
 
     def delete_messages(self, messages: List[Message]) -> None:
-        """ delete messages (local and remote).
+        """delete messages (local and remote).
 
         :param messages: list of :class:`deltachat.message.Message` object.
         :returns: None
@@ -457,31 +469,34 @@ class Account(object):
         lib.dc_delete_msgs(self._dc_context, msg_ids, len(msg_ids))
 
     def export_self_keys(self, path):
-        """ export public and private keys to the specified directory.
+        """export public and private keys to the specified directory.
 
         Note that the account does not have to be started.
         """
         return self._export(path, imex_cmd=const.DC_IMEX_EXPORT_SELF_KEYS)
 
-    def export_all(self, path):
-        """return new file containing a backup of all database state
-        (chats, contacts, keys, media, ...). The file is created in the
-        the `path` directory.
+    def export_all(self, path: str, passphrase: Optional[str] = None) -> str:
+        """Export a backup of all database state (chats, contacts, keys, media, ...).
+
+        :param path: the directory where the backup will be stored.
+        :param passphrase: the backup will be encrypted with the passphrase, if it is
+                           None or empty string, the backup is not encrypted.
+        :returns: path to the created backup.
 
         Note that the account has to be stopped; call stop_io() if necessary.
         """
-        export_files = self._export(path, const.DC_IMEX_EXPORT_BACKUP)
+        export_files = self._export(path, const.DC_IMEX_EXPORT_BACKUP, passphrase)
         if len(export_files) != 1:
             raise RuntimeError("found more than one new file")
         return export_files[0]
 
-    def _export(self, path, imex_cmd):
+    def _export(self, path: str, imex_cmd: int, passphrase: Optional[str] = None) -> list:
         with self.temp_plugin(ImexTracker()) as imex_tracker:
-            self.imex(path, imex_cmd)
+            self.imex(path, imex_cmd, passphrase)
             return imex_tracker.wait_finish()
 
     def import_self_keys(self, path):
-        """ Import private keys found in the `path` directory.
+        """Import private keys found in the `path` directory.
         The last imported key is made the default keys unless its name
         contains the string legacy. Public keys are not imported.
 
@@ -489,21 +504,23 @@ class Account(object):
         """
         self._import(path, imex_cmd=const.DC_IMEX_IMPORT_SELF_KEYS)
 
-    def import_all(self, path):
-        """import delta chat state from the specified backup `path` (a file).
-
+    def import_all(self, path: str, passphrase: Optional[str] = None) -> None:
+        """Import Delta Chat state from the specified backup file.
         The account must be in unconfigured state for import to attempted.
+
+        :param path: path to the backup file.
+        :param passphrase: if not None or empty, the backup will be opened with the passphrase.
         """
         assert not self.is_configured(), "cannot import into configured account"
-        self._import(path, imex_cmd=const.DC_IMEX_IMPORT_BACKUP)
+        self._import(path, imex_cmd=const.DC_IMEX_IMPORT_BACKUP, passphrase=passphrase)
 
-    def _import(self, path, imex_cmd):
+    def _import(self, path: str, imex_cmd: int, passphrase: Optional[str] = None) -> None:
         with self.temp_plugin(ImexTracker()) as imex_tracker:
-            self.imex(path, imex_cmd)
+            self.imex(path, imex_cmd, passphrase)
             imex_tracker.wait_finish()
 
-    def imex(self, path, imex_cmd):
-        lib.dc_imex(self._dc_context, imex_cmd, as_dc_charpointer(path), ffi.NULL)
+    def imex(self, path: str, imex_cmd: int, passphrase: Optional[str] = None) -> None:
+        lib.dc_imex(self._dc_context, imex_cmd, as_dc_charpointer(path), as_dc_charpointer(passphrase))
 
     def initiate_key_transfer(self) -> str:
         """return setup code after a Autocrypt setup message
@@ -517,7 +534,7 @@ class Account(object):
         return from_dc_charpointer(res)
 
     def get_setup_contact_qr(self) -> str:
-        """ get/create Setup-Contact QR Code as ascii-string.
+        """get/create Setup-Contact QR Code as ascii-string.
 
         this string needs to be transferred to another DC account
         in a second channel (typically used by mobiles with QRcode-show + scan UX)
@@ -527,18 +544,15 @@ class Account(object):
         return from_dc_charpointer(res)
 
     def check_qr(self, qr):
-        """ check qr code and return :class:`ScannedQRCode` instance representing the result"""
-        res = ffi.gc(
-            lib.dc_check_qr(self._dc_context, as_dc_charpointer(qr)),
-            lib.dc_lot_unref
-        )
+        """check qr code and return :class:`ScannedQRCode` instance representing the result"""
+        res = ffi.gc(lib.dc_check_qr(self._dc_context, as_dc_charpointer(qr)), lib.dc_lot_unref)
         lot = DCLot(res)
         if lot.state() == const.DC_QR_ERROR:
             raise ValueError("invalid or unknown QR code: {}".format(lot.text1()))
         return ScannedQRCode(lot)
 
     def qr_setup_contact(self, qr):
-        """ setup contact and return a Chat after contact is established.
+        """setup contact and return a Chat after contact is established.
 
         Note that this function may block for a long time as messages are exchanged
         with the emitter of the QR code.  On success a :class:`deltachat.chat.Chat` instance
@@ -552,7 +566,7 @@ class Account(object):
         return Chat(self, chat_id)
 
     def qr_join_chat(self, qr):
-        """ join a chat group through a QR code.
+        """join a chat group through a QR code.
 
         Note that this function may block for a long time as messages are exchanged
         with the emitter of the QR code.  On success a :class:`deltachat.chat.Chat` instance
@@ -566,9 +580,7 @@ class Account(object):
             raise ValueError("could not join group")
         return Chat(self, chat_id)
 
-    def set_location(
-        self, latitude: float = 0.0, longitude: float = 0.0, accuracy: float = 0.0
-    ) -> None:
+    def set_location(self, latitude: float = 0.0, longitude: float = 0.0, accuracy: float = 0.0) -> None:
         """set a new location. It effects all chats where we currently
         have enabled location streaming.
 
@@ -587,7 +599,7 @@ class Account(object):
     #
 
     def add_account_plugin(self, plugin, name=None):
-        """ add an account plugin which implements one or more of
+        """add an account plugin which implements one or more of
         the :class:`deltachat.hookspec.PerAccount` hooks.
         """
         if name and self._pm.has_plugin(name=name):
@@ -597,18 +609,18 @@ class Account(object):
         return plugin
 
     def remove_account_plugin(self, plugin, name=None):
-        """ remove an account plugin. """
+        """remove an account plugin."""
         self._pm.unregister(plugin, name=name)
 
     @contextmanager
     def temp_plugin(self, plugin):
-        """ run a with-block with the given plugin temporarily registered. """
+        """run a with-block with the given plugin temporarily registered."""
         self._pm.register(plugin)
         yield plugin
         self._pm.unregister(plugin)
 
     def stop_ongoing(self):
-        """ Stop ongoing securejoin, configuration or other core jobs. """
+        """Stop ongoing securejoin, configuration or other core jobs."""
         lib.dc_stop_ongoing_process(self._dc_context)
 
     def get_connectivity(self):
@@ -621,7 +633,7 @@ class Account(object):
         return lib.dc_all_work_done(self._dc_context)
 
     def start_io(self):
-        """ start this account's IO scheduling (Rust-core async scheduler)
+        """start this account's IO scheduling (Rust-core async scheduler)
 
         If this account is not configured an Exception is raised.
         You need to call account.configure() and account.wait_configure_finish()
@@ -665,7 +677,7 @@ class Account(object):
         lib.dc_maybe_network(self._dc_context)
 
     def configure(self, reconfigure: bool = False) -> ConfigureTracker:
-        """ Start configuration process and return a Configtracker instance
+        """Start configuration process and return a Configtracker instance
         on which you can block with wait_finish() to get a True/False success
         value for the configuration process.
         """
@@ -678,11 +690,11 @@ class Account(object):
         return configtracker
 
     def wait_shutdown(self) -> None:
-        """ wait until shutdown of this account has completed. """
+        """wait until shutdown of this account has completed."""
         self._shutdown_event.wait()
 
     def stop_io(self) -> None:
-        """ stop core IO scheduler if it is running. """
+        """stop core IO scheduler if it is running."""
         self.log("stop_ongoing")
         self.stop_ongoing()
 
@@ -690,7 +702,7 @@ class Account(object):
         lib.dc_stop_io(self._dc_context)
 
     def shutdown(self) -> None:
-        """ shutdown and destroy account (stop callback thread, close and remove
+        """shutdown and destroy account (stop callback thread, close and remove
         underlying dc_context)."""
         if self._dc_context is None:
             return

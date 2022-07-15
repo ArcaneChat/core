@@ -12,9 +12,9 @@ use crate::chat::{self, Chat, ChatId, ProtectionStatus};
 use crate::config::Config;
 use crate::contact::{Contact, ContactId, Origin};
 use crate::context::Context;
-use crate::dc_tools::dc_timestamp_to_str;
 use crate::message::{Message, Viewtype};
 use crate::param::Param;
+use crate::tools::timestamp_to_str;
 use humansize::{file_size_opts, FileSize};
 
 /// Stock strings
@@ -332,6 +332,9 @@ pub enum StockMessage {
 
     #[strum(props(fallback = "Not connected"))]
     NotConnected = 121,
+
+    #[strum(props(fallback = "%1$s changed their address from %2$s to %3$s"))]
+    AeapAddrChanged = 122,
 }
 
 impl StockMessage {
@@ -373,6 +376,17 @@ trait StockStringMods: AsRef<str> + Sized {
             .replacen("%2$s", replacement.as_ref(), 1)
             .replacen("%2$d", replacement.as_ref(), 1)
             .replacen("%2$@", replacement.as_ref(), 1)
+    }
+
+    /// Substitutes the third replacement value if one is present.
+    ///
+    /// Be aware you probably should have also called [`StockStringMods::replace1`] and
+    /// [`StockStringMods::replace2`] if you are calling this.
+    fn replace3(&self, replacement: impl AsRef<str>) -> String {
+        self.as_ref()
+            .replacen("%3$s", replacement.as_ref(), 1)
+            .replacen("%3$d", replacement.as_ref(), 1)
+            .replacen("%3$@", replacement.as_ref(), 1)
     }
 
     /// Augments the message by saying it was performed by a user.
@@ -988,7 +1002,7 @@ pub(crate) async fn partial_download_msg_body(context: &Context, org_bytes: u32)
 pub(crate) async fn download_availability(context: &Context, timestamp: i64) -> String {
     translated(context, StockMessage::DownloadAvailability)
         .await
-        .replace1(dc_timestamp_to_str(timestamp))
+        .replace1(timestamp_to_str(timestamp))
 }
 
 /// Stock string: `Incoming Messages`.
@@ -1074,6 +1088,20 @@ pub(crate) async fn part_of_total_used(
 /// Used as the default name for broadcast lists; a number may be added.
 pub(crate) async fn broadcast_list(context: &Context) -> String {
     translated(context, StockMessage::BroadcastList).await
+}
+
+/// Stock string: `%1$s changed their address from %2$s to %3$s`.
+pub(crate) async fn aeap_addr_changed(
+    context: &Context,
+    contact_name: impl AsRef<str>,
+    old_addr: impl AsRef<str>,
+    new_addr: impl AsRef<str>,
+) -> String {
+    translated(context, StockMessage::AeapAddrChanged)
+        .await
+        .replace1(contact_name)
+        .replace2(old_addr)
+        .replace3(new_addr)
 }
 
 impl Context {
@@ -1167,7 +1195,7 @@ mod tests {
         assert_eq!(StockMessage::NoMessages.fallback(), "No messages.");
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_set_stock_translation() {
         let t = TestContext::new().await;
         t.set_stock_translation(StockMessage::NoMessages, "xyz".to_string())
@@ -1176,7 +1204,7 @@ mod tests {
         assert_eq!(no_messages(&t).await, "xyz")
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_set_stock_translation_wrong_replacements() {
         let t = TestContext::new().await;
         assert!(t
@@ -1191,13 +1219,13 @@ mod tests {
             .is_err());
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_stock_str() {
         let t = TestContext::new().await;
         assert_eq!(no_messages(&t).await, "No messages.");
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_stock_string_repl_str() {
         let t = TestContext::new().await;
         let contact_id = Contact::create(&t.ctx, "Someone", "someone@example.org")
@@ -1212,13 +1240,13 @@ mod tests {
         // We have no string using %1$d to test...
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_stock_string_repl_str2() {
         let t = TestContext::new().await;
         assert_eq!(msg_action_by_user(&t, "foo", "bar").await, "foo by bar.");
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_stock_system_msg_simple() {
         let t = TestContext::new().await;
         assert_eq!(
@@ -1227,7 +1255,7 @@ mod tests {
         )
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_stock_system_msg_add_member_by_me() {
         let t = TestContext::new().await;
         assert_eq!(
@@ -1236,7 +1264,7 @@ mod tests {
         )
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_stock_system_msg_add_member_by_me_with_displayname() {
         let t = TestContext::new().await;
         Contact::create(&t, "Alice", "alice@example.org")
@@ -1248,7 +1276,7 @@ mod tests {
         );
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_stock_system_msg_add_member_by_other_with_displayname() {
         let t = TestContext::new().await;
         let contact_id = {
@@ -1265,7 +1293,7 @@ mod tests {
         );
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_quota_exceeding_stock_str() -> anyhow::Result<()> {
         let t = TestContext::new().await;
         let str = quota_exceeding(&t, 81).await;
@@ -1275,7 +1303,7 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_partial_download_msg_body() -> anyhow::Result<()> {
         let t = TestContext::new().await;
         let str = partial_download_msg_body(&t, 1024 * 1024).await;
@@ -1283,7 +1311,7 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_update_device_chats() {
         let t = TestContext::new().await;
         t.update_device_chats().await.ok();

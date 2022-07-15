@@ -3,20 +3,20 @@
 //! This are some helper functions around [`BobState`] which augment the state changes with
 //! the required user interactions.
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 
 use crate::chat::{is_contact_in_chat, ChatId, ProtectionStatus};
 use crate::constants::{Blocked, Chattype};
 use crate::contact::Contact;
 use crate::context::Context;
-use crate::dc_tools::time;
 use crate::events::EventType;
 use crate::mimeparser::MimeMessage;
+use crate::tools::time;
 use crate::{chat, stock_str};
 
 use super::bobstate::{BobHandshakeStage, BobState};
 use super::qrinvite::QrInvite;
-use super::{HandshakeMessage, JoinError};
+use super::HandshakeMessage;
 
 /// Starts the securejoin protocol with the QR `invite`.
 ///
@@ -30,20 +30,17 @@ use super::{HandshakeMessage, JoinError};
 ///
 /// The [`ChatId`] of the created chat is returned, for a SetupContact QR this is the 1:1
 /// chat with Alice, for a SecureJoin QR this is the group chat.
-pub(super) async fn start_protocol(
-    context: &Context,
-    invite: QrInvite,
-) -> Result<ChatId, JoinError> {
+pub(super) async fn start_protocol(context: &Context, invite: QrInvite) -> Result<ChatId> {
     // A 1:1 chat is needed to send messages to Alice.  When joining a group this chat is
     // hidden, if a user starts sending messages in it it will be unhidden in
-    // dc_receive_imf.
+    // receive_imf.
     let hidden = match invite {
         QrInvite::Contact { .. } => Blocked::Not,
         QrInvite::Group { .. } => Blocked::Yes,
     };
     let chat_id = ChatId::create_for_contact_with_blocked(context, invite.contact_id(), hidden)
         .await
-        .map_err(JoinError::UnknownContact)?;
+        .with_context(|| format!("can't create chat for contact {}", invite.contact_id()))?;
 
     // Now start the protocol and initialise the state
     let (state, stage, aborted_states) =

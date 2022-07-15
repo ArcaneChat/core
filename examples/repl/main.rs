@@ -9,17 +9,18 @@ extern crate deltachat;
 
 use std::borrow::Cow::{self, Borrowed, Owned};
 use std::io::{self, Write};
+use std::path::Path;
 use std::process::Command;
 
 use ansi_term::Color;
 use anyhow::{bail, Error};
-use async_std::path::Path;
 use deltachat::chat::ChatId;
 use deltachat::config;
 use deltachat::context::*;
 use deltachat::oauth2::*;
+use deltachat::qr_code_generator::get_securejoin_qr_svg;
 use deltachat::securejoin::*;
-use deltachat::EventType;
+use deltachat::{EventType, Events};
 use log::{error, info, warn};
 use rustyline::completion::{Completer, FilenameCompleter, Pair};
 use rustyline::config::OutputStreamType;
@@ -30,11 +31,11 @@ use rustyline::validate::Validator;
 use rustyline::{
     Cmd, CompletionType, Config, Context as RustyContext, EditMode, Editor, Helper, KeyEvent,
 };
+use tokio::fs;
+use tokio::runtime::Handle;
 
 mod cmdline;
 use self::cmdline::*;
-use deltachat::qr_code_generator::get_securejoin_qr_svg;
-use std::fs;
 
 /// Event Handler
 fn receive_event(event: EventType) {
@@ -298,10 +299,10 @@ async fn start(args: Vec<String>) -> Result<(), Error> {
         println!("Error: Bad arguments, expected [db-name].");
         bail!("No db-name specified");
     }
-    let context = Context::new(Path::new(&args[1]).to_path_buf(), 0).await?;
+    let context = Context::new(Path::new(&args[1]), 0, Events::new()).await?;
 
     let events = context.get_event_emitter();
-    async_std::task::spawn(async move {
+    tokio::task::spawn(async move {
         while let Some(event) = events.recv().await {
             receive_event(event.typ);
         }
@@ -316,8 +317,9 @@ async fn start(args: Vec<String>) -> Result<(), Error> {
         .output_stream(OutputStreamType::Stdout)
         .build();
     let mut selected_chat = ChatId::default();
-    let (reader_s, reader_r) = async_std::channel::bounded(100);
-    let input_loop = async_std::task::spawn_blocking(move || {
+
+    let ctx = context.clone();
+    let input_loop = tokio::task::spawn_blocking(move || {
         let h = DcHelper {
             completer: FilenameCompleter::new(),
             highlighter: MatchingBracketHighlighter::new(),
@@ -339,16 +341,30 @@ async fn start(args: Vec<String>) -> Result<(), Error> {
                 Ok(line) => {
                     // TODO: ignore "set mail_pw"
                     rl.add_history_entry(line.as_str());
-                    async_std::task::block_on(reader_s.send(line)).unwrap();
+                    let contine = Handle::current().block_on(async {
+                        match handle_cmd(line.trim(), ctx.clone(), &mut selected_chat).await {
+                            Ok(ExitResult::Continue) => true,
+                            Ok(ExitResult::Exit) => {
+                                println!("Exiting ...");
+                                false
+                            }
+                            Err(err) => {
+                                println!("Error: {}", err);
+                                true
+                            }
+                        }
+                    });
+
+                    if !contine {
+                        break;
+                    }
                 }
                 Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
                     println!("Exiting...");
-                    drop(reader_s);
                     break;
                 }
                 Err(err) => {
                     println!("Error: {}", err);
-                    drop(reader_s);
                     break;
                 }
             }
@@ -359,15 +375,8 @@ async fn start(args: Vec<String>) -> Result<(), Error> {
         Ok::<_, Error>(())
     });
 
-    while let Ok(line) = reader_r.recv().await {
-        match handle_cmd(line.trim(), context.clone(), &mut selected_chat).await {
-            Ok(ExitResult::Continue) => {}
-            Ok(ExitResult::Exit) => break,
-            Err(err) => println!("Error: {}", err),
-        }
-    }
     context.stop_io().await;
-    input_loop.await?;
+    input_loop.await??;
 
     Ok(())
 }
@@ -400,7 +409,7 @@ async fn handle_cmd(
         "oauth2" => {
             if let Some(addr) = ctx.get_config(config::Config::Addr).await? {
                 let oauth2_url =
-                    dc_get_oauth2_url(&ctx, &addr, "chat.delta:/com.b44t.messenger").await?;
+                    get_oauth2_url(&ctx, &addr, "chat.delta:/com.b44t.messenger").await?;
                 if oauth2_url.is_none() {
                     println!("OAuth2 not available for {}.", &addr);
                 } else {
@@ -417,7 +426,7 @@ async fn handle_cmd(
         "getqr" | "getbadqr" => {
             ctx.start_io().await;
             let group = arg1.parse::<u32>().ok().map(ChatId::new);
-            let mut qr = dc_get_securejoin_qr(&ctx, group).await?;
+            let mut qr = get_securejoin_qr(&ctx, group).await?;
             if !qr.is_empty() {
                 if arg0 == "getbadqr" && qr.len() > 40 {
                     qr.replace_range(12..22, "0000000000")
@@ -437,7 +446,7 @@ async fn handle_cmd(
             let file = dirs::home_dir().unwrap_or_default().join("qr.svg");
             match get_securejoin_qr_svg(&ctx, group).await {
                 Ok(svg) => {
-                    fs::write(&file, svg)?;
+                    fs::write(&file, svg).await?;
                     println!("QR code svg written to: {:#?}", file);
                 }
                 Err(err) => {
@@ -448,7 +457,7 @@ async fn handle_cmd(
         "joinqr" => {
             ctx.start_io().await;
             if !arg0.is_empty() {
-                dc_join_securejoin(&ctx, arg1).await?;
+                join_securejoin(&ctx, arg1).await?;
             }
         }
         "exit" | "quit" => return Ok(ExitResult::Exit),
@@ -458,11 +467,12 @@ async fn handle_cmd(
     Ok(ExitResult::Continue)
 }
 
-fn main() -> Result<(), Error> {
+#[tokio::main]
+async fn main() -> Result<(), Error> {
     let _ = pretty_env_logger::try_init();
 
     let args = std::env::args().collect();
-    async_std::task::block_on(async move { start(args).await })?;
+    start(args).await?;
 
     Ok(())
 }

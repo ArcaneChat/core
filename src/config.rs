@@ -8,10 +8,10 @@ use crate::blob::BlobObject;
 use crate::constants::DC_VERSION_STR;
 use crate::contact::addr_cmp;
 use crate::context::Context;
-use crate::dc_tools::{dc_get_abs_path, improve_single_line_input};
 use crate::events::EventType;
 use crate::mimefactory::RECOMMENDED_FILE_SIZE;
 use crate::provider::{get_provider_by_id, Provider};
+use crate::tools::{get_abs_path, improve_single_line_input, EmailAddress};
 
 /// The available configuration keys.
 #[derive(
@@ -88,6 +88,11 @@ pub enum Config {
     /// Existing recipients are added to the contact database regardless of this setting.
     #[strum(props(default = "0"))]
     FetchExistingMsgs,
+
+    /// If set to "1", then existing messages are considered to be already fetched.
+    /// This flag is reset after successful configuration.
+    #[strum(props(default = "1"))]
+    FetchedExistingMsgs,
 
     #[strum(props(default = "0"))]
     KeyGenType,
@@ -191,7 +196,7 @@ impl Context {
         let value = match key {
             Config::Selfavatar => {
                 let rel_path = self.sql.get_raw_config(key).await?;
-                rel_path.map(|p| dc_get_abs_path(self, &p).to_string_lossy().into_owned())
+                rel_path.map(|p| get_abs_path(self, &p).to_string_lossy().into_owned())
             }
             Config::SysVersion => Some((&*DC_VERSION_STR).clone()),
             Config::SysMsgsizeMaxRecommended => Some(format!("{}", RECOMMENDED_FILE_SIZE)),
@@ -355,6 +360,8 @@ impl Context {
     ///
     /// This should only be used by test code and during configure.
     pub(crate) async fn set_primary_self_addr(&self, primary_new: &str) -> Result<()> {
+        let old_addr = self.get_config(Config::ConfiguredAddr).await?;
+
         // add old primary address (if exists) to secondary addresses
         let mut secondary_addrs = self.get_all_self_addrs().await?;
         // never store a primary address also as a secondary
@@ -367,6 +374,17 @@ impl Context {
 
         self.set_config(Config::ConfiguredAddr, Some(primary_new))
             .await?;
+
+        if let Some(old_addr) = old_addr {
+            let old_addr = EmailAddress::new(&old_addr)?;
+            let old_keypair = crate::key::load_keypair(self, &old_addr).await?;
+
+            if let Some(mut old_keypair) = old_keypair {
+                old_keypair.addr = EmailAddress::new(primary_new)?;
+                crate::key::store_self_keypair(self, &old_keypair, crate::key::KeyPairUse::Default)
+                    .await?;
+            }
+        }
 
         Ok(())
     }
@@ -420,6 +438,7 @@ mod tests {
 
     use crate::constants;
     use crate::test_utils::TestContext;
+
     use num_traits::FromPrimitive;
 
     #[test]
@@ -434,7 +453,7 @@ mod tests {
         );
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_media_quality_config_option() {
         let t = TestContext::new().await;
         let media_quality = t.get_config_int(Config::MediaQuality).await.unwrap();
@@ -451,7 +470,7 @@ mod tests {
         assert_eq!(media_quality, constants::MediaQuality::Worse);
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_ui_config() -> Result<()> {
         let t = TestContext::new().await;
 
@@ -473,7 +492,7 @@ mod tests {
     }
 
     /// Regression test for https://github.com/deltachat/deltachat-core-rust/issues/3012
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_set_config_bool() -> Result<()> {
         let t = TestContext::new().await;
 
@@ -485,7 +504,7 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_self_addrs() -> Result<()> {
         let alice = TestContext::new_alice().await;
 
@@ -499,14 +518,14 @@ mod tests {
         assert_eq!(alice.get_all_self_addrs().await?, vec!["Alice@Example.Org"]);
 
         // Test adding a new (primary) self address
-        // The address is trimmed during by `LoginParam::from_database()`,
+        // The address is trimmed during configure by `LoginParam::from_database()`,
         // so `set_primary_self_addr()` doesn't have to trim it.
-        alice.set_primary_self_addr(" Alice@alice.com ").await?;
-        assert!(alice.is_self_addr("    aliCe@example.org").await?);
+        alice.set_primary_self_addr("Alice@alice.com").await?;
+        assert!(alice.is_self_addr("aliCe@example.org").await?);
         assert!(alice.is_self_addr("alice@alice.com").await?);
         assert_eq!(
             alice.get_all_self_addrs().await?,
-            vec![" Alice@alice.com ", "Alice@Example.Org"]
+            vec!["Alice@alice.com", "Alice@Example.Org"]
         );
 
         // Check that the entry is not duplicated

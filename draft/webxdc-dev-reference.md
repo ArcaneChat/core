@@ -1,6 +1,12 @@
 # Webxdc Developer Reference
 
-(This document may eventually be merged with the [webxdc guidebook](https://deltachat.github.io/webxdc_docs/), where you may currently find other useful information.)
+This document gives a quick overview about the Webxdc specification,
+It is meant for both, developing Webxdc apps
+and developing Webxdc implementations.
+
+The [Webxdc guidebook](https://deltachat.github.io/webxdc_docs/) shows more detailed information
+when developing Webxdc apps.
+
 
 ## Webxdc File Format
 
@@ -34,8 +40,9 @@ To get a shared state, the peers use `sendUpdate()` to send updates to each othe
 - `update`: an object with the following properties:  
     - `update.payload`: any javascript primitive, array or object.
     - `update.info`: optional, short, informational message that will be added to the chat,
-       eg. "Alice voted" or "Bob scored 123 in MyGame";
-       usually only one line of text is shown,
+       eg. "Alice voted" or "Bob scored 123 in MyGame".
+       usually only one line of text is shown
+       and if there are series of info messages, older ones may be dropped.
        use this option sparingly to not spam the chat.
     - `update.document`: optional, name of the document in edit,
        must not be used eg. in games where the Webxdc does not create documents
@@ -137,9 +144,37 @@ round corners etc. will be added by the implementations as needed.
 If no icon is set, a default icon will be used.
 
 
+## Other APIs and Tags Usage Hints
+
+- `localStorage`, `sessionStorage`, `indexedDB` are okay to be used
+- `visibilitychange`-events are okay to be used
+- `window.navigator.language` is okay to be used, on desktop it is the system language
+- `<a href="localfile.html">` and other internal links are okay to be used
+- `<a href="mailto:addr@example.org?body=...">`- mailto links are okay to be used
+- `<meta name="viewport" ...>` usage is okay to be used
+  and useful esp. different webviews have different defaults
+
+
+### Discouraged Things
+
+- `document.cookie` is known not to work on desktop and iOS
+  use `localStorage` instead
+- `unload`-, `beforeunload`- and `pagehide`-events are known not to work on iOS and are flaky on other systems
+  (also partly discouraged by [mozilla](https://developer.mozilla.org/en-US/docs/Web/API/Window/unload_event))
+  use `visibilitychange` instead
+- `<title>` and `document.title` is ignored by Webxdc;
+  use the `name` property from `manifest.toml` instead
+- newest js features may not work on all webviews,
+  you may want to transpile your code down to an older js version
+  eg. with <https://babeljs.io>
+- `<a href="https://example.org/foo">` and other external links are blocked by definition;
+  instead, embed content or use `mailto:` link to offer a way for contact
+- `<input type="file">` is discouraged currently; this may change in future
+
+
 ## Webxdc Examples
 
-The following example shows an input field and  every input is show on all peers.
+The following example shows an input field and every input is show on all peers.
 
 ```html
 <!DOCTYPE html>
@@ -169,30 +204,10 @@ The following example shows an input field and  every input is show on all peers
 </html>
 ```
 
-[Webxdc Development Tool](https://github.com/deltachat/webxdc-dev)
-offers an **Webxdc Simulator** that can be used in many browsers without any installation needed.
+More examples at [github.com/webxdc](https://github.com/webxdc) and
+[topic #webxdc](https://github.com/topics/webxdc)
+
+[github.com/webxdc/hello](https://github.com/webxdc/hello)
+offers an **Webxdc Tool** that can be used in many browsers without any installation needed.
 You can also use that repository as a template for your own Webxdc -
 just clone and start adapting things to your need.
-
-
-### Advanced Examples
-
-- [2048](https://github.com/adbenitez/2048.xdc)
-- [Draw](https://github.com/adbenitez/draw.xdc)
-- [Poll](https://github.com/r10s/webxdc-poll/)
-- [Tic Tac Toe](https://github.com/Simon-Laux/tictactoe.xdc)
-- Even more with [Topic #webxdc on Github](https://github.com/topics/webxdc) or in the [webxdc GitHub organization](https://github.com/webxdc)
-
-
-## Closing Remarks
-
-- older devices might not have the newest js features in their webview,
-  you may want to transpile your code down to an older js version eg. with https://babeljs.io
-- viewport and scaling features are implementation specific,
-  if you want to have an explicit behavior, you can add eg.
-  `<meta name="viewport" content="initial-scale=1; user-scalable=no">` to your Webxdc
-- the `<title>` tag should not be used and its content is usually not displayed;
-  instead, use the `name` property from `manifest.toml`
-- there are tons of ideas for enhancements of the API and the file format,
-  eg. in the future, we will may define icon- and manifest-files,
-  allow to aggregate the state or add metadata.

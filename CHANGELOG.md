@@ -1,5 +1,156 @@
 # Changelog
 
+## Unreleased
+
+### Changes
+- handle drafts from mailto links in scanned QR #3492
+- do not overflow ratelimiter leaky bucket #3496
+
+### Fixes
+- don't squash text parts of NDN into attachments #3497
+- do not treat non-failed DSNs as NDNs #3506
+
+
+## 1.89.0
+
+### Changes
+
+- (AEAP) When one of your contacts changed their address, they are
+  only replaced in the chat where you got a message from them
+  for now #3491
+
+### Fixes
+- replace musl libc name resolution errors with a better message #3485
+- handle updates for not yet downloaded webxdc instances #3487
+
+
+## 1.88.0
+
+### Changes
+- Implemented "Automatic e-mail address Porting" (AEAP). You can
+  configure a new address in DC now, and when receivers get messages
+  they will automatically recognize your moving to a new address. #3385
+- switch from `async-std` to `tokio` as the async runtime #3449
+- upgrade to `pgp@0.8.0` #3467
+- add IMAP ID extension support #3468
+- configure DeltaChat folder by selecting it, so it is configured even if not LISTed #3371
+- build PyPy wheels #6683
+- improve default error if NDN does not provide an error #3456
+- increase ratelimit from 3 to 6 messages per 60 seconds #3481
+
+### Fixes
+- mailing list: remove square-brackets only for first name #3452
+- do not use footers from mailinglists as the contact status #3460
+- don't ignore KML parsing errors #3473
+
+
+## 1.87.0
+
+### Changes
+- limit the rate of MDN sending #3402
+- ignore ratelimits for bots #3439
+- remove `msgs_mdns` references to deleted messages during housekeeping #3387
+- format message lines starting with `>` as quotes #3434
+- node: remove `split2` dependency #3418
+- node: add git installation info to readme #3418
+- limit the rate of webxdc update sending #3417
+
+### Fixes
+- set a default error if NDN does not provide an error #3410
+- python: avoid exceptions when messages/contacts/chats are compared with `None`
+- node: wait for the event loop to stop before destroying contexts #3431 #3451
+- emit configuration errors via event on failure #3433
+- report configure and imex success/failure after freeing ongoing process #3442
+
+### API-Changes
+- python: added `Message.get_status_updates()`  #3416
+- python: added `Message.send_status_update()`  #3416
+- python: added `Message.is_webxdc()`  #3416
+- python: added `Message.is_videochat_invitation()`  #3416
+- python: added support for "videochat" and "webxdc" view types to `Message.new_empty()`  #3416
+
+
+## 1.86.0
+
+### API-Changes
+- python: added optional `closed` parameter to `Account` constructor #3394
+- python: added optional `passphrase` parameter to `Account.export_all()` and `Account.import_all()` #3394
+- python: added `Account.open()` #3394
+- python: added `Chat.is_single()` #3394
+- python: added `Chat.is_mailinglist()` #3394
+- python: added `Chat.is_broadcast()` #3394
+- python: added `Chat.is_multiuser()` #3394
+- python: added `Chat.is_self_talk()` #3394
+- python: added `Chat.is_device_talk()` #3394
+- python: added `Chat.is_pinned()` #3394
+- python: added `Chat.pin()` #3394
+- python: added `Chat.unpin()` #3394
+- python: added `Chat.archive()` #3394
+- python: added `Chat.unarchive()` #3394
+- python: added `Message.get_summarytext()` #3394
+- python: added optional `closed` parameter to `ACFactory.get_unconfigured_account()` (pytest plugin) #3394
+- python: added optional `passphrase` parameter to `ACFactory.get_pseudo_configured_account()` (pytest plugin) #3394
+
+### Changes
+- clean up series of webxdc info messages;
+  `DC_EVENT_MSGS_CHANGED` is emitted on changes of existing info messages #3395
+- update provider database #3399
+- refactorings #3375 #3403 #3398 #3404
+
+### Fixes
+- do not reset our database if imported backup cannot be decrypted #3397
+- node: remove `npx` from build script, this broke flathub build #3396
+
+
+## 1.85.0
+
+### Changes
+- refactorings #3373 #3345 #3380 #3382
+- node: move split2 to devDependencies
+- python: build Python 3.10 wheels #3392
+- update Rust dependencies
+
+### Fixes
+- delete outgoing MDNs found in the Sent folder on Gmail #3372
+- fix searching one-to-one chats #3377
+- do not add legacy info-messages on resending webxdc #3389
+
+
+## 1.84.0
+
+### Changes
+- refactorings #3354 #3347 #3353 #3346
+
+### Fixes
+- do not unnecessarily SELECT folders if there are no operations planned on
+  them #3333
+- trim chat encryption info #3350
+- fix failure to decrypt first message to self after key synchronization
+  via Autocrypt Setup Message #3352
+- Keep pgp key when you change your own email address #3351
+- Do not ignore Sent and Spam folders on Gmail #3369
+- handle decryption errors explicitly and don't get confused by encrypted mail attachments #3374
+
+
+## 1.83.0
+
+### Fixes
+- fix node prebuild & package ci #3337
+
+
+## 1.82.0
+
+### API-Changes
+- re-add removed `DC_MSG_ID_MARKER1` as in use on iOS #3330
+
+### Changes
+- refactorings #3328
+
+### Fixes
+- fix node package ci #3331
+- fix race condition in ongoing process (import/export, configuration) allocation #3322
+
+
 ## 1.81.0
 
 ### API-Changes
@@ -24,11 +175,7 @@
 - node: throw error when getting context with an invalid account id
 - node: throw error when instanciating a wrapper class on `null` (Context, Message, Chat, ChatList and so on)
 - use same contact-color if email address differ only in upper-/lowercase #3327
-- fix race condition in ongoing process (import/export, configuration) allocation
 - repair encrypted mails "mixed up" by Google Workspace "Append footer" function #3315
-
-### Removed
-- node: remove unmaintained coverage scripts
 
 
 ## 1.80.0

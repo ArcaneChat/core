@@ -10,7 +10,7 @@ on:
 
 env:
   RUSTFLAGS: -Dwarnings
-
+   
 jobs:
 
   fmt:
@@ -77,19 +77,19 @@ jobs:
         include:
           # Currently used Rust version, same as in `rust-toolchain` file.
           - os: ubuntu-latest
-            rust: 1.60.0
+            rust: 1.61.0
             python: 3.9
           - os: windows-latest
-            rust: 1.60.0
+            rust: 1.61.0
             python: false # Python bindings compilation on Windows is not supported.
 
-          # Minimum Supported Rust Version = 1.56.0
+          # Minimum Supported Rust Version = 1.56.1
           #
           # Minimum Supported Python Version = 3.7
           # This is the minimum version for which manylinux Python wheels are
           # built.
           - os: ubuntu-latest
-            rust: 1.56.0
+            rust: 1.56.1
             python: 3.7
     runs-on: ${{ matrix.os }}
     steps:
@@ -118,7 +118,7 @@ jobs:
 
     - name: install python
       if: ${{ matrix.python }}
-      uses: actions/setup-python@v2
+      uses: actions/setup-python@v4
       with:
         python-version: ${{ matrix.python }}
 
@@ -141,3 +141,18 @@ jobs:
         DCC_RS_DEV: ${{ github.workspace }}
       working-directory: python
       run: tox -e lint,mypy,doc,py3
+
+    - name: install pypy
+      if: ${{ matrix.python }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: 'pypy${{ matrix.python }}'
+
+    - name: run pypy tests
+      if: ${{ matrix.python }}
+      env:
+        DCC_NEW_TMP_EMAIL: ${{ secrets.DCC_NEW_TMP_EMAIL }}
+        DCC_RS_TARGET: debug
+        DCC_RS_DEV: ${{ github.workspace }}
+      working-directory: python
+      run: tox -e pypy3

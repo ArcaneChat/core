@@ -98,14 +98,6 @@ static void finalize_provider(napi_env env, void* data, void* hint) {
   }
 }
 
-static void finalize_account(napi_env env, void* data, void* hint) {
-  if (data) {
-    dc_accounts_t* dcn_accounts = (dc_accounts_t*)data;
-    //TRACE("cleaning up provider");
-    dc_accounts_unref(dcn_accounts);
-  }
-}
-
 /**
  * Helpers.
  */
@@ -326,7 +318,7 @@ static void call_js_event_handler(napi_env env, napi_value js_callback, void* _c
 
   if (status != napi_ok) {
     TRACE("Unable to call event_handler callback2");
-    napi_extended_error_info* error_result;
+    const napi_extended_error_info* error_result;
     NAPI_STATUS_THROWS(napi_get_last_error_info(env, &error_result));
   }
 }
@@ -348,7 +340,7 @@ NAPI_METHOD(dcn_start_event_handler) {
     callback,
     0,
     async_resource_name,
-    1,
+    1000, // max_queue_size
     1,
     NULL,
     NULL,
@@ -371,6 +363,11 @@ NAPI_METHOD(dcn_context_unref) {
 
   TRACE("Unrefing dc_context");
   dcn_context->gc = 1;
+  if (dcn_context->event_handler_thread != 0) {
+    dc_stop_io(dcn_context->dc_context);
+    uv_thread_join(&dcn_context->event_handler_thread);
+    dcn_context->event_handler_thread = 0;
+  }
   dc_context_unref(dcn_context->dc_context);
   dcn_context->dc_context = NULL;
 
@@ -2922,6 +2919,11 @@ NAPI_METHOD(dcn_accounts_unref) {
 
   TRACE("Unrefing dc_accounts");
   dcn_accounts->gc = 1;
+  if (dcn_accounts->event_handler_thread != 0) {
+    dc_accounts_stop_io(dcn_accounts->dc_accounts);
+    uv_thread_join(&dcn_accounts->event_handler_thread);
+    dcn_accounts->event_handler_thread = 0;
+  }
   dc_accounts_unref(dcn_accounts->dc_accounts);
   dcn_accounts->dc_accounts = NULL;
 
@@ -3093,8 +3095,8 @@ static void accounts_event_handler_thread_func(void* arg)
     }
     event = dc_accounts_get_next_event(dc_accounts_event_emitter);
     if (event == NULL) {
-      //TRACE("received NULL event, skipping");
-      continue;
+      TRACE("no more events");
+      break;
     }
 
     if (!dcn_accounts->threadsafe_event_handler) {
@@ -3195,7 +3197,7 @@ static void call_accounts_js_event_handler(napi_env env, napi_value js_callback,
 
   if (status != napi_ok) {
     TRACE("Unable to call event_handler callback2");
-    napi_extended_error_info* error_result;
+    const napi_extended_error_info* error_result;
     NAPI_STATUS_THROWS(napi_get_last_error_info(env, &error_result));
   }
 }
@@ -3216,7 +3218,7 @@ NAPI_METHOD(dcn_accounts_start_event_handler) {
     callback,
     0,
     async_resource_name,
-    1,
+    1000, // max_queue_size
     1,
     NULL,
     NULL,

@@ -5,10 +5,10 @@ use anyhow::{Context as _, Result};
 use crate::config::Config;
 use crate::constants::ShowEmails;
 use crate::context::Context;
-use crate::dc_tools::EmailAddress;
 use crate::imap;
 use crate::provider::get_provider_by_domain;
 use crate::sql::Sql;
+use crate::tools::EmailAddress;
 
 const DBVERSION: i32 = 68;
 const VERSION_CFG: &str = "dbversion";
@@ -634,6 +634,19 @@ CREATE INDEX smtp_messageid ON imap(rfc724_mid);
               retries INTEGER NOT NULL DEFAULT 0 -- Number of failed attempts to send MDN
             );"#,
             90,
+        )
+        .await?;
+    }
+    if dbversion < 91 {
+        info!(context, "[migration] v91");
+        sql.execute_migration(
+            r#"CREATE TABLE smtp_status_updates (
+              msg_id INTEGER NOT NULL UNIQUE, -- msg_id of the webxdc instance with pending updates
+              first_serial INTEGER NOT NULL, -- id in msgs_status_updates
+              last_serial INTEGER NOT NULL, -- id in msgs_status_updates
+              descr TEXT NOT NULL -- text to send along with the updates
+            );"#,
+            91,
         )
         .await?;
     }

@@ -4,15 +4,13 @@ use core::cmp::max;
 use std::ffi::OsStr;
 use std::fmt;
 use std::io::Cursor;
+use std::path::{Path, PathBuf};
 
-use async_std::path::{Path, PathBuf};
-use async_std::prelude::*;
-use async_std::{fs, io};
-
-use anyhow::{format_err, Context as _, Error};
+use anyhow::{format_err, Context as _, Error, Result};
 use image::{DynamicImage, ImageFormat};
 use num_traits::FromPrimitive;
-use thiserror::Error;
+use tokio::io::AsyncWriteExt;
+use tokio::{fs, io};
 
 use crate::config::Config;
 use crate::constants::{
@@ -44,31 +42,15 @@ impl<'a> BlobObject<'a> {
     /// name, followed by a random number and followed by a possible
     /// extension.  The `data` will be written into the file without
     /// race-conditions.
-    ///
-    /// # Errors
-    ///
-    /// [BlobError::CreateFailure] is used when the file could not
-    /// be created.  You can expect [BlobError.cause] to contain an
-    /// underlying error.
-    ///
-    /// [BlobError::WriteFailure] is used when the file could not
-    /// be written to.  You can expect [BlobError.cause] to contain an
-    /// underlying error.
     pub async fn create(
         context: &'a Context,
         suggested_name: &str,
         data: &[u8],
-    ) -> std::result::Result<BlobObject<'a>, BlobError> {
+    ) -> Result<BlobObject<'a>> {
         let blobdir = context.get_blobdir();
         let (stem, ext) = BlobObject::sanitise_name(suggested_name);
         let (name, mut file) = BlobObject::create_new_file(context, blobdir, &stem, &ext).await?;
-        file.write_all(data)
-            .await
-            .map_err(|err| BlobError::WriteFailure {
-                blobdir: blobdir.to_path_buf(),
-                blobname: name.clone(),
-                cause: err.into(),
-            })?;
+        file.write_all(data).await.context("file write failure")?;
 
         // workaround a bug in async-std
         // (the executor does not handle blocking operation in Drop correctly,
@@ -89,7 +71,7 @@ impl<'a> BlobObject<'a> {
         dir: &Path,
         stem: &str,
         ext: &str,
-    ) -> Result<(String, fs::File), BlobError> {
+    ) -> Result<(String, fs::File)> {
         const MAX_ATTEMPT: u32 = 16;
         let mut attempt = 0;
         let mut name = format!("{}{}", stem, ext);
@@ -105,12 +87,8 @@ impl<'a> BlobObject<'a> {
                 Ok(file) => return Ok((name, file)),
                 Err(err) => {
                     if attempt >= MAX_ATTEMPT {
-                        return Err(BlobError::CreateFailure {
-                            blobdir: dir.to_path_buf(),
-                            blobname: name,
-                            cause: err,
-                        });
-                    } else if attempt == 1 && !dir.exists().await {
+                        return Err(err).context("failed to create file");
+                    } else if attempt == 1 && !dir.exists() {
                         fs::create_dir_all(dir).await.ok_or_log(context);
                     } else {
                         name = format!("{}-{}{}", stem, rand::random::<u32>(), ext);
@@ -126,40 +104,19 @@ impl<'a> BlobObject<'a> {
     /// but also copies an existing file into it.  This is done in a
     /// in way which avoids race-conditions when multiple files are
     /// concurrently created.
-    ///
-    /// # Errors
-    ///
-    /// In addition to the errors in [BlobObject::create] the
-    /// [BlobError::CopyFailure] is used when the data can not be
-    /// copied.
-    pub async fn create_and_copy(
-        context: &'a Context,
-        src: &Path,
-    ) -> std::result::Result<BlobObject<'a>, BlobError> {
+    pub async fn create_and_copy(context: &'a Context, src: &Path) -> Result<BlobObject<'a>> {
         let mut src_file = fs::File::open(src)
             .await
-            .map_err(|err| BlobError::CopyFailure {
-                blobdir: context.get_blobdir().to_path_buf(),
-                blobname: String::from(""),
-                src: src.to_path_buf(),
-                cause: err,
-            })?;
+            .with_context(|| format!("failed to open file {}", src.display()))?;
         let (stem, ext) = BlobObject::sanitise_name(&src.to_string_lossy());
         let (name, mut dst_file) =
             BlobObject::create_new_file(context, context.get_blobdir(), &stem, &ext).await?;
         let name_for_err = name.clone();
         if let Err(err) = io::copy(&mut src_file, &mut dst_file).await {
-            {
-                // Attempt to remove the failed file, swallow errors resulting from that.
-                let path = context.get_blobdir().join(&name_for_err);
-                fs::remove_file(path).await.ok();
-            }
-            return Err(BlobError::CopyFailure {
-                blobdir: context.get_blobdir().to_path_buf(),
-                blobname: name_for_err,
-                src: src.to_path_buf(),
-                cause: err,
-            });
+            // Attempt to remove the failed file, swallow errors resulting from that.
+            let path = context.get_blobdir().join(&name_for_err);
+            fs::remove_file(path).await.ok();
+            return Err(err).context("failed to copy file");
         }
 
         // workaround, see create() for details
@@ -184,16 +141,7 @@ impl<'a> BlobObject<'a> {
     ///
     /// Paths into the blob directory may be either defined by an absolute path
     /// or by the relative prefix `$BLOBDIR`.
-    ///
-    /// # Errors
-    ///
-    /// This merely delegates to the [BlobObject::create_and_copy] and
-    /// the [BlobObject::from_path] methods.  See those for possible
-    /// errors.
-    pub async fn new_from_path(
-        context: &'a Context,
-        src: &Path,
-    ) -> std::result::Result<BlobObject<'a>, BlobError> {
+    pub async fn new_from_path(context: &'a Context, src: &Path) -> Result<BlobObject<'a>> {
         if src.starts_with(context.get_blobdir()) {
             BlobObject::from_path(context, src)
         } else if src.starts_with("$BLOBDIR/") {
@@ -209,32 +157,14 @@ impl<'a> BlobObject<'a> {
     /// must use a valid blob name.  That is after sanitisation the
     /// name must still be the same, that means it must be valid UTF-8
     /// and not have any special characters in it.
-    ///
-    /// # Errors
-    ///
-    /// [BlobError::WrongBlobdir] is used if the path is not in
-    /// the blob directory.
-    ///
-    /// [BlobError::WrongName] is used if the file name does not
-    /// remain identical after sanitisation.
-    pub fn from_path(
-        context: &'a Context,
-        path: &Path,
-    ) -> std::result::Result<BlobObject<'a>, BlobError> {
-        let rel_path =
-            path.strip_prefix(context.get_blobdir())
-                .map_err(|_| BlobError::WrongBlobdir {
-                    blobdir: context.get_blobdir().to_path_buf(),
-                    src: path.to_path_buf(),
-                })?;
+    pub fn from_path(context: &'a Context, path: &Path) -> Result<BlobObject<'a>> {
+        let rel_path = path
+            .strip_prefix(context.get_blobdir())
+            .context("wrong blobdir")?;
         if !BlobObject::is_acceptible_blob_name(rel_path) {
-            return Err(BlobError::WrongName {
-                blobname: path.to_path_buf(),
-            });
+            return Err(format_err!("wrong name"));
         }
-        let name = rel_path.to_str().ok_or_else(|| BlobError::WrongName {
-            blobname: path.to_path_buf(),
-        })?;
+        let name = rel_path.to_str().context("wrong name")?;
         BlobObject::from_name(context, name.to_string())
     }
 
@@ -244,24 +174,13 @@ impl<'a> BlobObject<'a> {
     /// prefixed, as returned by [BlobObject::as_name].  This is how
     /// you want to create a [BlobObject] for a filename read from the
     /// database.
-    ///
-    /// # Errors
-    ///
-    /// [BlobError::WrongName] is used if the name is not a valid
-    /// blobname, i.e. if [BlobObject::sanitise_name] does modify the
-    /// provided name.
-    pub fn from_name(
-        context: &'a Context,
-        name: String,
-    ) -> std::result::Result<BlobObject<'a>, BlobError> {
+    pub fn from_name(context: &'a Context, name: String) -> Result<BlobObject<'a>> {
         let name: String = match name.starts_with("$BLOBDIR/") {
             true => name.splitn(2, '/').last().unwrap().to_string(),
             false => name,
         };
         if !BlobObject::is_acceptible_blob_name(&name) {
-            return Err(BlobError::WrongName {
-                blobname: PathBuf::from(name),
-            });
+            return Err(format_err!("not an acceptable blob name: {}", &name));
         }
         Ok(BlobObject {
             blobdir: context.get_blobdir(),
@@ -289,7 +208,7 @@ impl<'a> BlobObject<'a> {
 
     /// Returns the filename of the blob.
     pub fn as_file_name(&self) -> &str {
-        self.name.rsplit('/').next().unwrap()
+        self.name.rsplit('/').next().unwrap_or_default()
     }
 
     /// The path relative in the blob directory.
@@ -394,7 +313,7 @@ impl<'a> BlobObject<'a> {
         true
     }
 
-    pub async fn recode_to_avatar_size(&mut self, context: &Context) -> Result<(), BlobError> {
+    pub async fn recode_to_avatar_size(&mut self, context: &Context) -> Result<()> {
         let blob_abs = self.to_abs_path();
 
         let img_wh =
@@ -416,7 +335,7 @@ impl<'a> BlobObject<'a> {
         Ok(())
     }
 
-    pub async fn recode_to_image_size(&self, context: &Context) -> Result<(), BlobError> {
+    pub async fn recode_to_image_size(&self, context: &Context) -> Result<()> {
         let blob_abs = self.to_abs_path();
         if message::guess_msgtype_from_suffix(Path::new(&blob_abs))
             != Some((Viewtype::Image, "image/jpeg"))
@@ -439,8 +358,7 @@ impl<'a> BlobObject<'a> {
         {
             return Err(format_err!(
                 "Internal error: recode_to_size(..., None) shouldn't change the name of the image"
-            )
-            .into());
+            ));
         }
         Ok(())
     }
@@ -451,118 +369,82 @@ impl<'a> BlobObject<'a> {
         mut blob_abs: PathBuf,
         mut img_wh: u32,
         max_bytes: Option<usize>,
-    ) -> Result<Option<String>, BlobError> {
-        let mut img = image::open(&blob_abs).map_err(|err| BlobError::RecodeFailure {
-            blobdir: context.get_blobdir().to_path_buf(),
-            blobname: blob_abs.to_str().unwrap_or_default().to_string(),
-            cause: err,
-        })?;
-        let orientation = self.get_exif_orientation(context);
-        let mut encoded = Vec::new();
-        let mut changed_name = None;
+    ) -> Result<Option<String>> {
+        tokio::task::block_in_place(move || {
+            let mut img = image::open(&blob_abs).context("image recode failure")?;
+            let orientation = self.get_exif_orientation(context);
+            let mut encoded = Vec::new();
+            let mut changed_name = None;
 
-        fn encode_img(img: &DynamicImage, encoded: &mut Vec<u8>) -> anyhow::Result<()> {
-            encoded.clear();
-            let mut buf = Cursor::new(encoded);
-            img.write_to(&mut buf, image::ImageFormat::Jpeg)?;
-            Ok(())
-        }
-        fn encoded_img_exceeds_bytes(
-            context: &Context,
-            img: &DynamicImage,
-            max_bytes: Option<usize>,
-            encoded: &mut Vec<u8>,
-        ) -> anyhow::Result<bool> {
-            if let Some(max_bytes) = max_bytes {
-                encode_img(img, encoded)?;
-                if encoded.len() > max_bytes {
-                    info!(
-                        context,
-                        "image size {}B ({}x{}px) exceeds {}B, need to scale down",
-                        encoded.len(),
-                        img.width(),
-                        img.height(),
-                        max_bytes,
-                    );
-                    return Ok(true);
-                }
-            }
-            Ok(false)
-        }
-        let exceeds_width = img.width() > img_wh || img.height() > img_wh;
+            let exceeds_width = img.width() > img_wh || img.height() > img_wh;
 
-        let do_scale =
-            exceeds_width || encoded_img_exceeds_bytes(context, &img, max_bytes, &mut encoded)?;
-        let do_rotate = matches!(orientation, Ok(90) | Ok(180) | Ok(270));
+            let do_scale =
+                exceeds_width || encoded_img_exceeds_bytes(context, &img, max_bytes, &mut encoded)?;
+            let do_rotate = matches!(orientation, Ok(90) | Ok(180) | Ok(270));
 
-        if do_scale || do_rotate {
-            if do_rotate {
-                img = match orientation {
-                    Ok(90) => img.rotate90(),
-                    Ok(180) => img.rotate180(),
-                    Ok(270) => img.rotate270(),
-                    _ => img,
-                }
-            }
-
-            if do_scale {
-                if !exceeds_width {
-                    // The image is already smaller than img_wh, but exceeds max_bytes
-                    // We can directly start with trying to scale down to 2/3 of its current width
-                    img_wh = max(img.width(), img.height()) * 2 / 3
-                }
-
-                loop {
-                    let new_img = img.thumbnail(img_wh, img_wh);
-
-                    if encoded_img_exceeds_bytes(context, &new_img, max_bytes, &mut encoded)? {
-                        if img_wh < 20 {
-                            return Err(format_err!(
-                                "Failed to scale image to below {}B",
-                                max_bytes.unwrap_or_default()
-                            )
-                            .into());
-                        }
-
-                        img_wh = img_wh * 2 / 3;
-                    } else {
-                        if encoded.is_empty() {
-                            encode_img(&new_img, &mut encoded)?;
-                        }
-
-                        info!(
-                            context,
-                            "Final scaled-down image size: {}B ({}px)",
-                            encoded.len(),
-                            img_wh
-                        );
-                        break;
+            if do_scale || do_rotate {
+                if do_rotate {
+                    img = match orientation {
+                        Ok(90) => img.rotate90(),
+                        Ok(180) => img.rotate180(),
+                        Ok(270) => img.rotate270(),
+                        _ => img,
                     }
                 }
+
+                if do_scale {
+                    if !exceeds_width {
+                        // The image is already smaller than img_wh, but exceeds max_bytes
+                        // We can directly start with trying to scale down to 2/3 of its current width
+                        img_wh = max(img.width(), img.height()) * 2 / 3
+                    }
+
+                    loop {
+                        let new_img = img.thumbnail(img_wh, img_wh);
+
+                        if encoded_img_exceeds_bytes(context, &new_img, max_bytes, &mut encoded)? {
+                            if img_wh < 20 {
+                                return Err(format_err!(
+                                    "Failed to scale image to below {}B",
+                                    max_bytes.unwrap_or_default()
+                                ));
+                            }
+
+                            img_wh = img_wh * 2 / 3;
+                        } else {
+                            if encoded.is_empty() {
+                                encode_img(&new_img, &mut encoded)?;
+                            }
+
+                            info!(
+                                context,
+                                "Final scaled-down image size: {}B ({}px)",
+                                encoded.len(),
+                                img_wh
+                            );
+                            break;
+                        }
+                    }
+                }
+
+                // The file format is JPEG now, we may have to change the file extension
+                if !matches!(ImageFormat::from_path(&blob_abs), Ok(ImageFormat::Jpeg)) {
+                    blob_abs = blob_abs.with_extension("jpg");
+                    let file_name = blob_abs.file_name().context("No avatar file name (???)")?;
+                    let file_name = file_name.to_str().context("Filename is no UTF-8 (???)")?;
+                    changed_name = Some(format!("$BLOBDIR/{}", file_name));
+                }
+
+                if encoded.is_empty() {
+                    encode_img(&img, &mut encoded)?;
+                }
+
+                std::fs::write(&blob_abs, &encoded)
+                    .context("failed to write recoded blob to file")?;
             }
 
-            // The file format is JPEG now, we may have to change the file extension
-            if !matches!(ImageFormat::from_path(&blob_abs), Ok(ImageFormat::Jpeg)) {
-                blob_abs = blob_abs.with_extension("jpg");
-                let file_name = blob_abs.file_name().context("No avatar file name (???)")?;
-                let file_name = file_name.to_str().context("Filename is no UTF-8 (???)")?;
-                changed_name = Some(format!("$BLOBDIR/{}", file_name));
-            }
-
-            if encoded.is_empty() {
-                encode_img(&img, &mut encoded)?;
-            }
-
-            fs::write(&blob_abs, &encoded)
-                .await
-                .map_err(|err| BlobError::WriteFailure {
-                    blobdir: context.get_blobdir().to_path_buf(),
-                    blobname: blob_abs.to_str().unwrap_or_default().to_string(),
-                    cause: err.into(),
-                })?;
-        }
-
-        Ok(changed_name)
+            Ok(changed_name)
+        })
     }
 
     pub fn get_exif_orientation(&self, context: &Context) -> Result<i32, Error> {
@@ -590,44 +472,33 @@ impl<'a> fmt::Display for BlobObject<'a> {
     }
 }
 
-/// Errors for the [BlobObject].
-#[derive(Debug, Error)]
-pub enum BlobError {
-    #[error("Failed to create blob {blobname} in {}", .blobdir.display())]
-    CreateFailure {
-        blobdir: PathBuf,
-        blobname: String,
-        #[source]
-        cause: std::io::Error,
-    },
-    #[error("Failed to write data to blob {blobname} in {}", .blobdir.display())]
-    WriteFailure {
-        blobdir: PathBuf,
-        blobname: String,
-        #[source]
-        cause: anyhow::Error,
-    },
-    #[error("Failed to copy data from {} to blob {blobname} in {}", .src.display(), .blobdir.display())]
-    CopyFailure {
-        blobdir: PathBuf,
-        blobname: String,
-        src: PathBuf,
-        #[source]
-        cause: std::io::Error,
-    },
-    #[error("Failed to recode to blob {blobname} in {}", .blobdir.display())]
-    RecodeFailure {
-        blobdir: PathBuf,
-        blobname: String,
-        #[source]
-        cause: image::ImageError,
-    },
-    #[error("File path {} is not in {}", .src.display(), .blobdir.display())]
-    WrongBlobdir { blobdir: PathBuf, src: PathBuf },
-    #[error("Blob has a badname {}", .blobname.display())]
-    WrongName { blobname: PathBuf },
-    #[error("{0}")]
-    Other(#[from] anyhow::Error),
+fn encode_img(img: &DynamicImage, encoded: &mut Vec<u8>) -> anyhow::Result<()> {
+    encoded.clear();
+    let mut buf = Cursor::new(encoded);
+    img.write_to(&mut buf, image::ImageFormat::Jpeg)?;
+    Ok(())
+}
+fn encoded_img_exceeds_bytes(
+    context: &Context,
+    img: &DynamicImage,
+    max_bytes: Option<usize>,
+    encoded: &mut Vec<u8>,
+) -> anyhow::Result<bool> {
+    if let Some(max_bytes) = max_bytes {
+        encode_img(img, encoded)?;
+        if encoded.len() > max_bytes {
+            info!(
+                context,
+                "image size {}B ({}x{}px) exceeds {}B, need to scale down",
+                encoded.len(),
+                img.width(),
+                img.height(),
+                max_bytes,
+            );
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -643,7 +514,16 @@ mod tests {
 
     use super::*;
 
-    #[async_std::test]
+    fn check_image_size(path: impl AsRef<Path>, width: u32, height: u32) -> image::DynamicImage {
+        tokio::task::block_in_place(move || {
+            let img = image::open(path).expect("failed to open image");
+            assert_eq!(img.width(), width, "invalid width");
+            assert_eq!(img.height(), height, "invalid height");
+            img
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_create() {
         let t = TestContext::new().await;
         let blob = BlobObject::create(&t, "foo", b"hello").await.unwrap();
@@ -654,28 +534,28 @@ mod tests {
         assert_eq!(blob.to_abs_path(), t.get_blobdir().join("foo"));
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_lowercase_ext() {
         let t = TestContext::new().await;
         let blob = BlobObject::create(&t, "foo.TXT", b"hello").await.unwrap();
         assert_eq!(blob.as_name(), "$BLOBDIR/foo.txt");
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_as_file_name() {
         let t = TestContext::new().await;
         let blob = BlobObject::create(&t, "foo.txt", b"hello").await.unwrap();
         assert_eq!(blob.as_file_name(), "foo.txt");
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_as_rel_path() {
         let t = TestContext::new().await;
         let blob = BlobObject::create(&t, "foo.txt", b"hello").await.unwrap();
         assert_eq!(blob.as_rel_path(), Path::new("foo.txt"));
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_suffix() {
         let t = TestContext::new().await;
         let blob = BlobObject::create(&t, "foo.txt", b"hello").await.unwrap();
@@ -684,16 +564,16 @@ mod tests {
         assert_eq!(blob.suffix(), None);
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_create_dup() {
         let t = TestContext::new().await;
         BlobObject::create(&t, "foo.txt", b"hello").await.unwrap();
         let foo_path = t.get_blobdir().join("foo.txt");
-        assert!(foo_path.exists().await);
+        assert!(foo_path.exists());
         BlobObject::create(&t, "foo.txt", b"world").await.unwrap();
         let mut dir = fs::read_dir(t.get_blobdir()).await.unwrap();
-        while let Some(dirent) = dir.next().await {
-            let fname = dirent.unwrap().file_name();
+        while let Ok(Some(dirent)) = dir.next_entry().await {
+            let fname = dirent.file_name();
             if fname == foo_path.file_name().unwrap() {
                 assert_eq!(fs::read(&foo_path).await.unwrap(), b"hello");
             } else {
@@ -704,20 +584,20 @@ mod tests {
         }
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_double_ext_preserved() {
         let t = TestContext::new().await;
         BlobObject::create(&t, "foo.tar.gz", b"hello")
             .await
             .unwrap();
         let foo_path = t.get_blobdir().join("foo.tar.gz");
-        assert!(foo_path.exists().await);
+        assert!(foo_path.exists());
         BlobObject::create(&t, "foo.tar.gz", b"world")
             .await
             .unwrap();
         let mut dir = fs::read_dir(t.get_blobdir()).await.unwrap();
-        while let Some(dirent) = dir.next().await {
-            let fname = dirent.unwrap().file_name();
+        while let Ok(Some(dirent)) = dir.next_entry().await {
+            let fname = dirent.file_name();
             if fname == foo_path.file_name().unwrap() {
                 assert_eq!(fs::read(&foo_path).await.unwrap(), b"hello");
             } else {
@@ -729,7 +609,7 @@ mod tests {
         }
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_create_long_names() {
         let t = TestContext::new().await;
         let s = "1".repeat(150);
@@ -738,7 +618,7 @@ mod tests {
         assert!(blobname.len() < 128);
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_create_and_copy() {
         let t = TestContext::new().await;
         let src = t.dir.path().join("src");
@@ -753,10 +633,10 @@ mod tests {
             .await
             .is_err());
         let whoops = t.get_blobdir().join("whoops");
-        assert!(!whoops.exists().await);
+        assert!(!whoops.exists());
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_create_from_path() {
         let t = TestContext::new().await;
 
@@ -776,7 +656,7 @@ mod tests {
         let data = fs::read(blob.to_abs_path()).await.unwrap();
         assert_eq!(data, b"boo");
     }
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_create_from_name_long() {
         let t = TestContext::new().await;
         let src_ext = t.dir.path().join("autocrypt-setup-message-4137848473.html");
@@ -839,34 +719,24 @@ mod tests {
         assert!(!stem.contains('?'));
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_selfavatar_outside_blobdir() {
         let t = TestContext::new().await;
         let avatar_src = t.dir.path().join("avatar.jpg");
         let avatar_bytes = include_bytes!("../test-data/image/avatar1000x1000.jpg");
-        File::create(&avatar_src)
-            .await
-            .unwrap()
-            .write_all(avatar_bytes)
-            .await
-            .unwrap();
+        fs::write(&avatar_src, avatar_bytes).await.unwrap();
         let avatar_blob = t.get_blobdir().join("avatar.jpg");
-        assert!(!avatar_blob.exists().await);
+        assert!(!avatar_blob.exists());
         t.set_config(Config::Selfavatar, Some(avatar_src.to_str().unwrap()))
             .await
             .unwrap();
-        assert!(avatar_blob.exists().await);
-        assert!(std::fs::metadata(&avatar_blob).unwrap().len() < avatar_bytes.len() as u64);
+        assert!(avatar_blob.exists());
+        assert!(fs::metadata(&avatar_blob).await.unwrap().len() < avatar_bytes.len() as u64);
         let avatar_cfg = t.get_config(Config::Selfavatar).await.unwrap();
         assert_eq!(avatar_cfg, avatar_blob.to_str().map(|s| s.to_string()));
 
-        let img = image::open(avatar_src).unwrap();
-        assert_eq!(img.width(), 1000);
-        assert_eq!(img.height(), 1000);
-
-        let img = image::open(&avatar_blob).unwrap();
-        assert_eq!(img.width(), BALANCED_AVATAR_SIZE);
-        assert_eq!(img.height(), BALANCED_AVATAR_SIZE);
+        check_image_size(avatar_src, 1000, 1000);
+        check_image_size(&avatar_blob, BALANCED_AVATAR_SIZE, BALANCED_AVATAR_SIZE);
 
         async fn file_size(path_buf: &PathBuf) -> u64 {
             let file = File::open(path_buf).await.unwrap();
@@ -880,25 +750,22 @@ mod tests {
             .unwrap();
         assert!(file_size(&avatar_blob).await <= 3000);
         assert!(file_size(&avatar_blob).await > 2000);
-        let img = image::open(&avatar_blob).unwrap();
-        assert!(img.width() > 130);
-        assert_eq!(img.width(), img.height());
+        tokio::task::block_in_place(move || {
+            let img = image::open(&avatar_blob).unwrap();
+            assert!(img.width() > 130);
+            assert_eq!(img.width(), img.height());
+        });
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_selfavatar_in_blobdir() {
         let t = TestContext::new().await;
         let avatar_src = t.get_blobdir().join("avatar.png");
-        File::create(&avatar_src)
-            .await
-            .unwrap()
-            .write_all(test_utils::AVATAR_900x900_BYTES)
+        fs::write(&avatar_src, test_utils::AVATAR_900x900_BYTES)
             .await
             .unwrap();
 
-        let img = image::open(&avatar_src).unwrap();
-        assert_eq!(img.width(), 900);
-        assert_eq!(img.height(), 900);
+        check_image_size(&avatar_src, 900, 900);
 
         t.set_config(Config::Selfavatar, Some(avatar_src.to_str().unwrap()))
             .await
@@ -909,37 +776,30 @@ mod tests {
             avatar_src.with_extension("jpg").to_str().unwrap()
         );
 
-        let img = image::open(avatar_cfg).unwrap();
-        assert_eq!(img.width(), BALANCED_AVATAR_SIZE);
-        assert_eq!(img.height(), BALANCED_AVATAR_SIZE);
+        check_image_size(avatar_cfg, BALANCED_AVATAR_SIZE, BALANCED_AVATAR_SIZE);
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_selfavatar_copy_without_recode() {
         let t = TestContext::new().await;
         let avatar_src = t.dir.path().join("avatar.png");
         let avatar_bytes = include_bytes!("../test-data/image/avatar64x64.png");
-        File::create(&avatar_src)
-            .await
-            .unwrap()
-            .write_all(avatar_bytes)
-            .await
-            .unwrap();
+        fs::write(&avatar_src, avatar_bytes).await.unwrap();
         let avatar_blob = t.get_blobdir().join("avatar.png");
-        assert!(!avatar_blob.exists().await);
+        assert!(!avatar_blob.exists());
         t.set_config(Config::Selfavatar, Some(avatar_src.to_str().unwrap()))
             .await
             .unwrap();
-        assert!(avatar_blob.exists().await);
+        assert!(avatar_blob.exists());
         assert_eq!(
-            std::fs::metadata(&avatar_blob).unwrap().len(),
+            fs::metadata(&avatar_blob).await.unwrap().len(),
             avatar_bytes.len() as u64
         );
         let avatar_cfg = t.get_config(Config::Selfavatar).await.unwrap();
         assert_eq!(avatar_cfg, avatar_blob.to_str().map(|s| s.to_string()));
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_recode_image_1() {
         let bytes = include_bytes!("../test-data/image/avatar1000x1000.jpg");
         // BALANCED_IMAGE_SIZE > 1000, the original image size, so the image is not scaled down:
@@ -959,7 +819,7 @@ mod tests {
         .unwrap();
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_recode_image_2() {
         // The "-rotated" files are rotated by 270 degrees using the Exif metadata
         let bytes = include_bytes!("../test-data/image/rectangle2000x1800-rotated.jpg");
@@ -985,7 +845,7 @@ mod tests {
         // Do this in parallel to speed up the test a bit
         // (it still takes very long though)
         let bytes2 = bytes.clone();
-        let join_handle = async_std::task::spawn(async move {
+        let join_handle = tokio::task::spawn(async move {
             let img_rotated = send_image_check_mediaquality(
                 Some("0"),
                 &bytes2,
@@ -1013,10 +873,10 @@ mod tests {
         .unwrap();
         assert_correct_rotation(&img_rotated);
 
-        join_handle.await;
+        join_handle.await.unwrap();
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_recode_image_3() {
         let bytes = include_bytes!("../test-data/image/rectangle200x180-rotated.jpg");
         let img_rotated = send_image_check_mediaquality(Some("0"), bytes, 200, 180, 270, 180, 200)
@@ -1064,10 +924,10 @@ mod tests {
             .await?;
         let file = alice.get_blobdir().join("file.jpg");
 
-        File::create(&file).await?.write_all(bytes).await?;
-        let img = image::open(&file)?;
-        assert_eq!(img.width(), original_width);
-        assert_eq!(img.height(), original_height);
+        fs::write(&file, &bytes)
+            .await
+            .context("failed to write file")?;
+        check_image_size(&file, original_width, original_height);
 
         let blob = BlobObject::new_from_path(&alice, &file).await?;
         assert_eq!(blob.get_exif_orientation(&alice).unwrap_or(0), orientation);
@@ -1079,12 +939,13 @@ mod tests {
         let alice_msg = alice.get_last_msg().await;
         assert_eq!(alice_msg.get_width() as u32, compressed_width);
         assert_eq!(alice_msg.get_height() as u32, compressed_height);
-        let img = image::open(alice_msg.get_file(&alice).unwrap())?;
-        assert_eq!(img.width() as u32, compressed_width);
-        assert_eq!(img.height() as u32, compressed_height);
+        check_image_size(
+            alice_msg.get_file(&alice).unwrap(),
+            compressed_width,
+            compressed_height,
+        );
 
-        bob.recv_msg(&sent).await;
-        let bob_msg = bob.get_last_msg().await;
+        let bob_msg = bob.recv_msg(&sent).await;
         assert_eq!(bob_msg.get_width() as u32, compressed_width);
         assert_eq!(bob_msg.get_height() as u32, compressed_height);
         let file = bob_msg.get_file(&bob).unwrap();
@@ -1092,19 +953,17 @@ mod tests {
         let blob = BlobObject::new_from_path(&bob, &file).await?;
         assert_eq!(blob.get_exif_orientation(&bob).unwrap_or(0), 0);
 
-        let img = image::open(file)?;
-        assert_eq!(img.width() as u32, compressed_width);
-        assert_eq!(img.height() as u32, compressed_height);
+        let img = check_image_size(file, compressed_width, compressed_height);
         Ok(img)
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_increation_in_blobdir() -> Result<()> {
         let t = TestContext::new_alice().await;
         let chat_id = create_group_chat(&t, ProtectionStatus::Unprotected, "abc").await?;
 
         let file = t.get_blobdir().join("anyfile.dat");
-        File::create(&file).await?.write_all("bla".as_ref()).await?;
+        fs::write(&file, b"bla").await?;
         let mut msg = Message::new(Viewtype::File);
         msg.set_file(file.to_str().unwrap(), None);
         let prepared_id = chat::prepare_msg(&t, chat_id, &mut msg).await?;
@@ -1117,14 +976,14 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_increation_not_blobdir() -> Result<()> {
         let t = TestContext::new_alice().await;
         let chat_id = create_group_chat(&t, ProtectionStatus::Unprotected, "abc").await?;
         assert_ne!(t.get_blobdir().to_str(), t.dir.path().to_str());
 
         let file = t.dir.path().join("anyfile.dat");
-        File::create(&file).await?.write_all("bla".as_ref()).await?;
+        fs::write(&file, b"bla").await?;
         let mut msg = Message::new(Viewtype::File);
         msg.set_file(file.to_str().unwrap(), None);
         assert!(chat::prepare_msg(&t, chat_id, &mut msg).await.is_err());

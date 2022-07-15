@@ -3,27 +3,27 @@
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::ops::Deref;
-use std::time::{Instant, SystemTime};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
 
-use anyhow::{bail, ensure, Result};
-use async_std::{
-    channel::{self, Receiver, Sender},
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex, RwLock},
-};
+use anyhow::{ensure, Result};
+use async_channel::{self as channel, Receiver, Sender};
+use tokio::sync::{Mutex, RwLock};
 
 use crate::chat::{get_chat_cnt, ChatId};
 use crate::config::Config;
 use crate::constants::DC_VERSION_STR;
 use crate::contact::Contact;
-use crate::dc_tools::{duration_to_str, time};
 use crate::events::{Event, EventEmitter, EventType, Events};
 use crate::key::{DcKey, SignedPublicKey};
 use crate::login_param::LoginParam;
 use crate::message::{self, MessageState, MsgId};
 use crate::quota::QuotaInfo;
+use crate::ratelimit::Ratelimit;
 use crate::scheduler::Scheduler;
 use crate::sql::Sql;
+use crate::tools::{duration_to_str, time};
 
 #[derive(Clone, Debug)]
 pub struct Context {
@@ -44,7 +44,7 @@ pub struct InnerContext {
     pub(crate) blobdir: PathBuf,
     pub(crate) sql: Sql,
     pub(crate) last_smeared_timestamp: RwLock<i64>,
-    pub(crate) running_state: RwLock<RunningState>,
+    running_state: RwLock<RunningState>,
     /// Mutex to avoid generating the key for the user more than once.
     pub(crate) generating_key_mutex: Mutex<()>,
     /// Mutex to enforce only a single running oauth2 is running.
@@ -55,10 +55,16 @@ pub struct InnerContext {
     pub(crate) events: Events,
 
     pub(crate) scheduler: RwLock<Option<Scheduler>>,
+    pub(crate) ratelimit: RwLock<Ratelimit>,
 
     /// Recently loaded quota information, if any.
     /// Set to `None` if quota was never tried to load.
     pub(crate) quota: RwLock<Option<QuotaInfo>>,
+
+    /// Server ID response if ID capability is supported
+    /// and the server returned non-NIL on the inbox connection.
+    /// <https://datatracker.ietf.org/doc/html/rfc2971>
+    pub(crate) server_id: RwLock<Option<HashMap<String, String>>>,
 
     pub(crate) last_full_folder_scan: Mutex<Option<Instant>>,
 
@@ -73,14 +79,26 @@ pub struct InnerContext {
     /// The text of the last error logged and emitted as an event.
     /// If the ui wants to display an error after a failure,
     /// `last_error` should be used to avoid races with the event thread.
-    pub(crate) last_error: RwLock<String>,
+    pub(crate) last_error: std::sync::RwLock<String>,
 }
 
+/// The state of ongoing process.
 #[derive(Debug)]
-pub struct RunningState {
-    ongoing_running: bool,
-    shall_stop_ongoing: bool,
-    cancel_sender: Option<Sender<()>>,
+enum RunningState {
+    /// Ongoing process is allocated.
+    Running { cancel_sender: Sender<()> },
+
+    /// Cancel signal has been sent, waiting for ongoing process to be freed.
+    ShallStop,
+
+    /// There is no ongoing process, a new one can be allocated.
+    Stopped,
+}
+
+impl Default for RunningState {
+    fn default() -> Self {
+        Self::Stopped
+    }
 }
 
 /// Return some info about deltachat-core
@@ -101,8 +119,8 @@ pub fn get_info() -> BTreeMap<&'static str, String> {
 
 impl Context {
     /// Creates new context and opens the database.
-    pub async fn new(dbfile: PathBuf, id: u32) -> Result<Context> {
-        let context = Self::new_closed(dbfile, id).await?;
+    pub async fn new(dbfile: &Path, id: u32, events: Events) -> Result<Context> {
+        let context = Self::new_closed(dbfile, id, events).await?;
 
         // Open the database if is not encrypted.
         if context.check_passphrase("".to_string()).await? {
@@ -112,15 +130,15 @@ impl Context {
     }
 
     /// Creates new context without opening the database.
-    pub async fn new_closed(dbfile: PathBuf, id: u32) -> Result<Context> {
+    pub async fn new_closed(dbfile: &Path, id: u32, events: Events) -> Result<Context> {
         let mut blob_fname = OsString::new();
         blob_fname.push(dbfile.file_name().unwrap_or_default());
         blob_fname.push("-blobs");
         let blobdir = dbfile.with_file_name(blob_fname);
-        if !blobdir.exists().await {
-            async_std::fs::create_dir_all(&blobdir).await?;
+        if !blobdir.exists() {
+            tokio::fs::create_dir_all(&blobdir).await?;
         }
-        let context = Context::with_blobdir(dbfile, blobdir, id).await?;
+        let context = Context::with_blobdir(dbfile.into(), blobdir, id, events).await?;
         Ok(context)
     }
 
@@ -155,9 +173,10 @@ impl Context {
         dbfile: PathBuf,
         blobdir: PathBuf,
         id: u32,
+        events: Events,
     ) -> Result<Context> {
         ensure!(
-            blobdir.is_dir().await,
+            blobdir.is_dir(),
             "Blobdir does not exist: {}",
             blobdir.display()
         );
@@ -172,12 +191,14 @@ impl Context {
             oauth2_mutex: Mutex::new(()),
             wrong_pw_warning_mutex: Mutex::new(()),
             translated_stockstrings: RwLock::new(HashMap::new()),
-            events: Events::default(),
+            events,
             scheduler: RwLock::new(None),
+            ratelimit: RwLock::new(Ratelimit::new(Duration::new(60, 0), 6.0)), // Allow to send 6 messages immediately, no more than once every 10 seconds.
             quota: RwLock::new(None),
+            server_id: RwLock::new(None),
             creation_time: std::time::SystemTime::now(),
             last_full_folder_scan: Mutex::new(None),
-            last_error: RwLock::new("".to_string()),
+            last_error: std::sync::RwLock::new("".to_string()),
         };
 
         let ctx = Context {
@@ -279,45 +300,46 @@ impl Context {
 
     pub(crate) async fn alloc_ongoing(&self) -> Result<Receiver<()>> {
         let mut s = self.running_state.write().await;
-        if s.ongoing_running || !s.shall_stop_ongoing {
-            bail!("There is already another ongoing process running.");
-        }
+        ensure!(
+            matches!(*s, RunningState::Stopped),
+            "There is already another ongoing process running."
+        );
 
-        s.ongoing_running = true;
-        s.shall_stop_ongoing = false;
         let (sender, receiver) = channel::bounded(1);
-        s.cancel_sender = Some(sender);
+        *s = RunningState::Running {
+            cancel_sender: sender,
+        };
 
         Ok(receiver)
     }
 
     pub(crate) async fn free_ongoing(&self) {
         let mut s = self.running_state.write().await;
-
-        s.ongoing_running = false;
-        s.shall_stop_ongoing = true;
-        s.cancel_sender.take();
+        *s = RunningState::Stopped;
     }
 
     /// Signal an ongoing process to stop.
     pub async fn stop_ongoing(&self) {
         let mut s = self.running_state.write().await;
-        if let Some(cancel) = s.cancel_sender.take() {
-            if let Err(err) = cancel.send(()).await {
-                warn!(self, "could not cancel ongoing: {:?}", err);
+        match &*s {
+            RunningState::Running { cancel_sender } => {
+                if let Err(err) = cancel_sender.send(()).await {
+                    warn!(self, "could not cancel ongoing: {:?}", err);
+                }
+                info!(self, "Signaling the ongoing process to stop ASAP.",);
+                *s = RunningState::ShallStop;
             }
-        }
-
-        if s.ongoing_running && !s.shall_stop_ongoing {
-            info!(self, "Signaling the ongoing process to stop ASAP.",);
-            s.shall_stop_ongoing = true;
-        } else {
-            info!(self, "No ongoing process to stop.",);
+            RunningState::ShallStop | RunningState::Stopped => {
+                info!(self, "No ongoing process to stop.",);
+            }
         }
     }
 
     pub(crate) async fn shall_stop_ongoing(&self) -> bool {
-        self.running_state.read().await.shall_stop_ongoing
+        match &*self.running_state.read().await {
+            RunningState::Running { .. } => false,
+            RunningState::ShallStop | RunningState::Stopped => true,
+        }
     }
 
     /*******************************************************************************
@@ -326,7 +348,7 @@ impl Context {
 
     pub async fn get_info(&self) -> Result<BTreeMap<&'static str, String>> {
         let unset = "0";
-        let l = LoginParam::load_candidate_params(self).await?;
+        let l = LoginParam::load_candidate_params_unchecked(self).await?;
         let l2 = LoginParam::load_configured_params(self).await?;
         let secondary_addrs = self.get_secondary_self_addrs().await?.join(", ");
         let displayname = self.get_config(Config::Displayname).await?;
@@ -413,10 +435,21 @@ impl Context {
         res.insert("socks5_enabled", socks5_enabled.to_string());
         res.insert("entered_account_settings", l.to_string());
         res.insert("used_account_settings", l2.to_string());
+
+        let server_id = self.server_id.read().await;
+        res.insert("imap_server_id", format!("{:?}", server_id));
+        drop(server_id);
+
         res.insert("secondary_addrs", secondary_addrs);
         res.insert(
             "fetch_existing_msgs",
             self.get_config_int(Config::FetchExistingMsgs)
+                .await?
+                .to_string(),
+        );
+        res.insert(
+            "fetched_existing_msgs",
+            self.get_config_bool(Config::FetchedExistingMsgs)
                 .await?
                 .to_string(),
         );
@@ -561,7 +594,7 @@ impl Context {
 
         let list = if let Some(chat_id) = chat_id {
             do_query(
-                "SELECT m.id AS id, m.timestamp AS timestamp
+                "SELECT m.id AS id
                  FROM msgs m
                  LEFT JOIN contacts ct
                         ON m.from_id=ct.id
@@ -585,7 +618,7 @@ impl Context {
             // According to some tests, this limit speeds up eg. 2 character searches by factor 10.
             // The limit is documented and UI may add a hint when getting 1000 results.
             do_query(
-                "SELECT m.id AS id, m.timestamp AS timestamp
+                "SELECT m.id AS id
                  FROM msgs m
                  LEFT JOIN contacts ct
                         ON m.from_id=ct.id
@@ -620,28 +653,18 @@ impl Context {
         Ok(mvbox.as_deref() == Some(folder_name))
     }
 
-    pub(crate) fn derive_blobdir(dbfile: &PathBuf) -> PathBuf {
+    pub(crate) fn derive_blobdir(dbfile: &Path) -> PathBuf {
         let mut blob_fname = OsString::new();
         blob_fname.push(dbfile.file_name().unwrap_or_default());
         blob_fname.push("-blobs");
         dbfile.with_file_name(blob_fname)
     }
 
-    pub(crate) fn derive_walfile(dbfile: &PathBuf) -> PathBuf {
+    pub(crate) fn derive_walfile(dbfile: &Path) -> PathBuf {
         let mut wal_fname = OsString::new();
         wal_fname.push(dbfile.file_name().unwrap_or_default());
         wal_fname.push("-wal");
         dbfile.with_file_name(wal_fname)
-    }
-}
-
-impl Default for RunningState {
-    fn default() -> Self {
-        RunningState {
-            ongoing_running: false,
-            shall_stop_ongoing: true,
-            cancel_sender: None,
-        }
     }
 }
 
@@ -657,28 +680,28 @@ mod tests {
         get_chat_contacts, get_chat_msgs, send_msg, set_muted, Chat, ChatId, MuteDuration,
     };
     use crate::contact::ContactId;
-    use crate::dc_receive_imf::dc_receive_imf;
-    use crate::dc_tools::dc_create_outgoing_rfc724_mid;
     use crate::message::{Message, Viewtype};
+    use crate::receive_imf::receive_imf;
     use crate::test_utils::TestContext;
+    use crate::tools::create_outgoing_rfc724_mid;
     use anyhow::Context as _;
     use std::time::Duration;
     use strum::IntoEnumIterator;
     use tempfile::tempdir;
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_wrong_db() -> Result<()> {
         let tmp = tempfile::tempdir()?;
         let dbfile = tmp.path().join("db.sqlite");
-        std::fs::write(&dbfile, b"123")?;
-        let res = Context::new(dbfile.into(), 1).await?;
+        tokio::fs::write(&dbfile, b"123").await?;
+        let res = Context::new(&dbfile, 1, Events::new()).await?;
 
         // Broken database is indistinguishable from encrypted one.
         assert_eq!(res.is_open().await, false);
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_get_fresh_msgs() {
         let t = TestContext::new().await;
         let fresh = t.get_fresh_msgs().await.unwrap();
@@ -699,13 +722,13 @@ mod tests {
              \n\
              hello\n",
             contact.get_addr(),
-            dc_create_outgoing_rfc724_mid(None, contact.get_addr())
+            create_outgoing_rfc724_mid(None, contact.get_addr())
         );
         println!("{}", msg);
-        dc_receive_imf(t, msg.as_bytes(), false).await.unwrap();
+        receive_imf(t, msg.as_bytes(), false).await.unwrap();
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_get_fresh_msgs_and_muted_chats() {
         // receive various mails in 3 chats
         let t = TestContext::new_alice().await;
@@ -755,7 +778,7 @@ mod tests {
         assert_eq!(t.get_fresh_msgs().await.unwrap().len(), 9); // claire is counted again
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_get_fresh_msgs_and_muted_until() {
         let t = TestContext::new_alice().await;
         let bob = t.create_chat_with_contact("", "bob@g.it").await;
@@ -813,61 +836,61 @@ mod tests {
         assert_eq!(t.get_fresh_msgs().await.unwrap().len(), 1);
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_blobdir_exists() {
         let tmp = tempfile::tempdir().unwrap();
         let dbfile = tmp.path().join("db.sqlite");
-        Context::new(dbfile.into(), 1).await.unwrap();
+        Context::new(&dbfile, 1, Events::new()).await.unwrap();
         let blobdir = tmp.path().join("db.sqlite-blobs");
         assert!(blobdir.is_dir());
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_wrong_blogdir() {
         let tmp = tempfile::tempdir().unwrap();
         let dbfile = tmp.path().join("db.sqlite");
         let blobdir = tmp.path().join("db.sqlite-blobs");
-        std::fs::write(&blobdir, b"123").unwrap();
-        let res = Context::new(dbfile.into(), 1).await;
+        tokio::fs::write(&blobdir, b"123").await.unwrap();
+        let res = Context::new(&dbfile, 1, Events::new()).await;
         assert!(res.is_err());
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_sqlite_parent_not_exists() {
         let tmp = tempfile::tempdir().unwrap();
         let subdir = tmp.path().join("subdir");
         let dbfile = subdir.join("db.sqlite");
         let dbfile2 = dbfile.clone();
-        Context::new(dbfile.into(), 1).await.unwrap();
+        Context::new(&dbfile, 1, Events::new()).await.unwrap();
         assert!(subdir.is_dir());
         assert!(dbfile2.is_file());
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_with_empty_blobdir() {
         let tmp = tempfile::tempdir().unwrap();
         let dbfile = tmp.path().join("db.sqlite");
         let blobdir = PathBuf::new();
-        let res = Context::with_blobdir(dbfile.into(), blobdir, 1).await;
+        let res = Context::with_blobdir(dbfile, blobdir, 1, Events::new()).await;
         assert!(res.is_err());
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_with_blobdir_not_exists() {
         let tmp = tempfile::tempdir().unwrap();
         let dbfile = tmp.path().join("db.sqlite");
         let blobdir = tmp.path().join("blobs");
-        let res = Context::with_blobdir(dbfile.into(), blobdir.into(), 1).await;
+        let res = Context::with_blobdir(dbfile, blobdir, 1, Events::new()).await;
         assert!(res.is_err());
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn no_crashes_on_context_deref() {
         let t = TestContext::new().await;
         std::mem::drop(t);
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_get_info() {
         let t = TestContext::new().await;
 
@@ -883,7 +906,7 @@ mod tests {
         assert_eq!(info.get("level").unwrap(), "awesome");
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_get_info_completeness() {
         // For easier debugging,
         // get_info() shall return all important information configurable by the Config-values.
@@ -931,7 +954,7 @@ mod tests {
         }
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_search_msgs() -> Result<()> {
         let alice = TestContext::new_alice().await;
         let self_talk = ChatId::create_for_contact(&alice, ContactId::SELF).await?;
@@ -987,7 +1010,7 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_limit_search_msgs() -> Result<()> {
         let alice = TestContext::new_alice().await;
         let chat = alice
@@ -1020,13 +1043,13 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_check_passphrase() -> Result<()> {
         let dir = tempdir()?;
         let dbfile = dir.path().join("db.sqlite");
 
         let id = 1;
-        let context = Context::new_closed(dbfile.clone().into(), id)
+        let context = Context::new_closed(&dbfile, id, Events::new())
             .await
             .context("failed to create context")?;
         assert_eq!(context.open("foo".to_string()).await?, true);
@@ -1034,13 +1057,53 @@ mod tests {
         drop(context);
 
         let id = 2;
-        let context = Context::new(dbfile.into(), id)
+        let context = Context::new(&dbfile, id, Events::new())
             .await
             .context("failed to create context")?;
         assert_eq!(context.is_open().await, false);
         assert_eq!(context.check_passphrase("bar".to_string()).await?, false);
         assert_eq!(context.open("false".to_string()).await?, false);
         assert_eq!(context.open("foo".to_string()).await?, true);
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_ongoing() -> Result<()> {
+        let context = TestContext::new().await;
+
+        // No ongoing process allocated.
+        assert!(context.shall_stop_ongoing().await);
+
+        let receiver = context.alloc_ongoing().await?;
+
+        // Cannot allocate another ongoing process while the first one is running.
+        assert!(context.alloc_ongoing().await.is_err());
+
+        // Stop signal is not sent yet.
+        assert!(receiver.try_recv().is_err());
+
+        assert!(!context.shall_stop_ongoing().await);
+
+        // Send the stop signal.
+        context.stop_ongoing().await;
+
+        // Receive stop signal.
+        receiver.recv().await?;
+
+        assert!(context.shall_stop_ongoing().await);
+
+        // Ongoing process is still running even though stop signal was received,
+        // so another one cannot be allocated.
+        assert!(context.alloc_ongoing().await.is_err());
+
+        context.free_ongoing().await;
+
+        // No ongoing process allocated, should have been stopped already.
+        assert!(context.shall_stop_ongoing().await);
+
+        // Another ongoing process can be allocated now.
+        let _receiver = context.alloc_ongoing().await?;
 
         Ok(())
     }

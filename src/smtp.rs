@@ -8,19 +8,18 @@ use anyhow::{bail, format_err, Context as _, Error, Result};
 use async_smtp::smtp::client::net::ClientTlsParameters;
 use async_smtp::smtp::response::{Category, Code, Detail};
 use async_smtp::{smtp, EmailAddress, ServerAddress};
-use async_std::task;
+use tokio::task;
 
 use crate::config::Config;
-use crate::constants::DC_LP_AUTH_OAUTH2;
 use crate::contact::{Contact, ContactId};
 use crate::events::EventType;
 use crate::login_param::{
-    dc_build_tls, CertificateChecks, LoginParam, ServerLoginParam, Socks5Config,
+    build_tls, CertificateChecks, LoginParam, ServerLoginParam, Socks5Config,
 };
 use crate::message::Message;
 use crate::message::{self, MsgId};
 use crate::mimefactory::MimeFactory;
-use crate::oauth2::dc_get_oauth2_access_token;
+use crate::oauth2::get_oauth2_access_token;
 use crate::provider::Socket;
 use crate::sql;
 use crate::{context::Context, scheduler::connectivity::ConnectivityStore};
@@ -103,7 +102,6 @@ impl Smtp {
             &lp.smtp,
             &lp.socks5_config,
             &lp.addr,
-            lp.server_flags & DC_LP_AUTH_OAUTH2 != 0,
             lp.provider
                 .map_or(lp.socks5_config.is_some(), |provider| provider.strict_tls),
         )
@@ -117,7 +115,6 @@ impl Smtp {
         lp: &ServerLoginParam,
         socks5_config: &Option<Socks5Config>,
         addr: &str,
-        oauth2: bool,
         provider_strict_tls: bool,
     ) -> Result<()> {
         if self.is_connected().await {
@@ -143,13 +140,13 @@ impl Smtp {
             CertificateChecks::AcceptInvalidCertificates
             | CertificateChecks::AcceptInvalidCertificates2 => false,
         };
-        let tls_config = dc_build_tls(strict_tls);
+        let tls_config = build_tls(strict_tls);
         let tls_parameters = ClientTlsParameters::new(domain.to_string(), tls_config);
 
-        let (creds, mechanism) = if oauth2 {
+        let (creds, mechanism) = if lp.oauth2 {
             // oauth2
             let send_pw = &lp.password;
-            let access_token = dc_get_oauth2_access_token(context, addr, send_pw, false).await?;
+            let access_token = get_oauth2_access_token(context, addr, send_pw, false).await?;
             if access_token.is_none() {
                 bail!("SMTP OAuth 2 error {}", addr);
             }
@@ -360,7 +357,7 @@ pub(crate) async fn smtp_send(
 
     if let SendResult::Failure(err) = &status {
         // We couldn't send the message, so mark it as failed
-        message::set_msg_failed(context, msg_id, Some(err.to_string())).await;
+        message::set_msg_failed(context, msg_id, &err.to_string()).await;
     }
     status
 }
@@ -410,12 +407,7 @@ pub(crate) async fn send_msg_to_smtp(
         )
         .await?;
     if retries > 6 {
-        message::set_msg_failed(
-            context,
-            msg_id,
-            Some("Number of retries exceeded the limit."),
-        )
-        .await;
+        message::set_msg_failed(context, msg_id, "Number of retries exceeded the limit.").await;
         context
             .sql
             .execute("DELETE FROM smtp WHERE id=?", paramsv![rowid])
@@ -442,7 +434,7 @@ pub(crate) async fn send_msg_to_smtp(
         .collect::<Vec<_>>();
 
     // If there is a msg-id and it does not exist in the db, cancel sending. this happens if
-    // dc_delete_msgs() was called before the generated mime was sent out.
+    // delete_msgs() was called before the generated mime was sent out.
     if !message::exists(context, msg_id)
         .await
         .with_context(|| format!("failed to check message {} existence", msg_id))?
@@ -484,14 +476,42 @@ pub(crate) async fn send_msg_to_smtp(
     }
 }
 
-/// Tries to send all messages currently in `smtp` and `smtp_mdns` tables.
+/// Attempts to send queued MDNs.
+///
+/// Returns true if there are more MDNs to send, but rate limiter does not
+/// allow to send them. Returns false if there are no more MDNs to send.
+/// If sending an MDN fails, returns an error.
+async fn send_mdns(context: &Context, connection: &mut Smtp) -> Result<bool> {
+    loop {
+        if !context.ratelimit.read().await.can_send() {
+            info!(context, "Ratelimiter does not allow sending MDNs now");
+            return Ok(true);
+        }
+
+        let more_mdns = send_mdn(context, connection).await?;
+        if !more_mdns {
+            // No more MDNs to send.
+            return Ok(false);
+        }
+    }
+}
+
+/// Tries to send all messages currently in `smtp`, `smtp_status_updates` and `smtp_mdns` tables.
 ///
 /// Logs and ignores SMTP errors to ensure that a single SMTP message constantly failing to be sent
 /// does not block other messages in the queue from being sent.
 ///
-/// Returns true if all messages were sent successfully, false otherwise.
+/// Returns true if sending was ratelimited, false otherwise. Errors are propagated to the caller.
 pub(crate) async fn send_smtp_messages(context: &Context, connection: &mut Smtp) -> Result<bool> {
-    context.send_sync_msg().await?; // Add sync message to the end of the queue if needed.
+    let mut ratelimited = if context.ratelimit.read().await.can_send() {
+        // add status updates and sync messages to end of sending queue
+        context.flush_status_updates().await?;
+        context.send_sync_msg().await?;
+        false
+    } else {
+        true
+    };
+
     let rowids = context
         .sql
         .query_map(
@@ -508,28 +528,22 @@ pub(crate) async fn send_smtp_messages(context: &Context, connection: &mut Smtp)
             },
         )
         .await?;
-    let mut success = true;
     for rowid in rowids {
-        if let Err(err) = send_msg_to_smtp(context, connection, rowid).await {
-            info!(context, "Failed to send message over SMTP: {:#}.", err);
-            success = false;
-        }
+        send_msg_to_smtp(context, connection, rowid)
+            .await
+            .context("failed to send message")?;
     }
 
-    loop {
-        match send_mdn(context, connection).await {
-            Err(err) => {
-                info!(context, "Failed to send MDNs over SMTP: {:#}.", err);
-                success = false;
-                break;
-            }
-            Ok(false) => {
-                break;
-            }
-            Ok(true) => {}
-        }
+    // although by slow sending, ratelimit may have been expired meanwhile,
+    // do not attempt to send MDNs if ratelimited happend before on status-updates/sync:
+    // instead, let the caller recall this function so that more important status-updates/sync are sent out.
+    if !ratelimited {
+        ratelimited = send_mdns(context, connection)
+            .await
+            .context("failed to send MDNs")?;
     }
-    Ok(success)
+
+    Ok(ratelimited)
 }
 
 /// Tries to send MDN for message `msg_id` to `contact_id`.
@@ -593,7 +607,7 @@ async fn send_mdn_msg_id(
                 );
                 context
                     .sql
-                    .execute(q, rusqlite::params_from_iter(additional_msg_ids))
+                    .execute(&q, rusqlite::params_from_iter(additional_msg_ids))
                     .await?;
             }
             Ok(())

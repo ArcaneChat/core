@@ -8,9 +8,9 @@ use serde::Deserialize;
 
 use crate::config::Config;
 use crate::context::Context;
-use crate::dc_tools::time;
 use crate::provider;
 use crate::provider::Oauth2Authorizer;
+use crate::tools::time;
 
 const OAUTH2_GMAIL: Oauth2 = Oauth2 {
     // see <https://developers.google.com/identity/protocols/OAuth2InstalledApp>
@@ -53,7 +53,7 @@ struct Response {
     scope: Option<String>,
 }
 
-pub async fn dc_get_oauth2_url(
+pub async fn get_oauth2_url(
     context: &Context,
     addr: &str,
     redirect_uri: &str,
@@ -73,7 +73,7 @@ pub async fn dc_get_oauth2_url(
     }
 }
 
-pub async fn dc_get_oauth2_access_token(
+pub async fn get_oauth2_access_token(
     context: &Context,
     addr: &str,
     code: &str,
@@ -146,32 +146,36 @@ pub async fn dc_get_oauth2_access_token(
                 value = &redirect_uri;
             } else if value == "$CODE" {
                 value = code;
-            } else if value == "$REFRESH_TOKEN" && refresh_token.is_some() {
-                value = refresh_token.as_ref().unwrap();
+            } else if value == "$REFRESH_TOKEN" {
+                if let Some(refresh_token) = refresh_token.as_ref() {
+                    value = refresh_token;
+                }
             }
 
             post_param.insert(key, value);
         }
 
         // ... and POST
-        let mut req = surf::post(post_url).build();
-        if let Err(err) = req.body_form(&post_param) {
-            warn!(context, "Error calling OAuth2 at {}: {:?}", token_url, err);
-            return Ok(None);
-        }
+        let client = reqwest::Client::new();
 
-        let client = surf::Client::new();
-        let parsed: Result<Response, _> = client.recv_json(req).await;
-        if parsed.is_err() {
-            warn!(
-                context,
-                "Failed to parse OAuth2 JSON response from {}: error: {:?}", token_url, parsed
-            );
-            return Ok(None);
-        }
+        let response: Response = match client.post(post_url).form(&post_param).send().await {
+            Ok(resp) => match resp.json().await {
+                Ok(response) => response,
+                Err(err) => {
+                    warn!(
+                        context,
+                        "Failed to parse OAuth2 JSON response from {}: error: {}", token_url, err
+                    );
+                    return Ok(None);
+                }
+            },
+            Err(err) => {
+                warn!(context, "Error calling OAuth2 at {}: {:?}", token_url, err);
+                return Ok(None);
+            }
+        };
 
         // update refresh_token if given, typically on the first round, but we update it later as well.
-        let response = parsed.unwrap();
         if let Some(ref token) = response.refresh_token {
             context
                 .sql
@@ -220,11 +224,7 @@ pub async fn dc_get_oauth2_access_token(
     }
 }
 
-pub async fn dc_get_oauth2_addr(
-    context: &Context,
-    addr: &str,
-    code: &str,
-) -> Result<Option<String>> {
+pub async fn get_oauth2_addr(context: &Context, addr: &str, code: &str) -> Result<Option<String>> {
     let socks5_enabled = context.get_config_bool(Config::Socks5Enabled).await?;
     let oauth2 = match Oauth2::from_address(context, addr, socks5_enabled).await {
         Some(o) => o,
@@ -234,13 +234,11 @@ pub async fn dc_get_oauth2_addr(
         return Ok(None);
     }
 
-    if let Some(access_token) = dc_get_oauth2_access_token(context, addr, code, false).await? {
+    if let Some(access_token) = get_oauth2_access_token(context, addr, code, false).await? {
         let addr_out = oauth2.get_addr(context, &access_token).await;
         if addr_out.is_none() {
             // regenerate
-            if let Some(access_token) =
-                dc_get_oauth2_access_token(context, addr, code, true).await?
-            {
+            if let Some(access_token) = get_oauth2_access_token(context, addr, code, true).await? {
                 Ok(oauth2.get_addr(context, &access_token).await)
             } else {
                 Ok(None)
@@ -284,14 +282,21 @@ impl Oauth2 {
         //   "verified_email": true,
         //   "picture": "https://lh4.googleusercontent.com/-Gj5jh_9R0BY/AAAAAAAAAAI/AAAAAAAAAAA/IAjtjfjtjNA/photo.jpg"
         // }
-        let response: Result<HashMap<String, serde_json::Value>, surf::Error> =
-            surf::get(userinfo_url).recv_json().await;
-        if response.is_err() {
-            warn!(context, "Error getting userinfo: {:?}", response);
-            return None;
-        }
-
-        let parsed = response.unwrap();
+        let response = match reqwest::get(userinfo_url).await {
+            Ok(response) => response,
+            Err(err) => {
+                warn!(context, "failed to get userinfo: {}", err);
+                return None;
+            }
+        };
+        let response: Result<HashMap<String, serde_json::Value>, _> = response.json().await;
+        let parsed = match response {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                warn!(context, "Error getting userinfo: {}", err);
+                return None;
+            }
+        };
         // CAVE: serde_json::Value.as_str() removes the quotes of json-strings
         // but serde_json::Value.to_string() does not!
         if let Some(addr) = parsed.get("email") {
@@ -355,7 +360,7 @@ mod tests {
         );
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_oauth_from_address() {
         let t = TestContext::new().await;
         assert_eq!(
@@ -377,7 +382,7 @@ mod tests {
         assert_eq!(Oauth2::from_address(&t, "hello@web.de", false).await, None);
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_oauth_from_mx() {
         // youtube staff seems to use "google workspace with oauth2", figures this out by MX lookup
         let t = TestContext::new().await;
@@ -392,34 +397,32 @@ mod tests {
         );
     }
 
-    #[async_std::test]
-    async fn test_dc_get_oauth2_addr() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_get_oauth2_addr() {
         let ctx = TestContext::new().await;
         let addr = "dignifiedquire@gmail.com";
         let code = "fail";
-        let res = dc_get_oauth2_addr(&ctx.ctx, addr, code).await.unwrap();
+        let res = get_oauth2_addr(&ctx.ctx, addr, code).await.unwrap();
         // this should fail as it is an invalid password
         assert_eq!(res, None);
     }
 
-    #[async_std::test]
-    async fn test_dc_get_oauth2_url() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_get_oauth2_url() {
         let ctx = TestContext::new().await;
         let addr = "dignifiedquire@gmail.com";
         let redirect_uri = "chat.delta:/com.b44t.messenger";
-        let res = dc_get_oauth2_url(&ctx.ctx, addr, redirect_uri)
-            .await
-            .unwrap();
+        let res = get_oauth2_url(&ctx.ctx, addr, redirect_uri).await.unwrap();
 
         assert_eq!(res, Some("https://accounts.google.com/o/oauth2/auth?client_id=959970109878%2D4mvtgf6feshskf7695nfln6002mom908%2Eapps%2Egoogleusercontent%2Ecom&redirect_uri=chat%2Edelta%3A%2Fcom%2Eb44t%2Emessenger&response_type=code&scope=https%3A%2F%2Fmail.google.com%2F%20email&access_type=offline".into()));
     }
 
-    #[async_std::test]
-    async fn test_dc_get_oauth2_token() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_get_oauth2_token() {
         let ctx = TestContext::new().await;
         let addr = "dignifiedquire@gmail.com";
         let code = "fail";
-        let res = dc_get_oauth2_access_token(&ctx.ctx, addr, code, false)
+        let res = get_oauth2_access_token(&ctx.ctx, addr, code, false)
             .await
             .unwrap();
         // this should fail as it is an invalid password

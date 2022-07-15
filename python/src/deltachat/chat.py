@@ -1,32 +1,40 @@
 """ Chat and Location related API. """
 
-import mimetypes
 import calendar
 import json
-from datetime import datetime, timezone
+import mimetypes
 import os
-from .cutil import as_dc_charpointer, from_dc_charpointer, from_optional_dc_charpointer, iter_array
-from .capi import lib, ffi
-from . import const
-from .message import Message
+from datetime import datetime, timezone
 from typing import Optional
+
+from . import const
+from .capi import ffi, lib
+from .cutil import (
+    as_dc_charpointer,
+    from_dc_charpointer,
+    from_optional_dc_charpointer,
+    iter_array,
+)
+from .message import Message
 
 
 class Chat(object):
-    """ Chat object which manages members and through which you can send and retrieve messages.
+    """Chat object which manages members and through which you can send and retrieve messages.
 
     You obtain instances of it through :class:`deltachat.account.Account`.
     """
 
     def __init__(self, account, id) -> None:
         from .account import Account
+
         assert isinstance(account, Account), repr(account)
         self.account = account
         self.id = id
 
     def __eq__(self, other) -> bool:
-        return self.id == getattr(other, "id", None) and \
-               self.account._dc_context == other.account._dc_context
+        if other is None:
+            return False
+        return self.id == getattr(other, "id", None) and self.account._dc_context == other.account._dc_context
 
     def __ne__(self, other) -> bool:
         return not (self == other)
@@ -36,10 +44,7 @@ class Chat(object):
 
     @property
     def _dc_chat(self):
-        return ffi.gc(
-            lib.dc_get_chat(self.account._dc_context, self.id),
-            lib.dc_chat_unref
-        )
+        return ffi.gc(lib.dc_get_chat(self.account._dc_context, self.id), lib.dc_chat_unref)
 
     def delete(self) -> None:
         """Delete this chat and all its messages.
@@ -62,28 +67,66 @@ class Chat(object):
     # ------  chat status/metadata API ------------------------------
 
     def is_group(self) -> bool:
-        """ return true if this chat is a group chat.
+        """Return True if this chat is a group chat.
 
-        :returns: True if chat is a group-chat, false if it's a contact 1:1 chat.
+        :returns: True if chat is a group-chat, False otherwise
         """
         return lib.dc_chat_get_type(self._dc_chat) == const.DC_CHAT_TYPE_GROUP
 
+    def is_single(self) -> bool:
+        """Return True if this chat is a single/direct chat, False otherwise"""
+        return lib.dc_chat_get_type(self._dc_chat) == const.DC_CHAT_TYPE_SINGLE
+
+    def is_mailinglist(self) -> bool:
+        """Return True if this chat is a mailing list, False otherwise"""
+        return lib.dc_chat_get_type(self._dc_chat) == const.DC_CHAT_TYPE_MAILINGLIST
+
+    def is_broadcast(self) -> bool:
+        """Return True if this chat is a broadcast list, False otherwise"""
+        return lib.dc_chat_get_type(self._dc_chat) == const.DC_CHAT_TYPE_BROADCAST
+
+    def is_multiuser(self) -> bool:
+        """Return True if this chat is a multi-user chat (group, mailing list or broadcast), False otherwise"""
+        return lib.dc_chat_get_type(self._dc_chat) in (
+            const.DC_CHAT_TYPE_GROUP,
+            const.DC_CHAT_TYPE_MAILINGLIST,
+            const.DC_CHAT_TYPE_BROADCAST,
+        )
+
+    def is_self_talk(self) -> bool:
+        """Return True if this chat is the self-chat (a.k.a. "Saved Messages"), False otherwise"""
+        return bool(lib.dc_chat_is_self_talk(self._dc_chat))
+
+    def is_device_talk(self) -> bool:
+        """Returns True if this chat is the "Device Messages" chat, False otherwise"""
+        return bool(lib.dc_chat_is_device_talk(self._dc_chat))
+
     def is_muted(self) -> bool:
-        """ return true if this chat is muted.
+        """return true if this chat is muted.
 
         :returns: True if chat is muted, False otherwise.
         """
-        return lib.dc_chat_is_muted(self._dc_chat)
+        return bool(lib.dc_chat_is_muted(self._dc_chat))
 
-    def is_contact_request(self):
-        """ return True if this chat is a contact request chat.
+    def is_pinned(self) -> bool:
+        """Return True if this chat is pinned, False otherwise"""
+        return lib.dc_chat_get_visibility(self._dc_chat) == const.DC_CHAT_VISIBILITY_PINNED
+
+    def is_archived(self) -> bool:
+        """Return True if this chat is archived, False otherwise.
+        :returns: True if archived, False otherwise
+        """
+        return lib.dc_chat_get_visibility(self._dc_chat) == const.DC_CHAT_VISIBILITY_ARCHIVED
+
+    def is_contact_request(self) -> bool:
+        """return True if this chat is a contact request chat.
 
         :returns: True if chat is a contact request chat, False otherwise.
         """
-        return lib.dc_chat_is_contact_request(self._dc_chat)
+        return bool(lib.dc_chat_is_contact_request(self._dc_chat))
 
-    def is_promoted(self):
-        """ return True if this chat is promoted, i.e.
+    def is_promoted(self) -> bool:
+        """return True if this chat is promoted, i.e.
         the member contacts are aware of their membership,
         have been sent messages.
 
@@ -97,24 +140,24 @@ class Chat(object):
 
         :returns: True if the chat is writable, False otherwise
         """
-        return lib.dc_chat_can_send(self._dc_chat)
+        return bool(lib.dc_chat_can_send(self._dc_chat))
 
     def is_protected(self) -> bool:
-        """ return True if this chat is a protected chat.
+        """return True if this chat is a protected chat.
 
         :returns: True if chat is protected, False otherwise.
         """
-        return lib.dc_chat_is_protected(self._dc_chat)
+        return bool(lib.dc_chat_is_protected(self._dc_chat))
 
     def get_name(self) -> Optional[str]:
-        """ return name of this chat.
+        """return name of this chat.
 
         :returns: unicode name
         """
         return from_dc_charpointer(lib.dc_chat_get_name(self._dc_chat))
 
     def set_name(self, name: str) -> bool:
-        """ set name of this chat.
+        """set name of this chat.
 
         :param name: as a unicode string.
         :returns: True on success, False otherwise
@@ -122,8 +165,20 @@ class Chat(object):
         name = as_dc_charpointer(name)
         return bool(lib.dc_set_chat_name(self.account._dc_context, self.id, name))
 
+    def get_color(self):
+        """return the color of the chat.
+        :returns: color as 0x00rrggbb
+        """
+        return lib.dc_chat_get_color(self._dc_chat)
+
+    def get_summary(self):
+        """return dictionary with summary information."""
+        dc_res = lib.dc_chat_get_info_json(self.account._dc_context, self.id)
+        s = from_dc_charpointer(dc_res)
+        return json.loads(s)
+
     def mute(self, duration: Optional[int] = None) -> None:
-        """ mutes the chat
+        """mutes the chat
 
         :param duration: Number of seconds to mute the chat for. None to mute until unmuted again.
         :returns: None
@@ -137,7 +192,7 @@ class Chat(object):
             raise ValueError("Call to dc_set_chat_mute_duration failed")
 
     def unmute(self) -> None:
-        """ unmutes the chat
+        """unmutes the chat
 
         :returns: None
         """
@@ -145,8 +200,26 @@ class Chat(object):
         if not bool(ret):
             raise ValueError("Failed to unmute chat")
 
+    def pin(self) -> None:
+        """Pin the chat."""
+        lib.dc_set_chat_visibility(self.account._dc_context, self.id, const.DC_CHAT_VISIBILITY_PINNED)
+
+    def unpin(self) -> None:
+        """Unpin the chat."""
+        if self.is_pinned():
+            lib.dc_set_chat_visibility(self.account._dc_context, self.id, const.DC_CHAT_VISIBILITY_NORMAL)
+
+    def archive(self) -> None:
+        """Archive the chat."""
+        lib.dc_set_chat_visibility(self.account._dc_context, self.id, const.DC_CHAT_VISIBILITY_ARCHIVED)
+
+    def unarchive(self) -> None:
+        """Unarchive the chat."""
+        if self.is_archived():
+            lib.dc_set_chat_visibility(self.account._dc_context, self.id, const.DC_CHAT_VISIBILITY_NORMAL)
+
     def get_mute_duration(self) -> int:
-        """ Returns the number of seconds until the mute of this chat is lifted.
+        """Returns the number of seconds until the mute of this chat is lifted.
 
         :param duration:
         :returns: Returns the number of seconds the chat is still muted for. (0 for not muted, -1 forever muted)
@@ -154,14 +227,14 @@ class Chat(object):
         return lib.dc_chat_get_remaining_mute_duration(self._dc_chat)
 
     def get_ephemeral_timer(self) -> int:
-        """ get ephemeral timer.
+        """get ephemeral timer.
 
         :returns: ephemeral timer value in seconds
         """
         return lib.dc_get_chat_ephemeral_timer(self.account._dc_context, self.id)
 
     def set_ephemeral_timer(self, timer: int) -> bool:
-        """ set ephemeral timer.
+        """set ephemeral timer.
 
         :param: timer value in seconds
 
@@ -170,7 +243,7 @@ class Chat(object):
         return bool(lib.dc_set_chat_ephemeral_timer(self.account._dc_context, self.id, timer))
 
     def get_type(self) -> int:
-        """ (deprecated) return type of this chat.
+        """(deprecated) return type of this chat.
 
         :returns: one of const.DC_CHAT_TYPE_*
         """
@@ -184,7 +257,7 @@ class Chat(object):
         return from_dc_charpointer(res)
 
     def get_join_qr(self) -> Optional[str]:
-        """ get/create Join-Group QR Code as ascii-string.
+        """get/create Join-Group QR Code as ascii-string.
 
         this string needs to be transferred to another DC account
         in a second channel (typically used by mobiles with QRcode-show + scan UX)
@@ -220,7 +293,7 @@ class Chat(object):
         return msg
 
     def send_text(self, text):
-        """ send a text message and return the resulting Message instance.
+        """send a text message and return the resulting Message instance.
 
         :param msg: unicode text
         :raises ValueError: if message can not be send/chat does not exist.
@@ -233,7 +306,7 @@ class Chat(object):
         return Message.from_db(self.account, msg_id)
 
     def send_file(self, path, mime_type="application/octet-stream"):
-        """ send a file and return the resulting Message instance.
+        """send a file and return the resulting Message instance.
 
         :param path: path to the file.
         :param mime_type: the mime-type of this file, defaults to application/octet-stream.
@@ -248,7 +321,7 @@ class Chat(object):
         return Message.from_db(self.account, sent_id)
 
     def send_image(self, path):
-        """ send an image message and return the resulting Message instance.
+        """send an image message and return the resulting Message instance.
 
         :param path: path to an image file.
         :raises ValueError: if message can not be send/chat does not exist.
@@ -263,7 +336,7 @@ class Chat(object):
         return Message.from_db(self.account, sent_id)
 
     def prepare_message(self, msg):
-        """ prepare a message for sending.
+        """prepare a message for sending.
 
         :param msg: the message to be prepared.
         :returns: a :class:`deltachat.message.Message` instance.
@@ -278,7 +351,7 @@ class Chat(object):
         return msg
 
     def prepare_message_file(self, path, mime_type=None, view_type="file"):
-        """ prepare a message for sending and return the resulting Message instance.
+        """prepare a message for sending and return the resulting Message instance.
 
         To actually send the message, call :meth:`send_prepared`.
         The file must be inside the blob directory.
@@ -294,7 +367,7 @@ class Chat(object):
         return self.prepare_message(msg)
 
     def send_prepared(self, message):
-        """ send a previously prepared message.
+        """send a previously prepared message.
 
         :param message: a :class:`Message` instance previously returned by
                         :meth:`prepare_file`.
@@ -314,7 +387,7 @@ class Chat(object):
         msg._dc_msg = Message.from_db(self.account, sent_id)._dc_msg
 
     def set_draft(self, message):
-        """ set message as draft.
+        """set message as draft.
 
         :param message: a :class:`Message` instance
         :returns: None
@@ -325,7 +398,7 @@ class Chat(object):
             lib.dc_set_draft(self.account._dc_context, self.id, message._dc_msg)
 
     def get_draft(self):
-        """ get draft message for this chat.
+        """get draft message for this chat.
 
         :param message: a :class:`Message` instance
         :returns: Message object or None (if no draft available)
@@ -337,40 +410,34 @@ class Chat(object):
         return Message(self.account, dc_msg)
 
     def get_messages(self):
-        """ return list of messages in this chat.
+        """return list of messages in this chat.
 
         :returns: list of :class:`deltachat.message.Message` objects for this chat.
         """
         dc_array = ffi.gc(
             lib.dc_get_chat_msgs(self.account._dc_context, self.id, 0, 0),
-            lib.dc_array_unref
+            lib.dc_array_unref,
         )
         return list(iter_array(dc_array, lambda x: Message.from_db(self.account, x)))
 
     def count_fresh_messages(self):
-        """ return number of fresh messages in this chat.
+        """return number of fresh messages in this chat.
 
         :returns: number of fresh messages
         """
         return lib.dc_get_fresh_msg_cnt(self.account._dc_context, self.id)
 
     def mark_noticed(self):
-        """ mark all messages in this chat as noticed.
+        """mark all messages in this chat as noticed.
 
         Noticed messages are no longer fresh.
         """
         return lib.dc_marknoticed_chat(self.account._dc_context, self.id)
 
-    def get_summary(self):
-        """ return dictionary with summary information. """
-        dc_res = lib.dc_chat_get_info_json(self.account._dc_context, self.id)
-        s = from_dc_charpointer(dc_res)
-        return json.loads(s)
-
     # ------  group management API ------------------------------
 
     def add_contact(self, obj):
-        """ add a contact to this chat.
+        """add a contact to this chat.
 
         :params obj: Contact, Account or e-mail address.
         :raises ValueError: if contact could not be added
@@ -383,7 +450,7 @@ class Chat(object):
         return contact
 
     def remove_contact(self, obj):
-        """ remove a contact from this chat.
+        """remove a contact from this chat.
 
         :params obj: Contact, Account or e-mail address.
         :raises ValueError: if contact could not be removed
@@ -395,23 +462,22 @@ class Chat(object):
             raise ValueError("could not remove contact {!r} from chat".format(contact))
 
     def get_contacts(self):
-        """ get all contacts for this chat.
+        """get all contacts for this chat.
         :returns: list of :class:`deltachat.contact.Contact` objects for this chat
         """
         from .contact import Contact
+
         dc_array = ffi.gc(
             lib.dc_get_chat_contacts(self.account._dc_context, self.id),
-            lib.dc_array_unref
+            lib.dc_array_unref,
         )
-        return list(iter_array(
-            dc_array, lambda id: Contact(self.account, id))
-        )
+        return list(iter_array(dc_array, lambda id: Contact(self.account, id)))
 
     def num_contacts(self):
-        """ return number of contacts in this chat. """
+        """return number of contacts in this chat."""
         dc_array = ffi.gc(
             lib.dc_get_chat_contacts(self.account._dc_context, self.id),
-            lib.dc_array_unref
+            lib.dc_array_unref,
         )
         return lib.dc_array_get_cnt(dc_array)
 
@@ -458,12 +524,6 @@ class Chat(object):
             return None
         return from_dc_charpointer(dc_res)
 
-    def get_color(self):
-        """return the color of the chat.
-        :returns: color as 0x00rrggbb
-        """
-        return lib.dc_chat_get_color(self._dc_chat)
-
     # ------  location streaming API ------------------------------
 
     def is_sending_locations(self):
@@ -471,12 +531,6 @@ class Chat(object):
         :returns: True if location sending is enabled.
         """
         return lib.dc_is_sending_locations_to_chat(self.account._dc_context, self.id)
-
-    def is_archived(self):
-        """return True if this chat is archived.
-        :returns: True if archived.
-        """
-        return lib.dc_chat_get_visibility(self._dc_chat) == const.DC_CHAT_VISIBILITY_ARCHIVED
 
     def enable_sending_locations(self, seconds):
         """enable sending locations for this chat.
@@ -513,10 +567,7 @@ class Chat(object):
                 latitude=lib.dc_array_get_latitude(dc_array, i),
                 longitude=lib.dc_array_get_longitude(dc_array, i),
                 accuracy=lib.dc_array_get_accuracy(dc_array, i),
-                timestamp=datetime.fromtimestamp(
-                    lib.dc_array_get_timestamp(dc_array, i),
-                    timezone.utc
-                ),
+                timestamp=datetime.fromtimestamp(lib.dc_array_get_timestamp(dc_array, i), timezone.utc),
                 marker=from_optional_dc_charpointer(lib.dc_array_get_marker(dc_array, i)),
             )
             for i in range(lib.dc_array_get_cnt(dc_array))

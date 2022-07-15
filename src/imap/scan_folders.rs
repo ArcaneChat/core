@@ -1,13 +1,12 @@
 use std::{collections::BTreeMap, time::Instant};
 
 use anyhow::{Context as _, Result};
+use futures::stream::StreamExt;
 
 use crate::config::Config;
 use crate::imap::Imap;
 use crate::log::LogExt;
 use crate::{context::Context, imap::FolderMeaning};
-
-use async_std::stream::StreamExt;
 
 use super::{get_folder_meaning, get_folder_meaning_by_name};
 
@@ -35,16 +34,14 @@ impl Imap {
         let mut folder_configs = BTreeMap::new();
 
         for folder in folders {
-            // Gmail labels are not folders and should be skipped. For example,
-            // emails appear in the inbox and under "All Mail" as soon as it is
-            // received. The code used to wrongly conclude that the email had
-            // already been moved and left it in the inbox.
-            let folder_name = folder.name();
-            if folder_name.starts_with("[Gmail]") {
+            let folder_meaning = get_folder_meaning(&folder);
+            if folder_meaning == FolderMeaning::Virtual {
+                // Gmail has virtual folders that should be skipped. For example,
+                // emails appear in the inbox and under "All Mail" as soon as it is
+                // received. The code used to wrongly conclude that the email had
+                // already been moved and left it in the inbox.
                 continue;
             }
-
-            let folder_meaning = get_folder_meaning(&folder);
             let folder_name_meaning = get_folder_meaning_by_name(folder.name());
 
             if let Some(config) = folder_meaning.to_config() {
@@ -106,7 +103,7 @@ impl Imap {
         let list = session
             .list(Some(""), Some("*"))
             .await?
-            .filter_map(|f| f.ok_or_log_msg(context, "list_folders() can't get folder"));
+            .filter_map(|f| async { f.ok_or_log_msg(context, "list_folders() can't get folder") });
         Ok(list.collect().await)
     }
 }

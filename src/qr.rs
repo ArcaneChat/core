@@ -1,6 +1,6 @@
 //! # QR code module.
 
-use anyhow::{bail, ensure, format_err, Context as _, Error, Result};
+use anyhow::{bail, ensure, Context as _, Error, Result};
 use once_cell::sync::Lazy;
 use percent_encoding::percent_decode_str;
 use serde::Deserialize;
@@ -11,11 +11,11 @@ use crate::config::Config;
 use crate::constants::Blocked;
 use crate::contact::{addr_normalize, may_be_valid_addr, Contact, ContactId, Origin};
 use crate::context::Context;
-use crate::dc_tools::time;
 use crate::key::Fingerprint;
 use crate::message::Message;
 use crate::peerstate::Peerstate;
 use crate::token;
+use crate::tools::time;
 
 const OPENPGP4FPR_SCHEME: &str = "OPENPGP4FPR:"; // yes: uppercase
 const DCACCOUNT_SCHEME: &str = "DCACCOUNT:";
@@ -61,6 +61,7 @@ pub enum Qr {
     },
     Addr {
         contact_id: ContactId,
+        draft: Option<String>,
     },
     Url {
         url: String,
@@ -201,7 +202,7 @@ async fn decode_openpgp(context: &Context, qr: &str) -> Result<Qr> {
     };
 
     // retrieve known state for this fingerprint
-    let peerstate = Peerstate::from_fingerprint(context, &context.sql, &fingerprint)
+    let peerstate = Peerstate::from_fingerprint(context, &fingerprint)
         .await
         .context("Can't load peerstate")?;
 
@@ -355,13 +356,13 @@ struct CreateAccountResponse {
 async fn set_account_from_qr(context: &Context, qr: &str) -> Result<()> {
     let url_str = &qr[DCACCOUNT_SCHEME.len()..];
 
-    let parsed: CreateAccountResponse = surf::post(url_str).recv_json().await.map_err(|err| {
-        format_err!(
-            "Cannot create account, request to {:?} failed: {}",
-            url_str,
-            err
-        )
-    })?;
+    let parsed: CreateAccountResponse = reqwest::Client::new()
+        .post(url_str)
+        .send()
+        .await?
+        .json()
+        .await
+        .with_context(|| format!("Cannot create account, request to {:?} failed", url_str))?;
 
     context
         .set_config(Config::Addr, Some(&parsed.email))
@@ -451,15 +452,52 @@ pub async fn set_config_from_qr(context: &Context, qr: &str) -> Result<()> {
 async fn decode_mailto(context: &Context, qr: &str) -> Result<Qr> {
     let payload = &qr[MAILTO_SCHEME.len()..];
 
-    let addr = if let Some(query_index) = payload.find('?') {
-        &payload[..query_index]
+    let (addr, query) = if let Some(query_index) = payload.find('?') {
+        (&payload[..query_index], &payload[query_index + 1..])
     } else {
-        payload
+        (payload, "")
+    };
+
+    let param: BTreeMap<&str, &str> = query
+        .split('&')
+        .filter_map(|s| {
+            if let [key, value] = s.splitn(2, '=').collect::<Vec<_>>()[..] {
+                Some((key, value))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let subject = if let Some(subject) = param.get("subject") {
+        subject.to_string()
+    } else {
+        "".to_string()
+    };
+    let draft = if let Some(body) = param.get("body") {
+        if subject.is_empty() {
+            body.to_string()
+        } else {
+            subject + "\n" + body
+        }
+    } else {
+        subject
+    };
+    let draft = draft.replace('+', "%20"); // sometimes spaces are encoded as `+`
+    let draft = match percent_decode_str(&draft).decode_utf8() {
+        Ok(decoded_draft) => decoded_draft.to_string(),
+        Err(_err) => draft,
     };
 
     let addr = normalize_address(addr)?;
     let name = "".to_string();
-    Qr::from_address(context, name, addr).await
+    Qr::from_address(
+        context,
+        name,
+        addr,
+        if draft.is_empty() { None } else { Some(draft) },
+    )
+    .await
 }
 
 /// Extract address for the smtp scheme.
@@ -477,7 +515,7 @@ async fn decode_smtp(context: &Context, qr: &str) -> Result<Qr> {
 
     let addr = normalize_address(addr)?;
     let name = "".to_string();
-    Qr::from_address(context, name, addr).await
+    Qr::from_address(context, name, addr, None).await
 }
 
 /// Extract address for the matmsg scheme.
@@ -502,7 +540,7 @@ async fn decode_matmsg(context: &Context, qr: &str) -> Result<Qr> {
 
     let addr = normalize_address(addr)?;
     let name = "".to_string();
-    Qr::from_address(context, name, addr).await
+    Qr::from_address(context, name, addr, None).await
 }
 
 static VCARD_NAME_RE: Lazy<regex::Regex> =
@@ -531,14 +569,19 @@ async fn decode_vcard(context: &Context, qr: &str) -> Result<Qr> {
         bail!("Bad e-mail address");
     };
 
-    Qr::from_address(context, name, addr).await
+    Qr::from_address(context, name, addr, None).await
 }
 
 impl Qr {
-    pub async fn from_address(context: &Context, name: String, addr: String) -> Result<Self> {
+    pub async fn from_address(
+        context: &Context,
+        name: String,
+        addr: String,
+        draft: Option<String>,
+    ) -> Result<Self> {
         let (contact_id, _) =
             Contact::add_or_lookup(context, &name, &addr, Origin::UnhandledQrScan).await?;
-        Ok(Qr::Addr { contact_id })
+        Ok(Qr::Addr { contact_id, draft })
     }
 }
 
@@ -561,11 +604,11 @@ mod tests {
     use crate::chat::{create_group_chat, ProtectionStatus};
     use crate::key::DcKey;
     use crate::peerstate::ToSave;
-    use crate::securejoin::dc_get_securejoin_qr;
+    use crate::securejoin::get_securejoin_qr;
     use crate::test_utils::{alice_keypair, TestContext};
     use anyhow::Result;
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_decode_http() -> Result<()> {
         let ctx = TestContext::new().await;
 
@@ -580,7 +623,7 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_decode_https() -> Result<()> {
         let ctx = TestContext::new().await;
 
@@ -595,7 +638,7 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_decode_text() -> Result<()> {
         let ctx = TestContext::new().await;
 
@@ -610,7 +653,7 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_decode_vcard() -> Result<()> {
         let ctx = TestContext::new().await;
 
@@ -619,12 +662,13 @@ mod tests {
             "BEGIN:VCARD\nVERSION:3.0\nN:Last;First\nEMAIL;TYPE=INTERNET:stress@test.local\nEND:VCARD"
         ).await?;
 
-        if let Qr::Addr { contact_id } = qr {
+        if let Qr::Addr { contact_id, draft } = qr {
             let contact = Contact::get_by_id(&ctx.ctx, contact_id).await?;
             assert_eq!(contact.get_addr(), "stress@test.local");
             assert_eq!(contact.get_name(), "First Last");
             assert_eq!(contact.get_authname(), "");
             assert_eq!(contact.get_display_name(), "First Last");
+            assert!(draft.is_none());
         } else {
             bail!("Wrong QR code type");
         }
@@ -632,7 +676,7 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_decode_matmsg() -> Result<()> {
         let ctx = TestContext::new().await;
 
@@ -642,9 +686,10 @@ mod tests {
         )
         .await?;
 
-        if let Qr::Addr { contact_id } = qr {
+        if let Qr::Addr { contact_id, draft } = qr {
             let contact = Contact::get_by_id(&ctx.ctx, contact_id).await?;
             assert_eq!(contact.get_addr(), "stress@test.local");
+            assert!(draft.is_none());
         } else {
             bail!("Wrong QR code type");
         }
@@ -652,26 +697,28 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_decode_mailto() -> Result<()> {
         let ctx = TestContext::new().await;
 
         let qr = check_qr(
             &ctx.ctx,
-            "mailto:stress@test.local?subject=hello&body=world",
+            "mailto:stress@test.local?subject=hello&body=beautiful+world",
         )
         .await?;
-        if let Qr::Addr { contact_id } = qr {
+        if let Qr::Addr { contact_id, draft } = qr {
             let contact = Contact::get_by_id(&ctx.ctx, contact_id).await?;
             assert_eq!(contact.get_addr(), "stress@test.local");
+            assert_eq!(draft.unwrap(), "hello\nbeautiful world");
         } else {
             bail!("Wrong QR code type");
         }
 
         let res = check_qr(&ctx.ctx, "mailto:no-questionmark@example.org").await?;
-        if let Qr::Addr { contact_id } = res {
+        if let Qr::Addr { contact_id, draft } = res {
             let contact = Contact::get_by_id(&ctx.ctx, contact_id).await?;
             assert_eq!(contact.get_addr(), "no-questionmark@example.org");
+            assert!(draft.is_none());
         } else {
             bail!("Wrong QR code type");
         }
@@ -682,15 +729,16 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_decode_smtp() -> Result<()> {
         let ctx = TestContext::new().await;
 
-        if let Qr::Addr { contact_id } =
+        if let Qr::Addr { contact_id, draft } =
             check_qr(&ctx.ctx, "SMTP:stress@test.local:subjecthello:bodyworld").await?
         {
             let contact = Contact::get_by_id(&ctx.ctx, contact_id).await?;
             assert_eq!(contact.get_addr(), "stress@test.local");
+            assert!(draft.is_none());
         } else {
             bail!("Wrong QR code type");
         }
@@ -698,7 +746,7 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_decode_openpgp_group() -> Result<()> {
         let ctx = TestContext::new().await;
         let qr = check_qr(
@@ -741,7 +789,7 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_decode_openpgp_secure_join() -> Result<()> {
         let ctx = TestContext::new().await;
 
@@ -788,7 +836,7 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_decode_openpgp_fingerprint() -> Result<()> {
         let ctx = TestContext::new().await;
 
@@ -850,7 +898,7 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_decode_openpgp_without_addr() -> Result<()> {
         let ctx = TestContext::new().await;
 
@@ -886,10 +934,10 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_withdraw_verifycontact() -> Result<()> {
         let alice = TestContext::new_alice().await;
-        let qr = dc_get_securejoin_qr(&alice, None).await?;
+        let qr = get_securejoin_qr(&alice, None).await?;
 
         // scanning own verify-contact code offers withdrawing
         assert!(matches!(
@@ -920,11 +968,11 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_withdraw_verifygroup() -> Result<()> {
         let alice = TestContext::new_alice().await;
         let chat_id = create_group_chat(&alice, ProtectionStatus::Unprotected, "foo").await?;
-        let qr = dc_get_securejoin_qr(&alice, Some(chat_id)).await?;
+        let qr = get_securejoin_qr(&alice, Some(chat_id)).await?;
 
         // scanning own verify-group code offers withdrawing
         if let Qr::WithdrawVerifyGroup { grpname, .. } = check_qr(&alice, &qr).await? {
@@ -953,7 +1001,7 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_decode_account() -> Result<()> {
         let ctx = TestContext::new().await;
 
@@ -985,7 +1033,7 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_decode_webrtc_instance() -> Result<()> {
         let ctx = TestContext::new().await;
 
@@ -1011,7 +1059,7 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_decode_account_bad_scheme() {
         let ctx = TestContext::new().await;
         let res = check_qr(
@@ -1030,7 +1078,7 @@ mod tests {
         assert!(res.is_err());
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_set_config_from_qr() -> Result<()> {
         let ctx = TestContext::new().await;
 

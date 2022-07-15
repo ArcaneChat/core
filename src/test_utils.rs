@@ -1,22 +1,21 @@
 //! Utilities to help writing tests.
 //!
 //! This private module is only compiled for test runs.
-
+#![allow(clippy::indexing_slicing)]
 use std::collections::BTreeMap;
 use std::ops::Deref;
 use std::panic;
-use std::thread;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ansi_term::Color;
-use async_std::channel::{self, Receiver, Sender};
-use async_std::prelude::*;
-use async_std::sync::{Arc, RwLock};
-use async_std::task;
+use async_channel::{self as channel, Receiver, Sender};
 use chat::ChatItem;
 use once_cell::sync::Lazy;
 use rand::Rng;
 use tempfile::{tempdir, TempDir};
+use tokio::sync::RwLock;
+use tokio::task;
 
 use crate::chat::{self, Chat, ChatId};
 use crate::chatlist::Chatlist;
@@ -25,12 +24,12 @@ use crate::constants::Chattype;
 use crate::constants::{DC_GCM_ADDDAYMARKER, DC_MSG_ID_DAYMARKER};
 use crate::contact::{Contact, ContactId, Modifier, Origin};
 use crate::context::Context;
-use crate::dc_receive_imf::dc_receive_imf;
-use crate::dc_tools::EmailAddress;
-use crate::events::{Event, EventType};
+use crate::events::{Event, EventType, Events};
 use crate::key::{self, DcKey, KeyPair, KeyPairUse};
 use crate::message::{update_msg_state, Message, MessageState, MsgId, Viewtype};
 use crate::mimeparser::MimeMessage;
+use crate::receive_imf::receive_imf;
+use crate::tools::EmailAddress;
 
 #[allow(non_upper_case_globals)]
 pub const AVATAR_900x900_BYTES: &[u8] = include_bytes!("../test-data/image/avatar900x900.png");
@@ -40,7 +39,7 @@ static CONTEXT_NAMES: Lazy<std::sync::RwLock<BTreeMap<u32, String>>> =
     Lazy::new(|| std::sync::RwLock::new(BTreeMap::new()));
 
 pub struct TestContextManager {
-    log_tx: Sender<Event>,
+    log_tx: Sender<LogEvent>,
     _log_sink: LogSink,
 }
 
@@ -65,12 +64,67 @@ impl TestContextManager {
             .build()
             .await
     }
+
+    pub async fn fiona(&mut self) -> TestContext {
+        TestContext::builder()
+            .configure_fiona()
+            .with_log_sink(self.log_tx.clone())
+            .build()
+            .await
+    }
+
+    /// Writes info events to the log that mark a section, e.g.:
+    ///
+    /// ========== `msg` goes here ==========
+    pub fn section(&self, msg: &str) {
+        self.log_tx
+            .try_send(LogEvent::Section(msg.to_string()))
+            .expect(
+            "The events channel should be unbounded and not closed, so try_send() shouldn't fail",
+        );
+    }
+
+    /// - Let one TestContext send a message
+    /// - Let the other TestContext receive it and accept the chat
+    /// - Assert that the message arrived
+    pub async fn send_recv_accept(&self, from: &TestContext, to: &TestContext, msg: &str) {
+        self.section(&format!(
+            "{} sends a message '{}' to {}",
+            from.name(),
+            msg,
+            to.name()
+        ));
+
+        let chat = from.create_chat(to).await;
+        let sent = from.send_text(chat.id, msg).await;
+
+        let received_msg = to.recv_msg(&sent).await;
+        received_msg.chat_id.accept(to).await.unwrap();
+        assert_eq!(received_msg.text.unwrap(), msg);
+    }
+
+    pub async fn change_addr(&self, test_context: &TestContext, new_addr: &str) {
+        self.section(&format!(
+            "{} changes her self address and reconfigures",
+            test_context.name()
+        ));
+        test_context.set_primary_self_addr(new_addr).await.unwrap();
+        // ensure_secret_key_exists() is called during configure
+        crate::e2ee::ensure_secret_key_exists(test_context)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            test_context.get_primary_self_addr().await.unwrap(),
+            new_addr
+        );
+    }
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct TestContextBuilder {
     key_pair: Option<KeyPair>,
-    log_sink: Option<Sender<Event>>,
+    log_sink: Option<Sender<LogEvent>>,
 }
 
 impl TestContextBuilder {
@@ -110,7 +164,7 @@ impl TestContextBuilder {
     /// using a single [`LogSink`] for both contexts.  This shows the log messages in
     /// sequence as they occurred rather than all messages from each context in a single
     /// block.
-    pub fn with_log_sink(mut self, sink: Sender<Event>) -> Self {
+    pub fn with_log_sink(mut self, sink: Sender<LogEvent>) -> Self {
         self.log_sink = Some(sink);
         self
     }
@@ -144,8 +198,6 @@ pub struct TestContext {
     pub evtracker: EventTracker,
     /// Channels which should receive events from this context.
     event_senders: Arc<RwLock<Vec<Sender<Event>>>>,
-    /// Receives panics from sinks ("sink" means "event handler" here)
-    poison_receiver: Receiver<String>,
     /// Reference to implicit [`LogSink`] so it is dropped together with the context.
     ///
     /// Only used if no explicit `log_sender` is passed into [`TestContext::new_internal`]
@@ -197,6 +249,18 @@ impl TestContext {
         Self::builder().configure_fiona().build().await
     }
 
+    #[allow(dead_code)]
+    /// Print current chat state.
+    pub async fn print_chats(&self) {
+        println!("\n========== Chats of {}: ==========", self.name());
+        if let Ok(chats) = Chatlist::try_load(self, 0, None, None).await {
+            for (chat, _) in chats.iter() {
+                self.print_chat(*chat).await;
+            }
+        }
+        println!();
+    }
+
     /// Internal constructor.
     ///
     /// `name` is used to identify this context in e.g. log output.  This is useful mostly
@@ -205,7 +269,7 @@ impl TestContext {
     /// `log_sender` is assumed to be the sender for a [`LogSink`].  If not supplied a new
     /// [`LogSink`] will be created so that events are logged to this test when the
     /// [`TestContext`] is dropped.
-    async fn new_internal(name: Option<String>, log_sender: Option<Sender<Event>>) -> Self {
+    async fn new_internal(name: Option<String>, log_sender: Option<Sender<LogEvent>>) -> Self {
         let dir = tempdir().unwrap();
         let dbfile = dir.path().join("db.sqlite");
         let id = rand::thread_rng().gen();
@@ -213,7 +277,7 @@ impl TestContext {
             let mut context_names = CONTEXT_NAMES.write().unwrap();
             context_names.insert(id, name);
         }
-        let ctx = Context::new(dbfile.into(), id)
+        let ctx = Context::new(&dbfile, id, Events::new())
             .await
             .expect("failed to create context");
 
@@ -228,33 +292,17 @@ impl TestContext {
         };
 
         let (evtracker_sender, evtracker_receiver) = channel::unbounded();
-        let event_senders = Arc::new(RwLock::new(vec![log_sender, evtracker_sender]));
+        let event_senders = Arc::new(RwLock::new(vec![evtracker_sender]));
         let senders = Arc::clone(&event_senders);
-        let (poison_sender, poison_receiver) = channel::bounded(1);
 
         task::spawn(async move {
-            // Make sure that the test fails if there is a panic on this thread here
-            // (but not if there is a panic on another thread)
-            let looptask_id = task::current().id();
-            let orig_hook = panic::take_hook();
-            panic::set_hook(Box::new(move |panic_info| {
-                if let Some(panicked_task) = task::try_current() {
-                    if panicked_task.id() == looptask_id {
-                        poison_sender.try_send(panic_info.to_string()).ok();
-                    }
-                }
-                orig_hook(panic_info);
-            }));
-
             while let Some(event) = events.recv().await {
-                {
-                    let sinks = senders.read().await;
-                    for sender in sinks.iter() {
-                        // Don't block because someone wanted to use a oneshot receiver, use
-                        // an unbounded channel if you want all events.
-                        sender.try_send(event.clone()).ok();
-                    }
+                for sender in senders.read().await.iter() {
+                    // Don't block because someone wanted to use a oneshot receiver, use
+                    // an unbounded channel if you want all events.
+                    sender.try_send(event.clone()).ok();
                 }
+                log_sender.try_send(LogEvent::Event(event.clone())).ok();
             }
         });
 
@@ -263,7 +311,6 @@ impl TestContext {
             dir,
             evtracker: EventTracker(evtracker_receiver),
             event_senders,
-            poison_receiver,
             log_sink,
         }
     }
@@ -276,6 +323,15 @@ impl TestContext {
         context_names
             .entry(self.ctx.get_id())
             .or_insert_with(|| name.into());
+    }
+
+    /// Returns the name of this [`TestContext`].
+    ///
+    /// This is the same name that is shown in events logged in the test output.
+    pub fn name(&self) -> String {
+        let context_names = CONTEXT_NAMES.read().unwrap();
+        let id = &self.ctx.id;
+        context_names.get(id).unwrap_or(&id.to_string()).to_string()
     }
 
     /// Adds a new [`Event`]s sender.
@@ -337,7 +393,7 @@ impl TestContext {
                 break row;
             }
             if start.elapsed() < Duration::from_secs(3) {
-                async_std::task::sleep(Duration::from_millis(100)).await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
             } else {
                 panic!("no sent message found in jobs table");
             }
@@ -370,17 +426,41 @@ impl TestContext {
             .unwrap()
     }
 
-    /// Receive a message.
-    ///
-    /// Receives a message using the `dc_receive_imf()` pipeline.
-    pub async fn recv_msg(&self, msg: &SentMessage) {
-        let received_msg =
-            "Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n"
-                .to_owned()
-                + msg.payload();
-        dc_receive_imf(&self.ctx, received_msg.as_bytes(), false)
+    /// Receive a message using the `receive_imf()` pipeline. Panics if it's not shown
+    /// in the chat as exactly one message.
+    pub async fn recv_msg(&self, msg: &SentMessage) -> Message {
+        let received = self
+            .recv_msg_opt(msg)
+            .await
+            .expect("receive_imf() seems not to have added a new message to the db");
+
+        assert_eq!(
+            received.msg_ids.len(),
+            1,
+            "recv_msg() can currently only receive messages with exactly one part"
+        );
+        let msg = Message::load_from_db(self, received.msg_ids[0])
             .await
             .unwrap();
+
+        let chat_msgs = chat::get_chat_msgs(self, received.chat_id, 0)
+            .await
+            .unwrap();
+        assert!(
+            chat_msgs.contains(&ChatItem::Message { msg_id: msg.id }),
+            "received message is not shown in chat, maybe it's hidden (you may have \
+                to call set_config(Config::ShowEmails, Some(\"2\")).await)"
+        );
+
+        msg
+    }
+
+    /// Receive a message using the `receive_imf()` pipeline. This is similar
+    /// to `recv_msg()`, but doesn't assume that the message is shown in the chat.
+    pub async fn recv_msg_opt(&self, msg: &SentMessage) -> Option<crate::receive_imf::ReceivedMsg> {
+        receive_imf(self, msg.payload().as_bytes(), false)
+            .await
+            .unwrap()
     }
 
     /// Gets the most recent message of a chat.
@@ -497,8 +577,13 @@ impl TestContext {
     /// the message.
     pub async fn send_msg(&self, chat_id: ChatId, msg: &mut Message) -> SentMessage {
         chat::prepare_msg(self, chat_id, msg).await.unwrap();
-        chat::send_msg(self, chat_id, msg).await.unwrap();
-        self.pop_sent_msg().await
+        let msg_id = chat::send_msg(self, chat_id, msg).await.unwrap();
+        let res = self.pop_sent_msg().await;
+        assert_eq!(
+            res.sender_msg_id, msg_id,
+            "Apparently the message was not actually sent out"
+        );
+        res
     }
 
     /// Prints out the entire chat to stdout.
@@ -593,14 +678,12 @@ impl Deref for TestContext {
     }
 }
 
-impl Drop for TestContext {
-    fn drop(&mut self) {
-        if !thread::panicking() {
-            if let Ok(p) = self.poison_receiver.try_recv() {
-                panic!("{}", p);
-            }
-        }
-    }
+pub enum LogEvent {
+    /// Logged event.
+    Event(Event),
+
+    /// Test output section.
+    Section(String),
 }
 
 /// A receiver of [`Event`]s which will log the events to the captured test stdout.
@@ -616,12 +699,12 @@ impl Drop for TestContext {
 /// [`TestContextBuilder::with_log_sink`].
 #[derive(Debug)]
 pub struct LogSink {
-    events: Receiver<Event>,
+    events: Receiver<LogEvent>,
 }
 
 impl LogSink {
     /// Creates a new [`LogSink`] and returns the attached event sink.
-    pub fn create() -> (Sender<Event>, Self) {
+    pub fn create() -> (Sender<LogEvent>, Self) {
         let (tx, rx) = channel::unbounded();
         (tx, Self { events: rx })
     }
@@ -630,7 +713,7 @@ impl LogSink {
 impl Drop for LogSink {
     fn drop(&mut self) {
         while let Ok(event) = self.events.try_recv() {
-            print_event(&event);
+            print_logevent(&event);
         }
     }
 }
@@ -739,15 +822,14 @@ impl EventTracker {
     /// If no matching events are ready this will wait for new events to arrive and time out
     /// after 10 seconds.
     pub async fn get_matching<F: Fn(&EventType) -> bool>(&self, event_matcher: F) -> EventType {
-        async move {
+        tokio::time::timeout(Duration::from_secs(10), async move {
             loop {
                 let event = self.0.recv().await.unwrap();
                 if event_matcher(&event.typ) {
                     return event.typ;
                 }
             }
-        }
-        .timeout(Duration::from_secs(10))
+        })
         .await
         .expect("timeout waiting for event match")
     }
@@ -765,7 +847,6 @@ impl EventTracker {
 /// Gets a specific message from a chat and asserts that the chat has a specific length.
 ///
 /// Panics if the length of the chat is not `asserted_msgs_count` or if the chat item at `index` is not a Message.
-#[allow(clippy::indexing_slicing)]
 pub(crate) async fn get_chat_msg(
     t: &TestContext,
     chat_id: ChatId,
@@ -780,6 +861,13 @@ pub(crate) async fn get_chat_msg(
         panic!("Wrong item type");
     };
     Message::load_from_db(&t.ctx, msg_id).await.unwrap()
+}
+
+fn print_logevent(logevent: &LogEvent) {
+    match logevent {
+        LogEvent::Event(event) => print_event(event),
+        LogEvent::Section(msg) => println!("\n========== {} ==========", msg),
+    }
 }
 
 /// Pretty-print an event to stdout
@@ -853,9 +941,13 @@ fn print_event(event: &Event) {
 ///
 /// This includes a bunch of the message meta-data as well.
 async fn log_msg(context: &Context, prefix: impl AsRef<str>, msg: &Message) {
-    let contact = Contact::get_by_id(context, msg.get_from_id())
-        .await
-        .expect("invalid contact");
+    let contact = match Contact::get_by_id(context, msg.get_from_id()).await {
+        Ok(contact) => contact,
+        Err(e) => {
+            println!("Can't log message: invalid contact: {}", e);
+            return;
+        }
+    };
 
     let contact_name = contact.get_name();
     let contact_id = contact.get_id();
@@ -912,21 +1004,21 @@ mod tests {
     // The following three tests demonstrate, when made to fail, the log output being
     // directed to the correct test output.
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_with_alice() {
         let alice = TestContext::builder().configure_alice().build().await;
         alice.ctx.emit_event(EventType::Info("hello".into()));
         // panic!("Alice fails");
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_with_bob() {
         let bob = TestContext::builder().configure_bob().build().await;
         bob.ctx.emit_event(EventType::Info("there".into()));
         // panic!("Bob fails");
     }
 
-    #[async_std::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_with_both() {
         let mut tcm = TestContextManager::new().await;
         let alice = tcm.alice().await;

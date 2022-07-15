@@ -1791,6 +1791,11 @@ void            dc_delete_msgs               (dc_context_t* context, const uint3
 /**
  * Forward messages to another chat.
  *
+ * All types of messages can be forwarded,
+ * however, they will be flagged as such (dc_msg_is_forwarded() is set).
+ *
+ * Original sender, info-state and webxdc updates are not forwarded on purpose.
+ *
  * @memberof dc_context_t
  * @param context The context object.
  * @param msg_ids An array of uint32_t containing all message IDs that should be forwarded.
@@ -2287,7 +2292,7 @@ void            dc_stop_ongoing_process      (dc_context_t* context);
  * - DC_QR_FPR_MISMATCH with dc_lot_t::id=Contact ID:
  *   scanned fingerprint does not match last seen fingerprint.
  *
- * - DC_QR_FPR_WITHOUT_ADDR with dc_lot_t::test1=Formatted fingerprint
+ * - DC_QR_FPR_WITHOUT_ADDR with dc_lot_t::text1=Formatted fingerprint
  *   the scanned QR code contains a fingerprint but no e-mail address;
  *   suggest the user to establish an encrypted connection first.
  *
@@ -2300,7 +2305,8 @@ void            dc_stop_ongoing_process      (dc_context_t* context);
  *   if so, call dc_set_config_from_qr().
  *
  * - DC_QR_ADDR with dc_lot_t::id=Contact ID:
- *   e-mail address scanned,
+ *   e-mail address scanned, optionally, a draft message could be set in
+ *   dc_lot_t::text1 in which case dc_lot_t::text1_meaning will be DC_TEXT1_DRAFT;
  *   ask the user if they want to start chatting;
  *   if so, call dc_create_chat_by_contact_id().
  *
@@ -3979,7 +3985,7 @@ int             dc_msg_is_sent                (const dc_msg_t* msg);
  *
  * For privacy reasons, we do not provide the name or the e-mail address of the
  * original author (in a typical GUI, you select the messages text and click on
- * "forwared"; you won't expect other data to be send to the new recipient,
+ * "forwarded"; you won't expect other data to be send to the new recipient,
  * esp. as the new recipient may not be in any relationship to the original author)
  *
  * @memberof dc_msg_t
