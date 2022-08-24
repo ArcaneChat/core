@@ -23,7 +23,7 @@ typedef struct _dc_provider dc_provider_t;
 typedef struct _dc_event    dc_event_t;
 typedef struct _dc_event_emitter dc_event_emitter_t;
 typedef struct _dc_accounts_event_emitter dc_accounts_event_emitter_t;
-
+typedef struct _dc_jsonrpc_instance dc_jsonrpc_instance_t;
 
 /**
  * @mainpage Getting started
@@ -1263,7 +1263,7 @@ void            dc_marknoticed_chat          (dc_context_t* context, uint32_t ch
 
 
 /**
- * Returns all message IDs of the given types in a chat.
+ * Returns all message IDs of the given types in a given chat or any chat.
  * Typically used to show a gallery.
  * The result must be dc_array_unref()'d
  *
@@ -1273,7 +1273,8 @@ void            dc_marknoticed_chat          (dc_context_t* context, uint32_t ch
  *
  * @memberof dc_context_t
  * @param context The context object as returned from dc_context_new().
- * @param chat_id The chat ID to get all messages with media from.
+ * @param chat_id >0: get messages with media from this chat ID.
+ *    0: get messages with media from any chat of the currently used account.
  * @param msg_type Specify a message type to query here, one of the @ref DC_MSG constants.
  * @param msg_type2 Alternative message type to search for. 0 to skip.
  * @param msg_type3 Alternative message type to search for. 0 to skip.
@@ -1284,7 +1285,6 @@ dc_array_t*     dc_get_chat_media            (dc_context_t* context, uint32_t ch
 
 /**
  * Search next/previous message based on a given message and a list of types.
- * The
  * Typically used to implement the "next" and "previous" buttons
  * in a gallery or in a media player.
  *
@@ -3258,6 +3258,19 @@ int             dc_chat_get_type             (const dc_chat_t* chat);
 
 
 /**
+ * Returns the address where messages are sent to if the chat is a mailing list.
+ * If you just want to know if a mailing list can be written to,
+ * use dc_chat_can_send() instead.
+ *
+ * @memberof dc_chat_t
+ * @param chat The chat object.
+ * @return The mailing list address. Must be released using dc_str_unref() after usage.
+ *     If there is no such address, an empty string is returned, NULL is never returned.
+ */
+char*           dc_chat_get_mailinglist_addr (const dc_chat_t* chat);
+
+
+/**
  * Get name of a chat. For one-to-one chats, this is the name of the contact.
  * For group chats, this is the name given e.g. to dc_create_group_chat() or
  * received by a group-creation message.
@@ -5179,6 +5192,55 @@ int64_t          dc_lot_get_timestamp     (const dc_lot_t* lot);
  */
 
 
+
+/**
+ * @class dc_jsonrpc_instance_t
+ *
+ * Opaque object for using the json rpc api from the cffi bindings.
+ */
+
+/**
+ * Create the jsonrpc instance that is used to call the jsonrpc.
+ *
+ * @memberof dc_accounts_t
+ * @param account_manager The accounts object as created by dc_accounts_new().
+ * @return Returns the jsonrpc instance, NULL on errors.
+ *     Must be freed using dc_jsonrpc_unref() after usage.
+ *
+ */
+dc_jsonrpc_instance_t* dc_jsonrpc_init(dc_accounts_t* account_manager);
+
+/**
+ * Free a jsonrpc instance.
+ *
+ * @memberof dc_jsonrpc_instance_t
+ * @param jsonrpc_instance jsonrpc instance as returned from dc_jsonrpc_init().
+ *     If NULL is given, nothing is done and an error is logged.
+ */
+void dc_jsonrpc_unref(dc_jsonrpc_instance_t* jsonrpc_instance);
+
+/**
+ * Makes an asynchronous jsonrpc request,
+ * returns immediately and once the result is ready it can be retrieved via dc_jsonrpc_next_response()
+ * the jsonrpc specification defines an invocation id that can then be used to match request and response.
+ *
+ * @memberof dc_jsonrpc_instance_t
+ * @param jsonrpc_instance jsonrpc instance as returned from dc_jsonrpc_init().
+ * @param request JSON-RPC request as string
+ */
+void dc_jsonrpc_request(dc_jsonrpc_instance_t* jsonrpc_instance, const char* request);
+
+/**
+ * Get the next json_rpc response, blocks until there is a new event, so call this in a loop from a thread.
+ *
+ * @memberof dc_jsonrpc_instance_t
+ * @param jsonrpc_instance jsonrpc instance as returned from dc_jsonrpc_init().
+ * @return JSON-RPC response as string, must be freed using dc_str_unref() after usage.
+ *     If NULL is returned, the accounts_t belonging to the jsonrpc instance is unref'd and no more events will come;
+ *     in this case, free the jsonrpc instance using dc_jsonrpc_unref().
+ */
+char* dc_jsonrpc_next_response(dc_jsonrpc_instance_t* jsonrpc_instance);
+
 /**
  * @class dc_event_emitter_t
  *
@@ -6364,6 +6426,24 @@ void dc_event_unref(dc_event_t* event);
 ///
 /// Used as status in the connectivity view.
 #define DC_STR_NOT_CONNECTED              121
+
+/// %1$s changed their address from %2$s to %3$s"
+///
+/// Used as an info message to chats with contacts that changed their address.
+#define DC_STR_AEAP_ADDR_CHANGED          122
+
+/// "You changed your email address from %1$s to %2$s.
+/// If you now send a message to a group, contacts there will automatically
+/// replace the old with your new address.\n\nIt's highly advised to set up 
+/// your old email provider to forward all emails to your new email address. 
+/// Otherwise you might miss messages of contacts who did not get your new 
+/// address yet." + the link to the AEAP blog post
+/// 
+/// As soon as there is a post about AEAP, the UIs should add it:
+/// set_stock_translation(123, getString(aeap_explanation) + "\n\n" + AEAP_BLOG_LINK)
+///
+/// Used in a device message that explains AEAP.
+#define DC_STR_AEAP_EXPLANATION_AND_LINK  123
 
 /**
  * @}

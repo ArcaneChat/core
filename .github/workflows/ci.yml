@@ -45,7 +45,7 @@ jobs:
       - uses: actions-rs/clippy-check@v1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          args: --workspace --tests --examples --benches
+          args: --workspace --tests --examples --benches --features repl -- -D warnings
 
   docs:
     name: Rust doc comments
@@ -116,6 +116,11 @@ jobs:
         command: test
         args: --all
 
+    - name: test cargo vendor
+      uses: actions-rs/cargo@v1
+      with:
+        command: vendor
+
     - name: install python
       if: ${{ matrix.python }}
       uses: actions/setup-python@v4
@@ -131,7 +136,7 @@ jobs:
       uses: actions-rs/cargo@v1
       with:
         command: build
-        args: -p deltachat_ffi
+        args: -p deltachat_ffi --features jsonrpc
 
     - name: run python tests
       if: ${{ matrix.python }}

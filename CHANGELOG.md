@@ -2,9 +2,66 @@
 
 ## Unreleased
 
+### API-Changes
+
+### Changes
+
+### Fixes
+- do not emit notifications for blocked chats #3557
+
+
+## 1.93.0
+
+### API-Changes
+- added a JSON RPC API, accessible through a WebSocket server, the CFFI bindings and the Node.js bindings #3463 #3554 #3542
+- JSON RPC methods in CFFI #3463:
+ - `dc_jsonrpc_instance_t* dc_jsonrpc_init(dc_accounts_t* account_manager);`
+ - `void dc_jsonrpc_unref(dc_jsonrpc_instance_t* jsonrpc_instance);`
+ - `void dc_jsonrpc_request(dc_jsonrpc_instance_t* jsonrpc_instance, char* request);`
+ - `char* dc_jsonrpc_next_response(dc_jsonrpc_instance_t* jsonrpc_instance);`
+- node: JSON RPC methods #3463:
+ - `AccountManager.prototype.startJsonRpcHandler(callback: ((response: string) => void)): void`
+ - `AccountManager.prototype.jsonRpcRequest(message: string): void`
+
+### Changes
+- use [pathlib](https://docs.python.org/3/library/pathlib.html) in provider update script #3543
+- `dc_get_chat_media()` can return media globally #3528
+- node: add `getMailinglistAddr()` #3524
+- avoid duplicate encoded-words package and test `cargo vendor` in ci #3549
+- python: don't raise an error if addr changes #3530
+- improve coverage script #3530
+
+### Fixes
+- improved error handling for account setup from qrcode #3474
+- python: enable certificate checks in cloned accounts #3443
+
+
+## 1.92.0
+
+### API-Changes
+- add `dc_chat_get_mailinglist_addr()` #3520
+
+
+## 1.91.0
+
+### Added
+- python bindings: extra method to get an account running
+
+### Changes
+- refactorings #3437
+
+### Fixes
+- mark "group image changed" as system message on receiver side #3517
+
+
+## 1.90.0
+
 ### Changes
 - handle drafts from mailto links in scanned QR #3492
 - do not overflow ratelimiter leaky bucket #3496
+- (AEAP) Add device message after you changed your address #3505
+- (AEAP) Revert #3491, instead only replace contacts in verified groups #3510
+- improve python bindings and tests #3502 #3503
 
 ### Fixes
 - don't squash text parts of NDN into attachments #3497

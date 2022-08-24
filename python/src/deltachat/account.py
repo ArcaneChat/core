@@ -20,7 +20,7 @@ from .cutil import (
     from_optional_dc_charpointer,
     iter_array,
 )
-from .events import EventThread
+from .events import EventThread, FFIEventLogger
 from .message import Message
 from .tracker import ConfigureTracker, ImexTracker
 
@@ -169,8 +169,6 @@ class Account(object):
         """
         self._check_config_key(name)
         namebytes = name.encode("utf8")
-        if namebytes == b"addr" and self.is_configured():
-            raise ValueError("can not change 'addr' after account is configured.")
         if isinstance(value, (int, bool)):
             value = str(int(value))
         if value is not None:
@@ -598,6 +596,36 @@ class Account(object):
     # meta API for start/stop and event based processing
     #
 
+    def run_account(self, addr=None, password=None, account_plugins=None, show_ffi=False):
+        """get the account running, configure it if necessary. add plugins if provided.
+
+        :param addr: the email address of the account
+        :param password: the password of the account
+        :param account_plugins: a list of plugins to add
+        :param show_ffi: show low level ffi events
+        """
+        if show_ffi:
+            self.set_config("displayname", "bot")
+            log = FFIEventLogger(self)
+            self.add_account_plugin(log)
+
+        for plugin in account_plugins or []:
+            print("adding plugin", plugin)
+            self.add_account_plugin(plugin)
+
+        if not self.is_configured():
+            assert addr and password, "you must specify email and password once to configure this database/account"
+            self.set_config("addr", addr)
+            self.set_config("mail_pw", password)
+            self.set_config("mvbox_move", "0")
+            self.set_config("sentbox_watch", "0")
+            self.set_config("bot", "1")
+            configtracker = self.configure()
+            configtracker.wait_finish()
+
+        # start IO threads and configure if neccessary
+        self.start_io()
+
     def add_account_plugin(self, plugin, name=None):
         """add an account plugin which implements one or more of
         the :class:`deltachat.hookspec.PerAccount` hooks.
@@ -680,8 +708,9 @@ class Account(object):
         """Start configuration process and return a Configtracker instance
         on which you can block with wait_finish() to get a True/False success
         value for the configuration process.
+
+        :param reconfigure: deprecated, doesn't need to be checked anymore.
         """
-        assert self.is_configured() == reconfigure
         if not self.get_config("addr") or not self.get_config("mail_pw"):
             raise MissingCredentials("addr or mail_pwd not set in config")
         configtracker = ConfigureTracker(self)
