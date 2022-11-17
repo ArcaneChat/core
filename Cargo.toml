@@ -18,6 +18,7 @@ opt-level = 0
 strip = true
 lto = true
 panic = 'abort'
+codegen-units = 1
 
 [dependencies]
 deltachat_derive = { path = "./deltachat_derive" }
