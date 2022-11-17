@@ -23,8 +23,159 @@ use crate::quota::QuotaInfo;
 use crate::ratelimit::Ratelimit;
 use crate::scheduler::Scheduler;
 use crate::sql::Sql;
+use crate::stock_str::StockStrings;
 use crate::tools::{duration_to_str, time};
 
+/// Builder for the [`Context`].
+///
+/// Many arguments to the [`Context`] are kind of optional and only needed to handle
+/// multiple contexts, for which the [account manager](crate::accounts::Accounts) should be
+/// used.  This builder makes creating a new context simpler, especially for the
+/// standalone-context case.
+///
+/// # Examples
+///
+/// Creating a new unecrypted database:
+///
+/// ```
+/// # let rt = tokio::runtime::Runtime::new().unwrap();
+/// # rt.block_on(async move {
+/// use deltachat::context::ContextBuilder;
+///
+/// let dir = tempfile::tempdir().unwrap();
+/// let context = ContextBuilder::new(dir.path().join("db"))
+///      .open()
+///      .await
+///      .unwrap();
+/// drop(context);
+/// # });
+/// ```
+///
+/// To use an encrypted database provide a password.  If the database does not yet exist it
+/// will be created:
+///
+/// ```
+/// # let rt = tokio::runtime::Runtime::new().unwrap();
+/// # rt.block_on(async move {
+/// use deltachat::context::ContextBuilder;
+///
+/// let dir = tempfile::tempdir().unwrap();
+/// let context = ContextBuilder::new(dir.path().join("db"))
+///      .with_password("secret".into())
+///      .open()
+///      .await
+///      .unwrap();
+/// drop(context);
+/// # });
+/// ```
+#[derive(Clone, Debug)]
+pub struct ContextBuilder {
+    dbfile: PathBuf,
+    id: u32,
+    events: Events,
+    stock_strings: StockStrings,
+    password: Option<String>,
+}
+
+impl ContextBuilder {
+    /// Create the builder using the given database file.
+    ///
+    /// The *dbfile* should be in a dedicated directory and this directory must exist.  The
+    /// [`Context`] will create other files and folders in the same directory as the
+    /// database file used.
+    pub fn new(dbfile: PathBuf) -> Self {
+        ContextBuilder {
+            dbfile,
+            id: rand::random(),
+            events: Events::new(),
+            stock_strings: StockStrings::new(),
+            password: None,
+        }
+    }
+
+    /// Sets the context ID.
+    ///
+    /// This identifier is used e.g. in [`Event`]s to identify which [`Context`] an event
+    /// belongs to.  The only real limit on it is that it should not conflict with any other
+    /// [`Context`]s you currently have open.  So if you handle multiple [`Context`]s you
+    /// may want to use this.
+    ///
+    /// Note that the [account manager](crate::accounts::Accounts) is designed to handle the
+    /// common case for using multiple [`Context`] instances.
+    pub fn with_id(mut self, id: u32) -> Self {
+        self.id = id;
+        self
+    }
+
+    /// Sets the event channel for this [`Context`].
+    ///
+    /// Mostly useful when using multiple [`Context`]s, this allows creating one [`Events`]
+    /// channel and passing it to all [`Context`]s so all events are recieved on the same
+    /// channel.
+    ///
+    /// Note that the [account manager](crate::accounts::Accounts) is designed to handle the
+    /// common case for using multiple [`Context`] instances.
+    pub fn with_events(mut self, events: Events) -> Self {
+        self.events = events;
+        self
+    }
+
+    /// Sets the [`StockStrings`] map to use for this [`Context`].
+    ///
+    /// This is useful in order to share the same translation strings in all [`Context`]s.
+    /// The mapping may be empty when set, it will be populated by
+    /// [`Context::set_stock-translation`] or [`Accounts::set_stock_translation`] calls.
+    ///
+    /// Note that the [account manager](crate::accounts::Accounts) is designed to handle the
+    /// common case for using multiple [`Context`] instances.
+    ///
+    /// [`Accounts::set_stock_translation`]: crate::accounts::Accounts::set_stock_translation
+    pub fn with_stock_strings(mut self, stock_strings: StockStrings) -> Self {
+        self.stock_strings = stock_strings;
+        self
+    }
+
+    /// Sets the password to unlock the database.
+    ///
+    /// If an encrypted database is used it must be opened with a password.  Setting a
+    /// password on a new database will enable encryption.
+    pub fn with_password(mut self, password: String) -> Self {
+        self.password = Some(password);
+        self
+    }
+
+    /// Opens the [`Context`].
+    pub async fn open(self) -> Result<Context, ContextError> {
+        let context =
+            Context::new_closed(&self.dbfile, self.id, self.events, self.stock_strings).await?;
+        let password = self.password.unwrap_or_default();
+        match context.open(password).await? {
+            true => Ok(context),
+            false => Err(ContextError::DatabaseEncrypted),
+        }
+    }
+}
+
+#[non_exhaustive]
+#[derive(Debug, thiserror::Error)]
+pub enum ContextError {
+    #[error("database could not be decrypted, incorrect or missing password")]
+    DatabaseEncrypted,
+    #[error("failed to open context")]
+    Other(#[from] anyhow::Error),
+}
+
+/// The context for a single DeltaChat account.
+///
+/// This contains all the state for a single DeltaChat account, including background tasks
+/// running in Tokio to operate the account.  The [`Context`] can be cheaply cloned.
+///
+/// Each context, and thus each account, must be associated with an directory where all the
+/// state is kept.  This state is also preserved between restarts.
+///
+/// To use multiple accounts it is best to look at the [accounts
+/// manager][crate::accounts::Accounts] which handles storing multiple accounts in a single
+/// directory structure and handles loading them all concurrently.
 #[derive(Clone, Debug)]
 pub struct Context {
     pub(crate) inner: Arc<InnerContext>,
@@ -51,7 +202,7 @@ pub struct InnerContext {
     pub(crate) oauth2_mutex: Mutex<()>,
     /// Mutex to prevent a race condition when a "your pw is wrong" warning is sent, resulting in multiple messeges being sent.
     pub(crate) wrong_pw_warning_mutex: Mutex<()>,
-    pub(crate) translated_stockstrings: RwLock<HashMap<usize, String>>,
+    pub(crate) translated_stockstrings: StockStrings,
     pub(crate) events: Events,
 
     pub(crate) scheduler: RwLock<Option<Scheduler>>,
@@ -119,8 +270,13 @@ pub fn get_info() -> BTreeMap<&'static str, String> {
 
 impl Context {
     /// Creates new context and opens the database.
-    pub async fn new(dbfile: &Path, id: u32, events: Events) -> Result<Context> {
-        let context = Self::new_closed(dbfile, id, events).await?;
+    pub async fn new(
+        dbfile: &Path,
+        id: u32,
+        events: Events,
+        stock_strings: StockStrings,
+    ) -> Result<Context> {
+        let context = Self::new_closed(dbfile, id, events, stock_strings).await?;
 
         // Open the database if is not encrypted.
         if context.check_passphrase("".to_string()).await? {
@@ -130,7 +286,12 @@ impl Context {
     }
 
     /// Creates new context without opening the database.
-    pub async fn new_closed(dbfile: &Path, id: u32, events: Events) -> Result<Context> {
+    pub async fn new_closed(
+        dbfile: &Path,
+        id: u32,
+        events: Events,
+        stockstrings: StockStrings,
+    ) -> Result<Context> {
         let mut blob_fname = OsString::new();
         blob_fname.push(dbfile.file_name().unwrap_or_default());
         blob_fname.push("-blobs");
@@ -138,7 +299,7 @@ impl Context {
         if !blobdir.exists() {
             tokio::fs::create_dir_all(&blobdir).await?;
         }
-        let context = Context::with_blobdir(dbfile.into(), blobdir, id, events).await?;
+        let context = Context::with_blobdir(dbfile.into(), blobdir, id, events, stockstrings)?;
         Ok(context)
     }
 
@@ -169,11 +330,12 @@ impl Context {
         self.sql.check_passphrase(passphrase).await
     }
 
-    pub(crate) async fn with_blobdir(
+    pub(crate) fn with_blobdir(
         dbfile: PathBuf,
         blobdir: PathBuf,
         id: u32,
         events: Events,
+        stockstrings: StockStrings,
     ) -> Result<Context> {
         ensure!(
             blobdir.is_dir(),
@@ -190,7 +352,7 @@ impl Context {
             generating_key_mutex: Mutex::new(()),
             oauth2_mutex: Mutex::new(()),
             wrong_pw_warning_mutex: Mutex::new(()),
-            translated_stockstrings: RwLock::new(HashMap::new()),
+            translated_stockstrings: stockstrings,
             events,
             scheduler: RwLock::new(None),
             ratelimit: RwLock::new(Ratelimit::new(Duration::new(60, 0), 6.0)), // Allow to send 6 messages immediately, no more than once every 10 seconds.
@@ -346,6 +508,7 @@ impl Context {
         }
     }
 
+    #[allow(unused)]
     pub(crate) async fn shall_stop_ongoing(&self) -> bool {
         match &*self.running_state.read().await {
             RunningState::Running { .. } => false,
@@ -407,6 +570,10 @@ impl Context {
             .await?
             .unwrap_or_default();
 
+        let configured_inbox_folder = self
+            .get_config(Config::ConfiguredInboxFolder)
+            .await?
+            .unwrap_or_else(|| "<unset>".to_string());
         let configured_sentbox_folder = self
             .get_config(Config::ConfiguredSentboxFolder)
             .await?
@@ -478,6 +645,7 @@ impl Context {
         res.insert("mvbox_move", mvbox_move.to_string());
         res.insert("only_fetch_mvbox", only_fetch_mvbox.to_string());
         res.insert("folders_configured", folders_configured.to_string());
+        res.insert("configured_inbox_folder", configured_inbox_folder);
         res.insert("configured_sentbox_folder", configured_sentbox_folder);
         res.insert("configured_mvbox_folder", configured_mvbox_folder);
         res.insert("mdns_enabled", mdns_enabled.to_string());
@@ -530,6 +698,12 @@ impl Context {
             self.get_config_int(Config::QuotaExceeding)
                 .await?
                 .to_string(),
+        );
+        res.insert(
+            "authserv_id_candidates",
+            self.get_config(Config::AuthservIdCandidates)
+                .await?
+                .unwrap_or_default(),
         );
 
         let elapsed = self.creation_time.elapsed();
@@ -637,7 +811,7 @@ impl Context {
                         ON m.chat_id=c.id
                  WHERE m.chat_id>9
                    AND m.hidden=0
-                   AND c.blocked=0
+                   AND c.blocked!=1
                    AND ct.blocked=0
                    AND m.txt LIKE ?
                  ORDER BY m.id DESC LIMIT 1000",
@@ -690,6 +864,8 @@ mod tests {
     use crate::chat::{
         get_chat_contacts, get_chat_msgs, send_msg, set_muted, Chat, ChatId, MuteDuration,
     };
+    use crate::chatlist::Chatlist;
+    use crate::constants::Chattype;
     use crate::contact::ContactId;
     use crate::message::{Message, Viewtype};
     use crate::receive_imf::receive_imf;
@@ -705,7 +881,7 @@ mod tests {
         let tmp = tempfile::tempdir()?;
         let dbfile = tmp.path().join("db.sqlite");
         tokio::fs::write(&dbfile, b"123").await?;
-        let res = Context::new(&dbfile, 1, Events::new()).await?;
+        let res = Context::new(&dbfile, 1, Events::new(), StockStrings::new()).await?;
 
         // Broken database is indistinguishable from encrypted one.
         assert_eq!(res.is_open().await, false);
@@ -851,7 +1027,9 @@ mod tests {
     async fn test_blobdir_exists() {
         let tmp = tempfile::tempdir().unwrap();
         let dbfile = tmp.path().join("db.sqlite");
-        Context::new(&dbfile, 1, Events::new()).await.unwrap();
+        Context::new(&dbfile, 1, Events::new(), StockStrings::new())
+            .await
+            .unwrap();
         let blobdir = tmp.path().join("db.sqlite-blobs");
         assert!(blobdir.is_dir());
     }
@@ -862,7 +1040,7 @@ mod tests {
         let dbfile = tmp.path().join("db.sqlite");
         let blobdir = tmp.path().join("db.sqlite-blobs");
         tokio::fs::write(&blobdir, b"123").await.unwrap();
-        let res = Context::new(&dbfile, 1, Events::new()).await;
+        let res = Context::new(&dbfile, 1, Events::new(), StockStrings::new()).await;
         assert!(res.is_err());
     }
 
@@ -872,7 +1050,9 @@ mod tests {
         let subdir = tmp.path().join("subdir");
         let dbfile = subdir.join("db.sqlite");
         let dbfile2 = dbfile.clone();
-        Context::new(&dbfile, 1, Events::new()).await.unwrap();
+        Context::new(&dbfile, 1, Events::new(), StockStrings::new())
+            .await
+            .unwrap();
         assert!(subdir.is_dir());
         assert!(dbfile2.is_file());
     }
@@ -882,7 +1062,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dbfile = tmp.path().join("db.sqlite");
         let blobdir = PathBuf::new();
-        let res = Context::with_blobdir(dbfile, blobdir, 1, Events::new()).await;
+        let res = Context::with_blobdir(dbfile, blobdir, 1, Events::new(), StockStrings::new());
         assert!(res.is_err());
     }
 
@@ -891,7 +1071,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dbfile = tmp.path().join("db.sqlite");
         let blobdir = tmp.path().join("blobs");
-        let res = Context::with_blobdir(dbfile, blobdir, 1, Events::new()).await;
+        let res = Context::with_blobdir(dbfile, blobdir, 1, Events::new(), StockStrings::new());
         assert!(res.is_err());
     }
 
@@ -1022,6 +1202,59 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_search_unaccepted_requests() -> Result<()> {
+        let t = TestContext::new_alice().await;
+        receive_imf(
+            &t,
+            b"From: BobBar <bob@example.org>\n\
+                 To: alice@example.org\n\
+                 Subject: foo\n\
+                 Message-ID: <msg1234@example.org>\n\
+                 Chat-Version: 1.0\n\
+                 Date: Tue, 25 Oct 2022 13:37:00 +0000\n\
+                 \n\
+                 hello bob, foobar test!\n",
+            false,
+        )
+        .await?;
+        let chat_id = t.get_last_msg().await.get_chat_id();
+        let chat = Chat::load_from_db(&t, chat_id).await?;
+        assert_eq!(chat.get_type(), Chattype::Single);
+        assert!(chat.is_contact_request());
+
+        assert_eq!(Chatlist::try_load(&t, 0, None, None).await?.len(), 1);
+        assert_eq!(
+            Chatlist::try_load(&t, 0, Some("BobBar"), None).await?.len(),
+            1
+        );
+        assert_eq!(t.search_msgs(None, "foobar").await?.len(), 1);
+        assert_eq!(t.search_msgs(Some(chat_id), "foobar").await?.len(), 1);
+
+        chat_id.block(&t).await?;
+
+        assert_eq!(Chatlist::try_load(&t, 0, None, None).await?.len(), 0);
+        assert_eq!(
+            Chatlist::try_load(&t, 0, Some("BobBar"), None).await?.len(),
+            0
+        );
+        assert_eq!(t.search_msgs(None, "foobar").await?.len(), 0);
+        assert_eq!(t.search_msgs(Some(chat_id), "foobar").await?.len(), 0);
+
+        let contact_ids = get_chat_contacts(&t, chat_id).await?;
+        Contact::unblock(&t, *contact_ids.first().unwrap()).await?;
+
+        assert_eq!(Chatlist::try_load(&t, 0, None, None).await?.len(), 1);
+        assert_eq!(
+            Chatlist::try_load(&t, 0, Some("BobBar"), None).await?.len(),
+            1
+        );
+        assert_eq!(t.search_msgs(None, "foobar").await?.len(), 1);
+        assert_eq!(t.search_msgs(Some(chat_id), "foobar").await?.len(), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_limit_search_msgs() -> Result<()> {
         let alice = TestContext::new_alice().await;
         let chat = alice
@@ -1060,7 +1293,7 @@ mod tests {
         let dbfile = dir.path().join("db.sqlite");
 
         let id = 1;
-        let context = Context::new_closed(&dbfile, id, Events::new())
+        let context = Context::new_closed(&dbfile, id, Events::new(), StockStrings::new())
             .await
             .context("failed to create context")?;
         assert_eq!(context.open("foo".to_string()).await?, true);
@@ -1068,7 +1301,7 @@ mod tests {
         drop(context);
 
         let id = 2;
-        let context = Context::new(&dbfile, id, Events::new())
+        let context = Context::new(&dbfile, id, Events::new(), StockStrings::new())
             .await
             .context("failed to create context")?;
         assert_eq!(context.is_open().await, false);

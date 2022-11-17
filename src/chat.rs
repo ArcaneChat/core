@@ -1130,8 +1130,8 @@ impl Chat {
     }
 
     /// Returns mailing list address where messages are sent to.
-    pub fn get_mailinglist_addr(&self) -> &str {
-        self.param.get(Param::ListPost).unwrap_or_default()
+    pub fn get_mailinglist_addr(&self) -> Option<&str> {
+        self.param.get(Param::ListPost)
     }
 
     /// Returns profile image path for the chat.
@@ -2254,7 +2254,7 @@ pub async fn get_chat_msgs(
                 let curr_day = curr_local_timestamp / 86400;
                 if curr_day != last_day {
                     ret.push(ChatItem::DayMarker {
-                        timestamp: curr_day,
+                        timestamp: curr_day * 86400, // Convert day back to Unix timestamp
                     });
                     last_day = curr_day;
                 }
@@ -2439,7 +2439,7 @@ pub async fn get_chat_media(
                 AND hidden=0
               ORDER BY timestamp, id;",
             paramsv![
-                if chat_id.is_none() { 1i32 } else { 0i32 },
+                chat_id.is_none(),
                 chat_id.unwrap_or_else(|| ChatId::new(0)),
                 msg_type,
                 if msg_type2 != Viewtype::Unknown {
@@ -2525,7 +2525,7 @@ pub async fn get_chat_contacts(context: &Context, chat_id: ChatId) -> Result<Vec
                LEFT JOIN contacts c
                       ON c.id=cc.contact_id
               WHERE cc.chat_id=?
-              ORDER BY c.id=1, LOWER(c.name||c.addr), c.id;",
+              ORDER BY c.id=1, c.last_seen DESC, c.id DESC;",
             paramsv![chat_id],
             |row| row.get::<_, ContactId>(0),
             |ids| ids.collect::<Result<Vec<_>, _>>().map_err(Into::into),
@@ -2863,7 +2863,7 @@ pub async fn remove_contact_from_chat(
     let mut success = false;
 
     /* we do not check if "contact_id" exists but just delete all records with the id from chats_contacts */
-    /* this allows to delete pending references to deleted contacts.  Of course, this should _not_ happen. */
+    /* this allows to delete pending references to deleted contacts. Of course, this should _not_ happen. */
     if let Ok(chat) = Chat::load_from_db(context, chat_id).await {
         if chat.typ == Chattype::Group || chat.typ == Chattype::Broadcast {
             if !chat.is_self_in_chat(context).await? {
@@ -3369,6 +3369,15 @@ pub(crate) async fn delete_and_reset_all_device_msgs(context: &Context) -> Resul
         .sql
         .execute("DELETE FROM devmsglabels;", paramsv![])
         .await?;
+
+    // Insert labels for welcome messages to avoid them being readded on reconfiguration.
+    context
+        .sql
+        .execute(
+            r#"INSERT INTO devmsglabels (label) VALUES ("core-welcome-image"), ("core-welcome")"#,
+            paramsv![],
+        )
+        .await?;
     context.set_config(Config::QuotaExceeding, None).await?;
     Ok(())
 }
@@ -3693,11 +3702,11 @@ mod tests {
 
         // create group and sync it to the second device
         let a1_chat_id = create_group_chat(&a1, ProtectionStatus::Unprotected, "foo").await?;
-        a1.send_text(a1_chat_id, "ho!").await;
+        let sent = a1.send_text(a1_chat_id, "ho!").await;
         let a1_msg = a1.get_last_msg().await;
         let a1_chat = Chat::load_from_db(&a1, a1_chat_id).await?;
 
-        let a2_msg = a2.recv_msg(&a1.pop_sent_msg().await).await;
+        let a2_msg = a2.recv_msg(&sent).await;
         let a2_chat_id = a2_msg.chat_id;
         let a2_chat = Chat::load_from_db(&a2, a2_chat_id).await?;
 
@@ -4554,26 +4563,24 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_set_protection() {
+    async fn test_set_protection() -> Result<()> {
         let t = TestContext::new_alice().await;
-        let chat_id = create_group_chat(&t, ProtectionStatus::Unprotected, "foo")
-            .await
-            .unwrap();
-        let chat = Chat::load_from_db(&t, chat_id).await.unwrap();
+        t.set_config_bool(Config::BccSelf, false).await?;
+        let chat_id = create_group_chat(&t, ProtectionStatus::Unprotected, "foo").await?;
+        let chat = Chat::load_from_db(&t, chat_id).await?;
         assert!(!chat.is_protected());
         assert!(chat.is_unpromoted());
 
         // enable protection on unpromoted chat, the info-message is added via add_info_msg()
         chat_id
             .set_protection(&t, ProtectionStatus::Protected)
-            .await
-            .unwrap();
+            .await?;
 
-        let chat = Chat::load_from_db(&t, chat_id).await.unwrap();
+        let chat = Chat::load_from_db(&t, chat_id).await?;
         assert!(chat.is_protected());
         assert!(chat.is_unpromoted());
 
-        let msgs = get_chat_msgs(&t, chat_id, 0).await.unwrap();
+        let msgs = get_chat_msgs(&t, chat_id, 0).await?;
         assert_eq!(msgs.len(), 1);
 
         let msg = t.get_last_msg_in(chat_id).await;
@@ -4584,10 +4591,9 @@ mod tests {
         // disable protection again, still unpromoted
         chat_id
             .set_protection(&t, ProtectionStatus::Unprotected)
-            .await
-            .unwrap();
+            .await?;
 
-        let chat = Chat::load_from_db(&t, chat_id).await.unwrap();
+        let chat = Chat::load_from_db(&t, chat_id).await?;
         assert!(!chat.is_protected());
         assert!(chat.is_unpromoted());
 
@@ -4597,21 +4603,20 @@ mod tests {
         assert_eq!(msg.get_state(), MessageState::InNoticed);
 
         // send a message, this switches to promoted state
-        send_text_msg(&t, chat_id, "hi!".to_string()).await.unwrap();
+        send_text_msg(&t, chat_id, "hi!".to_string()).await?;
 
-        let chat = Chat::load_from_db(&t, chat_id).await.unwrap();
+        let chat = Chat::load_from_db(&t, chat_id).await?;
         assert!(!chat.is_protected());
         assert!(!chat.is_unpromoted());
 
-        let msgs = get_chat_msgs(&t, chat_id, 0).await.unwrap();
+        let msgs = get_chat_msgs(&t, chat_id, 0).await?;
         assert_eq!(msgs.len(), 3);
 
         // enable protection on promoted chat, the info-message is sent via send_msg() this time
         chat_id
             .set_protection(&t, ProtectionStatus::Protected)
-            .await
-            .unwrap();
-        let chat = Chat::load_from_db(&t, chat_id).await.unwrap();
+            .await?;
+        let chat = Chat::load_from_db(&t, chat_id).await?;
         assert!(chat.is_protected());
         assert!(!chat.is_unpromoted());
 
@@ -4619,6 +4624,8 @@ mod tests {
         assert!(msg.is_info());
         assert_eq!(msg.get_info_type(), SystemMessage::ChatProtectionEnabled);
         assert_eq!(msg.get_state(), MessageState::OutDelivered); // as bcc-self is disabled and there is nobody else in the chat
+
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5456,8 +5463,8 @@ mod tests {
         assert_eq!(
             chat_id.get_encryption_info(&alice).await?,
             "No encryption:\n\
-            bob@example.net\n\
-            fiona@example.net"
+            fiona@example.net\n\
+            bob@example.net"
         );
 
         let direct_chat = bob.create_chat(&alice).await;

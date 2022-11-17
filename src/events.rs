@@ -173,6 +173,13 @@ pub enum EventType {
         msg_id: MsgId,
     },
 
+    /// Reactions for the message changed.
+    ReactionsChanged {
+        chat_id: ChatId,
+        msg_id: MsgId,
+        contact_id: ContactId,
+    },
+
     /// There is a fresh message. Typically, the user will show an notification
     /// when receiving this message.
     ///
@@ -180,6 +187,10 @@ pub enum EventType {
     IncomingMsg {
         chat_id: ChatId,
         msg_id: MsgId,
+    },
+
+    IncomingMsgBunch {
+        msg_ids: Vec<MsgId>,
     },
 
     /// Messages were seen or noticed.
@@ -301,5 +312,10 @@ pub enum EventType {
     WebxdcStatusUpdate {
         msg_id: MsgId,
         status_update_serial: StatusUpdateSerial,
+    },
+
+    /// Inform that a message containing a webxdc instance has been deleted
+    WebxdcInstanceDeleted {
+        msg_id: MsgId,
     },
 }

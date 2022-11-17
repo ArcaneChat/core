@@ -33,6 +33,7 @@ use crate::mimeparser::{
 };
 use crate::param::{Param, Params};
 use crate::peerstate::{Peerstate, PeerstateKeyType, PeerstateVerifiedStatus};
+use crate::reaction::{set_msg_reaction, Reaction};
 use crate::securejoin::{self, handle_securejoin_handshake, observe_securejoin_on_other_device};
 use crate::sql;
 use crate::stock_str;
@@ -172,10 +173,13 @@ pub(crate) async fn receive_imf_inner(
     .await?;
 
     let rcvd_timestamp = smeared_time(context).await;
+
+    // Sender timestamp is allowed to be a bit in the future due to
+    // unsynchronized clocks, but not too much.
     let sent_timestamp = mime_parser
         .get_header(HeaderDef::Date)
         .and_then(|value| mailparse::dateparse(value).ok())
-        .map_or(rcvd_timestamp, |value| min(value, rcvd_timestamp));
+        .map_or(rcvd_timestamp, |value| min(value, rcvd_timestamp + 60));
 
     // Add parts
     let received_msg = add_parts(
@@ -388,6 +392,9 @@ pub async fn from_field_to_contact_id(
     }
 }
 
+/// Creates a `ReceivedMsg` from given parts which might consist of
+/// mulitple messages (if there are multiple attachments).
+/// Every entry in `mime_parser.parts` produces a new row in the `msgs` table.
 #[allow(clippy::too_many_arguments, clippy::cognitive_complexity)]
 async fn add_parts(
     context: &Context,
@@ -401,7 +408,7 @@ async fn add_parts(
     from_id: ContactId,
     seen: bool,
     is_partial_download: Option<u32>,
-    replace_msg_id: Option<MsgId>,
+    mut replace_msg_id: Option<MsgId>,
     fetching_existing_messages: bool,
     prevent_rename: bool,
 ) -> Result<ReceivedMsg> {
@@ -427,8 +434,9 @@ async fn add_parts(
     };
     // incoming non-chat messages may be discarded
 
-    let location_kml_is = mime_parser.location_kml.is_some();
+    let is_location_kml = mime_parser.location_kml.is_some();
     let is_mdn = !mime_parser.mdn_reports.is_empty();
+    let is_reaction = mime_parser.parts.iter().any(|part| part.is_reaction);
     let show_emails =
         ShowEmails::from_i32(context.get_config_int(Config::ShowEmails).await?).unwrap_or_default();
 
@@ -447,7 +455,7 @@ async fn add_parts(
             ShowEmails::All => allow_creation = !is_mdn,
         }
     } else {
-        allow_creation = !is_mdn;
+        allow_creation = !is_mdn && !is_reaction;
     }
 
     // check if the message introduces a new chat:
@@ -492,7 +500,7 @@ async fn add_parts(
         }
 
         let test_normal_chat = if from_id == ContactId::UNDEFINED {
-            Default::default()
+            None
         } else {
             ChatIdBlocked::lookup_by_contact(context, from_id).await?
         };
@@ -513,6 +521,9 @@ async fn add_parts(
             }
         }
 
+        // signals wether the current user is a bot
+        let is_bot = context.get_config(Config::Bot).await?.is_some();
+
         if chat_id.is_none() {
             // try to create a group
 
@@ -521,6 +532,7 @@ async fn add_parts(
                     id: _,
                     blocked: Blocked::Not,
                 }) => Blocked::Not,
+                _ if is_bot => Blocked::Not,
                 _ => Blocked::Request,
             };
 
@@ -540,6 +552,9 @@ async fn add_parts(
             {
                 chat_id = Some(new_chat_id);
                 chat_id_blocked = new_chat_id_blocked;
+
+                // if the chat is somehow blocked but we want to create a non-blocked chat,
+                // unblock the chat
                 if chat_id_blocked != Blocked::Not && create_blocked == Blocked::Not {
                     new_chat_id.unblock(context).await?;
                     chat_id_blocked = Blocked::Not;
@@ -637,10 +652,10 @@ async fn add_parts(
                 Blocked::Not
             } else {
                 let contact = Contact::load_from_db(context, from_id).await?;
-                if contact.is_blocked() {
-                    Blocked::Yes
-                } else {
-                    Blocked::Request
+                match contact.is_blocked() {
+                    true => Blocked::Yes,
+                    false if is_bot => Blocked::Not,
+                    false => Blocked::Request,
                 }
             };
 
@@ -679,7 +694,8 @@ async fn add_parts(
         state = if seen
             || fetching_existing_messages
             || is_mdn
-            || location_kml_is
+            || is_reaction
+            || is_location_kml
             || securejoin_seen
             || chat_id_blocked == Blocked::Yes
         {
@@ -831,14 +847,15 @@ async fn add_parts(
         }
     }
 
-    if is_mdn {
-        chat_id = Some(DC_CHAT_ID_TRASH);
-    }
-
-    let chat_id = chat_id.unwrap_or_else(|| {
-        info!(context, "No chat id for message (TRASH)");
+    let orig_chat_id = chat_id;
+    let chat_id = if is_mdn || is_reaction {
         DC_CHAT_ID_TRASH
-    });
+    } else {
+        chat_id.unwrap_or_else(|| {
+            info!(context, "No chat id for message (TRASH)");
+            DC_CHAT_ID_TRASH
+        })
+    };
 
     // Extract ephemeral timer from the message or use the existing timer if the message is not fully downloaded.
     let mut ephemeral_timer = if is_partial_download.is_some() {
@@ -1043,11 +1060,41 @@ async fn add_parts(
     let conn = context.sql.get_conn().await?;
 
     for part in &mime_parser.parts {
+        if part.is_reaction {
+            set_msg_reaction(
+                context,
+                &mime_in_reply_to,
+                orig_chat_id.unwrap_or_default(),
+                from_id,
+                Reaction::from(part.msg.as_str()),
+            )
+            .await?;
+        }
+
+        let mut param = part.param.clone();
+        if is_system_message != SystemMessage::Unknown {
+            param.set_int(Param::Cmd, is_system_message as i32);
+        }
+        if let Some(replace_msg_id) = replace_msg_id {
+            let placeholder = Message::load_from_db(context, replace_msg_id).await?;
+            for key in [
+                Param::WebxdcSummary,
+                Param::WebxdcSummaryTimestamp,
+                Param::WebxdcDocument,
+                Param::WebxdcDocumentTimestamp,
+            ] {
+                if let Some(value) = placeholder.param.get(key) {
+                    param.set(key, value);
+                }
+            }
+        }
+
         let mut txt_raw = "".to_string();
         let mut stmt = conn.prepare_cached(
             r#"
 INSERT INTO msgs
   (
+    id,
     rfc724_mid, chat_id,
     from_id, to_id, timestamp, timestamp_sent, 
     timestamp_rcvd, type, state, msgrmsg, 
@@ -1057,13 +1104,22 @@ INSERT INTO msgs
     ephemeral_timestamp, download_state, hop_info
   )
   VALUES (
+    ?,
     ?, ?, ?, ?,
     ?, ?, ?, ?,
     ?, ?, ?, ?,
     ?, ?, ?, ?,
     ?, ?, ?, ?,
     ?, ?, ?, ?
-  );
+  )
+ON CONFLICT (id) DO UPDATE
+SET rfc724_mid=excluded.rfc724_mid, chat_id=excluded.chat_id,
+    from_id=excluded.from_id, to_id=excluded.to_id, timestamp=excluded.timestamp, timestamp_sent=excluded.timestamp_sent,
+    timestamp_rcvd=excluded.timestamp_rcvd, type=excluded.type, state=excluded.state, msgrmsg=excluded.msgrmsg,
+    txt=excluded.txt, subject=excluded.subject, txt_raw=excluded.txt_raw, param=excluded.param,
+    bytes=excluded.bytes, mime_headers=excluded.mime_headers, mime_in_reply_to=excluded.mime_in_reply_to,
+    mime_references=excluded.mime_references, mime_modified=excluded.mime_modified, error=excluded.error, ephemeral_timer=excluded.ephemeral_timer,
+    ephemeral_timestamp=excluded.ephemeral_timestamp, download_state=excluded.download_state, hop_info=excluded.hop_info
 "#,
         )?;
 
@@ -1085,11 +1141,6 @@ INSERT INTO msgs
             txt_raw = format!("{}\n\n{}", subject, msg_raw);
         }
 
-        let mut param = part.param.clone();
-        if is_system_message != SystemMessage::Unknown {
-            param.set_int(Param::Cmd, is_system_message as i32);
-        }
-
         let ephemeral_timestamp = if in_fresh {
             0
         } else {
@@ -1103,9 +1154,10 @@ INSERT INTO msgs
 
         // If you change which information is skipped if the message is trashed,
         // also change `MsgId::trash()` and `delete_expired_messages()`
-        let trash = chat_id.is_trash() || (location_kml_is && msg.is_empty());
+        let trash = chat_id.is_trash() || (is_location_kml && msg.is_empty());
 
         stmt.execute(paramsv![
+            replace_msg_id,
             rfc724_mid,
             if trash { DC_CHAT_ID_TRASH } else { chat_id },
             if trash { ContactId::UNDEFINED } else { from_id },
@@ -1144,6 +1196,10 @@ INSERT INTO msgs
             },
             mime_parser.hop_info
         ])?;
+
+        // We only replace placeholder with a first part,
+        // afterwards insert additional parts.
+        replace_msg_id = None;
         let row_id = conn.last_insert_rowid();
 
         drop(stmt);
@@ -1152,14 +1208,8 @@ INSERT INTO msgs
     drop(conn);
 
     if let Some(replace_msg_id) = replace_msg_id {
-        if let Some(created_msg_id) = created_db_entries.pop() {
-            context
-                .merge_messages(created_msg_id, replace_msg_id)
-                .await?;
-            created_db_entries.push(replace_msg_id);
-        } else {
-            replace_msg_id.delete_from_db(context).await?;
-        }
+        // "Replace" placeholder with a message that has no parts.
+        replace_msg_id.delete_from_db(context).await?;
     }
 
     chat_id.unarchive_if_not_muted(context).await?;
@@ -1854,7 +1904,7 @@ async fn apply_mailinglist_changes(
             Contact::add_or_lookup(context, "", list_post, Origin::Hidden).await?;
         let mut contact = Contact::load_from_db(context, contact_id).await?;
         if contact.param.get(Param::ListId) != Some(listid) {
-            contact.param.set(Param::ListId, &listid);
+            contact.param.set(Param::ListId, listid);
             contact.update_param(context).await?;
         }
 
@@ -1862,7 +1912,7 @@ async fn apply_mailinglist_changes(
             if list_post != old_list_post {
                 // Apparently the mailing list is using a different List-Post header in each message.
                 // Make the mailing list read-only because we would't know which message the user wants to reply to.
-                chat.param.set(Param::ListPost, "");
+                chat.param.remove(Param::ListPost);
                 chat.update_param(context).await?;
             }
         } else {
@@ -2939,7 +2989,7 @@ mod tests {
         assert!(chat.can_send(&t.ctx).await?);
         assert_eq!(
             chat.get_mailinglist_addr(),
-            "reply+elernshsetushoyseshetihseusaferuhsedtisneu@reply.github.com"
+            Some("reply+elernshsetushoyseshetihseusaferuhsedtisneu@reply.github.com")
         );
         assert_eq!(chat.name, "deltachat/deltachat-core-rust");
         assert_eq!(chat::get_chat_contacts(&t.ctx, chat_id).await?.len(), 1);
@@ -2948,7 +2998,7 @@ mod tests {
 
         let chat = chat::Chat::load_from_db(&t.ctx, chat_id).await?;
         assert!(!chat.can_send(&t.ctx).await?);
-        assert_eq!(chat.get_mailinglist_addr(), "");
+        assert_eq!(chat.get_mailinglist_addr(), None);
 
         let chats = Chatlist::try_load(&t.ctx, 0, None, None).await?;
         assert_eq!(chats.len(), 1);
@@ -3007,7 +3057,7 @@ mod tests {
         let chat = Chat::load_from_db(&t.ctx, chat_id).await.unwrap();
         assert_eq!(chat.name, "delta-dev");
         assert!(chat.can_send(&t).await?);
-        assert_eq!(chat.get_mailinglist_addr(), "delta@codespeak.net");
+        assert_eq!(chat.get_mailinglist_addr(), Some("delta@codespeak.net"));
 
         let msg = get_chat_msg(&t, chat_id, 0, 1).await;
         let contact1 = Contact::load_from_db(&t.ctx, msg.from_id).await.unwrap();
@@ -3099,6 +3149,7 @@ Hello mailinglist!\r\n"
             .unwrap();
 
         receive_imf(&t.ctx, DC_MAILINGLIST, false).await.unwrap();
+        t.evtracker.wait_next_incoming_message().await;
         let chats = Chatlist::try_load(&t.ctx, 0, None, None).await.unwrap();
         assert_eq!(chats.len(), 1);
         let chat_id = chats.get_chat_id(0).unwrap();
@@ -3111,7 +3162,6 @@ Hello mailinglist!\r\n"
         let chats = Chatlist::try_load(&t.ctx, 0, None, None).await.unwrap();
         assert_eq!(chats.len(), 0); // Test that the message disappeared
 
-        t.evtracker.consume_events().await;
         receive_imf(&t.ctx, DC_MAILINGLIST2, false).await.unwrap();
 
         // Check that no notification is displayed for blocked mailing list message.
@@ -3270,7 +3320,7 @@ Hello mailinglist!\r\n"
         assert_eq!(chat.name, "ola");
         assert_eq!(chat::get_chat_msgs(&t, chat.id, 0).await.unwrap().len(), 1);
         assert!(!chat.can_send(&t).await?);
-        assert_eq!(chat.get_mailinglist_addr(), "");
+        assert_eq!(chat.get_mailinglist_addr(), None);
 
         // receive another message with no sender name but the same address,
         // make sure this lands in the same chat
@@ -3323,7 +3373,7 @@ Hello mailinglist!\r\n"
         );
         assert_eq!(chat.name, "Atlas Obscura");
         assert!(!chat.can_send(&t).await?);
-        assert_eq!(chat.get_mailinglist_addr(), "");
+        assert_eq!(chat.get_mailinglist_addr(), None);
 
         Ok(())
     }
@@ -3352,7 +3402,7 @@ Hello mailinglist!\r\n"
         assert_eq!(chat.grpid, "1234ABCD-123LMNO.mailing.dhl.de");
         assert_eq!(chat.name, "DHL Paket");
         assert!(!chat.can_send(&t).await?);
-        assert_eq!(chat.get_mailinglist_addr(), "");
+        assert_eq!(chat.get_mailinglist_addr(), None);
 
         Ok(())
     }
@@ -3381,7 +3431,7 @@ Hello mailinglist!\r\n"
         assert_eq!(chat.grpid, "dpdde.mxmail.service.dpd.de");
         assert_eq!(chat.name, "DPD");
         assert!(!chat.can_send(&t).await?);
-        assert_eq!(chat.get_mailinglist_addr(), "");
+        assert_eq!(chat.get_mailinglist_addr(), None);
 
         Ok(())
     }
@@ -3402,7 +3452,7 @@ Hello mailinglist!\r\n"
         assert_eq!(chat.grpid, "96540.xt.local");
         assert_eq!(chat.name, "Microsoft Store");
         assert!(!chat.can_send(&t).await?);
-        assert_eq!(chat.get_mailinglist_addr(), "");
+        assert_eq!(chat.get_mailinglist_addr(), None);
 
         receive_imf(
             &t,
@@ -3415,7 +3465,7 @@ Hello mailinglist!\r\n"
         assert_eq!(chat.grpid, "121231234.xt.local");
         assert_eq!(chat.name, "DER SPIEGEL Kundenservice");
         assert!(!chat.can_send(&t).await?);
-        assert_eq!(chat.get_mailinglist_addr(), "");
+        assert_eq!(chat.get_mailinglist_addr(), None);
 
         Ok(())
     }
@@ -3438,7 +3488,7 @@ Hello mailinglist!\r\n"
         assert_eq!(chat.grpid, "51231231231231231231231232869f58.xing.com");
         assert_eq!(chat.name, "xing.com");
         assert!(!chat.can_send(&t).await?);
-        assert_eq!(chat.get_mailinglist_addr(), "");
+        assert_eq!(chat.get_mailinglist_addr(), None);
 
         Ok(())
     }
@@ -3560,6 +3610,27 @@ Hello mailinglist!\r\n"
             contact.param.get(Param::ListId).unwrap(),
             "deltachat-core-rust.deltachat.github.com"
         )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_mailing_list_chat_message() {
+        let t = TestContext::new_alice().await;
+
+        receive_imf(
+            &t,
+            include_bytes!("../test-data/message/mailinglist_chat_message.eml"),
+            false,
+        )
+        .await
+        .unwrap();
+        let msg = t.get_last_msg().await;
+        assert_eq!(msg.text, Some("hello, this is a test 👋\n\n_______________________________________________\nTest1 mailing list -- test1@example.net\nTo unsubscribe send an email to test1-leave@example.net".to_string()));
+        assert!(!msg.has_html());
+        let chat = Chat::load_from_db(&t, msg.chat_id).await.unwrap();
+        assert_eq!(chat.typ, Chattype::Mailinglist);
+        assert_eq!(chat.blocked, Blocked::Request);
+        assert_eq!(chat.grpid, "test1.example.net");
+        assert_eq!(chat.name, "Test1");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4595,7 +4666,7 @@ Reply to all"#,
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_chat_assignment_adhoc() -> Result<()> {
         let alice = TestContext::new_alice().await;
-        let bob = TestContext::new_alice().await;
+        let bob = TestContext::new_bob().await;
         alice.set_config(Config::ShowEmails, Some("2")).await?;
         bob.set_config(Config::ShowEmails, Some("2")).await?;
 
@@ -4918,7 +4989,7 @@ Reply from different address
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_long_filenames() -> Result<()> {
-        let mut tcm = TestContextManager::new().await;
+        let mut tcm = TestContextManager::new();
         let alice = tcm.alice().await;
         let bob = tcm.bob().await;
 
@@ -4970,7 +5041,7 @@ Reply from different address
     /// Tests that contact request is accepted automatically on outgoing message.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_accept_outgoing() -> Result<()> {
-        let mut tcm = TestContextManager::new().await;
+        let mut tcm = TestContextManager::new();
         let alice1 = tcm.alice().await;
         let alice2 = tcm.alice().await;
         let bob1 = tcm.bob().await;
@@ -5015,7 +5086,7 @@ Reply from different address
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_outgoing_private_reply_multidevice() -> Result<()> {
-        let mut tcm = TestContextManager::new().await;
+        let mut tcm = TestContextManager::new();
         let alice1 = tcm.alice().await;
         let alice2 = tcm.alice().await;
         let bob = tcm.bob().await;
@@ -5091,8 +5162,19 @@ Reply from different address
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_auto_accept_for_bots() -> Result<()> {
+        let t = TestContext::new_alice().await;
+        t.set_config(Config::Bot, Some("1")).await.unwrap();
+        receive_imf(&t, MSGRMSG, false).await?;
+        let msg = t.get_last_msg().await;
+        let chat = chat::Chat::load_from_db(&t, msg.chat_id).await?;
+        assert!(!chat.is_contact_request());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_no_private_reply_to_blocked_account() -> Result<()> {
-        let mut tcm = TestContextManager::new().await;
+        let mut tcm = TestContextManager::new();
         let alice = tcm.alice().await;
         let bob = tcm.bob().await;
 

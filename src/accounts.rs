@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use crate::context::Context;
 use crate::events::{Event, EventEmitter, EventType, Events};
+use crate::stock_str::StockStrings;
 
 /// Account manager, that can handle multiple accounts in a single place.
 #[derive(Debug)]
@@ -20,6 +21,12 @@ pub struct Accounts {
 
     /// Event channel to emit account manager errors.
     events: Events,
+
+    /// Stock string translations shared by all created contexts.
+    ///
+    /// This way changing a translation for one context automatically
+    /// changes it for all other contexts.
+    pub(crate) stockstrings: StockStrings,
 }
 
 impl Accounts {
@@ -55,8 +62,9 @@ impl Accounts {
             .await
             .context("failed to load accounts config")?;
         let events = Events::new();
+        let stockstrings = StockStrings::new();
         let accounts = config
-            .load_accounts(&events)
+            .load_accounts(&events, &stockstrings)
             .await
             .context("failed to load accounts")?;
 
@@ -65,23 +73,24 @@ impl Accounts {
             config,
             accounts,
             events,
+            stockstrings,
         })
     }
 
     /// Get an account by its `id`:
-    pub async fn get_account(&self, id: u32) -> Option<Context> {
+    pub fn get_account(&self, id: u32) -> Option<Context> {
         self.accounts.get(&id).cloned()
     }
 
     /// Get the currently selected account.
-    pub async fn get_selected_account(&self) -> Option<Context> {
-        let id = self.config.get_selected_account().await;
+    pub fn get_selected_account(&self) -> Option<Context> {
+        let id = self.config.get_selected_account();
         self.accounts.get(&id).cloned()
     }
 
     /// Returns the currently selected account's id or None if no account is selected.
-    pub async fn get_selected_account_id(&self) -> Option<u32> {
-        match self.config.get_selected_account().await {
+    pub fn get_selected_account_id(&self) -> Option<u32> {
+        match self.config.get_selected_account() {
             0 => None,
             id => Some(id),
         }
@@ -104,6 +113,7 @@ impl Accounts {
             &account_config.dbfile(),
             account_config.id,
             self.events.clone(),
+            self.stockstrings.clone(),
         )
         .await?;
         self.accounts.insert(account_config.id, ctx);
@@ -119,6 +129,7 @@ impl Accounts {
             &account_config.dbfile(),
             account_config.id,
             self.events.clone(),
+            self.stockstrings.clone(),
         )
         .await?;
         self.accounts.insert(account_config.id, ctx);
@@ -135,7 +146,7 @@ impl Accounts {
         ctx.stop_io().await;
         drop(ctx);
 
-        if let Some(cfg) = self.config.get_account(id).await {
+        if let Some(cfg) = self.config.get_account(id) {
             // Spend up to 1 minute trying to remove the files.
             // Files may remain locked up to 30 seconds due to r2d2 bug:
             // https://github.com/sfackler/r2d2/issues/99
@@ -171,7 +182,7 @@ impl Accounts {
         ensure!(dbfile.exists(), "no database found: {}", dbfile.display());
         ensure!(blobdir.exists(), "no blobdir found: {}", blobdir.display());
 
-        let old_id = self.config.get_selected_account().await;
+        let old_id = self.config.get_selected_account();
 
         // create new account
         let account_config = self
@@ -204,7 +215,13 @@ impl Accounts {
 
         match res {
             Ok(_) => {
-                let ctx = Context::new(&new_dbfile, account_config.id, self.events.clone()).await?;
+                let ctx = Context::new(
+                    &new_dbfile,
+                    account_config.id,
+                    self.events.clone(),
+                    self.stockstrings.clone(),
+                )
+                .await?;
                 self.accounts.insert(account_config.id, ctx);
                 Ok(account_config.id)
             }
@@ -225,7 +242,7 @@ impl Accounts {
     }
 
     /// Get a list of all account ids.
-    pub async fn get_all(&self) -> Vec<u32> {
+    pub fn get_all(&self) -> Vec<u32> {
         self.accounts.keys().copied().collect()
     }
 
@@ -281,7 +298,7 @@ impl Accounts {
     }
 
     /// Returns event emitter.
-    pub async fn get_event_emitter(&self) -> EventEmitter {
+    pub fn get_event_emitter(&self) -> EventEmitter {
         self.events.get_emitter()
     }
 }
@@ -339,17 +356,31 @@ impl Config {
         Ok(Config { file, inner })
     }
 
-    pub async fn load_accounts(&self, events: &Events) -> Result<BTreeMap<u32, Context>> {
+    /// Loads all accounts defined in the configuration file.
+    ///
+    /// Created contexts share the same event channel and stock string
+    /// translations.
+    pub async fn load_accounts(
+        &self,
+        events: &Events,
+        stockstrings: &StockStrings,
+    ) -> Result<BTreeMap<u32, Context>> {
         let mut accounts = BTreeMap::new();
+
         for account_config in &self.inner.accounts {
-            let ctx = Context::new(&account_config.dbfile(), account_config.id, events.clone())
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to create context from file {:?}",
-                        account_config.dbfile()
-                    )
-                })?;
+            let ctx = Context::new(
+                &account_config.dbfile(),
+                account_config.id,
+                events.clone(),
+                stockstrings.clone(),
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to create context from file {:?}",
+                    account_config.dbfile()
+                )
+            })?;
 
             accounts.insert(account_config.id, ctx);
         }
@@ -380,7 +411,6 @@ impl Config {
             .context("failed to select just added account")?;
         let cfg = self
             .get_account(id)
-            .await
             .context("failed to get just added account")?;
         Ok(cfg)
     }
@@ -402,11 +432,11 @@ impl Config {
         self.sync().await
     }
 
-    async fn get_account(&self, id: u32) -> Option<AccountConfig> {
+    fn get_account(&self, id: u32) -> Option<AccountConfig> {
         self.inner.accounts.iter().find(|e| e.id == id).cloned()
     }
 
-    pub async fn get_selected_account(&self) -> u32 {
+    pub fn get_selected_account(&self) -> u32 {
         self.inner.selected_account
     }
 
@@ -447,6 +477,8 @@ impl AccountConfig {
 mod tests {
     use super::*;
 
+    use crate::stock_str::{self, StockMessage};
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_account_new_open() {
         let dir = tempfile::tempdir().unwrap();
@@ -458,7 +490,7 @@ mod tests {
         let accounts2 = Accounts::open(p).await.unwrap();
 
         assert_eq!(accounts1.accounts.len(), 1);
-        assert_eq!(accounts1.config.get_selected_account().await, 1);
+        assert_eq!(accounts1.config.get_selected_account(), 1);
 
         assert_eq!(accounts1.dir, accounts2.dir);
         assert_eq!(accounts1.config, accounts2.config,);
@@ -472,23 +504,23 @@ mod tests {
 
         let mut accounts = Accounts::new(p.clone()).await.unwrap();
         assert_eq!(accounts.accounts.len(), 0);
-        assert_eq!(accounts.config.get_selected_account().await, 0);
+        assert_eq!(accounts.config.get_selected_account(), 0);
 
         let id = accounts.add_account().await.unwrap();
         assert_eq!(id, 1);
         assert_eq!(accounts.accounts.len(), 1);
-        assert_eq!(accounts.config.get_selected_account().await, 1);
+        assert_eq!(accounts.config.get_selected_account(), 1);
 
         let id = accounts.add_account().await.unwrap();
         assert_eq!(id, 2);
-        assert_eq!(accounts.config.get_selected_account().await, id);
+        assert_eq!(accounts.config.get_selected_account(), id);
         assert_eq!(accounts.accounts.len(), 2);
 
         accounts.select_account(1).await.unwrap();
-        assert_eq!(accounts.config.get_selected_account().await, 1);
+        assert_eq!(accounts.config.get_selected_account(), 1);
 
         accounts.remove_account(1).await.unwrap();
-        assert_eq!(accounts.config.get_selected_account().await, 2);
+        assert_eq!(accounts.config.get_selected_account(), 2);
         assert_eq!(accounts.accounts.len(), 1);
     }
 
@@ -498,17 +530,17 @@ mod tests {
         let p: PathBuf = dir.path().join("accounts");
 
         let mut accounts = Accounts::new(p.clone()).await?;
-        assert!(accounts.get_selected_account().await.is_none());
-        assert_eq!(accounts.config.get_selected_account().await, 0);
+        assert!(accounts.get_selected_account().is_none());
+        assert_eq!(accounts.config.get_selected_account(), 0);
 
         let id = accounts.add_account().await?;
-        assert!(accounts.get_selected_account().await.is_some());
+        assert!(accounts.get_selected_account().is_some());
         assert_eq!(id, 1);
         assert_eq!(accounts.accounts.len(), 1);
-        assert_eq!(accounts.config.get_selected_account().await, id);
+        assert_eq!(accounts.config.get_selected_account(), id);
 
         accounts.remove_account(id).await?;
-        assert!(accounts.get_selected_account().await.is_none());
+        assert!(accounts.get_selected_account().is_none());
 
         Ok(())
     }
@@ -520,10 +552,10 @@ mod tests {
 
         let mut accounts = Accounts::new(p.clone()).await.unwrap();
         assert_eq!(accounts.accounts.len(), 0);
-        assert_eq!(accounts.config.get_selected_account().await, 0);
+        assert_eq!(accounts.config.get_selected_account(), 0);
 
         let extern_dbfile: PathBuf = dir.path().join("other");
-        let ctx = Context::new(&extern_dbfile, 0, Events::new())
+        let ctx = Context::new(&extern_dbfile, 0, Events::new(), StockStrings::new())
             .await
             .unwrap();
         ctx.set_config(crate::config::Config::Addr, Some("me@mail.com"))
@@ -537,9 +569,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(accounts.accounts.len(), 1);
-        assert_eq!(accounts.config.get_selected_account().await, 1);
+        assert_eq!(accounts.config.get_selected_account(), 1);
 
-        let ctx = accounts.get_selected_account().await.unwrap();
+        let ctx = accounts.get_selected_account().unwrap();
         assert_eq!(
             "me@mail.com",
             ctx.get_config(crate::config::Config::Addr)
@@ -562,7 +594,7 @@ mod tests {
             assert_eq!(id, expected_id);
         }
 
-        let ids = accounts.get_all().await;
+        let ids = accounts.get_all();
         for (i, expected_id) in (1..10).enumerate() {
             assert_eq!(ids.get(i), Some(&expected_id));
         }
@@ -577,16 +609,16 @@ mod tests {
         let (id0, id1, id2) = {
             let mut accounts = Accounts::new(p.clone()).await?;
             accounts.add_account().await?;
-            let ids = accounts.get_all().await;
+            let ids = accounts.get_all();
             assert_eq!(ids.len(), 1);
 
             let id0 = *ids.first().unwrap();
-            let ctx = accounts.get_account(id0).await.unwrap();
+            let ctx = accounts.get_account(id0).unwrap();
             ctx.set_config(crate::config::Config::Addr, Some("one@example.org"))
                 .await?;
 
             let id1 = accounts.add_account().await?;
-            let ctx = accounts.get_account(id1).await.unwrap();
+            let ctx = accounts.get_account(id1).unwrap();
             ctx.set_config(crate::config::Config::Addr, Some("two@example.org"))
                 .await?;
 
@@ -597,7 +629,7 @@ mod tests {
             }
 
             let id2 = accounts.add_account().await?;
-            let ctx = accounts.get_account(id2).await.unwrap();
+            let ctx = accounts.get_account(id2).unwrap();
             ctx.set_config(crate::config::Config::Addr, Some("three@example.org"))
                 .await?;
 
@@ -611,31 +643,31 @@ mod tests {
 
         let (id0_reopened, id1_reopened, id2_reopened) = {
             let accounts = Accounts::new(p.clone()).await?;
-            let ctx = accounts.get_selected_account().await.unwrap();
+            let ctx = accounts.get_selected_account().unwrap();
             assert_eq!(
                 ctx.get_config(crate::config::Config::Addr).await?,
                 Some("two@example.org".to_string())
             );
 
-            let ids = accounts.get_all().await;
+            let ids = accounts.get_all();
             assert_eq!(ids.len(), 3);
 
             let id0 = *ids.first().unwrap();
-            let ctx = accounts.get_account(id0).await.unwrap();
+            let ctx = accounts.get_account(id0).unwrap();
             assert_eq!(
                 ctx.get_config(crate::config::Config::Addr).await?,
                 Some("one@example.org".to_string())
             );
 
             let id1 = *ids.get(1).unwrap();
-            let t = accounts.get_account(id1).await.unwrap();
+            let t = accounts.get_account(id1).unwrap();
             assert_eq!(
                 t.get_config(crate::config::Config::Addr).await?,
                 Some("two@example.org".to_string())
             );
 
             let id2 = *ids.get(2).unwrap();
-            let ctx = accounts.get_account(id2).await.unwrap();
+            let ctx = accounts.get_account(id2).unwrap();
             assert_eq!(
                 ctx.get_config(crate::config::Config::Addr).await?,
                 Some("three@example.org".to_string())
@@ -661,7 +693,7 @@ mod tests {
         assert_eq!(accounts.accounts.len(), 0);
 
         // Create event emitter.
-        let event_emitter = accounts.get_event_emitter().await;
+        let event_emitter = accounts.get_event_emitter();
 
         // Test that event emitter does not return `None` immediately.
         let duration = std::time::Duration::from_millis(1);
@@ -692,7 +724,6 @@ mod tests {
             .context("failed to add closed account")?;
         let account = accounts
             .get_selected_account()
-            .await
             .context("failed to get account")?;
         assert_eq!(account.id, account_id);
         let passphrase_set_success = account
@@ -707,7 +738,6 @@ mod tests {
             .context("failed to create second accounts manager")?;
         let account = accounts
             .get_selected_account()
-            .await
             .context("failed to get account")?;
         assert_eq!(account.is_open().await, false);
 
@@ -717,6 +747,30 @@ mod tests {
 
         assert_eq!(account.open("foobar".to_string()).await?, true);
         assert_eq!(account.is_open().await, true);
+
+        Ok(())
+    }
+
+    /// Tests that accounts share stock string translations.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_accounts_share_translations() -> Result<()> {
+        let dir = tempfile::tempdir().unwrap();
+        let p: PathBuf = dir.path().join("accounts");
+
+        let mut accounts = Accounts::new(p.clone()).await?;
+        accounts.add_account().await?;
+        accounts.add_account().await?;
+
+        let account1 = accounts.get_account(1).context("failed to get account 1")?;
+        let account2 = accounts.get_account(2).context("failed to get account 2")?;
+
+        assert_eq!(stock_str::no_messages(&account1).await, "No messages.");
+        assert_eq!(stock_str::no_messages(&account2).await, "No messages.");
+        account1
+            .set_stock_translation(StockMessage::NoMessages, "foobar".to_string())
+            .await?;
+        assert_eq!(stock_str::no_messages(&account1).await, "foobar");
+        assert_eq!(stock_str::no_messages(&account2).await, "foobar");
 
         Ok(())
     }

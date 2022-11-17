@@ -12,10 +12,10 @@ use once_cell::sync::Lazy;
 
 use crate::aheader::Aheader;
 use crate::blob::BlobObject;
-use crate::constants::{DC_DESIRED_TEXT_LEN, DC_ELLIPSIS};
+use crate::constants::{DC_DESIRED_TEXT_LINES, DC_DESIRED_TEXT_LINE_LEN};
 use crate::contact::{addr_cmp, addr_normalize, ContactId};
 use crate::context::Context;
-use crate::decrypt::{create_decryption_info, try_decrypt};
+use crate::decrypt::{prepare_decryption, try_decrypt};
 use crate::dehtml::dehtml;
 use crate::events::EventType;
 use crate::format_flowed::unformat_flowed;
@@ -28,7 +28,7 @@ use crate::peerstate::Peerstate;
 use crate::simplify::{simplify, SimplifiedText};
 use crate::stock_str;
 use crate::sync::SyncItems;
-use crate::tools::{get_filemeta, parse_receive_headers, truncate};
+use crate::tools::{get_filemeta, parse_receive_headers, truncate_by_lines};
 
 /// A parsed MIME message.
 ///
@@ -178,7 +178,7 @@ impl MimeMessage {
             .get_header_value(HeaderDef::Date)
             .and_then(|v| mailparse::dateparse(&v).ok())
             .unwrap_or_default();
-        let hop_info = parse_receive_headers(&mail.get_headers());
+        let mut hop_info = parse_receive_headers(&mail.get_headers());
 
         let mut headers = Default::default();
         let mut recipients = Default::default();
@@ -220,7 +220,9 @@ impl MimeMessage {
         let mut mail_raw = Vec::new();
         let mut gossiped_addr = Default::default();
         let mut from_is_signed = false;
-        let mut decryption_info = create_decryption_info(context, &mail, message_time).await?;
+        let mut decryption_info = prepare_decryption(context, &mail, &from, message_time).await?;
+        hop_info += "\n\n";
+        hop_info += &decryption_info.dkim_results.to_string();
 
         // `signatures` is non-empty exactly if the message was encrypted and correctly signed.
         let (mail, signatures, warn_empty_signature) =
@@ -296,6 +298,8 @@ impl MimeMessage {
                     if let Some(peerstate) = &mut decryption_info.peerstate {
                         if message_time > peerstate.last_seen_autocrypt
                             && mail.ctype.mimetype != "multipart/report"
+                        // Disallowing keychanges is disabled for now:
+                        // && decryption_info.dkim_results.allow_keychange
                         {
                             peerstate.degrade_encryption(message_time);
                             peerstate.save_to_db(&context.sql, false).await?;
@@ -369,6 +373,12 @@ impl MimeMessage {
         parser.heuristically_parse_ndn(context).await;
         parser.parse_headers(context).await?;
 
+        // Disallowing keychanges is disabled for now
+        // if !decryption_info.dkim_results.allow_keychange {
+        //     for part in parser.parts.iter_mut() {
+        //         part.error = Some("Seems like DKIM failed, this either is an attack or (more likely) a bug in Authentication-Results checking. Please tell us about this at https://support.delta.chat.".to_string());
+        //     }
+        // }
         if warn_empty_signature && parser.signatures.is_empty() {
             for part in parser.parts.iter_mut() {
                 part.error = Some("No valid signature".to_string());
@@ -392,15 +402,10 @@ impl MimeMessage {
     /// Parses system messages.
     fn parse_system_message_headers(&mut self, context: &Context) {
         if self.get_header(HeaderDef::AutocryptSetupMessage).is_some() {
-            self.parts = self
-                .parts
-                .iter()
-                .filter(|part| {
-                    part.mimetype.is_none()
-                        || part.mimetype.as_ref().unwrap().as_ref() == MIME_AC_SETUP_FILE
-                })
-                .cloned()
-                .collect();
+            self.parts.retain(|part| {
+                part.mimetype.is_none()
+                    || part.mimetype.as_ref().unwrap().as_ref() == MIME_AC_SETUP_FILE
+            });
 
             if self.parts.len() == 1 {
                 self.is_system_message = SystemMessage::AutocryptSetupMessage;
@@ -551,12 +556,15 @@ impl MimeMessage {
 
             // For mailing lists, always add the subject because sometimes there are different topics
             // and otherwise it might be hard to keep track:
-            if self.is_mailinglist_message() {
+            if self.is_mailinglist_message() && !self.has_chat_version() {
                 prepend_subject = true;
             }
 
             if prepend_subject && !subject.is_empty() {
-                let part_with_text = self.parts.iter_mut().find(|part| !part.msg.is_empty());
+                let part_with_text = self
+                    .parts
+                    .iter_mut()
+                    .find(|part| !part.msg.is_empty() && !part.is_reaction);
                 if let Some(mut part) = part_with_text {
                     part.msg = format!("{} – {}", subject, part.msg);
                 }
@@ -746,7 +754,7 @@ impl MimeMessage {
                     MimeS::Single
                 }
             } else if mimetype.starts_with("message") {
-                if mimetype == "message/rfc822" {
+                if mimetype == "message/rfc822" && !is_attachment_disposition(mail) {
                     MimeS::Message
                 } else {
                     MimeS::Single
@@ -918,6 +926,7 @@ impl MimeMessage {
         Ok(any_part_added)
     }
 
+    /// Returns true if any part was added, false otherwise.
     async fn add_single_part_if_known(
         &mut self,
         context: &Context,
@@ -950,6 +959,30 @@ impl MimeMessage {
                     mime::IMAGE | mime::AUDIO | mime::VIDEO | mime::APPLICATION => {
                         warn!(context, "Missing attachment");
                         return Ok(false);
+                    }
+                    mime::TEXT
+                        if mail.get_content_disposition().disposition
+                            == DispositionType::Extension("reaction".to_string()) =>
+                    {
+                        // Reaction.
+                        let decoded_data = match mail.get_body() {
+                            Ok(decoded_data) => decoded_data,
+                            Err(err) => {
+                                warn!(context, "Invalid body parsed {:?}", err);
+                                // Note that it's not always an error - might be no data
+                                return Ok(false);
+                            }
+                        };
+
+                        let part = Part {
+                            typ: Viewtype::Text,
+                            mimetype: Some(mime_type),
+                            msg: decoded_data,
+                            is_reaction: true,
+                            ..Default::default()
+                        };
+                        self.do_add_single_part(part);
+                        return Ok(true);
                     }
                     mime::TEXT | mime::HTML => {
                         let decoded_data = match mail.get_body() {
@@ -1012,14 +1045,15 @@ impl MimeMessage {
                             (simplified_txt, top_quote)
                         };
 
-                        let simplified_txt = if simplified_txt.chars().count()
-                            > DC_DESIRED_TEXT_LEN + DC_ELLIPSIS.len()
-                        {
-                            self.is_mime_modified = true;
-                            truncate(&*simplified_txt, DC_DESIRED_TEXT_LEN).to_string()
-                        } else {
-                            simplified_txt
-                        };
+                        // Truncate text if it has too many lines
+                        let (simplified_txt, was_truncated) = truncate_by_lines(
+                            simplified_txt,
+                            DC_DESIRED_TEXT_LINES,
+                            DC_DESIRED_TEXT_LINE_LEN,
+                        );
+                        if was_truncated {
+                            self.is_mime_modified = was_truncated;
+                        }
 
                         if !simplified_txt.is_empty() || simplified_quote.is_some() {
                             let mut part = Part {
@@ -1648,6 +1682,9 @@ pub struct Part {
     /// note that multipart/related may contain further multipart nestings
     /// and all of them needs to be marked with `is_related`.
     pub(crate) is_related: bool,
+
+    /// Part is an RFC 9078 reaction.
+    pub(crate) is_reaction: bool,
 }
 
 /// return mimetype and viewtype for a parsed mail
@@ -1674,14 +1711,18 @@ fn get_mime_type(mail: &mailparse::ParsedMail<'_>) -> Result<(Mime, Viewtype)> {
         mime::VIDEO => Viewtype::Video,
         mime::MULTIPART => Viewtype::Unknown,
         mime::MESSAGE => {
-            // Enacapsulated messages, see <https://www.w3.org/Protocols/rfc1341/7_3_Message.html>
-            // Also used as part "message/disposition-notification" of "multipart/report", which, however, will
-            // be handled separatedly.
-            // I've not seen any messages using this, so we do not attach these parts (maybe they're used to attach replies,
-            // which are unwanted at all).
-            // For now, we skip these parts at all; if desired, we could return DcMimeType::File/DC_MSG_File
-            // for selected and known subparts.
-            Viewtype::Unknown
+            if is_attachment_disposition(mail) {
+                Viewtype::File
+            } else {
+                // Enacapsulated messages, see <https://www.w3.org/Protocols/rfc1341/7_3_Message.html>
+                // Also used as part "message/disposition-notification" of "multipart/report", which, however, will
+                // be handled separatedly.
+                // I've not seen any messages using this, so we do not attach these parts (maybe they're used to attach replies,
+                // which are unwanted at all).
+                // For now, we skip these parts at all; if desired, we could return DcMimeType::File/DC_MSG_File
+                // for selected and known subparts.
+                Viewtype::Unknown
+            }
         }
         mime::APPLICATION => Viewtype::File,
         _ => Viewtype::Unknown,
@@ -1813,7 +1854,7 @@ mod tests {
     use crate::{
         chatlist::Chatlist,
         config::Config,
-        constants::Blocked,
+        constants::{Blocked, DC_DESIRED_TEXT_LEN, DC_ELLIPSIS},
         message::{Message, MessageState, MessengerMessage},
         receive_imf::receive_imf,
         test_utils::TestContext,
@@ -3295,6 +3336,71 @@ Message.
         assert_eq!(
             original_msg_id.get_state(&t).await?,
             MessageState::OutMdnRcvd
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_receive_eml() -> Result<()> {
+        let alice = TestContext::new_alice().await;
+
+        let mime_message = MimeMessage::from_bytes(
+            &alice,
+            include_bytes!("../test-data/message/attached-eml.eml"),
+        )
+        .await?;
+
+        assert_eq!(mime_message.parts.len(), 1);
+        assert_eq!(mime_message.parts[0].typ, Viewtype::File);
+        assert_eq!(
+            mime_message.parts[0].mimetype,
+            Some("message/rfc822".parse().unwrap(),)
+        );
+        assert_eq!(
+            mime_message.parts[0].msg,
+            "this is a classic email – I attached the .EML file".to_string()
+        );
+        assert_eq!(
+            mime_message.parts[0].param.get(Param::File),
+            Some("$BLOBDIR/.eml")
+        );
+
+        assert_eq!(mime_message.parts[0].org_filename, Some(".eml".to_string()));
+
+        Ok(())
+    }
+
+    /// Tests parsing of MIME message containing RFC 9078 reaction.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_parse_reaction() -> Result<()> {
+        let alice = TestContext::new_alice().await;
+
+        let mime_message = MimeMessage::from_bytes(
+            &alice,
+            "To: alice@example.org\n\
+From: bob@example.net\n\
+Date: Today, 29 February 2021 00:00:10 -800\n\
+Message-ID: 56789@example.net\n\
+In-Reply-To: 12345@example.org\n\
+Subject: Meeting\n\
+Mime-Version: 1.0 (1.0)\n\
+Content-Type: text/plain; charset=utf-8\n\
+Content-Disposition: reaction\n\
+\n\
+\u{1F44D}"
+                .as_bytes(),
+        )
+        .await?;
+
+        assert_eq!(mime_message.parts.len(), 1);
+        assert_eq!(mime_message.parts[0].is_reaction, true);
+        assert_eq!(
+            mime_message
+                .get_header(HeaderDef::InReplyTo)
+                .and_then(|msgid| parse_message_id(msgid).ok())
+                .unwrap(),
+            "12345@example.org"
         );
 
         Ok(())

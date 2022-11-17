@@ -59,6 +59,9 @@ pub enum Param {
     /// For Messages
     WantsMdn = b'r',
 
+    /// For Messages: the message is a reaction.
+    Reaction = b'x',
+
     /// For Messages: a message with Auto-Submitted header ("bot").
     Bot = b'b',
 
@@ -163,7 +166,7 @@ pub enum Param {
     /// For Chats: timestamp of group name update.
     GroupNameTimestamp = b'g',
 
-    /// For Chats: timestamp of group name update.
+    /// For Chats: timestamp of member list update.
     MemberListTimestamp = b'k',
 
     /// For Chats: timestamp of protection settings update.
@@ -263,8 +266,8 @@ impl Params {
     }
 
     /// Set the given key to the passed in value.
-    pub fn set(&mut self, key: Param, value: impl AsRef<str>) -> &mut Self {
-        self.inner.insert(key, value.as_ref().to_string());
+    pub fn set(&mut self, key: Param, value: impl ToString) -> &mut Self {
+        self.inner.insert(key, value.to_string());
         self
     }
 

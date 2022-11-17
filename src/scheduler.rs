@@ -1,10 +1,11 @@
 use anyhow::{bail, Context as _, Result};
 use async_channel::{self as channel, Receiver, Sender};
-use futures::{join, try_join};
+use futures::try_join;
 use futures_lite::FutureExt;
 use tokio::task;
 
 use crate::config::Config;
+use crate::contact::{ContactId, RecentlySeenLoop};
 use crate::context::Context;
 use crate::ephemeral::{self, delete_expired_imap_messages};
 use crate::imap::Imap;
@@ -35,6 +36,8 @@ pub(crate) struct Scheduler {
     ephemeral_interrupt_send: Sender<()>,
     location_handle: task::JoinHandle<()>,
     location_interrupt_send: Sender<()>,
+
+    recently_seen_loop: RecentlySeenLoop,
 }
 
 impl Context {
@@ -42,7 +45,7 @@ impl Context {
     pub async fn maybe_network(&self) {
         let lock = self.scheduler.read().await;
         if let Some(scheduler) = &*lock {
-            scheduler.maybe_network().await;
+            scheduler.maybe_network();
         }
         connectivity::idle_interrupted(lock).await;
     }
@@ -51,32 +54,38 @@ impl Context {
     pub async fn maybe_network_lost(&self) {
         let lock = self.scheduler.read().await;
         if let Some(scheduler) = &*lock {
-            scheduler.maybe_network_lost().await;
+            scheduler.maybe_network_lost();
         }
         connectivity::maybe_network_lost(self, lock).await;
     }
 
     pub(crate) async fn interrupt_inbox(&self, info: InterruptInfo) {
         if let Some(scheduler) = &*self.scheduler.read().await {
-            scheduler.interrupt_inbox(info).await;
+            scheduler.interrupt_inbox(info);
         }
     }
 
     pub(crate) async fn interrupt_smtp(&self, info: InterruptInfo) {
         if let Some(scheduler) = &*self.scheduler.read().await {
-            scheduler.interrupt_smtp(info).await;
+            scheduler.interrupt_smtp(info);
         }
     }
 
     pub(crate) async fn interrupt_ephemeral_task(&self) {
         if let Some(scheduler) = &*self.scheduler.read().await {
-            scheduler.interrupt_ephemeral_task().await;
+            scheduler.interrupt_ephemeral_task();
         }
     }
 
     pub(crate) async fn interrupt_location(&self) {
         if let Some(scheduler) = &*self.scheduler.read().await {
-            scheduler.interrupt_location().await;
+            scheduler.interrupt_location();
+        }
+    }
+
+    pub(crate) async fn interrupt_recently_seen(&self, contact_id: ContactId, timestamp: i64) {
+        if let Some(scheduler) = &*self.scheduler.read().await {
+            scheduler.interrupt_recently_seen(contact_id, timestamp);
         }
     }
 }
@@ -157,112 +166,117 @@ async fn inbox_loop(ctx: Context, started: Sender<()>, inbox_handlers: ImapConne
         .await;
 }
 
-async fn fetch_idle(ctx: &Context, connection: &mut Imap, folder: Config) -> InterruptInfo {
-    match ctx.get_config(folder).await {
-        Ok(Some(watch_folder)) => {
-            // connect and fake idle if unable to connect
-            if let Err(err) = connection.prepare(ctx).await {
-                warn!(ctx, "imap connection failed: {}", err);
-                return connection.fake_idle(ctx, Some(watch_folder)).await;
-            }
-
-            if folder == Config::ConfiguredInboxFolder {
-                if let Err(err) = connection
-                    .store_seen_flags_on_imap(ctx)
-                    .await
-                    .context("store_seen_flags_on_imap failed")
-                {
-                    warn!(ctx, "{:#}", err);
-                }
-            }
-
-            // Fetch the watched folder.
-            if let Err(err) = connection
-                .fetch_move_delete(ctx, &watch_folder, false)
-                .await
-            {
-                connection.trigger_reconnect(ctx).await;
-                warn!(ctx, "{:#}", err);
-                return InterruptInfo::new(false);
-            }
-
-            // Mark expired messages for deletion. Marked messages will be deleted from the server
-            // on the next iteration of `fetch_move_delete`. `delete_expired_imap_messages` is not
-            // called right before `fetch_move_delete` because it is not well optimized and would
-            // otherwise slow down message fetching.
-            if let Err(err) = delete_expired_imap_messages(ctx)
-                .await
-                .context("delete_expired_imap_messages failed")
-            {
-                warn!(ctx, "{:#}", err);
-            }
-
-            // Scan additional folders only after finishing fetching the watched folder.
-            //
-            // On iOS the application has strictly limited time to work in background, so we may not
-            // be able to scan all folders before time is up if there are many of them.
-            if folder == Config::ConfiguredInboxFolder {
-                // Only scan on the Inbox thread in order to prevent parallel scans, which might lead to duplicate messages
-                match connection.scan_folders(ctx).await {
-                    Err(err) => {
-                        // Don't reconnect, if there is a problem with the connection we will realize this when IDLEing
-                        // but maybe just one folder can't be selected or something
-                        warn!(ctx, "{}", err);
-                    }
-                    Ok(true) => {
-                        // Fetch the watched folder again in case scanning other folder moved messages
-                        // there.
-                        //
-                        // In most cases this will select the watched folder and return because there are
-                        // no new messages. We want to select the watched folder anyway before going IDLE
-                        // there, so this does not take additional protocol round-trip.
-                        if let Err(err) = connection
-                            .fetch_move_delete(ctx, &watch_folder, false)
-                            .await
-                        {
-                            connection.trigger_reconnect(ctx).await;
-                            warn!(ctx, "{:#}", err);
-                            return InterruptInfo::new(false);
-                        }
-                    }
-                    Ok(false) => {}
-                }
-            }
-
-            // Synchronize Seen flags.
-            connection
-                .sync_seen_flags(ctx, &watch_folder)
-                .await
-                .context("sync_seen_flags")
-                .ok_or_log(ctx);
-
-            connection.connectivity.set_connected(ctx).await;
-
-            // idle
-            if connection.can_idle() {
-                match connection.idle(ctx, Some(watch_folder)).await {
-                    Ok(v) => v,
-                    Err(err) => {
-                        connection.trigger_reconnect(ctx).await;
-                        warn!(ctx, "{}", err);
-                        InterruptInfo::new(false)
-                    }
-                }
-            } else {
-                connection.fake_idle(ctx, Some(watch_folder)).await
-            }
-        }
-        Ok(None) => {
-            connection.connectivity.set_not_configured(ctx).await;
-            info!(ctx, "Can not watch {} folder, not set", folder);
-            connection.fake_idle(ctx, None).await
-        }
+async fn fetch_idle(ctx: &Context, connection: &mut Imap, folder_config: Config) -> InterruptInfo {
+    let folder = match ctx.get_config(folder_config).await {
+        Ok(folder) => folder,
         Err(err) => {
             warn!(
                 ctx,
-                "Can not watch {} folder, failed to retrieve config: {:?}", folder, err
+                "Can not watch {} folder, failed to retrieve config: {:#}", folder_config, err
             );
-            connection.fake_idle(ctx, None).await
+            return connection.fake_idle(ctx, None).await;
+        }
+    };
+
+    let watch_folder = if let Some(watch_folder) = folder {
+        watch_folder
+    } else {
+        connection.connectivity.set_not_configured(ctx).await;
+        info!(ctx, "Can not watch {} folder, not set", folder_config);
+        return connection.fake_idle(ctx, None).await;
+    };
+
+    // connect and fake idle if unable to connect
+    if let Err(err) = connection.prepare(ctx).await {
+        warn!(ctx, "imap connection failed: {}", err);
+        return connection.fake_idle(ctx, Some(watch_folder)).await;
+    }
+
+    if folder_config == Config::ConfiguredInboxFolder {
+        if let Err(err) = connection
+            .store_seen_flags_on_imap(ctx)
+            .await
+            .context("store_seen_flags_on_imap failed")
+        {
+            warn!(ctx, "{:#}", err);
+        }
+    }
+
+    // Fetch the watched folder.
+    if let Err(err) = connection
+        .fetch_move_delete(ctx, &watch_folder, false)
+        .await
+        .context("fetch_move_delete")
+    {
+        connection.trigger_reconnect(ctx).await;
+        warn!(ctx, "{:#}", err);
+        return InterruptInfo::new(false);
+    }
+
+    // Mark expired messages for deletion. Marked messages will be deleted from the server
+    // on the next iteration of `fetch_move_delete`. `delete_expired_imap_messages` is not
+    // called right before `fetch_move_delete` because it is not well optimized and would
+    // otherwise slow down message fetching.
+    if let Err(err) = delete_expired_imap_messages(ctx)
+        .await
+        .context("delete_expired_imap_messages")
+    {
+        warn!(ctx, "{:#}", err);
+    }
+
+    // Scan additional folders only after finishing fetching the watched folder.
+    //
+    // On iOS the application has strictly limited time to work in background, so we may not
+    // be able to scan all folders before time is up if there are many of them.
+    if folder_config == Config::ConfiguredInboxFolder {
+        // Only scan on the Inbox thread in order to prevent parallel scans, which might lead to duplicate messages
+        match connection.scan_folders(ctx).await.context("scan_folders") {
+            Err(err) => {
+                // Don't reconnect, if there is a problem with the connection we will realize this when IDLEing
+                // but maybe just one folder can't be selected or something
+                warn!(ctx, "{:#}", err);
+            }
+            Ok(true) => {
+                // Fetch the watched folder again in case scanning other folder moved messages
+                // there.
+                //
+                // In most cases this will select the watched folder and return because there are
+                // no new messages. We want to select the watched folder anyway before going IDLE
+                // there, so this does not take additional protocol round-trip.
+                if let Err(err) = connection
+                    .fetch_move_delete(ctx, &watch_folder, false)
+                    .await
+                    .context("fetch_move_delete after scan_folders")
+                {
+                    connection.trigger_reconnect(ctx).await;
+                    warn!(ctx, "{:#}", err);
+                    return InterruptInfo::new(false);
+                }
+            }
+            Ok(false) => {}
+        }
+    }
+
+    // Synchronize Seen flags.
+    connection
+        .sync_seen_flags(ctx, &watch_folder)
+        .await
+        .context("sync_seen_flags")
+        .ok_or_log(ctx);
+
+    connection.connectivity.set_connected(ctx).await;
+
+    // idle
+    if !connection.can_idle() {
+        return connection.fake_idle(ctx, Some(watch_folder)).await;
+    }
+
+    match connection.idle(ctx, Some(watch_folder)).await {
+        Ok(v) => v,
+        Err(err) => {
+            connection.trigger_reconnect(ctx).await;
+            warn!(ctx, "{:#}", err);
+            InterruptInfo::new(false)
         }
     }
 }
@@ -271,11 +285,11 @@ async fn simple_imap_loop(
     ctx: Context,
     started: Sender<()>,
     inbox_handlers: ImapConnectionHandlers,
-    folder: Config,
+    folder_config: Config,
 ) {
     use futures::future::FutureExt;
 
-    info!(ctx, "starting simple loop for {}", folder.as_ref());
+    info!(ctx, "starting simple loop for {}", folder_config);
     let ImapConnectionHandlers {
         mut connection,
         stop_receiver,
@@ -291,7 +305,7 @@ async fn simple_imap_loop(
         }
 
         loop {
-            fetch_idle(&ctx, &mut connection, folder).await;
+            fetch_idle(&ctx, &mut connection, folder_config).await;
         }
     };
 
@@ -472,6 +486,8 @@ impl Scheduler {
             })
         };
 
+        let recently_seen_loop = RecentlySeenLoop::new(ctx.clone());
+
         let res = Self {
             inbox,
             mvbox,
@@ -485,6 +501,7 @@ impl Scheduler {
             ephemeral_interrupt_send,
             location_handle,
             location_interrupt_send,
+            recently_seen_loop,
         };
 
         // wait for all loops to be started
@@ -501,46 +518,46 @@ impl Scheduler {
         Ok(res)
     }
 
-    async fn maybe_network(&self) {
-        join!(
-            self.interrupt_inbox(InterruptInfo::new(true)),
-            self.interrupt_mvbox(InterruptInfo::new(true)),
-            self.interrupt_sentbox(InterruptInfo::new(true)),
-            self.interrupt_smtp(InterruptInfo::new(true))
-        );
+    fn maybe_network(&self) {
+        self.interrupt_inbox(InterruptInfo::new(true));
+        self.interrupt_mvbox(InterruptInfo::new(true));
+        self.interrupt_sentbox(InterruptInfo::new(true));
+        self.interrupt_smtp(InterruptInfo::new(true));
     }
 
-    async fn maybe_network_lost(&self) {
-        join!(
-            self.interrupt_inbox(InterruptInfo::new(false)),
-            self.interrupt_mvbox(InterruptInfo::new(false)),
-            self.interrupt_sentbox(InterruptInfo::new(false)),
-            self.interrupt_smtp(InterruptInfo::new(false))
-        );
+    fn maybe_network_lost(&self) {
+        self.interrupt_inbox(InterruptInfo::new(false));
+        self.interrupt_mvbox(InterruptInfo::new(false));
+        self.interrupt_sentbox(InterruptInfo::new(false));
+        self.interrupt_smtp(InterruptInfo::new(false));
     }
 
-    async fn interrupt_inbox(&self, info: InterruptInfo) {
-        self.inbox.interrupt(info).await;
+    fn interrupt_inbox(&self, info: InterruptInfo) {
+        self.inbox.interrupt(info);
     }
 
-    async fn interrupt_mvbox(&self, info: InterruptInfo) {
-        self.mvbox.interrupt(info).await;
+    fn interrupt_mvbox(&self, info: InterruptInfo) {
+        self.mvbox.interrupt(info);
     }
 
-    async fn interrupt_sentbox(&self, info: InterruptInfo) {
-        self.sentbox.interrupt(info).await;
+    fn interrupt_sentbox(&self, info: InterruptInfo) {
+        self.sentbox.interrupt(info);
     }
 
-    async fn interrupt_smtp(&self, info: InterruptInfo) {
-        self.smtp.interrupt(info).await;
+    fn interrupt_smtp(&self, info: InterruptInfo) {
+        self.smtp.interrupt(info);
     }
 
-    async fn interrupt_ephemeral_task(&self) {
+    fn interrupt_ephemeral_task(&self) {
         self.ephemeral_interrupt_send.try_send(()).ok();
     }
 
-    async fn interrupt_location(&self) {
+    fn interrupt_location(&self) {
         self.location_interrupt_send.try_send(()).ok();
+    }
+
+    fn interrupt_recently_seen(&self, contact_id: ContactId, timestamp: i64) {
+        self.recently_seen_loop.interrupt(contact_id, timestamp);
     }
 
     /// Halt the scheduler.
@@ -578,6 +595,7 @@ impl Scheduler {
             .ok_or_log(context);
         self.ephemeral_handle.abort();
         self.location_handle.abort();
+        self.recently_seen_loop.abort();
     }
 }
 
@@ -603,7 +621,7 @@ impl ConnectionState {
         Ok(())
     }
 
-    async fn interrupt(&self, info: InterruptInfo) {
+    fn interrupt(&self, info: InterruptInfo) {
         // Use try_send to avoid blocking on interrupts.
         self.idle_interrupt_sender.try_send(info).ok();
     }
@@ -637,8 +655,8 @@ impl SmtpConnectionState {
     }
 
     /// Interrupt any form of idle.
-    async fn interrupt(&self, info: InterruptInfo) {
-        self.state.interrupt(info).await;
+    fn interrupt(&self, info: InterruptInfo) {
+        self.state.interrupt(info);
     }
 
     /// Shutdown this connection completely.
@@ -682,8 +700,8 @@ impl ImapConnectionState {
     }
 
     /// Interrupt any form of idle.
-    async fn interrupt(&self, info: InterruptInfo) {
-        self.state.interrupt(info).await;
+    fn interrupt(&self, info: InterruptInfo) {
+        self.state.interrupt(info);
     }
 
     /// Shutdown this connection completely.

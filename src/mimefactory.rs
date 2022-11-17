@@ -183,7 +183,10 @@ impl<'a> MimeFactory<'a> {
                 )
                 .await?;
 
-            if !msg.is_system_message() && context.get_config_bool(Config::MdnsEnabled).await? {
+            if !msg.is_system_message()
+                && msg.param.get_int(Param::Reaction).unwrap_or_default() == 0
+                && context.get_config_bool(Config::MdnsEnabled).await?
+            {
                 req_mdn = chat.typ != Chattype::Group;
             }
         }
@@ -447,6 +450,8 @@ impl<'a> MimeFactory<'a> {
             .collect()
     }
 
+    /// Consumes a `MimeFactory` and renders it into a message which is then stored in
+    /// `smtp`-table to be used by the SMTP loop
     pub async fn render(mut self, context: &Context) -> Result<RenderedEmail> {
         let mut headers: MessageHeaders = Default::default();
 
@@ -1098,6 +1103,11 @@ impl<'a> MimeFactory<'a> {
                 "text/plain; charset=utf-8; format=flowed; delsp=no".to_string(),
             ))
             .body(message_text);
+
+        if self.msg.param.get_int(Param::Reaction).unwrap_or_default() != 0 {
+            main_part = main_part.header(("Content-Disposition", "reaction"));
+        }
+
         let mut parts = Vec::new();
 
         // add HTML-part, this is needed only if a HTML-message from a non-delta-client is forwarded;
@@ -1153,17 +1163,17 @@ impl<'a> MimeFactory<'a> {
         if command == SystemMessage::MultiDeviceSync && self.is_e2ee_guaranteed() {
             let json = self.msg.param.get(Param::Arg).unwrap_or_default();
             let ids = self.msg.param.get(Param::Arg2).unwrap_or_default();
-            parts.push(context.build_sync_part(json.to_string()).await);
+            parts.push(context.build_sync_part(json.to_string()));
             self.sync_ids_to_delete = Some(ids.to_string());
         } else if command == SystemMessage::WebxdcStatusUpdate {
             let json = self.msg.param.get(Param::Arg).unwrap_or_default();
-            parts.push(context.build_status_update_part(json).await);
+            parts.push(context.build_status_update_part(json));
         } else if self.msg.viewtype == Viewtype::Webxdc {
             if let Some(json) = context
                 .render_webxdc_status_update_object(self.msg.id, None)
                 .await?
             {
-                parts.push(context.build_status_update_part(&json).await);
+                parts.push(context.build_status_update_part(&json));
             }
         }
 
@@ -1279,7 +1289,7 @@ impl<'a> MimeFactory<'a> {
 /// This line length limit is an
 /// [RFC5322 requirement](https://tools.ietf.org/html/rfc5322#section-2.1.1).
 fn wrapped_base64_encode(buf: &[u8]) -> String {
-    let base64 = base64::encode(&buf);
+    let base64 = base64::encode(buf);
     let mut chars = base64.chars();
     std::iter::repeat_with(|| chars.by_ref().take(78).collect::<String>())
         .take_while(|s| !s.is_empty())

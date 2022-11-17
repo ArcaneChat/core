@@ -22,6 +22,7 @@ use crate::imap::markseen_on_imap_table;
 use crate::mimeparser::{parse_message_id, DeliveryReport, SystemMessage};
 use crate::param::{Param, Params};
 use crate::pgp::split_armored_data;
+use crate::reaction::get_msg_reactions;
 use crate::scheduler::InterruptInfo;
 use crate::sql;
 use crate::stock_str;
@@ -725,7 +726,7 @@ impl Message {
         self.text = text;
     }
 
-    pub fn set_file(&mut self, file: impl AsRef<str>, filemime: Option<&str>) {
+    pub fn set_file(&mut self, file: impl ToString, filemime: Option<&str>) {
         self.param.set(Param::File, file);
         if let Some(filemime) = filemime {
             self.param.set(Param::MimeType, filemime);
@@ -749,6 +750,11 @@ impl Message {
 
     pub fn set_duration(&mut self, duration: i32) {
         self.param.set_int(Param::Duration, duration);
+    }
+
+    /// Marks the message as reaction.
+    pub(crate) fn set_reaction(&mut self) {
+        self.param.set_int(Param::Reaction, 1);
     }
 
     pub async fn latefiling_mediasize(
@@ -1082,6 +1088,11 @@ pub async fn get_msg_info(context: &Context, msg_id: MsgId) -> Result<String> {
 
     ret += "\n";
 
+    let reactions = get_msg_reactions(context, msg_id).await?;
+    if !reactions.is_empty() {
+        ret += &format!("Reactions: {}\n", reactions);
+    }
+
     if let Some(error) = msg.error.as_ref() {
         ret += &format!("Error: {}", error);
     }
@@ -1111,6 +1122,28 @@ pub async fn get_msg_info(context: &Context, msg_id: MsgId) -> Result<String> {
     }
     if !msg.rfc724_mid.is_empty() {
         ret += &format!("\nMessage-ID: {}", msg.rfc724_mid);
+
+        let server_uids = context
+            .sql
+            .query_map(
+                "SELECT folder, uid FROM imap WHERE rfc724_mid=?",
+                paramsv![msg.rfc724_mid],
+                |row| {
+                    let folder: String = row.get("folder")?;
+                    let uid: u32 = row.get("uid")?;
+                    Ok((folder, uid))
+                },
+                |rows| {
+                    rows.collect::<std::result::Result<Vec<_>, _>>()
+                        .map_err(Into::into)
+                },
+            )
+            .await?;
+
+        for (folder, uid) in server_uids {
+            // Format as RFC 5092 relative IMAP URL.
+            ret += &format!("\n</{}/;UID={}>", folder, uid);
+        }
     }
     let hop_info: Option<String> = context
         .sql
@@ -1236,6 +1269,11 @@ pub async fn delete_msgs(context: &Context, msg_ids: &[MsgId]) -> Result<()> {
             .trash(context)
             .await
             .with_context(|| format!("Unable to trash message {}", msg_id))?;
+
+        if msg.viewtype == Viewtype::Webxdc {
+            context.emit_event(EventType::WebxdcInstanceDeleted { msg_id: *msg_id });
+        }
+
         context
             .sql
             .execute(

@@ -20,6 +20,7 @@ use deltachat::context::*;
 use deltachat::oauth2::*;
 use deltachat::qr_code_generator::get_securejoin_qr_svg;
 use deltachat::securejoin::*;
+use deltachat::stock_str::StockStrings;
 use deltachat::{EventType, Events};
 use log::{error, info, warn};
 use rustyline::completion::{Completer, FilenameCompleter, Pair};
@@ -68,6 +69,19 @@ fn receive_event(event: EventType) {
                 yellow.paint(format!(
                     "Received MSGS_CHANGED(chat_id={}, msg_id={})",
                     chat_id, msg_id,
+                ))
+            );
+        }
+        EventType::ReactionsChanged {
+            chat_id,
+            msg_id,
+            contact_id,
+        } => {
+            info!(
+                "{}",
+                yellow.paint(format!(
+                    "Received REACTIONS_CHANGED(chat_id={}, msg_id={}, contact_id={})",
+                    chat_id, msg_id, contact_id
                 ))
             );
         }
@@ -207,7 +221,7 @@ const CHAT_COMMANDS: [&str; 36] = [
     "accept",
     "blockchat",
 ];
-const MESSAGE_COMMANDS: [&str; 8] = [
+const MESSAGE_COMMANDS: [&str; 9] = [
     "listmsgs",
     "msginfo",
     "listfresh",
@@ -216,6 +230,7 @@ const MESSAGE_COMMANDS: [&str; 8] = [
     "markseen",
     "delmsg",
     "download",
+    "react",
 ];
 const CONTACT_COMMANDS: [&str; 9] = [
     "listcontacts",
@@ -298,7 +313,7 @@ async fn start(args: Vec<String>) -> Result<(), Error> {
         println!("Error: Bad arguments, expected [db-name].");
         bail!("No db-name specified");
     }
-    let context = Context::new(Path::new(&args[1]), 0, Events::new()).await?;
+    let context = Context::new(Path::new(&args[1]), 0, Events::new(), StockStrings::new()).await?;
 
     let events = context.get_event_emitter();
     tokio::task::spawn(async move {
@@ -431,7 +446,7 @@ async fn handle_cmd(
                 }
                 println!("{}", qr);
                 let output = Command::new("qrencode")
-                    .args(&["-t", "ansiutf8", qr.as_str(), "-o", "-"])
+                    .args(["-t", "ansiutf8", qr.as_str(), "-o", "-"])
                     .output()
                     .expect("failed to execute process");
                 io::stdout().write_all(&output.stdout).unwrap();

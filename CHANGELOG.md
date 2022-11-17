@@ -2,12 +2,241 @@
 
 ## Unreleased
 
+### Changes
+
 ### API-Changes
 
+### Fixes
+
+
+## 1.101.0
+
 ### Changes
+- add `configured_inbox_folder` to account info #3748
+- `dc_delete_contact()` hides contacts if referenced #3751
+- add IMAP UIDs to message info #3755
+
+### Fixes
+- improve IMAP logging, in particular fix incorrect "IMAP IDLE protocol
+  timed out" message on network error during IDLE #3749
+- pop Recently Seen Loop event out of the queue when it is in the past
+  to avoid busy looping #3753
+- fix build failures by going back to standard `async_zip` #3747
+
+
+## 1.100.0
+
+### API-Changes
+- jsonrpc: add `miscSaveSticker` method
+
+### Changes
+- add JSON-RPC stdio server `deltachat-rpc-server` and use it for JSON-RPC tests #3695
+- update rPGP from 0.8 to 0.9 #3737
+- jsonrpc: typescript client: use npm released deltachat fork of the tiny emitter package #3741
+- jsonrpc: show sticker image in quote #3744
+
+
+
+## 1.99.0
+
+### API-Changes
+- breaking jsonrpc: changed function naming
+  - `autocryptInitiateKeyTransfer` -> `initiateAutocryptKeyTransfer`
+  - `autocryptContinueKeyTransfer` -> `continueAutocryptKeyTransfer`
+  - `chatlistGetFullChatById` -> `getFullChatById`
+  - `messageGetMessage` -> `getMessage`
+  - `messageGetMessages` -> `getMessages`
+  - `messageGetNotificationInfo` -> `getMessageNotificationInfo`
+  - `contactsGetContact` -> `getContact`
+  - `contactsCreateContact` -> `createContact`
+  - `contactsCreateChatByContactId` -> `createChatByContactId`
+  - `contactsBlock` -> `blockContact`
+  - `contactsUnblock` -> `unblockContact`
+  - `contactsGetBlocked` -> `getBlockedContacts`
+  - `contactsGetContactIds` -> `getContactIds`
+  - `contactsGetContacts` -> `getContacts`
+  - `contactsGetContactsByIds` -> `getContactsByIds`
+  - `chatGetMedia` -> `getChatMedia`
+  - `chatGetNeighboringMedia` -> `getNeighboringChatMedia`
+  - `webxdcSendStatusUpdate` -> `sendWebxdcStatusUpdate`
+  - `webxdcGetStatusUpdates` -> `getWebxdcStatusUpdates`
+  - `messageGetWebxdcInfo` -> `getWebxdcInfo`
+- jsonrpc: changed method signature
+  - `miscSendTextMessage(accountId, text, chatId)` -> `miscSendTextMessage(accountId, chatId, text)`
+- jsonrpc: add `SystemMessageType` to `Message`
+- cffi: add missing `DC_INFO_` constants
+- Add DC_EVENT_INCOMING_MSG_BUNCH event #3643
+- Python bindings: Make get_matching() only match the
+  whole event name, e.g. events.get_matching("DC_EVENT_INCOMING_MSG")
+  won't match DC_EVENT_INCOMING_MSG_BUNCH anymore #3643
+
+
+- Rust: Introduce a ContextBuilder #3698
+
+### Changes
+- allow sender timestamp to be in the future, but not too much
+- Disable the new "Authentication-Results/DKIM checking" security feature
+  until we have tested it a bit #3728
+- refactorings #3706
+
+### Fixes
+- `dc_search_msgs()` returns unaccepted requests #3694
+- emit "contacts changed" event when the contact is no longer "seen recently" #3703
+- do not allow peerstate reset if DKIM check failed #3731
+
+
+## 1.98.0
+
+### API-Changes
+- jsonrpc: typescript client: export constants under `C` enum, similar to how its exported from `deltachat-node` #3681
+- added reactions support #3644
+- jsonrpc: reactions: added reactions to `Message` type and the `sendReaction()` method #3686
+
+### Changes
+- simplify `UPSERT` queries #3676
+
+### Fixes
+
+
+## 1.97.0
+
+### API-Changes
+- jsonrpc: add function: #3641, #3645, #3653
+  - `getChatContacts()`
+  - `createGroupChat()`
+  - `createBroadcastList()`
+  - `setChatName()`
+  - `setChatProfileImage()`
+  - `downloadFullMessage()`
+  - `lookupContactIdByAddr()`
+  - `sendVideochatInvitation()`
+  - `searchMessages()`
+  - `messageIdsToSearchResults()`
+  - `setChatVisibility()`
+  - `getChatEphemeralTimer()`
+  - `setChatEphemeralTimer()`
+  - `getLocations()`
+  - `getAccountFileSize()`
+  - `estimateAutoDeletionCount()`
+  - `setStockStrings()`
+  - `exportSelfKeys()`
+  - `importSelfKeys()`
+  - `sendSticker()`
+  - `changeContactName()`
+  - `deleteContact()`
+  - `joinSecurejoin()`
+  - `stopIoForAllAccounts()`
+  - `startIoForAllAccounts()`
+  - `startIo()`
+  - `stopIo()`
+  - `exportBackup()`
+  - `importBackup()`
+  - `getMessageHtml()` #3671
+  - `miscGetStickerFolder` and `miscGetStickers` #3672
+- breaking: jsonrpc: remove function `messageListGetMessageIds()`, it is replaced by `getMessageIds()` and `getMessageListItems()` the latter returns a new `MessageListItem` type, which is the now prefered way of using the message list.
+- jsonrpc: add type: #3641, #3645
+  - `MessageSearchResult`
+  - `Location`
+- jsonrpc: add `viewType` to quoted message(`MessageQuote` type) in `Message` object type #3651
+
+
+### Changes
+- Look at Authentication-Results. Don't accept Autocrypt key changes
+  if they come with negative authentiation results while this contact
+  sent emails with positive authentication results in the past. #3583
+- jsonrpc in cffi also sends events now #3662
+- jsonrpc: new format for events and better typescript autocompletion
+- Join all "[migration] vXX" log messages into one
+
+### Fixes
+- share stock string translations across accounts created by the same account manager #3640
+- suppress welcome device messages after account import #3642
+- fix unix timestamp used for daymarker #3660
+
+## 1.96.0
+
+### Changes
+- jsonrpc js client:
+  - Change package name from `deltachat-jsonrpc-client` to `@deltachat/jsonrpc-client`
+  - remove relative file dependency to it from `deltachat-node` (because it did not work anyway and broke the nix build of desktop)
+  - ci: add github ci action to upload it to our download server automaticaly on realease
+
+## 1.95.0
+
+### API-Changes
+- jsonrpc: add `mailingListAddress` property to `FullChat` #3607
+- jsonrpc: add `MessageNotificationInfo` & `messageGetNotificationInfo()` #3614
+- jsonrpc: add `chat_get_neighboring_media` function #3610
+
+### Changes
+- added `dclogin:` scheme to allow configuration from a qr code
+  (data inside qrcode, contrary to `dcaccount:` which points to an API to create an account) #3541
+- truncate incoming messages by lines instead of just length #3480
+- emit separate `DC_EVENT_MSGS_CHANGED` for each expired message,
+  and `DC_EVENT_WEBXDC_INSTANCE_DELETED` when a message contains a webxdc #3605
+- enable `bcc_self` by default #3612
+
+
+## 1.94.0
+
+### API-Changes
+- breaking change: replace `dc_accounts_event_emitter_t` with `dc_event_emitter_t` #3422
+
+  Type `dc_accounts_event_emitter_t` is removed.
+  `dc_accounts_get_event_emitter()` returns `dc_event_emitter_t` now, so
+  `dc_get_next_event()` should be used instead of `dc_accounts_get_next_event`
+  and `dc_event_emitter_unref()` should be used instead of
+  `dc_accounts_event_emitter_unref`.
+- add `dc_contact_was_seen_recently()` #3560
+- Fix `get_connectivity_html` and `get_encrinfo` futures not being Send. See rust-lang/rust#101650 for more information
+- jsonrpc: add functions: #3586, #3587, #3590
+  - `deleteChat()`
+  - `getChatEncryptionInfo()`
+  - `getChatSecurejoinQrCodeSvg()`
+  - `leaveGroup()`
+  - `removeContactFromChat()`
+  - `addContactToChat()`
+  - `deleteMessages()`
+  - `getMessageInfo()`
+  - `getBasicChatInfo()`
+  - `marknoticedChat()`
+  - `getFirstUnreadMessageOfChat()`
+  - `markseenMsgs()`
+  - `forwardMessages()`
+  - `removeDraft()`
+  - `getDraft()`
+  - `miscSendMsg()`
+  - `miscSetDraft()`
+  - `maybeNetwork()`
+  - `getConnectivity()`
+  - `getContactEncryptionInfo()`
+  - `getConnectivityHtml()`
+- jsonrpc: add `is_broadcast` property to `ChatListItemFetchResult` #3584
+- jsonrpc: add `was_seen_recently` property to `ChatListItemFetchResult`, `FullChat` and `Contact` #3584
+- jsonrpc: add `webxdc_info` property to `Message` #3588
+- python: move `get_dc_event_name()` from `deltachat` to `deltachat.events` #3564
+- jsonrpc: add `webxdc_info`, `parent_id` and `download_state` property to `Message` #3588, #3590
+- jsonrpc: add `BasicChat` object as a leaner alternative to `FullChat` #3590
+- jsonrpc: add `last_seen` property to `Contact` #3590
+- breaking! jsonrpc: replace `Message.quoted_text` and `Message.quoted_message_id` with `Message.quote` #3590
+- add separate stock strings for actions done by contacts to make them easier to translate #3518
+- `dc_initiate_key_transfer()` is non-blocking now. #3553
+  UIs don't need to display a button to cancel sending Autocrypt Setup Message with
+  `dc_stop_ongoing_process()` anymore.
+
+### Changes
+- order contact lists by "last seen";
+  this affects `dc_get_chat_contacts()`, `dc_get_contacts()` and `dc_get_blocked_contacts()` #3562
+- add `internet_access` flag to `dc_msg_get_webxdc_info()` #3516
+- `DC_EVENT_WEBXDC_INSTANCE_DELETED` is emitted when a message containing a webxdc gets deleted #3592
 
 ### Fixes
 - do not emit notifications for blocked chats #3557
+- Show attached .eml files correctly #3561
+- Auto accept contact requests if `Config::Bot` is set for a client #3567 
+- Don't prepend the subject to chat messages in mailinglists
+- fix `set_core_version.py` script to also update version in `deltachat-jsonrpc/typescript/package.json` #3585
+- Reject webxcd-updates from contacts who are not group members #3568
 
 
 ## 1.93.0

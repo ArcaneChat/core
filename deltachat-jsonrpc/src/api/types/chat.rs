@@ -1,10 +1,13 @@
-use anyhow::{anyhow, Result};
-use deltachat::chat::get_chat_contacts;
+use std::time::{Duration, SystemTime};
+
+use anyhow::{anyhow, bail, Result};
+use deltachat::chat::{self, get_chat_contacts, ChatVisibility};
 use deltachat::chat::{Chat, ChatId};
+use deltachat::constants::Chattype;
 use deltachat::contact::{Contact, ContactId};
 use deltachat::context::Context;
 use num_traits::cast::ToPrimitive;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use typescript_type_def::TypeDef;
 
 use super::color_int_to_hex_string;
@@ -33,6 +36,8 @@ pub struct FullChat {
     is_muted: bool,
     ephemeral_timer: u32, //TODO look if there are more important properties in newer core versions
     can_send: bool,
+    was_seen_recently: bool,
+    mailing_list_address: Option<String>,
 }
 
 impl FullChat {
@@ -65,12 +70,25 @@ impl FullChat {
 
         let can_send = chat.can_send(context).await?;
 
+        let was_seen_recently = if chat.get_type() == Chattype::Single {
+            match contact_ids.get(0) {
+                Some(contact) => Contact::load_from_db(context, *contact)
+                    .await?
+                    .was_seen_recently(),
+                None => false,
+            }
+        } else {
+            false
+        };
+
+        let mailing_list_address = chat.get_mailinglist_addr().map(|s| s.to_string());
+
         Ok(FullChat {
             id: chat_id,
             name: chat.name.clone(),
             is_protected: chat.is_protected(),
             profile_image, //BLOBS ?
-            archived: chat.get_visibility() == deltachat::chat::ChatVisibility::Archived,
+            archived: chat.get_visibility() == chat::ChatVisibility::Archived,
             chat_type: chat
                 .get_type()
                 .to_u32()
@@ -87,6 +105,109 @@ impl FullChat {
             is_muted: chat.is_muted(),
             ephemeral_timer,
             can_send,
+            was_seen_recently,
+            mailing_list_address,
         })
+    }
+}
+
+/// cheaper version of fullchat, omits:
+/// - contacts
+/// - contact_ids
+/// - fresh_message_counter
+/// - ephemeral_timer
+/// - self_in_group
+/// - was_seen_recently
+/// - can_send
+///
+/// used when you only need the basic metadata of a chat like type, name, profile picture
+#[derive(Serialize, TypeDef)]
+#[serde(rename_all = "camelCase")]
+pub struct BasicChat {
+    id: u32,
+    name: String,
+    is_protected: bool,
+    profile_image: Option<String>, //BLOBS ?
+    archived: bool,
+    chat_type: u32,
+    is_unpromoted: bool,
+    is_self_talk: bool,
+    color: String,
+    is_contact_request: bool,
+    is_device_chat: bool,
+    is_muted: bool,
+}
+
+impl BasicChat {
+    pub async fn try_from_dc_chat_id(context: &Context, chat_id: u32) -> Result<Self> {
+        let rust_chat_id = ChatId::new(chat_id);
+        let chat = Chat::load_from_db(context, rust_chat_id).await?;
+
+        let profile_image = match chat.get_profile_image(context).await? {
+            Some(path_buf) => path_buf.to_str().map(|s| s.to_owned()),
+            None => None,
+        };
+        let color = color_int_to_hex_string(chat.get_color(context).await?);
+
+        Ok(BasicChat {
+            id: chat_id,
+            name: chat.name.clone(),
+            is_protected: chat.is_protected(),
+            profile_image, //BLOBS ?
+            archived: chat.get_visibility() == chat::ChatVisibility::Archived,
+            chat_type: chat
+                .get_type()
+                .to_u32()
+                .ok_or_else(|| anyhow!("unknown chat type id"))?, // TODO get rid of this unwrap?
+            is_unpromoted: chat.is_unpromoted(),
+            is_self_talk: chat.is_self_talk(),
+            color,
+            is_contact_request: chat.is_contact_request(),
+            is_device_chat: chat.is_device_talk(),
+            is_muted: chat.is_muted(),
+        })
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, TypeDef)]
+pub enum MuteDuration {
+    NotMuted,
+    Forever,
+    Until(i64),
+}
+
+impl MuteDuration {
+    pub fn try_into_core_type(self) -> Result<chat::MuteDuration> {
+        match self {
+            MuteDuration::NotMuted => Ok(chat::MuteDuration::NotMuted),
+            MuteDuration::Forever => Ok(chat::MuteDuration::Forever),
+            MuteDuration::Until(n) => {
+                if n <= 0 {
+                    bail!("failed to read mute duration")
+                }
+
+                Ok(SystemTime::now()
+                    .checked_add(Duration::from_secs(n as u64))
+                    .map_or(chat::MuteDuration::Forever, chat::MuteDuration::Until))
+            }
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, TypeDef)]
+#[serde(rename = "ChatVisibility")]
+pub enum JSONRPCChatVisibility {
+    Normal,
+    Archived,
+    Pinned,
+}
+
+impl JSONRPCChatVisibility {
+    pub fn into_core_type(self) -> ChatVisibility {
+        match self {
+            JSONRPCChatVisibility::Normal => ChatVisibility::Normal,
+            JSONRPCChatVisibility::Archived => ChatVisibility::Archived,
+            JSONRPCChatVisibility::Pinned => ChatVisibility::Pinned,
+        }
     }
 }

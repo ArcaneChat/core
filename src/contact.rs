@@ -1,14 +1,20 @@
 //! Contacts module
 
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::convert::{TryFrom, TryInto};
 use std::fmt;
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, ensure, Context as _, Result};
+use async_channel::{self as channel, Receiver, Sender};
 use deltachat_derive::{FromSql, ToSql};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use tokio::task;
+use tokio::time::{timeout, Duration};
 
 use crate::aheader::EncryptPreference;
 use crate::chat::ChatId;
@@ -24,14 +30,19 @@ use crate::mimeparser::AvatarAction;
 use crate::param::{Param, Params};
 use crate::peerstate::{Peerstate, PeerstateVerifiedStatus};
 use crate::sql::{self, params_iter};
-use crate::tools::{get_abs_path, improve_single_line_input, EmailAddress};
+use crate::tools::{duration_to_str, get_abs_path, improve_single_line_input, time, EmailAddress};
 use crate::{chat, stock_str};
+
+/// Time during which a contact is considered as seen recently.
+const SEEN_RECENTLY_SECONDS: i64 = 600;
 
 /// Contact ID, including reserved IDs.
 ///
 /// Some contact IDs are reserved to identify special contacts.  This
 /// type can represent both the special as well as normal contacts.
-#[derive(Debug, Copy, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Copy, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 pub struct ContactId(u32);
 
 impl ContactId {
@@ -323,6 +334,11 @@ impl Contact {
         self.last_seen
     }
 
+    /// Returns `true` if this contact was seen recently.
+    pub fn was_seen_recently(&self) -> bool {
+        time() - self.last_seen <= SEEN_RECENTLY_SECONDS
+    }
+
     /// Check if a contact is blocked.
     pub async fn is_blocked_load(context: &Context, id: ContactId) -> Result<bool> {
         let blocked = Self::load_from_db(context, id).await?.blocked;
@@ -498,9 +514,9 @@ impl Contact {
         let mut update_addr = false;
         let mut row_id = 0;
 
-        if let Ok((id, row_name, row_addr, row_origin, row_authname)) = context
+        if let Some((id, row_name, row_addr, row_origin, row_authname)) = context
             .sql
-            .query_row(
+            .query_row_optional(
                 "SELECT id, name, addr, origin, authname \
             FROM contacts WHERE addr=? COLLATE NOCASE;",
                 paramsv![addr.to_string()],
@@ -514,7 +530,7 @@ impl Contact {
                     Ok((row_id, row_name, row_addr, row_origin, row_authname))
                 },
             )
-            .await
+            .await?
         {
             let update_name = manual && name != row_name;
             let update_authname = !manual
@@ -708,7 +724,7 @@ impl Contact {
                  AND c.blocked=0 \
                  AND (iif(c.name='',c.authname,c.name) LIKE ? OR c.addr LIKE ?) \
                  AND (1=? OR LENGTH(ps.verified_key_fingerprint)!=0)  \
-                 ORDER BY LOWER(iif(c.name='',c.authname,c.name)||c.addr),c.id;",
+                 ORDER BY c.last_seen DESC, c.id DESC;",
                         sql::repeat_vars(self_addrs.len())
                     ),
                     rusqlite::params_from_iter(params_iter(&self_addrs).chain(params_iterv![
@@ -760,7 +776,7 @@ impl Contact {
                  AND id>?
                  AND origin>=?
                  AND blocked=0
-                 ORDER BY LOWER(iif(name='',authname,name)||addr),id;",
+                 ORDER BY last_seen DESC, id DESC;",
                         sql::repeat_vars(self_addrs.len())
                     ),
                     rusqlite::params_from_iter(params_iter(&self_addrs).chain(params_iterv![
@@ -849,7 +865,7 @@ impl Contact {
         let list = context
             .sql
             .query_map(
-                "SELECT id FROM contacts WHERE id>? AND blocked!=0 ORDER BY LOWER(iif(name='',authname,name)||addr),id;",
+                "SELECT id FROM contacts WHERE id>? AND blocked!=0 ORDER BY last_seen DESC, id DESC;",
                 paramsv![ContactId::LAST_SPECIAL],
                 |row| row.get::<_, ContactId>(0),
                 |ids| {
@@ -888,11 +904,8 @@ impl Contact {
                     EncryptPreference::Reset => stock_str::encr_none(context).await,
                 };
 
-                ret += &format!(
-                    "{}.\n{}:",
-                    stock_message,
-                    stock_str::finger_prints(context).await
-                );
+                let finger_prints = stock_str::finger_prints(context).await;
+                ret += &format!("{}.\n{}:", stock_message, finger_prints);
 
                 let fingerprint_self = SignedPublicKey::load_self(context)
                     .await?
@@ -931,43 +944,36 @@ impl Contact {
         Ok(ret)
     }
 
-    /// Delete a contact. The contact is deleted from the local device. It may happen that this is not
-    /// possible as the contact is in use. In this case, the contact can be blocked.
+    /// Delete a contact so that it disappears from the corresponding lists.
+    //  Depending on whether there are ongoing chats, deletion is done by physical deletion or hiding.
+    //  The contact is deleted from the local device.
     ///
     /// May result in a `#DC_EVENT_CONTACTS_CHANGED` event.
     pub async fn delete(context: &Context, contact_id: ContactId) -> Result<()> {
         ensure!(!contact_id.is_special(), "Can not delete special contact");
 
-        let count_chats = context
+        context
             .sql
-            .count(
-                "SELECT COUNT(*) FROM chats_contacts WHERE contact_id=?;",
-                paramsv![contact_id],
-            )
+            .transaction(move |transaction| {
+                // make sure, the transaction starts with a write command and becomes EXCLUSIVE by that -
+                // upgrading later may be impossible by races.
+                let deleted_contacts = transaction.execute(
+                    "DELETE FROM contacts WHERE id=?
+                     AND (SELECT COUNT(*) FROM chats_contacts WHERE contact_id=?)=0;",
+                    paramsv![contact_id, contact_id],
+                )?;
+                if deleted_contacts == 0 {
+                    transaction.execute(
+                        "UPDATE contacts SET origin=? WHERE id=?;",
+                        paramsv![Origin::Hidden, contact_id],
+                    )?;
+                }
+                Ok(())
+            })
             .await?;
 
-        if count_chats == 0 {
-            match context
-                .sql
-                .execute("DELETE FROM contacts WHERE id=?;", paramsv![contact_id])
-                .await
-            {
-                Ok(_) => {
-                    context.emit_event(EventType::ContactsChanged(None));
-                    return Ok(());
-                }
-                Err(err) => {
-                    error!(context, "delete_contact {} failed ({})", contact_id, err);
-                    return Err(err);
-                }
-            }
-        }
-
-        info!(
-            context,
-            "could not delete contact {}, there are {} chats with it", contact_id, count_chats
-        );
-        bail!("Could not delete contact with ongoing chats");
+        context.emit_event(EventType::ContactsChanged(None));
+        Ok(())
     }
 
     /// Get a single contact object.  For a list, see eg. get_contacts().
@@ -1178,7 +1184,7 @@ impl Contact {
 
 /// Returns false if addr is an invalid address, otherwise true.
 pub fn may_be_valid_addr(addr: &str) -> bool {
-    let res = addr.parse::<EmailAddress>();
+    let res = EmailAddress::new(addr);
     res.is_ok()
 }
 
@@ -1363,13 +1369,17 @@ pub(crate) async fn update_last_seen(
         "Can not update special contact last seen timestamp"
     );
 
-    context
+    if context
         .sql
         .execute(
             "UPDATE contacts SET last_seen = ?1 WHERE last_seen < ?1 AND id = ?2",
             paramsv![timestamp, contact_id],
         )
-        .await?;
+        .await?
+        > 0
+    {
+        context.interrupt_recently_seen(contact_id, timestamp).await;
+    }
     Ok(())
 }
 
@@ -1436,6 +1446,132 @@ fn split_address_book(book: &str) -> Vec<(&str, &str)> {
         .collect()
 }
 
+#[derive(Debug)]
+pub(crate) struct RecentlySeenInterrupt {
+    contact_id: ContactId,
+    timestamp: i64,
+}
+
+#[derive(Debug)]
+pub(crate) struct RecentlySeenLoop {
+    /// Task running "recently seen" loop.
+    handle: task::JoinHandle<()>,
+
+    interrupt_send: Sender<RecentlySeenInterrupt>,
+}
+
+impl RecentlySeenLoop {
+    pub(crate) fn new(context: Context) -> Self {
+        let (interrupt_send, interrupt_recv) = channel::bounded(1);
+
+        let handle = task::spawn(async move { Self::run(context, interrupt_recv).await });
+        Self {
+            handle,
+            interrupt_send,
+        }
+    }
+
+    async fn run(context: Context, interrupt: Receiver<RecentlySeenInterrupt>) {
+        type MyHeapElem = (Reverse<i64>, ContactId);
+
+        // Priority contains all recently seen sorted by the timestamp
+        // when they become not recently seen.
+        //
+        // Initialize with contacts which are currently seen, but will
+        // become unseen in the future.
+        let mut unseen_queue: BinaryHeap<MyHeapElem> = context
+            .sql
+            .query_map(
+                "SELECT id, last_seen FROM contacts
+                 WHERE last_seen > ?",
+                paramsv![time() - SEEN_RECENTLY_SECONDS],
+                |row| {
+                    let contact_id: ContactId = row.get("id")?;
+                    let last_seen: i64 = row.get("last_seen")?;
+                    Ok((Reverse(last_seen + SEEN_RECENTLY_SECONDS), contact_id))
+                },
+                |rows| {
+                    rows.collect::<std::result::Result<BinaryHeap<MyHeapElem>, _>>()
+                        .map_err(Into::into)
+                },
+            )
+            .await
+            .unwrap_or_default();
+
+        loop {
+            let now = SystemTime::now();
+
+            let (until, contact_id) =
+                if let Some((Reverse(timestamp), contact_id)) = unseen_queue.peek() {
+                    (
+                        UNIX_EPOCH
+                            + Duration::from_secs((*timestamp).try_into().unwrap_or(u64::MAX))
+                            + Duration::from_secs(1),
+                        Some(contact_id),
+                    )
+                } else {
+                    // Sleep for 24 hours.
+                    (now + Duration::from_secs(86400), None)
+                };
+
+            if let Ok(duration) = until.duration_since(now) {
+                info!(
+                    context,
+                    "Recently seen loop waiting for {} or interupt",
+                    duration_to_str(duration)
+                );
+
+                match timeout(duration, interrupt.recv()).await {
+                    Err(_) => {
+                        // Timeout, notify about contact.
+                        if let Some(contact_id) = contact_id {
+                            context.emit_event(EventType::ContactsChanged(Some(*contact_id)));
+                            unseen_queue.pop();
+                        }
+                    }
+                    Ok(Err(err)) => {
+                        warn!(
+                            context,
+                            "Error receiving an interruption in recently seen loop: {}", err
+                        );
+                    }
+                    Ok(Ok(RecentlySeenInterrupt {
+                        contact_id,
+                        timestamp,
+                    })) => {
+                        // Received an interrupt.
+                        unseen_queue.push((Reverse(timestamp + SEEN_RECENTLY_SECONDS), contact_id));
+                    }
+                }
+            } else {
+                info!(
+                    context,
+                    "Recently seen loop is not waiting, event is already due."
+                );
+
+                // Event is already in the past.
+                if let Some(contact_id) = contact_id {
+                    context.emit_event(EventType::ContactsChanged(Some(*contact_id)));
+                }
+                unseen_queue.pop();
+            }
+        }
+    }
+
+    pub(crate) fn interrupt(&self, contact_id: ContactId, timestamp: i64) {
+        self.interrupt_send
+            .try_send(RecentlySeenInterrupt {
+                contact_id,
+                timestamp,
+            })
+            .ok();
+    }
+
+    pub(crate) fn abort(self) {
+        self.handle.abort();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1444,7 +1580,7 @@ mod tests {
     use crate::chatlist::Chatlist;
     use crate::message::Message;
     use crate::receive_imf::receive_imf;
-    use crate::test_utils::{self, TestContext};
+    use crate::test_utils::{self, TestContext, TestContextManager};
 
     #[test]
     fn test_contact_id_values() {
@@ -1803,21 +1939,70 @@ mod tests {
         // Create Bob contact
         let (contact_id, _) =
             Contact::add_or_lookup(&alice, "Bob", "bob@example.net", Origin::ManuallyCreated)
-                .await
-                .unwrap();
-
+                .await?;
         let chat = alice
             .create_chat_with_contact("Bob", "bob@example.net")
             .await;
+        assert_eq!(
+            Contact::get_all(&alice, 0, Some("bob@example.net"))
+                .await?
+                .len(),
+            1
+        );
 
-        // Can't delete a contact with ongoing chats.
-        assert!(Contact::delete(&alice, contact_id).await.is_err());
+        // If a contact has ongoing chats, contact is only hidden on deletion
+        Contact::delete(&alice, contact_id).await?;
+        let contact = Contact::load_from_db(&alice, contact_id).await?;
+        assert_eq!(contact.origin, Origin::Hidden);
+        assert_eq!(
+            Contact::get_all(&alice, 0, Some("bob@example.net"))
+                .await?
+                .len(),
+            0
+        );
 
         // Delete chat.
         chat.get_id().delete(&alice).await?;
 
-        // Can delete contact now.
+        // Can delete contact physically now
         Contact::delete(&alice, contact_id).await?;
+        assert!(Contact::load_from_db(&alice, contact_id).await.is_err());
+        assert_eq!(
+            Contact::get_all(&alice, 0, Some("bob@example.net"))
+                .await?
+                .len(),
+            0
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_delete_and_recreate_contact() -> Result<()> {
+        let t = TestContext::new_alice().await;
+
+        // test recreation after physical deletion
+        let contact_id1 = Contact::create(&t, "Foo", "foo@bar.de").await?;
+        assert_eq!(Contact::get_all(&t, 0, Some("foo@bar.de")).await?.len(), 1);
+        Contact::delete(&t, contact_id1).await?;
+        assert!(Contact::load_from_db(&t, contact_id1).await.is_err());
+        assert_eq!(Contact::get_all(&t, 0, Some("foo@bar.de")).await?.len(), 0);
+        let contact_id2 = Contact::create(&t, "Foo", "foo@bar.de").await?;
+        assert_ne!(contact_id2, contact_id1);
+        assert_eq!(Contact::get_all(&t, 0, Some("foo@bar.de")).await?.len(), 1);
+
+        // test recreation after hiding
+        t.create_chat_with_contact("Foo", "foo@bar.de").await;
+        Contact::delete(&t, contact_id2).await?;
+        let contact = Contact::load_from_db(&t, contact_id2).await?;
+        assert_eq!(contact.origin, Origin::Hidden);
+        assert_eq!(Contact::get_all(&t, 0, Some("foo@bar.de")).await?.len(), 0);
+
+        let contact_id3 = Contact::create(&t, "Foo", "foo@bar.de").await?;
+        let contact = Contact::load_from_db(&t, contact_id3).await?;
+        assert_eq!(contact.origin, Origin::ManuallyCreated);
+        assert_eq!(contact_id3, contact_id2);
+        assert_eq!(Contact::get_all(&t, 0, Some("foo@bar.de")).await?.len(), 1);
 
         Ok(())
     }
@@ -2267,6 +2452,30 @@ Hi."#;
         assert!(timestamp > 0);
         let contact = Contact::load_from_db(&alice, contact_id).await?;
         assert_eq!(contact.last_seen(), timestamp);
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_was_seen_recently() -> Result<()> {
+        let mut tcm = TestContextManager::new();
+        let alice = tcm.alice().await;
+        let bob = tcm.bob().await;
+
+        let chat = alice.create_chat(&bob).await;
+        let sent_msg = alice.send_text(chat.id, "moin").await;
+
+        let chat = bob.create_chat(&alice).await;
+        let contacts = chat::get_chat_contacts(&bob, chat.id).await?;
+        let contact = Contact::get_by_id(&bob, *contacts.first().unwrap()).await?;
+        assert!(!contact.was_seen_recently());
+
+        bob.recv_msg(&sent_msg).await;
+        let contact = Contact::get_by_id(&bob, *contacts.first().unwrap()).await?;
+        assert!(contact.was_seen_recently());
+
+        let self_contact = Contact::get_by_id(&bob, ContactId::SELF).await?;
+        assert!(!self_contact.was_seen_recently());
 
         Ok(())
     }

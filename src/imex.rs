@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use ::pgp::types::KeyTrait;
 use anyhow::{bail, ensure, format_err, Context as _, Result};
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
 use futures_lite::FutureExt;
 use rand::{thread_rng, Rng};
 use tokio::fs::{self, File};
@@ -17,7 +17,6 @@ use crate::chat::{self, delete_and_reset_all_device_msgs, ChatId};
 use crate::config::Config;
 use crate::contact::ContactId;
 use crate::context::Context;
-use crate::e2ee;
 use crate::events::EventType;
 use crate::key::{self, DcKey, DcSecretKey, SignedPublicKey, SignedSecretKey};
 use crate::log::LogExt;
@@ -31,6 +30,7 @@ use crate::tools::{
     create_folder, delete_file, get_filesuffix_lc, open_file_std, read_file, time, write_file,
     EmailAddress,
 };
+use crate::{e2ee, tools};
 
 // Name of the database file in the backup.
 const DBFILE_BACKUP_NAME: &str = "dc_database_backup.sqlite";
@@ -134,19 +134,9 @@ pub async fn has_backup(_context: &Context, dir_name: &Path) -> Result<String> {
 }
 
 /// Initiates key transfer via Autocrypt Setup Message.
+///
+/// Returns setup code.
 pub async fn initiate_key_transfer(context: &Context) -> Result<String> {
-    use futures::future::FutureExt;
-
-    let cancel = context.alloc_ongoing().await?;
-    let res = do_initiate_key_transfer(context)
-        .race(cancel.recv().map(|_| Err(format_err!("canceled"))))
-        .await;
-
-    context.free_ongoing().await;
-    res
-}
-
-async fn do_initiate_key_transfer(context: &Context) -> Result<String> {
     let setup_code = create_setup_code(context);
     /* this may require a keypair to be created. this may take a second ... */
     let setup_file_content = render_setup_file(context, &setup_code).await?;
@@ -171,17 +161,7 @@ async fn do_initiate_key_transfer(context: &Context) -> Result<String> {
     msg.force_plaintext();
     msg.param.set_int(Param::SkipAutocrypt, 1);
 
-    let msg_id = chat::send_msg(context, chat_id, &mut msg).await?;
-    info!(context, "Wait for setup message being sent ...",);
-    while !context.shall_stop_ongoing().await {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        if let Ok(msg) = Message::load_from_db(context, msg_id).await {
-            if msg.is_sent() {
-                info!(context, "... setup message sent.",);
-                break;
-            }
-        }
-    }
+    chat::send_msg(context, chat_id, &mut msg).await?;
     // no maybe_add_bcc_self_device_msg() here.
     // the ui shows the dialog with the setup code on this device,
     // it would be too much noise to have two things popping up at the same time.
@@ -596,10 +576,7 @@ async fn export_backup_inner(
         .append_path_with_name(temp_db_path, DBFILE_BACKUP_NAME)
         .await?;
 
-    let read_dir: Vec<_> =
-        tokio_stream::wrappers::ReadDirStream::new(fs::read_dir(context.get_blobdir()).await?)
-            .try_collect()
-            .await?;
+    let read_dir = tools::read_dir(context.get_blobdir()).await?;
     let count = read_dir.len();
     let mut written_files = 0;
 
@@ -980,16 +957,10 @@ mod tests {
     async fn test_key_transfer() -> Result<()> {
         let alice = TestContext::new_alice().await;
 
-        let alice_clone = alice.clone();
-        let key_transfer_task = tokio::task::spawn(async move {
-            let ctx = alice_clone;
-            initiate_key_transfer(&ctx).await
-        });
+        let setup_code = initiate_key_transfer(&alice).await?;
 
-        // Wait for the message to be added to the queue.
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        // Get Autocrypt Setup Message.
         let sent = alice.pop_sent_msg().await;
-        let setup_code = key_transfer_task.await??;
 
         // Alice sets up a second device.
         let alice2 = TestContext::new().await;

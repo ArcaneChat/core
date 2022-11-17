@@ -80,7 +80,7 @@ class TestOfflineAccountBasic:
         d = ac1.get_info()
         assert d["arch"]
         assert d["number_of_chats"] == "0"
-        assert d["bcc_self"] == "0"
+        assert d["bcc_self"] == "1"
 
     def test_is_not_configured(self, acfactory):
         ac1 = acfactory.get_unconfigured_account()
@@ -118,7 +118,7 @@ class TestOfflineAccountBasic:
     def test_has_bccself(self, acfactory):
         ac1 = acfactory.get_unconfigured_account()
         assert "bcc_self" in ac1.get_config("sys.config_keys").split()
-        assert ac1.get_config("bcc_self") == "0"
+        assert ac1.get_config("bcc_self") == "1"
 
     def test_selfcontact_if_unconfigured(self, acfactory):
         ac1 = acfactory.get_unconfigured_account()
@@ -200,11 +200,11 @@ class TestOfflineContact:
         assert ac1.delete_contact(contact1)
         assert contact1 not in ac1.get_contacts()
 
-    def test_get_contacts_and_delete_fails(self, acfactory):
+    def test_delete_referenced_contact_hides_contact(self, acfactory):
         ac1 = acfactory.get_pseudo_configured_account()
         contact1 = ac1.create_contact("some1@example.com", name="some1")
         msg = contact1.create_chat().send_text("one message")
-        assert not ac1.delete_contact(contact1)
+        assert ac1.delete_contact(contact1)
         assert not msg.filemime
 
     def test_create_chat_flexibility(self, acfactory):
@@ -301,7 +301,7 @@ class TestOfflineChat:
         assert d["draft"] == "" if chat.get_draft() is None else chat.get_draft()
 
     def test_group_chat_creation_with_translation(self, ac1):
-        ac1.set_stock_translation(const.DC_STR_MSGGRPNAME, "abc %1$s xyz %2$s")
+        ac1.set_stock_translation(const.DC_STR_GROUP_NAME_CHANGED_BY_YOU, "abc %1$s xyz %2$s")
         ac1._evtracker.consume_events()
         with pytest.raises(ValueError):
             ac1.set_stock_translation(const.DC_STR_FILE, "xyz %1$s")
@@ -317,7 +317,7 @@ class TestOfflineChat:
         chat.send_text("Now we have a group for homework")
         assert chat.is_promoted()
         chat.set_name("Homework")
-        assert chat.get_messages()[-1].text == "abc homework xyz Homework by me."
+        assert chat.get_messages()[-1].text == "abc homework xyz Homework"
 
     @pytest.mark.parametrize("verified", [True, False])
     def test_group_chat_qr(self, acfactory, ac1, verified):

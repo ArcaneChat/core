@@ -1930,6 +1930,13 @@ NAPI_METHOD(dcn_contact_get_last_seen) {
   NAPI_RETURN_INT64(timestamp);
 }
 
+NAPI_METHOD(dcn_contact_was_seen_recently) {
+  NAPI_ARGV(1);
+  NAPI_DC_CONTACT();
+  int seen_recently = dc_contact_was_seen_recently(dc_contact);
+  NAPI_RETURN_UINT32(seen_recently);
+}
+
 NAPI_METHOD(dcn_contact_is_blocked) {
   NAPI_ARGV(1);
   NAPI_DC_CONTACT();
@@ -3105,14 +3112,14 @@ static void accounts_event_handler_thread_func(void* arg)
 
   TRACE("event_handler_thread_func starting");
 
-  dc_accounts_event_emitter_t * dc_accounts_event_emitter = dc_accounts_get_event_emitter(dcn_accounts->dc_accounts);
+  dc_event_emitter_t * dc_event_emitter = dc_accounts_get_event_emitter(dcn_accounts->dc_accounts);
   dc_event_t* event;
   while (true) {
-    if (dc_accounts_event_emitter == NULL) {
+    if (dc_event_emitter == NULL) {
       TRACE("event emitter is null, bailing");
       break;
     }
-    event = dc_accounts_get_next_event(dc_accounts_event_emitter);
+    event = dc_get_next_event(dc_event_emitter);
     if (event == NULL) {
       TRACE("no more events");
       break;
@@ -3138,7 +3145,7 @@ static void accounts_event_handler_thread_func(void* arg)
     }
   }
 
-  dc_accounts_event_emitter_unref(dc_accounts_event_emitter);
+  dc_event_emitter_unref(dc_event_emitter);
 
   TRACE("event_handler_thread_func ended");
 
