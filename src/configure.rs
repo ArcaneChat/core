@@ -131,7 +131,7 @@ async fn on_configure_completed(
 ) -> Result<()> {
     if let Some(provider) = param.provider {
         if let Some(config_defaults) = &provider.config_defaults {
-            for def in config_defaults.iter() {
+            for def in config_defaults {
                 if !context.config_exists(def.key).await? {
                     info!(context, "apply config_defaults {}={}", def.key, def.value);
                     context.set_config(def.key, Some(def.value)).await?;
@@ -318,7 +318,7 @@ async fn configure(ctx: &Context, param: &mut LoginParam) -> Result<()> {
     }
 
     // respect certificate setting from function parameters
-    for mut server in &mut servers {
+    for server in &mut servers {
         let certificate_checks = match server.protocol {
             Protocol::Imap => param.imap.certificate_checks,
             Protocol::Smtp => param.smtp.certificate_checks,
@@ -462,9 +462,12 @@ async fn configure(ctx: &Context, param: &mut LoginParam) -> Result<()> {
 
     progress!(ctx, 910);
 
-    if ctx.get_config(Config::ConfiguredAddr).await?.as_deref() != Some(&param.addr) {
-        // Switched account, all server UIDs we know are invalid
-        job::schedule_resync(ctx).await?;
+    if let Some(configured_addr) = ctx.get_config(Config::ConfiguredAddr).await? {
+        if configured_addr != param.addr {
+            // Switched account, all server UIDs we know are invalid
+            info!(ctx, "Scheduling resync because the address has changed.");
+            job::schedule_resync(ctx).await?;
+        }
     }
 
     // the trailing underscore is correct
@@ -653,7 +656,7 @@ async fn try_smtp_one_param(
         })
     } else {
         info!(context, "success: {}", inf);
-        smtp.disconnect().await;
+        smtp.disconnect();
         Ok(())
     }
 }

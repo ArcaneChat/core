@@ -1,9 +1,9 @@
 [package]
 name = "deltachat"
-version = "1.117.0"
+version = "1.118.0"
 edition = "2021"
 license = "MPL-2.0"
-rust-version = "1.65"
+rust-version = "1.66"
 
 [profile.dev]
 debug = 0
@@ -118,11 +118,6 @@ members = [
   "deltachat-repl",
   "format-flowed",
 ]
-
-[[example]]
-name = "simple"
-path = "examples/simple.rs"
-
 
 [[bench]]
 name = "create_account"
