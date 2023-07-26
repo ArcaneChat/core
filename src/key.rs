@@ -6,9 +6,11 @@ use std::io::Cursor;
 use std::pin::Pin;
 
 use anyhow::{ensure, Context as _, Result};
+use base64::Engine as _;
 use futures::Future;
 use num_traits::FromPrimitive;
 use pgp::composed::Deserializable;
+pub use pgp::composed::{SignedPublicKey, SignedSecretKey};
 use pgp::ser::Serialize;
 use pgp::types::{KeyTrait, SecretKeyTrait};
 use tokio::runtime::Handle;
@@ -16,11 +18,9 @@ use tokio::runtime::Handle;
 use crate::config::Config;
 use crate::constants::KeyGenType;
 use crate::context::Context;
-use crate::tools::{time, EmailAddress};
-
 // Re-export key types
 pub use crate::pgp::KeyPair;
-pub use pgp::composed::{SignedPublicKey, SignedSecretKey};
+use crate::tools::{time, EmailAddress};
 
 /// Convenience trait for working with keys.
 ///
@@ -28,20 +28,16 @@ pub use pgp::composed::{SignedPublicKey, SignedSecretKey};
 /// [SignedSecretKey] types and makes working with them a little
 /// easier in the deltachat world.
 pub trait DcKey: Serialize + Deserializable + KeyTrait + Clone {
-    type KeyType: Serialize + Deserializable + KeyTrait + Clone;
-
     /// Create a key from some bytes.
-    fn from_slice(bytes: &[u8]) -> Result<Self::KeyType> {
-        Ok(<Self::KeyType as Deserializable>::from_bytes(Cursor::new(
-            bytes,
-        ))?)
+    fn from_slice(bytes: &[u8]) -> Result<Self> {
+        Ok(<Self as Deserializable>::from_bytes(Cursor::new(bytes))?)
     }
 
     /// Create a key from a base64 string.
-    fn from_base64(data: &str) -> Result<Self::KeyType> {
+    fn from_base64(data: &str) -> Result<Self> {
         // strip newlines and other whitespace
         let cleaned: String = data.split_whitespace().collect();
-        let bytes = base64::decode(cleaned.as_bytes())?;
+        let bytes = base64::engine::general_purpose::STANDARD.decode(cleaned.as_bytes())?;
         Self::from_slice(&bytes)
     }
 
@@ -49,15 +45,15 @@ pub trait DcKey: Serialize + Deserializable + KeyTrait + Clone {
     ///
     /// Returns the key and a map of any headers which might have been set in
     /// the ASCII-armored representation.
-    fn from_asc(data: &str) -> Result<(Self::KeyType, BTreeMap<String, String>)> {
+    fn from_asc(data: &str) -> Result<(Self, BTreeMap<String, String>)> {
         let bytes = data.as_bytes();
-        Self::KeyType::from_armor_single(Cursor::new(bytes)).context("rPGP error")
+        Self::from_armor_single(Cursor::new(bytes)).context("rPGP error")
     }
 
     /// Load the users' default key from the database.
     fn load_self<'a>(
         context: &'a Context,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::KeyType>> + 'a + Send>>;
+    ) -> Pin<Box<dyn Future<Output = Result<Self>> + 'a + Send>>;
 
     /// Serialise the key as bytes.
     fn to_bytes(&self) -> Vec<u8> {
@@ -72,7 +68,7 @@ pub trait DcKey: Serialize + Deserializable + KeyTrait + Clone {
 
     /// Serialise the key to a base64 string.
     fn to_base64(&self) -> String {
-        base64::encode(&DcKey::to_bytes(self))
+        base64::engine::general_purpose::STANDARD.encode(DcKey::to_bytes(self))
     }
 
     /// Serialise the key to ASCII-armored representation.
@@ -90,11 +86,9 @@ pub trait DcKey: Serialize + Deserializable + KeyTrait + Clone {
 }
 
 impl DcKey for SignedPublicKey {
-    type KeyType = SignedPublicKey;
-
     fn load_self<'a>(
         context: &'a Context,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::KeyType>> + 'a + Send>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Self>> + 'a + Send>> {
         Box::pin(async move {
             let addr = context.get_primary_self_addr().await?;
             match context
@@ -106,7 +100,7 @@ impl DcKey for SignedPublicKey {
                      WHERE addr=?
                        AND is_default=1;
                     "#,
-                    paramsv![addr],
+                    (addr,),
                     |row| {
                         let bytes: Vec<u8> = row.get(0)?;
                         Ok(bytes)
@@ -141,11 +135,9 @@ impl DcKey for SignedPublicKey {
 }
 
 impl DcKey for SignedSecretKey {
-    type KeyType = SignedSecretKey;
-
     fn load_self<'a>(
         context: &'a Context,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::KeyType>> + 'a + Send>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Self>> + 'a + Send>> {
         Box::pin(async move {
             match context
                 .sql
@@ -156,7 +148,7 @@ impl DcKey for SignedSecretKey {
                      WHERE addr=(SELECT value FROM config WHERE keyname="configured_addr")
                        AND is_default=1;
                     "#,
-                    paramsv![],
+                    (),
                     |row| {
                         let bytes: Vec<u8> = row.get(0)?;
                         Ok(bytes)
@@ -248,7 +240,7 @@ pub(crate) async fn load_keypair(
          WHERE addr=?1
            AND is_default=1;
         "#,
-            paramsv![addr],
+            (addr,),
             |row| {
                 let pub_bytes: Vec<u8> = row.get(0)?;
                 let sec_bytes: Vec<u8> = row.get(1)?;
@@ -297,39 +289,41 @@ pub async fn store_self_keypair(
     keypair: &KeyPair,
     default: KeyPairUse,
 ) -> Result<()> {
-    let mut conn = context.sql.get_conn().await?;
-    let transaction = conn.transaction()?;
+    context
+        .sql
+        .transaction(|transaction| {
+            let public_key = DcKey::to_bytes(&keypair.public);
+            let secret_key = DcKey::to_bytes(&keypair.secret);
+            transaction
+                .execute(
+                    "DELETE FROM keypairs WHERE public_key=? OR private_key=?;",
+                    (&public_key, &secret_key),
+                )
+                .context("failed to remove old use of key")?;
+            if default == KeyPairUse::Default {
+                transaction
+                    .execute("UPDATE keypairs SET is_default=0;", ())
+                    .context("failed to clear default")?;
+            }
+            let is_default = match default {
+                KeyPairUse::Default => i32::from(true),
+                KeyPairUse::ReadOnly => i32::from(false),
+            };
 
-    let public_key = DcKey::to_bytes(&keypair.public);
-    let secret_key = DcKey::to_bytes(&keypair.secret);
-    transaction
-        .execute(
-            "DELETE FROM keypairs WHERE public_key=? OR private_key=?;",
-            paramsv![public_key, secret_key],
-        )
-        .context("failed to remove old use of key")?;
-    if default == KeyPairUse::Default {
-        transaction
-            .execute("UPDATE keypairs SET is_default=0;", paramsv![])
-            .context("failed to clear default")?;
-    }
-    let is_default = match default {
-        KeyPairUse::Default => i32::from(true),
-        KeyPairUse::ReadOnly => i32::from(false),
-    };
+            let addr = keypair.addr.to_string();
+            let t = time();
 
-    let addr = keypair.addr.to_string();
-    let t = time();
-
-    transaction
-        .execute(
-            "INSERT INTO keypairs (addr, is_default, public_key, private_key, created)
+            transaction
+                .execute(
+                    "INSERT INTO keypairs (addr, is_default, public_key, private_key, created)
                 VALUES (?,?,?,?,?);",
-            paramsv![addr, is_default, public_key, secret_key, t],
-        )
-        .context("failed to insert keypair")?;
+                    (addr, is_default, &public_key, &secret_key, t),
+                )
+                .context("failed to insert keypair")?;
 
-    transaction.commit()?;
+            Ok(())
+        })
+        .await?;
 
     Ok(())
 }
@@ -339,6 +333,7 @@ pub async fn store_self_keypair(
 pub struct Fingerprint(Vec<u8>);
 
 impl Fingerprint {
+    /// Creates new 160-bit (20 bytes) fingerprint.
     pub fn new(v: Vec<u8>) -> Fingerprint {
         debug_assert_eq!(v.len(), 20);
         Fingerprint(v)
@@ -371,7 +366,7 @@ impl fmt::Display for Fingerprint {
             } else if i > 0 && i % 4 == 0 {
                 write!(f, " ")?;
             }
-            write!(f, "{}", c)?;
+            write!(f, "{c}")?;
         }
         Ok(())
     }
@@ -385,7 +380,7 @@ impl std::str::FromStr for Fingerprint {
         let hex_repr: String = input
             .to_uppercase()
             .chars()
-            .filter(|&c| ('0'..='9').contains(&c) || ('A'..='F').contains(&c))
+            .filter(|&c| c.is_ascii_hexdigit())
             .collect();
         let v: Vec<u8> = hex::decode(&hex_repr)?;
         ensure!(v.len() == 20, "wrong fingerprint length: {}", hex_repr);
@@ -396,11 +391,12 @@ impl std::str::FromStr for Fingerprint {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::test_utils::{alice_keypair, TestContext};
+    use std::sync::Arc;
 
     use once_cell::sync::Lazy;
-    use std::sync::Arc;
+
+    use super::*;
+    use crate::test_utils::{alice_keypair, TestContext};
 
     static KEYPAIR: Lazy<KeyPair> = Lazy::new(alice_keypair);
 
@@ -596,7 +592,7 @@ i8pcjGO+IZffvyZJVRWfVooBJmWWbPB1pueo3tx8w3+fcuzpxz+RLFKaPyqXO+dD
 
         let nrows = || async {
             ctx.sql
-                .count("SELECT COUNT(*) FROM keypairs;", paramsv![])
+                .count("SELECT COUNT(*) FROM keypairs;", ())
                 .await
                 .unwrap()
         };

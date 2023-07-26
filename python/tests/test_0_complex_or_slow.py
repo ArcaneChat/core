@@ -123,6 +123,7 @@ class TestGroupStressTests:
 
 def test_qr_verified_group_and_chatting(acfactory, lp):
     ac1, ac2, ac3 = acfactory.get_online_accounts(3)
+    ac1_addr = ac1.get_self_contact().addr
     lp.sec("ac1: create verified-group QR, ac2 scans and joins")
     chat1 = ac1.create_group_chat("hello", verified=True)
     assert chat1.is_protected()
@@ -141,11 +142,16 @@ def test_qr_verified_group_and_chatting(acfactory, lp):
     msg_out = chat1.send_text("hello")
     assert msg_out.is_encrypted()
 
-    lp.sec("ac2: read message and check it's verified chat")
+    lp.sec("ac2: read message and check that it's a verified chat")
     msg = ac2._evtracker.wait_next_incoming_message()
     assert msg.text == "hello"
     assert msg.chat.is_protected()
     assert msg.is_encrypted()
+
+    lp.sec("ac2: Check that ac2 verified ac1")
+    # If we verified the contact ourselves then verifier addr == contact addr
+    ac2_ac1_contact = ac2.get_contacts()[0]
+    assert ac2.get_self_contact().get_verifier(ac2_ac1_contact) == ac1_addr
 
     lp.sec("ac2: send message and let ac1 read it")
     chat2.send_text("world")
@@ -167,6 +173,12 @@ def test_qr_verified_group_and_chatting(acfactory, lp):
     assert msg.is_encrypted()
     assert msg.is_system_message()
     assert not msg.error
+
+    lp.sec("ac2: Check that ac1 verified ac3 for ac2")
+    ac2_ac1_contact = ac2.get_contacts()[0]
+    assert ac2.get_self_contact().get_verifier(ac2_ac1_contact) == ac1_addr
+    ac2_ac3_contact = ac2.get_contacts()[1]
+    assert ac2.get_self_contact().get_verifier(ac2_ac3_contact) == ac1_addr
 
     lp.sec("ac2: send message and let ac3 read it")
     chat2.send_text("hi")
@@ -204,20 +216,20 @@ def test_fetch_existing(acfactory, lp, mvbox_move):
     # would also find the "Sent" folder, but it would be too late:
     # The sentbox thread, started by `start_io()`, would have seen that there is no
     # ConfiguredSentboxFolder and do nothing.
-    acfactory._acsetup.start_configure(ac1, reconfigure=True)
+    acfactory._acsetup.start_configure(ac1)
     acfactory.bring_accounts_online()
     assert_folders_configured(ac1)
 
-    assert ac1.direct_imap.select_config_folder("mvbox" if mvbox_move else "inbox")
-    with ac1.direct_imap.idle() as idle1:
-        lp.sec("send out message with bcc to ourselves")
-        ac1.set_config("bcc_self", "1")
-        chat = acfactory.get_accepted_chat(ac1, ac2)
-        chat.send_text("message text")
-        assert_folders_configured(ac1)
+    lp.sec("send out message with bcc to ourselves")
+    ac1.set_config("bcc_self", "1")
+    chat = acfactory.get_accepted_chat(ac1, ac2)
+    chat.send_text("message text")
 
-        lp.sec("wait until the bcc_self message arrives in correct folder and is marked seen")
-        assert idle1.wait_for_seen()
+    lp.sec("wait until the bcc_self message arrives in correct folder and is marked seen")
+    if mvbox_move:
+        ac1._evtracker.get_info_contains("Marked messages [0-9]+ in folder DeltaChat as seen.")
+    else:
+        ac1._evtracker.get_info_contains("Marked messages [0-9]+ in folder INBOX as seen.")
     assert_folders_configured(ac1)
 
     lp.sec("create a cloned ac1 and fetch contact history during configure")
@@ -227,7 +239,7 @@ def test_fetch_existing(acfactory, lp, mvbox_move):
     ac1_clone.start_io()
     assert_folders_configured(ac1_clone)
 
-    lp.sec("check that ac2 contact was fetchted during configure")
+    lp.sec("check that ac2 contact was fetched during configure")
     ac1_clone._evtracker.get_matching("DC_EVENT_CONTACTS_CHANGED")
     ac2_addr = ac2.get_config("addr")
     assert any(c.addr == ac2_addr for c in ac1_clone.get_contacts())
@@ -259,12 +271,12 @@ def test_fetch_existing_msgs_group_and_single(acfactory, lp):
     ac1._evtracker.wait_next_incoming_message()
 
     lp.sec("send out message with bcc to ourselves")
-    with ac1.direct_imap.idle() as idle1:
-        ac1.set_config("bcc_self", "1")
-        ac1_ac2_chat = ac1.create_chat(ac2)
-        ac1_ac2_chat.send_text("outgoing, encrypted direct message, creating a chat")
-        # wait until the bcc_self message arrives
-        assert idle1.wait_for_seen()
+    ac1.set_config("bcc_self", "1")
+    ac1_ac2_chat = ac1.create_chat(ac2)
+    ac1_ac2_chat.send_text("outgoing, encrypted direct message, creating a chat")
+
+    # wait until the bcc_self message arrives
+    ac1._evtracker.get_info_contains("Marked messages [0-9]+ in folder INBOX as seen.")
 
     lp.sec("Clone online account and let it fetch the existing messages")
     ac1_clone = acfactory.new_online_configuring_account(cloned_from=ac1)
@@ -480,3 +492,101 @@ def test_multidevice_sync_seen(acfactory, lp):
     assert ac1_clone_message.is_in_seen
     # Test that the timer is started on the second device after synchronizing the seen status.
     assert "Expires: " in ac1_clone_message.get_message_info()
+
+
+def test_see_new_verified_member_after_going_online(acfactory, tmp_path, lp):
+    """The test for the bug #3836:
+    - Alice has two devices, the second is offline.
+    - Alice creates a verified group and sends a QR invitation to Bob.
+    - Bob joins the group and sends a message there. Alice sees it.
+    - Alice's second devices goes online, but doesn't see Bob in the group.
+    """
+    ac1, ac2 = acfactory.get_online_accounts(2)
+    ac2_addr = ac2.get_config("addr")
+    ac1_offl = acfactory.new_online_configuring_account(cloned_from=ac1)
+    for ac in [ac1, ac1_offl]:
+        ac.set_config("bcc_self", "1")
+    acfactory.bring_accounts_online()
+    dir = tmp_path / "exportdir"
+    dir.mkdir()
+    ac1.export_self_keys(str(dir))
+    ac1_offl.import_self_keys(str(dir))
+    ac1_offl.stop_io()
+
+    lp.sec("ac1: create verified-group QR, ac2 scans and joins")
+    chat = ac1.create_group_chat("hello", verified=True)
+    assert chat.is_protected()
+    qr = chat.get_join_qr()
+    lp.sec("ac2: start QR-code based join-group protocol")
+    chat2 = ac2.qr_join_chat(qr)
+    ac1._evtracker.wait_securejoin_inviter_progress(1000)
+
+    lp.sec("ac2: sending message")
+    # Message can be sent only after a receipt of "vg-member-added" message. Just wait for
+    # "Member Me (<addr>) added by <addr>." message.
+    ac2._evtracker.wait_next_incoming_message()
+    msg_out = chat2.send_text("hello")
+
+    lp.sec("ac1: receiving message")
+    msg_in = ac1._evtracker.wait_next_incoming_message()
+    assert msg_in.text == msg_out.text
+    assert msg_in.get_sender_contact().addr == ac2_addr
+
+    lp.sec("ac1_offl: going online, receiving message")
+    ac1_offl.start_io()
+    ac1_offl._evtracker.wait_securejoin_inviter_progress(1000)
+    msg_in = ac1_offl._evtracker.wait_next_incoming_message()
+    assert msg_in.text == msg_out.text
+    assert msg_in.get_sender_contact().addr == ac2_addr
+
+    ac1.set_config("bcc_self", "0")
+
+
+def test_use_new_verified_group_after_going_online(acfactory, tmp_path, lp):
+    """Another test for the bug #3836:
+    - Bob has two devices, the second is offline.
+    - Alice creates a verified group and sends a QR invitation to Bob.
+    - Bob joins the group.
+    - Bob's second devices goes online, but sees a contact request instead of the verified group.
+    - The "member added" message is not a system message but a plain text message.
+    - Sending a message fails as the key is missing -- message info says "proper enc-key for <Alice>
+      missing, cannot encrypt".
+    """
+    ac1, ac2 = acfactory.get_online_accounts(2)
+    ac2_offl = acfactory.new_online_configuring_account(cloned_from=ac2)
+    for ac in [ac2, ac2_offl]:
+        ac.set_config("bcc_self", "1")
+    acfactory.bring_accounts_online()
+    dir = tmp_path / "exportdir"
+    dir.mkdir()
+    ac2.export_self_keys(str(dir))
+    ac2_offl.import_self_keys(str(dir))
+    ac2_offl.stop_io()
+
+    lp.sec("ac1: create verified-group QR, ac2 scans and joins")
+    chat = ac1.create_group_chat("hello", verified=True)
+    assert chat.is_protected()
+    qr = chat.get_join_qr()
+    lp.sec("ac2: start QR-code based join-group protocol")
+    ac2.qr_join_chat(qr)
+    ac1._evtracker.wait_securejoin_inviter_progress(1000)
+
+    lp.sec("ac2_offl: going online, checking the 'member added' message")
+    ac2_offl.start_io()
+    # Receive "Member Me (<addr>) added by <addr>." message.
+    msg_in = ac2_offl._evtracker.wait_next_incoming_message()
+    assert msg_in.is_system_message()
+    assert msg_in.get_sender_contact().addr == ac1.get_config("addr")
+    chat2 = msg_in.chat
+    assert chat2.is_protected()
+
+    lp.sec("ac2_offl: sending message")
+    msg_out = chat2.send_text("hello")
+
+    lp.sec("ac1: receiving message")
+    msg_in = ac1._evtracker.wait_next_incoming_message()
+    assert msg_in.chat == chat
+    assert msg_in.get_sender_contact().addr == ac2.get_config("addr")
+    assert msg_in.text == msg_out.text
+
+    ac2.set_config("bcc_self", "0")

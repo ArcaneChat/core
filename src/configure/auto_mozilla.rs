@@ -1,17 +1,16 @@
 //! # Thunderbird's Autoconfiguration implementation
 //!
-//! Documentation: <https://developer.mozilla.org/en-US/docs/Mozilla/Thunderbird/Autoconfiguration>
-use quick_xml::events::{BytesStart, Event};
-
+//! Documentation: <https://web.archive.org/web/20210624004729/https://developer.mozilla.org/en-US/docs/Mozilla/Thunderbird/Autoconfiguration>
 use std::io::BufRead;
 use std::str::FromStr;
 
+use quick_xml::events::{BytesStart, Event};
+
+use super::{Error, ServerParams};
 use crate::context::Context;
 use crate::login_param::LoginParam;
+use crate::net::read_url;
 use crate::provider::{Protocol, Socket};
-
-use super::read_url::read_url;
-use super::{Error, ServerParams};
 
 #[derive(Debug)]
 struct Server {
@@ -62,7 +61,7 @@ fn parse_server<B: BufRead>(
     reader: &mut quick_xml::Reader<B>,
     server_event: &BytesStart,
 ) -> Result<Option<Server>, quick_xml::Error> {
-    let end_tag = String::from_utf8_lossy(server_event.name())
+    let end_tag = String::from_utf8_lossy(server_event.name().as_ref())
         .trim()
         .to_lowercase();
 
@@ -70,12 +69,17 @@ fn parse_server<B: BufRead>(
         .attributes()
         .find(|attr| {
             attr.as_ref()
-                .map(|a| String::from_utf8_lossy(a.key).trim().to_lowercase() == "type")
+                .map(|a| {
+                    String::from_utf8_lossy(a.key.as_ref())
+                        .trim()
+                        .to_lowercase()
+                        == "type"
+                })
                 .unwrap_or_default()
         })
         .map(|typ| {
             typ.unwrap()
-                .unescape_and_decode_value(reader)
+                .decode_and_unescape_value(reader)
                 .unwrap_or_default()
                 .to_lowercase()
         })
@@ -89,25 +93,23 @@ fn parse_server<B: BufRead>(
     let mut tag_config = MozConfigTag::Undefined;
     let mut buf = Vec::new();
     loop {
-        match reader.read_event(&mut buf)? {
+        match reader.read_event_into(&mut buf)? {
             Event::Start(ref event) => {
-                tag_config = String::from_utf8_lossy(event.name())
+                tag_config = String::from_utf8_lossy(event.name().as_ref())
                     .parse()
                     .unwrap_or_default();
             }
             Event::End(ref event) => {
-                let tag = String::from_utf8_lossy(event.name()).trim().to_lowercase();
+                let tag = String::from_utf8_lossy(event.name().as_ref())
+                    .trim()
+                    .to_lowercase();
 
                 if tag == end_tag {
                     break;
                 }
             }
             Event::Text(ref event) => {
-                let val = event
-                    .unescape_and_decode(reader)
-                    .unwrap_or_default()
-                    .trim()
-                    .to_owned();
+                let val = event.unescape().unwrap_or_default().trim().to_owned();
 
                 match tag_config {
                     MozConfigTag::Hostname => hostname = Some(val),
@@ -150,9 +152,11 @@ fn parse_xml_reader<B: BufRead>(
 
     let mut buf = Vec::new();
     loop {
-        match reader.read_event(&mut buf)? {
+        match reader.read_event_into(&mut buf)? {
             Event::Start(ref event) => {
-                let tag = String::from_utf8_lossy(event.name()).trim().to_lowercase();
+                let tag = String::from_utf8_lossy(event.name().as_ref())
+                    .trim()
+                    .to_lowercase();
 
                 if tag == "incomingserver" {
                     if let Some(incoming_server) = parse_server(reader, event)? {
@@ -230,7 +234,7 @@ fn parse_serverparams(in_emailaddr: &str, xml_raw: &str) -> Result<Vec<ServerPar
     let res = moz_ac
         .incoming_servers
         .into_iter()
-        .chain(moz_ac.outgoing_servers.into_iter())
+        .chain(moz_ac.outgoing_servers)
         .filter_map(|server| {
             let protocol = match server.typ.as_ref() {
                 "imap" => Some(Protocol::Imap),

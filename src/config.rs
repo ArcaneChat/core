@@ -1,7 +1,10 @@
 //! # Key-value configuration management.
 
+use std::env;
+use std::str::FromStr;
+
 use anyhow::{ensure, Context as _, Result};
-use strum::{EnumProperty as EnumPropertyTrait, IntoEnumIterator};
+use strum::{EnumProperty, IntoEnumIterator};
 use strum_macros::{AsRefStr, Display, EnumIter, EnumProperty, EnumString};
 
 use crate::blob::BlobObject;
@@ -30,43 +33,97 @@ use crate::tools::{get_abs_path, improve_single_line_input, EmailAddress};
 )]
 #[strum(serialize_all = "snake_case")]
 pub enum Config {
+    /// Email address, used in the `From:` field.
     Addr,
+
+    /// IMAP server hostname.
     MailServer,
+
+    /// IMAP server username.
     MailUser,
+
+    /// IMAP server password.
     MailPw,
+
+    /// IMAP server port.
     MailPort,
+
+    /// IMAP server security (e.g. TLS, STARTTLS).
     MailSecurity,
+
+    /// How to check IMAP server TLS certificates.
     ImapCertificateChecks,
+
+    /// SMTP server hostname.
     SendServer,
+
+    /// SMTP server username.
     SendUser,
+
+    /// SMTP server password.
     SendPw,
+
+    /// SMTP server port.
     SendPort,
+
+    /// SMTP server security (e.g. TLS, STARTTLS).
     SendSecurity,
+
+    /// How to check SMTP server TLS certificates.
     SmtpCertificateChecks,
+
+    /// Whether to use OAuth 2.
+    ///
+    /// Historically contained other bitflags, which are now deprecated.
+    /// Should not be extended in the future, create new config keys instead.
     ServerFlags,
 
+    /// True if SOCKS5 is enabled.
+    ///
+    /// Can be used to disable SOCKS5 without erasing SOCKS5 configuration.
     Socks5Enabled,
+
+    /// SOCKS5 proxy server hostname or address.
     Socks5Host,
+
+    /// SOCKS5 proxy server port.
     Socks5Port,
+
+    /// SOCKS5 proxy server username.
     Socks5User,
+
+    /// SOCKS5 proxy server password.
     Socks5Password,
 
+    /// Own name to use in the `From:` field when sending messages.
     Displayname,
+
+    /// Own status to display, sent in message footer.
     Selfstatus,
+
+    /// Own avatar filename.
     Selfavatar,
 
+    /// Send BCC copy to self.
+    ///
+    /// Should be enabled for multidevice setups.
     #[strum(props(default = "1"))]
     BccSelf,
 
-    #[strum(props(default = "0"))]
+    /// True if encryption is preferred according to Autocrypt standard.
+    #[strum(props(default = "1"))]
     E2eeEnabled,
 
+    /// True if Message Delivery Notifications (read receipts) should
+    /// be sent and requested.
     #[strum(props(default = "1"))]
     MdnsEnabled,
 
+    /// True if "Sent" folder should be watched for changes.
     #[strum(props(default = "0"))]
     SentboxWatch,
 
+    /// True if chat messages should be moved to a separate folder.
     #[strum(props(default = "1"))]
     MvboxMove,
 
@@ -77,9 +134,11 @@ pub enum Config {
     #[strum(props(default = "0"))]
     OnlyFetchMvbox,
 
+    /// Whether to show classic emails or only chat messages.
     #[strum(props(default = "2"))] // also change ShowEmails.default() on changes
     ShowEmails,
 
+    /// Quality of the media files to send.
     #[strum(props(default = "1"))] // also change MediaQuality.default() on changes
     MediaQuality,
 
@@ -94,6 +153,7 @@ pub enum Config {
     #[strum(props(default = "1"))]
     FetchedExistingMsgs,
 
+    /// Type of the OpenPGP key to generate.
     #[strum(props(default = "0"))]
     KeyGenType,
 
@@ -116,43 +176,93 @@ pub enum Config {
     #[strum(props(default = "0"))]
     DeleteDeviceAfter,
 
+    /// Move messages to the Trash folder instead of marking them "\Deleted". Overrides
+    /// `ProviderOptions::delete_to_trash`.
+    DeleteToTrash,
+
+    /// Save raw MIME messages with headers in the database if true.
     SaveMimeHeaders,
+
     /// The primary email address. Also see `SecondaryAddrs`.
     ConfiguredAddr,
+
+    /// Configured IMAP server hostname.
     ConfiguredMailServer,
+
+    /// Configured IMAP server username.
     ConfiguredMailUser,
+
+    /// Configured IMAP server password.
     ConfiguredMailPw,
+
+    /// Configured IMAP server port.
     ConfiguredMailPort,
+
+    /// Configured IMAP server security (e.g. TLS, STARTTLS).
     ConfiguredMailSecurity,
+
+    /// How to check IMAP server TLS certificates.
     ConfiguredImapCertificateChecks,
+
+    /// Configured SMTP server hostname.
     ConfiguredSendServer,
+
+    /// Configured SMTP server username.
     ConfiguredSendUser,
+
+    /// Configured SMTP server password.
     ConfiguredSendPw,
+
+    /// Configured SMTP server port.
     ConfiguredSendPort,
+
+    /// How to check SMTP server TLS certificates.
     ConfiguredSmtpCertificateChecks,
+
+    /// Whether OAuth 2 is used with configured provider.
     ConfiguredServerFlags,
+
+    /// Configured SMTP server security (e.g. TLS, STARTTLS).
     ConfiguredSendSecurity,
-    ConfiguredE2EEEnabled,
+
+    /// Configured folder for incoming messages.
     ConfiguredInboxFolder,
+
+    /// Configured folder for chat messages.
     ConfiguredMvboxFolder,
+
+    /// Configured "Sent" folder.
     ConfiguredSentboxFolder,
+
+    /// Configured "Trash" folder.
+    ConfiguredTrashFolder,
+
+    /// Unix timestamp of the last successful configuration.
     ConfiguredTimestamp,
+
+    /// ID of the configured provider from the provider database.
     ConfiguredProvider,
+
+    /// True if account is configured.
     Configured,
 
     /// All secondary self addresses separated by spaces
-    /// (`addr1@example.org addr2@exapmle.org addr3@example.org`)
+    /// (`addr1@example.org addr2@example.org addr3@example.org`)
     SecondaryAddrs,
 
+    /// Read-only core version string.
     #[strum(serialize = "sys.version")]
     SysVersion,
 
+    /// Maximal recommended attachment size in bytes.
     #[strum(serialize = "sys.msgsize_max_recommended")]
     SysMsgsizeMaxRecommended,
 
+    /// Space separated list of all config keys available.
     #[strum(serialize = "sys.config_keys")]
     SysConfigKeys,
 
+    /// True if it is a bot account.
     Bot,
 
     /// Whether we send a warning if the password is wrong (set to false when we send a warning
@@ -190,24 +300,51 @@ pub enum Config {
     ///
     /// See `crate::authres::update_authservid_candidates`.
     AuthservIdCandidates,
+
+    /// Make all outgoing messages with Autocrypt header "multipart/signed".
+    SignUnencrypted,
+
+    /// Let the core save all events to the database.
+    /// This value is used internally to remember the MsgId of the logging xdc
+    #[strum(props(default = "0"))]
+    DebugLogging,
+
+    /// Last message processed by the bot.
+    LastMsgId,
+
+    /// Feature flag for verified 1:1 chats; the UI should set it
+    /// to 1 if it supports verified 1:1 chats.
+    /// Regardless of this setting, `chat.is_protected()` returns true while the key is verified,
+    /// and when the key changes, an info message is posted into the chat.
+    /// 0=Nothing else happens when the key changes.
+    /// 1=After the key changed, `can_send()` returns false and `is_protection_broken()` returns true
+    /// until `chat_id.accept()` is called.
+    #[strum(props(default = "0"))]
+    VerifiedOneOnOneChats,
 }
 
 impl Context {
+    /// Returns true if configuration value is set for the given key.
     pub async fn config_exists(&self, key: Config) -> Result<bool> {
-        Ok(self.sql.get_raw_config(key).await?.is_some())
+        Ok(self.sql.get_raw_config(key.as_ref()).await?.is_some())
     }
 
     /// Get a configuration key. Returns `None` if no value is set, and no default value found.
     pub async fn get_config(&self, key: Config) -> Result<Option<String>> {
+        let env_key = format!("DELTACHAT_{}", key.as_ref().to_uppercase());
+        if let Ok(value) = env::var(env_key) {
+            return Ok(Some(value));
+        }
+
         let value = match key {
             Config::Selfavatar => {
-                let rel_path = self.sql.get_raw_config(key).await?;
-                rel_path.map(|p| get_abs_path(self, &p).to_string_lossy().into_owned())
+                let rel_path = self.sql.get_raw_config(key.as_ref()).await?;
+                rel_path.map(|p| get_abs_path(self, p).to_string_lossy().into_owned())
             }
             Config::SysVersion => Some((*DC_VERSION_STR).clone()),
-            Config::SysMsgsizeMaxRecommended => Some(format!("{}", RECOMMENDED_FILE_SIZE)),
+            Config::SysMsgsizeMaxRecommended => Some(format!("{RECOMMENDED_FILE_SIZE}")),
             Config::SysConfigKeys => Some(get_config_keys_string()),
-            _ => self.sql.get_raw_config(key).await?,
+            _ => self.sql.get_raw_config(key.as_ref()).await?,
         };
 
         if value.is_some() {
@@ -221,28 +358,45 @@ impl Context {
         }
     }
 
+    /// Returns Some(T) if a value for the given key exists and was successfully parsed.
+    /// Returns None if could not parse.
+    pub async fn get_config_parsed<T: FromStr>(&self, key: Config) -> Result<Option<T>> {
+        self.get_config(key)
+            .await
+            .map(|s: Option<String>| s.and_then(|s| s.parse().ok()))
+    }
+
+    /// Returns 32-bit signed integer configuration value for the given key.
     pub async fn get_config_int(&self, key: Config) -> Result<i32> {
-        self.get_config(key)
-            .await
-            .map(|s: Option<String>| s.and_then(|s| s.parse().ok()).unwrap_or_default())
+        Ok(self.get_config_parsed(key).await?.unwrap_or_default())
     }
 
+    /// Returns 32-bit unsigned integer configuration value for the given key.
+    pub async fn get_config_u32(&self, key: Config) -> Result<u32> {
+        Ok(self.get_config_parsed(key).await?.unwrap_or_default())
+    }
+
+    /// Returns 64-bit signed integer configuration value for the given key.
     pub async fn get_config_i64(&self, key: Config) -> Result<i64> {
-        self.get_config(key)
-            .await
-            .map(|s: Option<String>| s.and_then(|s| s.parse().ok()).unwrap_or_default())
+        Ok(self.get_config_parsed(key).await?.unwrap_or_default())
     }
 
+    /// Returns 64-bit unsigned integer configuration value for the given key.
     pub async fn get_config_u64(&self, key: Config) -> Result<u64> {
-        self.get_config(key)
-            .await
-            .map(|s: Option<String>| s.and_then(|s| s.parse().ok()).unwrap_or_default())
+        Ok(self.get_config_parsed(key).await?.unwrap_or_default())
     }
 
+    /// Returns boolean configuration value (if any) for the given key.
+    pub async fn get_config_bool_opt(&self, key: Config) -> Result<Option<bool>> {
+        Ok(self.get_config_parsed::<i32>(key).await?.map(|x| x != 0))
+    }
+
+    /// Returns boolean configuration value for the given key.
     pub async fn get_config_bool(&self, key: Config) -> Result<bool> {
-        Ok(self.get_config_int(key).await? != 0)
+        Ok(self.get_config_bool_opt(key).await?.unwrap_or_default())
     }
 
+    /// Returns true if movebox ("DeltaChat" folder) should be watched.
     pub(crate) async fn should_watch_mvbox(&self) -> Result<bool> {
         Ok(self.get_config_bool(Config::MvboxMove).await?
             || self.get_config_bool(Config::OnlyFetchMvbox).await?)
@@ -288,40 +442,48 @@ impl Context {
         match key {
             Config::Selfavatar => {
                 self.sql
-                    .execute("UPDATE contacts SET selfavatar_sent=0;", paramsv![])
-                    .await?;
-                self.sql
-                    .set_raw_config_bool("attach_selfavatar", true)
+                    .execute("UPDATE contacts SET selfavatar_sent=0;", ())
                     .await?;
                 match value {
                     Some(value) => {
                         let mut blob = BlobObject::new_from_path(self, value.as_ref()).await?;
                         blob.recode_to_avatar_size(self).await?;
-                        self.sql.set_raw_config(key, Some(blob.as_name())).await?;
+                        self.sql
+                            .set_raw_config(key.as_ref(), Some(blob.as_name()))
+                            .await?;
                     }
                     None => {
-                        self.sql.set_raw_config(key, None).await?;
+                        self.sql.set_raw_config(key.as_ref(), None).await?;
                     }
                 }
                 self.emit_event(EventType::SelfavatarChanged);
             }
             Config::DeleteDeviceAfter => {
-                let ret = self.sql.set_raw_config(key, value).await;
+                let ret = self.sql.set_raw_config(key.as_ref(), value).await;
                 // Interrupt ephemeral loop to delete old messages immediately.
-                self.interrupt_ephemeral_task().await;
+                self.scheduler.interrupt_ephemeral_task().await;
                 ret?
             }
             Config::Displayname => {
                 let value = value.map(improve_single_line_input);
-                self.sql.set_raw_config(key, value.as_deref()).await?;
+                self.sql
+                    .set_raw_config(key.as_ref(), value.as_deref())
+                    .await?;
             }
             _ => {
-                self.sql.set_raw_config(key, value).await?;
+                self.sql.set_raw_config(key.as_ref(), value).await?;
             }
         }
         Ok(())
     }
 
+    /// Set the given config to an unsigned 32-bit integer value.
+    pub async fn set_config_u32(&self, key: Config, value: u32) -> Result<()> {
+        self.set_config(key, Some(&value.to_string())).await?;
+        Ok(())
+    }
+
+    /// Set the given config to a boolean value.
     pub async fn set_config_bool(&self, key: Config, value: bool) -> Result<()> {
         self.set_config(key, if value { Some("1") } else { Some("0") })
             .await?;
@@ -432,20 +594,18 @@ fn get_config_keys_string() -> String {
         acc
     });
 
-    format!(" {} ", keys)
+    format!(" {keys} ")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    use std::str::FromStr;
     use std::string::ToString;
 
+    use num_traits::FromPrimitive;
+
+    use super::*;
     use crate::constants;
     use crate::test_utils::TestContext;
-
-    use num_traits::FromPrimitive;
 
     #[test]
     fn test_to_string() {

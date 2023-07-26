@@ -1,4 +1,4 @@
-""" Hooks for Python bindings to Delta Chat Core Rust CFFI"""
+"""Hooks for Python bindings to Delta Chat Core Rust CFFI."""
 
 import pluggy
 
@@ -48,6 +48,10 @@ class PerAccount:
     @account_hookspec
     def ac_outgoing_message(self, message):
         """Called on each outgoing message (both system and "normal")."""
+
+    @account_hookspec
+    def ac_reactions_changed(self, message):
+        """Called when message reactions changed."""
 
     @account_hookspec
     def ac_message_delivered(self, message):

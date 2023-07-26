@@ -3,15 +3,14 @@
 //! This module implements autoconfiguration via POX (Plain Old XML) interface to Autodiscover
 //! Service. Newer SOAP interface, introduced in Exchange 2010, is not used.
 
-use quick_xml::events::Event;
-
 use std::io::BufRead;
 
-use crate::context::Context;
-use crate::provider::{Protocol, Socket};
+use quick_xml::events::Event;
 
-use super::read_url::read_url;
 use super::{Error, ServerParams};
+use crate::context::Context;
+use crate::net::read_url;
+use crate::provider::{Protocol, Socket};
 
 /// Result of parsing a single `Protocol` tag.
 ///
@@ -59,12 +58,18 @@ fn parse_protocol<B: BufRead>(
 
     let mut current_tag: Option<String> = None;
     loop {
-        match reader.read_event(&mut buf)? {
+        match reader.read_event_into(&mut buf)? {
             Event::Start(ref event) => {
-                current_tag = Some(String::from_utf8_lossy(event.name()).trim().to_lowercase());
+                current_tag = Some(
+                    String::from_utf8_lossy(event.name().as_ref())
+                        .trim()
+                        .to_lowercase(),
+                );
             }
             Event::End(ref event) => {
-                let tag = String::from_utf8_lossy(event.name()).trim().to_lowercase();
+                let tag = String::from_utf8_lossy(event.name().as_ref())
+                    .trim()
+                    .to_lowercase();
                 if tag == "protocol" {
                     break;
                 }
@@ -73,7 +78,7 @@ fn parse_protocol<B: BufRead>(
                 }
             }
             Event::Text(ref e) => {
-                let val = e.unescape_and_decode(reader).unwrap_or_default();
+                let val = e.unescape().unwrap_or_default();
 
                 if let Some(ref tag) = current_tag {
                     match tag.as_str() {
@@ -115,9 +120,9 @@ fn parse_redirecturl<B: BufRead>(
     reader: &mut quick_xml::Reader<B>,
 ) -> Result<String, quick_xml::Error> {
     let mut buf = Vec::new();
-    match reader.read_event(&mut buf)? {
+    match reader.read_event_into(&mut buf)? {
         Event::Text(ref e) => {
-            let val = e.unescape_and_decode(reader).unwrap_or_default();
+            let val = e.unescape().unwrap_or_default();
             Ok(val.trim().to_string())
         }
         _ => Ok("".to_string()),
@@ -131,9 +136,11 @@ fn parse_xml_reader<B: BufRead>(
 
     let mut buf = Vec::new();
     loop {
-        match reader.read_event(&mut buf)? {
+        match reader.read_event_into(&mut buf)? {
             Event::Start(ref e) => {
-                let tag = String::from_utf8_lossy(e.name()).trim().to_lowercase();
+                let tag = String::from_utf8_lossy(e.name().as_ref())
+                    .trim()
+                    .to_lowercase();
 
                 if tag == "protocol" {
                     if let Some(protocol) = parse_protocol(reader)? {

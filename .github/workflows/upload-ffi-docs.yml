@@ -1,3 +1,7 @@
+# GitHub Actions workflow
+# to build `deltachat_fii` crate documentation
+# and upload it to <https://cffi.delta.chat/>
+
 name: Build & Deploy Documentation on cffi.delta.chat
 
 on:
@@ -8,21 +12,18 @@ on:
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v1
-    - uses: actions-rs/toolchain@v1
-    - name: Build the documentation with cargo
-      run: |
-        cargo doc --package deltachat_ffi --no-deps
-    - name: Upload to cffi.delta.chat
-      uses: up9cloud/action-rsync@v1.3
-      env:
-        USER: ${{ secrets.USERNAME }}
-        KEY: ${{ secrets.KEY }}
-        HOST: "delta.chat"
-        SOURCE: "target/doc"
-        TARGET: "/var/www/html/cffi/"
-
+      - uses: actions/checkout@v3
+      - name: Build the documentation with cargo
+        run: |
+          cargo doc --package deltachat_ffi --no-deps
+      - name: Upload to cffi.delta.chat
+        uses: up9cloud/action-rsync@v1.3
+        env:
+          USER: ${{ secrets.USERNAME }}
+          KEY: ${{ secrets.KEY }}
+          HOST: "delta.chat"
+          SOURCE: "target/doc"
+          TARGET: "/var/www/html/cffi/"

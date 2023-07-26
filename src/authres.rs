@@ -34,10 +34,9 @@ pub(crate) async fn handle_authres(
     let from_domain = match EmailAddress::new(from) {
         Ok(email) => email.domain,
         Err(e) => {
-            warn!(context, "invalid email {:#}", e);
             // This email is invalid, but don't return an error, we still want to
             // add a stub to the database so that it's not downloaded again
-            return Ok(DkimResults::default());
+            return Err(anyhow::format_err!("invalid email {}: {:#}", from, e));
         }
     };
 
@@ -46,7 +45,7 @@ pub(crate) async fn handle_authres(
     compute_dkim_results(context, authres, &from_domain, message_time).await
 }
 
-#[derive(Default, Debug)]
+#[derive(Debug)]
 pub(crate) struct DkimResults {
     /// Whether DKIM passed for this particular e-mail.
     pub dkim_passed: bool,
@@ -309,7 +308,7 @@ async fn dkim_works_timestamp(context: &Context, from_domain: &str) -> Result<i6
         .sql
         .query_get_value(
             "SELECT dkim_works FROM sending_domains WHERE domain=?",
-            paramsv![from_domain],
+            (from_domain,),
         )
         .await?
         .unwrap_or(0);
@@ -326,7 +325,7 @@ async fn set_dkim_works_timestamp(
         .execute(
             "INSERT INTO sending_domains (domain, dkim_works) VALUES (?,?)
                 ON CONFLICT(domain) DO UPDATE SET dkim_works=excluded.dkim_works",
-            paramsv![from_domain, timestamp],
+            (from_domain, timestamp),
         )
         .await?;
     Ok(())
@@ -335,7 +334,7 @@ async fn set_dkim_works_timestamp(
 async fn clear_dkim_works(context: &Context) -> Result<()> {
     context
         .sql
-        .execute("DELETE FROM sending_domains", paramsv![])
+        .execute("DELETE FROM sending_domains", ())
         .await?;
     Ok(())
 }
@@ -356,7 +355,6 @@ mod tests {
     use tokio::io::AsyncReadExt;
 
     use super::*;
-
     use crate::aheader::EncryptPreference;
     use crate::e2ee;
     use crate::mimeparser;
@@ -574,7 +572,7 @@ Authentication-Results: box.hispanilandia.net; spf=pass smtp.mailfrom=adbenitez@
                 file.read_to_end(&mut bytes).await.unwrap();
 
                 let mail = mailparse::parse_mail(&bytes)?;
-                let from = &mimeparser::get_from(&mail.headers)[0].addr;
+                let from = &mimeparser::get_from(&mail.headers).unwrap().addr;
 
                 let res = handle_authres(&t, &mail, from, time()).await?;
                 assert!(res.allow_keychange);
@@ -586,7 +584,7 @@ Authentication-Results: box.hispanilandia.net; spf=pass smtp.mailfrom=adbenitez@
                 file.read_to_end(&mut bytes).await.unwrap();
 
                 let mail = mailparse::parse_mail(&bytes)?;
-                let from = &mimeparser::get_from(&mail.headers)[0].addr;
+                let from = &mimeparser::get_from(&mail.headers).unwrap().addr;
 
                 let res = handle_authres(&t, &mail, from, time()).await?;
                 if !res.allow_keychange {
@@ -637,9 +635,10 @@ Authentication-Results: box.hispanilandia.net; spf=pass smtp.mailfrom=adbenitez@
         // Even if the format is wrong and parsing fails, handle_authres() shouldn't
         // return an Err because this would prevent the message from being added
         // to the database and downloaded again and again
-        let bytes = b"Authentication-Results: dkim=";
+        let bytes = b"From: invalid@from.com
+Authentication-Results: dkim=";
         let mail = mailparse::parse_mail(bytes).unwrap();
-        handle_authres(&t, &mail, "invalidfrom.com", time())
+        handle_authres(&t, &mail, "invalid@rom.com", time())
             .await
             .unwrap();
     }
@@ -681,7 +680,7 @@ Authentication-Results: box.hispanilandia.net; spf=pass smtp.mailfrom=adbenitez@
             .await;
 
         sent.payload
-            .insert_str(0, "Authentication-Results: example.org; dkim=fail");
+            .insert_str(0, "Authentication-Results: example.org; dkim=fail\n");
 
         let received = alice.recv_msg(&sent).await;
 
@@ -705,7 +704,7 @@ Authentication-Results: box.hispanilandia.net; spf=pass smtp.mailfrom=adbenitez@
         let received = tcm
             .try_send_recv(&alice, &bob2, "My credit card number is 1234")
             .await;
-        assert!(!received.text.as_ref().unwrap().contains("1234"));
+        assert!(!received.text.contains("1234"));
         assert!(received.error.is_some());
 
         tcm.section("Turns out bob2 wasn't an attacker at all, Bob just has a new phone and DKIM just stopped working.");
@@ -717,7 +716,7 @@ Authentication-Results: box.hispanilandia.net; spf=pass smtp.mailfrom=adbenitez@
         loop {
             if let Some(mut sent) = bob2.pop_sent_msg_opt(Duration::ZERO).await {
                 sent.payload
-                    .insert_str(0, "Authentication-Results: example.org; dkim=fail");
+                    .insert_str(0, "Authentication-Results: example.org; dkim=fail\n");
                 alice.recv_msg(&sent).await;
             } else if let Some(sent) = alice.pop_sent_msg_opt(Duration::ZERO).await {
                 bob2.recv_msg(&sent).await;
@@ -747,6 +746,90 @@ Authentication-Results: box.hispanilandia.net; spf=pass smtp.mailfrom=adbenitez@
         //     .await;
         // assert_eq!(received.text.as_ref().unwrap(), "Can you read this again?");
         // assert!(received.error.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_autocrypt_in_mailinglist_ignored() -> Result<()> {
+        let mut tcm = TestContextManager::new();
+        let alice = tcm.alice().await;
+        let bob = tcm.bob().await;
+
+        let alice_bob_chat = alice.create_chat(&bob).await;
+        let bob_alice_chat = bob.create_chat(&alice).await;
+        let mut sent = alice.send_text(alice_bob_chat.id, "hellooo").await;
+        sent.payload
+            .insert_str(0, "List-Post: <mailto:deltachat-community.example.net>\n");
+        bob.recv_msg(&sent).await;
+        let peerstate = Peerstate::from_addr(&bob, "alice@example.org").await?;
+        assert!(peerstate.is_none());
+
+        // Do the same without the mailing list header, this time the peerstate should be accepted
+        let sent = alice
+            .send_text(alice_bob_chat.id, "hellooo without mailing list")
+            .await;
+        bob.recv_msg(&sent).await;
+        let peerstate = Peerstate::from_addr(&bob, "alice@example.org").await?;
+        assert!(peerstate.is_some());
+
+        // This also means that Bob can now write encrypted to Alice:
+        let mut sent = bob
+            .send_text(bob_alice_chat.id, "hellooo in the mailinglist again")
+            .await;
+        assert!(sent.load_from_db().await.get_showpadlock());
+
+        // But if Bob writes to a mailing list, Alice doesn't show a padlock
+        // since she can't verify the signature without accepting Bob's key:
+        sent.payload
+            .insert_str(0, "List-Post: <mailto:deltachat-community.example.net>\n");
+        let rcvd = alice.recv_msg(&sent).await;
+        assert!(!rcvd.get_showpadlock());
+        assert_eq!(&rcvd.text, "hellooo in the mailinglist again");
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_authres_in_mailinglist_ignored() -> Result<()> {
+        let mut tcm = TestContextManager::new();
+        let alice = tcm.alice().await;
+        let bob = tcm.bob().await;
+
+        // Assume Bob received an email from something@example.net with
+        // correct DKIM -> `set_dkim_works()` was called
+        set_dkim_works_timestamp(&bob, "example.org", time()).await?;
+        // And Bob knows his server's authserv-id
+        bob.set_config(Config::AuthservIdCandidates, Some("example.net"))
+            .await?;
+
+        let alice_bob_chat = alice.create_chat(&bob).await;
+        let mut sent = alice.send_text(alice_bob_chat.id, "hellooo").await;
+        sent.payload
+            .insert_str(0, "List-Post: <mailto:deltachat-community.example.net>\n");
+        sent.payload
+            .insert_str(0, "Authentication-Results: example.net; dkim=fail\n");
+        let rcvd = bob.recv_msg(&sent).await;
+        assert!(rcvd.error.is_none());
+
+        // Do the same without the mailing list header, this time the failed
+        // authres isn't ignored
+        let mut sent = alice
+            .send_text(alice_bob_chat.id, "hellooo without mailing list")
+            .await;
+        sent.payload
+            .insert_str(0, "Authentication-Results: example.net; dkim=fail\n");
+        let rcvd = bob.recv_msg(&sent).await;
+
+        // Disallowing keychanges is disabled for now:
+        // assert!(rcvd.error.unwrap().contains("DKIM failed"));
+        // The message info should contain a warning:
+        assert!(rcvd
+            .id
+            .get_info(&bob)
+            .await
+            .unwrap()
+            .contains("KEYCHANGES NOT ALLOWED"));
 
         Ok(())
     }

@@ -1,4 +1,7 @@
 //! # Constants.
+
+#![allow(missing_docs)]
+
 use deltachat_derive::{FromSql, ToSql};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
@@ -9,6 +12,7 @@ pub static DC_VERSION_STR: Lazy<String> = Lazy::new(|| env!("CARGO_PKG_VERSION")
 
 #[derive(
     Debug,
+    Default,
     Display,
     Clone,
     Copy,
@@ -23,78 +27,60 @@ pub static DC_VERSION_STR: Lazy<String> = Lazy::new(|| env!("CARGO_PKG_VERSION")
 )]
 #[repr(i8)]
 pub enum Blocked {
+    #[default]
     Not = 0,
     Yes = 1,
     Request = 2,
 }
 
-impl Default for Blocked {
-    fn default() -> Self {
-        Blocked::Not
-    }
-}
-
 #[derive(
-    Debug, Display, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive, FromSql, ToSql,
+    Debug, Default, Display, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive, FromSql, ToSql,
 )]
 #[repr(u8)]
 pub enum ShowEmails {
     Off = 0,
     AcceptedContacts = 1,
+    #[default] // also change Config.ShowEmails props(default) on changes
     All = 2,
 }
 
-impl Default for ShowEmails {
-    fn default() -> Self {
-        ShowEmails::Off // also change Config.ShowEmails props(default) on changes
-    }
-}
-
 #[derive(
-    Debug, Display, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive, FromSql, ToSql,
+    Debug, Default, Display, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive, FromSql, ToSql,
 )]
 #[repr(u8)]
 pub enum MediaQuality {
+    #[default] // also change Config.MediaQuality props(default) on changes
     Balanced = 0,
     Worse = 1,
 }
 
-impl Default for MediaQuality {
-    fn default() -> Self {
-        MediaQuality::Balanced // also change Config.MediaQuality props(default) on changes
-    }
-}
-
+/// Type of the key to generate.
 #[derive(
-    Debug, Display, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive, FromSql, ToSql,
+    Debug, Default, Display, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive, FromSql, ToSql,
 )]
 #[repr(u8)]
 pub enum KeyGenType {
+    #[default]
     Default = 0,
     Rsa2048 = 1,
     Ed25519 = 2,
 }
 
-impl Default for KeyGenType {
-    fn default() -> Self {
-        KeyGenType::Default
-    }
-}
-
+/// Video chat URL type.
 #[derive(
-    Debug, Display, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive, FromSql, ToSql,
+    Debug, Default, Display, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive, FromSql, ToSql,
 )]
 #[repr(i8)]
 pub enum VideochatType {
+    /// Unknown type.
+    #[default]
     Unknown = 0,
-    BasicWebrtc = 1,
-    Jitsi = 2,
-}
 
-impl Default for VideochatType {
-    fn default() -> Self {
-        VideochatType::Unknown
-    }
+    /// [basicWebRTC](https://github.com/cracker0dks/basicwebrtc) instance.
+    BasicWebrtc = 1,
+
+    /// [Jitsi Meet](https://jitsi.org/jitsi-meet/) instance.
+    Jitsi = 2,
 }
 
 pub const DC_HANDSHAKE_CONTINUE_NORMAL_PROCESSING: i32 = 0x01;
@@ -108,20 +94,17 @@ pub const DC_GCL_NO_SPECIALS: usize = 0x02;
 pub const DC_GCL_ADD_ALLDONE_HINT: usize = 0x04;
 pub const DC_GCL_FOR_FORWARDING: usize = 0x08;
 
-pub const DC_GCM_ADDDAYMARKER: u32 = 0x01;
-pub const DC_GCM_INFO_ONLY: u32 = 0x02;
-
 pub const DC_GCL_VERIFIED_ONLY: u32 = 0x01;
 pub const DC_GCL_ADD_SELF: u32 = 0x02;
 
 // unchanged user avatars are resent to the recipients every some days
-pub const DC_RESEND_USER_AVATAR_DAYS: i64 = 14;
+pub(crate) const DC_RESEND_USER_AVATAR_DAYS: i64 = 14;
 
 // warn about an outdated app after a given number of days.
 // as we use the "provider-db generation date" as reference (that might not be updated very often)
 // and as not all system get speedy updates,
-// do not use too small value that will annoy users checking for nonexistant updates.
-pub const DC_OUTDATED_WARNING_DAYS: i64 = 365;
+// do not use too small value that will annoy users checking for nonexistent updates.
+pub(crate) const DC_OUTDATED_WARNING_DAYS: i64 = 365;
 
 /// messages that should be deleted get this chat_id; the messages are deleted from the working thread later then. This is also needed as rfc724_mid should be preset as long as the message is not deleted on the server (otherwise it is downloaded again)
 pub const DC_CHAT_ID_TRASH: ChatId = ChatId::new(3);
@@ -132,8 +115,10 @@ pub const DC_CHAT_ID_ALLDONE_HINT: ChatId = ChatId::new(7);
 /// larger chat IDs are "real" chats, their messages are "real" messages.
 pub const DC_CHAT_ID_LAST_SPECIAL: ChatId = ChatId::new(9);
 
+/// Chat type.
 #[derive(
     Debug,
+    Default,
     Display,
     Clone,
     Copy,
@@ -149,24 +134,28 @@ pub const DC_CHAT_ID_LAST_SPECIAL: ChatId = ChatId::new(9);
 )]
 #[repr(u32)]
 pub enum Chattype {
+    /// Undefined chat type.
+    #[default]
     Undefined = 0,
-    Single = 100,
-    Group = 120,
-    Mailinglist = 140,
-    Broadcast = 160,
-}
 
-impl Default for Chattype {
-    fn default() -> Self {
-        Chattype::Undefined
-    }
+    /// 1:1 chat.
+    Single = 100,
+
+    /// Group chat.
+    Group = 120,
+
+    /// Mailing list.
+    Mailinglist = 140,
+
+    /// Broadcast list.
+    Broadcast = 160,
 }
 
 pub const DC_MSG_ID_DAYMARKER: u32 = 9;
 pub const DC_MSG_ID_LAST_SPECIAL: u32 = 9;
 
 /// String that indicates that something is left out or truncated.
-pub const DC_ELLIPSIS: &str = "[...]";
+pub(crate) const DC_ELLIPSIS: &str = "[...]";
 // how many lines desktop can display when fullscreen (fullscreen at zoomlevel 1x)
 // (taken from "subjective" testing what looks ok)
 pub const DC_DESIRED_TEXT_LINES: usize = 38;
@@ -182,11 +171,6 @@ pub const DC_DESIRED_TEXT_LINE_LEN: usize = 100;
 /// Note that for simplicity maximum length is defined as the number of Unicode Scalar Values (Rust
 /// `char`s), not Unicode Grapheme Clusters.
 pub const DC_DESIRED_TEXT_LEN: usize = DC_DESIRED_TEXT_LINE_LEN * DC_DESIRED_TEXT_LINES;
-
-// Flags for empty server job
-
-pub const DC_EMPTY_MVBOX: u32 = 0x01;
-pub const DC_EMPTY_INBOX: u32 = 0x02;
 
 // Flags for configuring IMAP and SMTP servers.
 // These flags are optional
@@ -206,32 +190,22 @@ pub const DC_LP_AUTH_NORMAL: i32 = 0x4;
 pub const DC_LP_AUTH_FLAGS: i32 = DC_LP_AUTH_OAUTH2 | DC_LP_AUTH_NORMAL;
 
 /// How many existing messages shall be fetched after configuration.
-pub const DC_FETCH_EXISTING_MSGS_COUNT: i64 = 100;
+pub(crate) const DC_FETCH_EXISTING_MSGS_COUNT: i64 = 100;
+
+// max. weight of images to send w/o recoding
+pub const BALANCED_IMAGE_BYTES: usize = 500_000;
+pub const WORSE_IMAGE_BYTES: usize = 130_000;
 
 // max. width/height of an avatar
-pub const BALANCED_AVATAR_SIZE: u32 = 256;
-pub const WORSE_AVATAR_SIZE: u32 = 128;
+pub(crate) const BALANCED_AVATAR_SIZE: u32 = 256;
+pub(crate) const WORSE_AVATAR_SIZE: u32 = 128;
 
-// max. width/height of images
+// max. width/height of images scaled down because of being too huge
 pub const BALANCED_IMAGE_SIZE: u32 = 1280;
 pub const WORSE_IMAGE_SIZE: u32 = 640;
 
 // this value can be increased if the folder configuration is changed and must be redone on next program start
-pub const DC_FOLDERS_CONFIGURED_VERSION: i32 = 3;
-
-// if more recipients are needed in SMTP's `RCPT TO:` header, recipient-list is splitted to chunks.
-// this does not affect MIME'e `To:` header.
-// can be overwritten by the setting `max_smtp_rcpt_to` in provider-db.
-pub const DEFAULT_MAX_SMTP_RCPT_TO: usize = 50;
-
-pub const DC_JOB_DELETE_MSG_ON_IMAP: i32 = 110;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive)]
-#[repr(u8)]
-pub enum KeyType {
-    Public = 0,
-    Private = 1,
-}
+pub(crate) const DC_FOLDERS_CONFIGURED_VERSION: i32 = 4;
 
 #[cfg(test)]
 mod tests {
@@ -260,16 +234,9 @@ mod tests {
     }
 
     #[test]
-    fn test_keytype_values() {
-        // values may be written to disk and must not change
-        assert_eq!(KeyType::Public, KeyType::from_i32(0).unwrap());
-        assert_eq!(KeyType::Private, KeyType::from_i32(1).unwrap());
-    }
-
-    #[test]
     fn test_showemails_values() {
         // values may be written to disk and must not change
-        assert_eq!(ShowEmails::Off, ShowEmails::default());
+        assert_eq!(ShowEmails::All, ShowEmails::default());
         assert_eq!(ShowEmails::Off, ShowEmails::from_i32(0).unwrap());
         assert_eq!(
             ShowEmails::AcceptedContacts,

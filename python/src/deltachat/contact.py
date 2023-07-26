@@ -1,4 +1,4 @@
-""" Contact object. """
+"""Contact object."""
 
 from datetime import date, datetime, timezone
 from typing import Optional
@@ -9,13 +9,13 @@ from .chat import Chat
 from .cutil import from_dc_charpointer, from_optional_dc_charpointer
 
 
-class Contact(object):
+class Contact:
     """Delta-Chat Contact.
 
     You obtain instances of it through :class:`deltachat.account.Account`.
     """
 
-    def __init__(self, account, id):
+    def __init__(self, account, id) -> None:
         from .account import Account
 
         assert isinstance(account, Account), repr(account)
@@ -27,11 +27,11 @@ class Contact(object):
             return False
         return self.account._dc_context == other.account._dc_context and self.id == other.id
 
-    def __ne__(self, other):
-        return not (self == other)
+    def __ne__(self, other) -> bool:
+        return not self == other
 
-    def __repr__(self):
-        return "<Contact id={} addr={} dc_context={}>".format(self.id, self.addr, self.account._dc_context)
+    def __repr__(self) -> str:
+        return f"<Contact id={self.id} addr={self.addr} dc_context={self.account._dc_context}>"
 
     @property
     def _dc_contact(self):
@@ -71,9 +71,13 @@ class Contact(object):
         """Unblock this contact. Messages from this contact will be retrieved (again)."""
         return lib.dc_block_contact(self.account._dc_context, self.id, False)
 
-    def is_verified(self):
+    def is_verified(self) -> bool:
         """Return True if the contact is verified."""
-        return lib.dc_contact_is_verified(self._dc_contact)
+        return lib.dc_contact_is_verified(self._dc_contact) == 2
+
+    def get_verifier(self, contact):
+        """Return the address of the contact that verified the contact."""
+        return from_dc_charpointer(lib.dc_contact_get_verifier_addr(contact._dc_contact))
 
     def get_profile_image(self) -> Optional[str]:
         """Get contact profile image.

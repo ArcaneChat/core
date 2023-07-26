@@ -1,14 +1,14 @@
 pub mod api;
-pub use api::events;
 pub use yerpc;
 
 #[cfg(test)]
 mod tests {
-    use super::api::{Accounts, CommandApi};
     use async_channel::unbounded;
     use futures::StreamExt;
     use tempfile::TempDir;
     use yerpc::{RpcClient, RpcSession};
+
+    use super::api::{Accounts, CommandApi};
 
     #[tokio::test(flavor = "multi_thread")]
     async fn basic_json_rpc_functionality() -> anyhow::Result<()> {
@@ -36,7 +36,7 @@ mod tests {
             let response = r#"{"jsonrpc":"2.0","id":1,"result":1}"#;
             session.handle_incoming(request).await;
             let result = receiver.next().await;
-            println!("{:?}", result);
+            println!("{result:?}");
             assert_eq!(result, Some(response.to_owned()));
         }
         {
@@ -44,7 +44,7 @@ mod tests {
             let response = r#"{"jsonrpc":"2.0","id":2,"result":[1]}"#;
             session.handle_incoming(request).await;
             let result = receiver.next().await;
-            println!("{:?}", result);
+            println!("{result:?}");
             assert_eq!(result, Some(response.to_owned()));
         }
 

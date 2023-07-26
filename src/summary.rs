@@ -1,5 +1,8 @@
 //! # Message summary for chatlist.
 
+use std::borrow::Cow;
+use std::fmt;
+
 use crate::chat::Chat;
 use crate::constants::Chattype;
 use crate::contact::{Contact, ContactId};
@@ -9,8 +12,6 @@ use crate::mimeparser::SystemMessage;
 use crate::param::Param;
 use crate::stock_str;
 use crate::tools::truncate;
-use std::borrow::Cow;
-use std::fmt;
 
 /// Prefix displayed before message and separated by ":" in the chatlist.
 #[derive(Debug)]
@@ -28,9 +29,9 @@ pub enum SummaryPrefix {
 impl fmt::Display for SummaryPrefix {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            SummaryPrefix::Username(username) => write!(f, "{}", username),
-            SummaryPrefix::Draft(text) => write!(f, "{}", text),
-            SummaryPrefix::Me(text) => write!(f, "{}", text),
+            SummaryPrefix::Username(username) => write!(f, "{username}"),
+            SummaryPrefix::Draft(text) => write!(f, "{text}"),
+            SummaryPrefix::Me(text) => write!(f, "{text}"),
         }
     }
 }
@@ -49,9 +50,14 @@ pub struct Summary {
 
     /// Message state.
     pub state: MessageState,
+
+    /// Message preview image path
+    pub thumbnail_path: Option<String>,
 }
 
 impl Summary {
+    /// Constructs chatlist summary
+    /// from the provided message, chat and message author contact snapshots.
     pub async fn new(
         context: &Context,
         msg: &Message,
@@ -87,11 +93,22 @@ impl Summary {
             text = stock_str::reply_noun(context).await
         }
 
+        let thumbnail_path = if msg.viewtype == Viewtype::Image
+            || msg.viewtype == Viewtype::Gif
+            || msg.viewtype == Viewtype::Sticker
+        {
+            msg.get_file(context)
+                .and_then(|path| path.to_str().map(|p| p.to_owned()))
+        } else {
+            None
+        };
+
         Self {
             prefix,
             text,
             timestamp: msg.get_timestamp(),
             state: msg.state,
+            thumbnail_path,
         }
     }
 
@@ -130,7 +147,7 @@ impl Message {
                     } else {
                         stock_str::file(context).await
                     };
-                    format!("{} – {}", label, file_name)
+                    format!("{label} – {file_name}")
                 }
             }
             Viewtype::VideochatInvitation => {
@@ -158,16 +175,12 @@ impl Message {
             return prefix;
         }
 
-        let summary_content = if let Some(text) = &self.text {
-            if text.is_empty() {
-                prefix
-            } else if prefix.is_empty() {
-                text.to_string()
-            } else {
-                format!("{} – {}", prefix, text)
-            }
-        } else {
+        let summary_content = if self.text.is_empty() {
             prefix
+        } else if prefix.is_empty() {
+            self.text.to_string()
+        } else {
+            format!("{prefix} – {}", self.text)
         };
 
         let summary = if self.is_forwarded() {
@@ -194,19 +207,16 @@ mod tests {
         let d = test::TestContext::new().await;
         let ctx = &d.ctx;
 
-        let some_text = Some(" bla \t\n\tbla\n\t".to_string());
-        let empty_text = Some("".to_string());
-        let no_text: Option<String> = None;
+        let some_text = " bla \t\n\tbla\n\t".to_string();
 
         let mut msg = Message::new(Viewtype::Text);
-        msg.set_text(some_text.clone());
+        msg.set_text(some_text.to_string());
         assert_eq!(
             msg.get_summary_text(ctx).await,
             "bla bla" // for simple text, the type is not added to the summary
         );
 
         let mut msg = Message::new(Viewtype::Image);
-        msg.set_text(no_text.clone());
         msg.set_file("foo.bar", None);
         assert_eq!(
             msg.get_summary_text(ctx).await,
@@ -214,7 +224,6 @@ mod tests {
         );
 
         let mut msg = Message::new(Viewtype::Video);
-        msg.set_text(no_text.clone());
         msg.set_file("foo.bar", None);
         assert_eq!(
             msg.get_summary_text(ctx).await,
@@ -222,7 +231,6 @@ mod tests {
         );
 
         let mut msg = Message::new(Viewtype::Gif);
-        msg.set_text(no_text.clone());
         msg.set_file("foo.bar", None);
         assert_eq!(
             msg.get_summary_text(ctx).await,
@@ -230,7 +238,6 @@ mod tests {
         );
 
         let mut msg = Message::new(Viewtype::Sticker);
-        msg.set_text(no_text.clone());
         msg.set_file("foo.bar", None);
         assert_eq!(
             msg.get_summary_text(ctx).await,
@@ -238,7 +245,6 @@ mod tests {
         );
 
         let mut msg = Message::new(Viewtype::Voice);
-        msg.set_text(empty_text.clone());
         msg.set_file("foo.bar", None);
         assert_eq!(
             msg.get_summary_text(ctx).await,
@@ -246,7 +252,6 @@ mod tests {
         );
 
         let mut msg = Message::new(Viewtype::Voice);
-        msg.set_text(no_text.clone());
         msg.set_file("foo.bar", None);
         assert_eq!(
             msg.get_summary_text(ctx).await,
@@ -262,7 +267,6 @@ mod tests {
         );
 
         let mut msg = Message::new(Viewtype::Audio);
-        msg.set_text(no_text.clone());
         msg.set_file("foo.bar", None);
         assert_eq!(
             msg.get_summary_text(ctx).await,
@@ -270,7 +274,6 @@ mod tests {
         );
 
         let mut msg = Message::new(Viewtype::Audio);
-        msg.set_text(empty_text.clone());
         msg.set_file("foo.bar", None);
         assert_eq!(
             msg.get_summary_text(ctx).await,
@@ -312,7 +315,6 @@ mod tests {
         );
 
         let mut msg = Message::new(Viewtype::File);
-        msg.set_text(no_text.clone());
         msg.param.set(Param::File, "foo.bar");
         msg.param.set_cmd(SystemMessage::AutocryptSetupMessage);
         assert_eq!(

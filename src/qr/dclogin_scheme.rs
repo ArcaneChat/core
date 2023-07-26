@@ -1,30 +1,61 @@
 use std::collections::HashMap;
 
-use crate::config::Config;
-use crate::context::Context;
-use crate::provider::Socket;
-use crate::{contact, login_param::CertificateChecks};
 use anyhow::{bail, Context as _, Result};
 use num_traits::cast::ToPrimitive;
 
 use super::{Qr, DCLOGIN_SCHEME};
+use crate::config::Config;
+use crate::context::Context;
+use crate::provider::Socket;
+use crate::{contact, login_param::CertificateChecks};
 
+/// Options for `dclogin:` scheme.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoginOptions {
+    /// Unsupported version.
     UnsuportedVersion(u32),
+
+    /// Version 1.
     V1 {
+        /// IMAP server password.
+        ///
+        /// Used for SMTP if separate SMTP password is not provided.
         mail_pw: String,
+
+        /// IMAP host.
         imap_host: Option<String>,
+
+        /// IMAP port.
         imap_port: Option<u16>,
+
+        /// IMAP username.
         imap_username: Option<String>,
+
+        /// IMAP password.
         imap_password: Option<String>,
+
+        /// IMAP socket security.
         imap_security: Option<Socket>,
+
+        /// IMAP certificate checks.
         imap_certificate_checks: Option<CertificateChecks>,
+
+        /// SMTP host.
         smtp_host: Option<String>,
+
+        /// SMTP port.
         smtp_port: Option<u16>,
+
+        /// SMTP username.
         smtp_username: Option<String>,
+
+        /// SMTP password.
         smtp_password: Option<String>,
+
+        /// SMTP socket security.
         smtp_security: Option<Socket>,
+
+        /// SMTP certificate checks.
         smtp_certificate_checks: Option<CertificateChecks>,
     },
 }
@@ -32,7 +63,7 @@ pub enum LoginOptions {
 /// scheme: `dclogin://user@host/?p=password&v=1[&options]`
 /// read more about the scheme at <https://github.com/deltachat/interface/blob/master/uri-schemes.md#DCLOGIN>
 pub(super) fn decode_login(qr: &str) -> Result<Qr> {
-    let url = url::Url::parse(qr).with_context(|| format!("Malformed url: {:?}", qr))?;
+    let url = url::Url::parse(qr).with_context(|| format!("Malformed url: {qr:?}"))?;
 
     let url_without_scheme = qr
         .get(DCLOGIN_SCHEME.len()..)
@@ -221,9 +252,10 @@ pub(crate) async fn configure_from_login_qr(
 
 #[cfg(test)]
 mod test {
+    use anyhow::{self, bail};
+
     use super::{decode_login, LoginOptions};
     use crate::{login_param::CertificateChecks, provider::Socket, qr::Qr};
-    use anyhow::{self, bail};
 
     macro_rules! login_options_just_pw {
         ($pw: expr) => {

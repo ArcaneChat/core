@@ -90,8 +90,6 @@ impl Chatlist {
         let flag_no_specials = 0 != listflags & DC_GCL_NO_SPECIALS;
         let flag_add_alldone_hint = 0 != listflags & DC_GCL_ADD_ALLDONE_HINT;
 
-        let mut add_archived_link_item = false;
-
         let process_row = |row: &rusqlite::Row| {
             let chat_id: ChatId = row.get(0)?;
             let msg_id: Option<MsgId> = row.get(1)?;
@@ -121,7 +119,7 @@ impl Chatlist {
         //
         // The query shows messages from blocked contacts in
         // groups. Otherwise it would be hard to follow conversations.
-        let mut ids = if let Some(query_contact_id) = query_contact_id {
+        let ids = if let Some(query_contact_id) = query_contact_id {
             // show chats shared with a given contact
             context.sql.query_map(
                 "SELECT c.id, m.id
@@ -139,7 +137,7 @@ impl Chatlist {
                    AND c.id IN(SELECT chat_id FROM chats_contacts WHERE contact_id=?2)
                  GROUP BY c.id
                  ORDER BY c.archived=?3 DESC, IFNULL(m.timestamp,c.created_timestamp) DESC, m.id DESC;",
-                paramsv![MessageState::OutDraft, query_contact_id, ChatVisibility::Pinned],
+                (MessageState::OutDraft, query_contact_id, ChatVisibility::Pinned),
                 process_row,
                 process_rows,
             ).await?
@@ -166,7 +164,7 @@ impl Chatlist {
                    AND c.archived=1
                  GROUP BY c.id
                  ORDER BY IFNULL(m.timestamp,c.created_timestamp) DESC, m.id DESC;",
-                    paramsv![MessageState::OutDraft],
+                    (MessageState::OutDraft,),
                     process_row,
                     process_rows,
                 )
@@ -178,10 +176,10 @@ impl Chatlist {
             // allow searching over special names that may change at any time
             // when the ui calls set_stock_translation()
             if let Err(err) = update_special_chat_names(context).await {
-                warn!(context, "cannot update special chat names: {:?}", err)
+                warn!(context, "Cannot update special chat names: {err:#}.")
             }
 
-            let str_like_cmd = format!("%{}%", query);
+            let str_like_cmd = format!("%{query}%");
             context
                 .sql
                 .query_map(
@@ -200,7 +198,7 @@ impl Chatlist {
                    AND c.name LIKE ?3
                  GROUP BY c.id
                  ORDER BY IFNULL(m.timestamp,c.created_timestamp) DESC, m.id DESC;",
-                    paramsv![MessageState::OutDraft, skip_id, str_like_cmd],
+                    (MessageState::OutDraft, skip_id, str_like_cmd),
                     process_row,
                     process_rows,
                 )
@@ -214,7 +212,7 @@ impl Chatlist {
             } else {
                 ChatId::new(0)
             };
-            let ids = context.sql.query_map(
+            let mut ids = context.sql.query_map(
                 "SELECT c.id, m.id
                  FROM chats c
                  LEFT JOIN msgs m
@@ -230,22 +228,18 @@ impl Chatlist {
                    AND NOT c.archived=?4
                  GROUP BY c.id
                  ORDER BY c.id=?5 DESC, c.archived=?6 DESC, IFNULL(m.timestamp,c.created_timestamp) DESC, m.id DESC;",
-                paramsv![MessageState::OutDraft, skip_id, flag_for_forwarding, ChatVisibility::Archived, sort_id_up, ChatVisibility::Pinned],
+                (MessageState::OutDraft, skip_id, flag_for_forwarding, ChatVisibility::Archived, sort_id_up, ChatVisibility::Pinned),
                 process_row,
                 process_rows,
             ).await?;
-            if !flag_no_specials {
-                add_archived_link_item = true;
+            if !flag_no_specials && get_archived_cnt(context).await? > 0 {
+                if ids.is_empty() && flag_add_alldone_hint {
+                    ids.push((DC_CHAT_ID_ALLDONE_HINT, None));
+                }
+                ids.insert(0, (DC_CHAT_ID_ARCHIVED_LINK, None));
             }
             ids
         };
-
-        if add_archived_link_item && get_archived_cnt(context).await? > 0 {
-            if ids.is_empty() && flag_add_alldone_hint {
-                ids.push((DC_CHAT_ID_ALLDONE_HINT, None));
-            }
-            ids.push((DC_CHAT_ID_ARCHIVED_LINK, None));
-        }
 
         Ok(Chatlist { ids })
     }
@@ -317,13 +311,17 @@ impl Chatlist {
         };
 
         let (lastmsg, lastcontact) = if let Some(lastmsg_id) = lastmsg_id {
-            let lastmsg = Message::load_from_db(context, lastmsg_id).await?;
+            let lastmsg = Message::load_from_db(context, lastmsg_id)
+                .await
+                .context("loading message failed")?;
             if lastmsg.from_id == ContactId::SELF {
                 (Some(lastmsg), None)
             } else {
                 match chat.typ {
                     Chattype::Group | Chattype::Broadcast | Chattype::Mailinglist => {
-                        let lastcontact = Contact::load_from_db(context, lastmsg.from_id).await?;
+                        let lastcontact = Contact::get_by_id(context, lastmsg.from_id)
+                            .await
+                            .context("loading contact failed")?;
                         (Some(lastmsg), Some(lastcontact))
                     }
                     Chattype::Single | Chattype::Undefined => (Some(lastmsg), None),
@@ -345,10 +343,12 @@ impl Chatlist {
         }
     }
 
+    /// Returns chatlist item position for the given chat ID.
     pub fn get_index_for_id(&self, id: ChatId) -> Option<usize> {
         self.ids.iter().position(|(chat_id, _)| chat_id == &id)
     }
 
+    /// An iterator visiting all chatlist items.
     pub fn iter(&self) -> impl Iterator<Item = &(ChatId, Option<MsgId>)> {
         self.ids.iter()
     }
@@ -360,16 +360,34 @@ pub async fn get_archived_cnt(context: &Context) -> Result<usize> {
         .sql
         .count(
             "SELECT COUNT(*) FROM chats WHERE blocked!=? AND archived=?;",
-            paramsv![Blocked::Yes, ChatVisibility::Archived],
+            (Blocked::Yes, ChatVisibility::Archived),
         )
         .await?;
     Ok(count)
 }
 
+/// Gets the last message of a chat, the message that would also be displayed in the ChatList
+/// Used for passing to `deltachat::chatlist::Chatlist::get_summary2`
+pub async fn get_last_message_for_chat(
+    context: &Context,
+    chat_id: ChatId,
+) -> Result<Option<MsgId>> {
+    context
+        .sql
+        .query_get_value(
+            "SELECT id
+                FROM msgs
+                WHERE chat_id=?2
+                AND (hidden=0 OR state=?1)
+                ORDER BY timestamp DESC, id DESC LIMIT 1",
+            (MessageState::OutDraft, chat_id),
+        )
+        .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
     use crate::chat::{create_group_chat, get_chat_contacts, ProtectionStatus};
     use crate::message::Viewtype;
     use crate::receive_imf::receive_imf;
@@ -406,7 +424,7 @@ mod tests {
         // 2s here.
         for chat_id in &[chat_id1, chat_id3, chat_id2] {
             let mut msg = Message::new(Viewtype::Text);
-            msg.set_text(Some("hello".to_string()));
+            msg.set_text("hello".to_string());
             chat_id.set_draft(&t, Some(&mut msg)).await.unwrap();
         }
 
@@ -618,7 +636,7 @@ mod tests {
             .unwrap();
 
         let mut msg = Message::new(Viewtype::Text);
-        msg.set_text(Some("foo:\nbar \r\n test".to_string()));
+        msg.set_text("foo:\nbar \r\n test".to_string());
         chat_id1.set_draft(&t, Some(&mut msg)).await.unwrap();
 
         let chats = Chatlist::try_load(&t, 0, None, None).await.unwrap();

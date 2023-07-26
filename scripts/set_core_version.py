@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 
-import os
+import datetime
 import json
-import re
+import os
 import pathlib
+import re
 import subprocess
 from argparse import ArgumentParser
+from pathlib import Path
 
 rex = re.compile(r'version = "(\S+)"')
 
@@ -23,7 +25,7 @@ def read_toml_version(relpath):
     res = regex_matches(relpath, rex)
     if res is not None:
         return res.group(1)
-    raise ValueError("no version found in {}".format(relpath))
+    raise ValueError(f"no version found in {relpath}")
 
 
 def replace_toml_version(relpath, newversion):
@@ -34,8 +36,8 @@ def replace_toml_version(relpath, newversion):
         for line in open(str(p)):
             m = rex.match(line)
             if m is not None:
-                print("{}: set version={}".format(relpath, newversion))
-                f.write('version = "{}"\n'.format(newversion))
+                print(f"{relpath}: set version={newversion}")
+                f.write(f'version = "{newversion}"\n')
             else:
                 f.write(line)
     os.rename(tmp_path, str(p))
@@ -44,7 +46,7 @@ def replace_toml_version(relpath, newversion):
 def read_json_version(relpath):
     p = pathlib.Path(relpath)
     assert p.exists()
-    with open(p, "r") as f:
+    with open(p) as f:
         json_data = json.loads(f.read())
     return json_data["version"]
 
@@ -52,32 +54,34 @@ def read_json_version(relpath):
 def update_package_json(relpath, newversion):
     p = pathlib.Path(relpath)
     assert p.exists()
-    with open(p, "r") as f:
+    with open(p) as f:
         json_data = json.loads(f.read())
     json_data["version"] = newversion
     with open(p, "w") as f:
-        f.write(json.dumps(json_data, sort_keys=True, indent=2))
+        json.dump(json_data, f, sort_keys=True, indent=2)
+        f.write("\n")
 
 
 def main():
     parser = ArgumentParser(prog="set_core_version")
     parser.add_argument("newversion")
 
-    json_list = ["package.json",  "deltachat-jsonrpc/typescript/package.json"]
+    json_list = ["package.json", "deltachat-jsonrpc/typescript/package.json"]
     toml_list = [
         "Cargo.toml",
         "deltachat-ffi/Cargo.toml",
         "deltachat-jsonrpc/Cargo.toml",
         "deltachat-rpc-server/Cargo.toml",
+        "deltachat-repl/Cargo.toml",
     ]
     try:
         opts = parser.parse_args()
     except SystemExit:
         print()
         for x in toml_list:
-            print("{}: {}".format(x, read_toml_version(x)))
+            print(f"{x}: {read_toml_version(x)}")
         for x in json_list:
-            print("{}: {}".format(x, read_json_version(x)))
+            print(f"{x}: {read_json_version(x)}")
         print()
         raise SystemExit("need argument: new version, example: 1.25.0")
 
@@ -89,21 +93,26 @@ def main():
     ffi_toml = read_toml_version("deltachat-ffi/Cargo.toml")
     assert core_toml == ffi_toml, (core_toml, ffi_toml)
 
+    today = datetime.date.today().isoformat()
+
     if "alpha" not in newversion:
-        for line in open("CHANGELOG.md"):
-            ## 1.25.0
-            if line.startswith("## "):
-                if line[2:].strip().startswith(newversion):
-                    break
-        else:
-            raise SystemExit("CHANGELOG.md contains no entry for version: {}".format(newversion))
+        found = False
+        for line in Path("CHANGELOG.md").open():
+            if line == f"## [{newversion}] - {today}\n":
+                found = True
+        if not found:
+            raise SystemExit(
+                f"{changelog_name} contains no entry for version: {newversion}"
+            )
 
     for toml_filename in toml_list:
         replace_toml_version(toml_filename, newversion)
-    
+
     for json_filename in json_list:
         update_package_json(json_filename, newversion)
 
+    with open("release-date.in", "w") as f:
+        f.write(today)
 
     print("running cargo check")
     subprocess.call(["cargo", "check"])
@@ -112,15 +121,16 @@ def main():
     subprocess.call(["git", "add", "-u"])
     # subprocess.call(["cargo", "update", "-p", "deltachat"])
 
-    print("after commit, on master make sure to: ")
-    print("")
-    print("   git tag -a {}".format(newversion))
-    print("   git push origin {}".format(newversion))
-    print("   git tag -a py-{}".format(newversion))
-    print("   git push origin py-{}".format(newversion))
-    print("")
+    print("After commit, make sure to:")
+    print()
+    print(f"   git tag -a v{newversion}")
+    print(f"   git push origin v{newversion}")
+    print(f"   gh release create v{newversion} -n ''")
+    print()
+    print("Merge release branch into `master` if the release")
+    print("is made on a stable branch.")
+    print()
 
 
 if __name__ == "__main__":
     main()
-

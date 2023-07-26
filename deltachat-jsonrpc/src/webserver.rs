@@ -1,11 +1,11 @@
-use axum::{extract::ws::WebSocketUpgrade, response::Response, routing::get, Extension, Router};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+
+use axum::{extract::ws::WebSocketUpgrade, response::Response, routing::get, Extension, Router};
 use yerpc::axum::handle_ws_rpc;
 use yerpc::{RpcClient, RpcSession};
 
 mod api;
-use api::events::event_to_json_rpc_notification;
 use api::{Accounts, CommandApi};
 
 const DEFAULT_PORT: u16 = 20808;
@@ -43,12 +43,5 @@ async fn main() -> Result<(), std::io::Error> {
 async fn handler(ws: WebSocketUpgrade, Extension(api): Extension<CommandApi>) -> Response {
     let (client, out_receiver) = RpcClient::new();
     let session = RpcSession::new(client.clone(), api.clone());
-    tokio::spawn(async move {
-        let events = api.accounts.read().await.get_event_emitter();
-        while let Some(event) = events.recv().await {
-            let event = event_to_json_rpc_notification(event);
-            client.send_notification("event", Some(event)).await.ok();
-        }
-    });
     handle_ws_rpc(ws, out_receiver, session).await
 }

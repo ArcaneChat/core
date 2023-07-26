@@ -543,7 +543,7 @@ export class Context extends EventEmitter {
 
   /**
    *
-   * @deprectated please use `AccountManager.getSystemInfo()` instead
+   * @deprecated please use `AccountManager.getSystemInfo()` instead
    */
   static getSystemInfo() {
     return AccountManager.getSystemInfo()
@@ -699,23 +699,6 @@ export class Context extends EventEmitter {
     )
   }
 
-  /**
-   *
-   * @param chatId
-   * @param protect
-   * @returns success boolean
-   */
-  setChatProtection(chatId: number, protect: boolean) {
-    debug(`setChatProtection ${chatId} ${protect}`)
-    return Boolean(
-      binding.dcn_set_chat_protection(
-        this.dcn_context,
-        Number(chatId),
-        protect ? 1 : 0
-      )
-    )
-  }
-
   getChatEphemeralTimer(chatId: number): number {
     debug(`getChatEphemeralTimer ${chatId}`)
     return binding.dcn_get_chat_ephemeral_timer(
@@ -818,7 +801,7 @@ export class Context extends EventEmitter {
    *     Must be given in number of seconds since 00:00 hours, Jan 1, 1970 UTC.
    *     0 for "all up to now".
    * @return Array of locations, NULL is never returned.
-   *     The array is sorted decending;
+   *     The array is sorted descending;
    *     the first entry in the array is the location with the newest timestamp.
    *
    * Examples:

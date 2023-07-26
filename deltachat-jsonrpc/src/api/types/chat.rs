@@ -1,6 +1,6 @@
 use std::time::{Duration, SystemTime};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Context as _, Result};
 use deltachat::chat::{self, get_chat_contacts, ChatVisibility};
 use deltachat::chat::{Chat, ChatId};
 use deltachat::constants::Chattype;
@@ -13,7 +13,7 @@ use typescript_type_def::TypeDef;
 use super::color_int_to_hex_string;
 use super::contact::ContactObject;
 
-#[derive(Serialize, TypeDef)]
+#[derive(Serialize, TypeDef, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct FullChat {
     id: u32,
@@ -53,7 +53,9 @@ impl FullChat {
             contacts.push(
                 ContactObject::try_from_dc_contact(
                     context,
-                    Contact::load_from_db(context, *contact_id).await?,
+                    Contact::get_by_id(context, *contact_id)
+                        .await
+                        .context("failed to load contact")?,
                 )
                 .await?,
             )
@@ -72,8 +74,9 @@ impl FullChat {
 
         let was_seen_recently = if chat.get_type() == Chattype::Single {
             match contact_ids.get(0) {
-                Some(contact) => Contact::load_from_db(context, *contact)
-                    .await?
+                Some(contact) => Contact::get_by_id(context, *contact)
+                    .await
+                    .context("failed to load contact for was_seen_recently")?
                     .was_seen_recently(),
                 None => false,
             }
@@ -89,10 +92,7 @@ impl FullChat {
             is_protected: chat.is_protected(),
             profile_image, //BLOBS ?
             archived: chat.get_visibility() == chat::ChatVisibility::Archived,
-            chat_type: chat
-                .get_type()
-                .to_u32()
-                .ok_or_else(|| anyhow!("unknown chat type id"))?, // TODO get rid of this unwrap?
+            chat_type: chat.get_type().to_u32().context("unknown chat type id")?,
             is_unpromoted: chat.is_unpromoted(),
             is_self_talk: chat.is_self_talk(),
             contacts,
@@ -121,7 +121,7 @@ impl FullChat {
 /// - can_send
 ///
 /// used when you only need the basic metadata of a chat like type, name, profile picture
-#[derive(Serialize, TypeDef)]
+#[derive(Serialize, TypeDef, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct BasicChat {
     id: u32,
@@ -155,10 +155,7 @@ impl BasicChat {
             is_protected: chat.is_protected(),
             profile_image, //BLOBS ?
             archived: chat.get_visibility() == chat::ChatVisibility::Archived,
-            chat_type: chat
-                .get_type()
-                .to_u32()
-                .ok_or_else(|| anyhow!("unknown chat type id"))?, // TODO get rid of this unwrap?
+            chat_type: chat.get_type().to_u32().context("unknown chat type id")?,
             is_unpromoted: chat.is_unpromoted(),
             is_self_talk: chat.is_self_talk(),
             color,
@@ -169,7 +166,7 @@ impl BasicChat {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize, TypeDef)]
+#[derive(Clone, Serialize, Deserialize, TypeDef, schemars::JsonSchema)]
 pub enum MuteDuration {
     NotMuted,
     Forever,
@@ -194,7 +191,7 @@ impl MuteDuration {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize, TypeDef)]
+#[derive(Clone, Serialize, Deserialize, TypeDef, schemars::JsonSchema)]
 #[serde(rename = "ChatVisibility")]
 pub enum JSONRPCChatVisibility {
     Normal,

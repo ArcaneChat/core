@@ -13,8 +13,8 @@ def datadir():
         datadir = path.join("test-data")
         if datadir.isdir():
             return datadir
-    else:
-        pytest.skip("test-data directory not found")
+    pytest.skip("test-data directory not found")
+    return None
 
 
 def test_echo_quit_plugin(acfactory, lp):
@@ -40,14 +40,14 @@ def test_echo_quit_plugin(acfactory, lp):
 
 def test_group_tracking_plugin(acfactory, lp):
     lp.sec("creating one group-tracking bot and two temp accounts")
-    botproc = acfactory.run_bot_process(group_tracking, ffi=False)
+    botproc = acfactory.run_bot_process(group_tracking)
 
     ac1, ac2 = acfactory.get_online_accounts(2)
 
     botproc.fnmatch_lines(
         """
         *ac_configure_completed*
-    """
+    """,
     )
     ac1.add_account_plugin(FFIEventLogger(ac1))
     ac2.add_account_plugin(FFIEventLogger(ac2))
@@ -61,7 +61,7 @@ def test_group_tracking_plugin(acfactory, lp):
     botproc.fnmatch_lines(
         """
         *ac_chat_modified*bot test group*
-    """
+    """,
     )
 
     lp.sec("adding third member {}".format(ac2.get_config("addr")))
@@ -76,8 +76,9 @@ def test_group_tracking_plugin(acfactory, lp):
         """
         *ac_member_added {}*from*{}*
     """.format(
-            contact3.addr, ac1.get_config("addr")
-        )
+            contact3.addr,
+            ac1.get_config("addr"),
+        ),
     )
 
     lp.sec("contact successfully added, now removing")
@@ -86,6 +87,7 @@ def test_group_tracking_plugin(acfactory, lp):
         """
         *ac_member_removed {}*from*{}*
     """.format(
-            contact3.addr, ac1.get_config("addr")
-        )
+            contact3.addr,
+            ac1.get_config("addr"),
+        ),
     )

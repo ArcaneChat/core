@@ -1,32 +1,29 @@
 // @ts-check
-import DeltaChat, { Message } from '../dist'
-import binding from '../binding'
+import DeltaChat from '../dist'
 
-import { deepEqual, deepStrictEqual, strictEqual } from 'assert'
+import { deepStrictEqual, strictEqual } from 'assert'
 import chai, { expect } from 'chai'
 import chaiAsPromised from 'chai-as-promised'
 import { EventId2EventName, C } from '../dist/constants'
 import { join } from 'path'
-import { mkdtempSync, statSync } from 'fs'
-import { tmpdir } from 'os'
+import { statSync } from 'fs'
 import { Context } from '../dist/context'
+import fetch from 'node-fetch'
 chai.use(chaiAsPromised)
+chai.config.truncateThreshold = 0 // Do not truncate assertion errors.
 
 async function createTempUser(url) {
-  const fetch = require('node-fetch')
-
   async function postData(url = '') {
     // Default options are marked with *
     const response = await fetch(url, {
       method: 'POST', // *GET, POST, PUT, DELETE, etc.
-      mode: 'cors', // no-cors, *cors, same-origin
-      cache: 'no-cache', // *default, no-cache, reload, force-cache, only-if-cached
-      credentials: 'same-origin', // include, *same-origin, omit
       headers: {
         'cache-control': 'no-cache',
       },
-      referrerPolicy: 'no-referrer', // no-referrer, *client
     })
+    if (!response.ok) {
+      throw new Error('request failed: ' + response.body.read())
+    }
     return response.json() // parses JSON response into native JavaScript objects
   }
 
@@ -121,7 +118,7 @@ describe('JSON RPC', function () {
     const promises = {}
     dc.startJsonRpcHandler((msg) => {
       const response = JSON.parse(msg)
-      promises[response.id](response)
+      if (response.hasOwnProperty('id')) promises[response.id](response)
       delete promises[response.id]
     })
     const call = (request) => {
@@ -616,7 +613,7 @@ describe('Offline Tests with unconfigured account', function () {
     const id = context.createContact('someuser', 'someuser@site.com')
     const contact = context.getContact(id)
     strictEqual(contact.getId(), id, 'contact id matches')
-    strictEqual(context.deleteContact(id), true, 'delete call succesful')
+    context.deleteContact(id)
     strictEqual(context.getContact(id), null, 'contact is gone')
   })
 
@@ -772,7 +769,7 @@ describe('Integration tests', function () {
   this.beforeAll(async function () {
     if (!process.env.DCC_NEW_TMP_EMAIL) {
       console.log(
-        'Missing DCC_NEW_TMP_EMAIL environment variable!, skip intergration tests'
+        'Missing DCC_NEW_TMP_EMAIL environment variable!, skip integration tests'
       )
       this.skip()
     }
@@ -780,7 +777,7 @@ describe('Integration tests', function () {
     account = await createTempUser(process.env.DCC_NEW_TMP_EMAIL)
     if (!account || !account.email || !account.password) {
       console.log(
-        "We didn't got back an account from the api, skip intergration tests"
+        "We didn't got back an account from the api, skip integration tests"
       )
       this.skip()
     }

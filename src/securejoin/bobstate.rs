@@ -10,6 +10,8 @@
 use anyhow::{Error, Result};
 use rusqlite::Connection;
 
+use super::qrinvite::QrInvite;
+use super::{encrypted_and_signed, fingerprint_equals_sender, mark_peer_as_verified};
 use crate::chat::{self, ChatId};
 use crate::contact::{Contact, Origin};
 use crate::context::Context;
@@ -20,9 +22,6 @@ use crate::message::{Message, Viewtype};
 use crate::mimeparser::{MimeMessage, SystemMessage};
 use crate::param::Param;
 use crate::sql::Sql;
-
-use super::qrinvite::QrInvite;
-use super::{encrypted_and_signed, fingerprint_equals_sender, mark_peer_as_verified};
 
 /// The stage of the [`BobState`] securejoin handshake protocol state machine.
 ///
@@ -136,21 +135,21 @@ impl BobState {
                 // rows that we will delete.  So start with a dummy UPDATE.
                 transaction.execute(
                     r#"UPDATE bobstate SET next_step=?;"#,
-                    params![SecureJoinStep::Terminated],
+                    (SecureJoinStep::Terminated,),
                 )?;
                 let mut stmt = transaction.prepare("SELECT id FROM bobstate;")?;
                 let mut aborted = Vec::new();
-                for id in stmt.query_map(params![], |row| row.get::<_, i64>(0))? {
+                for id in stmt.query_map((), |row| row.get::<_, i64>(0))? {
                     let id = id?;
                     let state = BobState::from_db_id(transaction, id)?;
                     aborted.push(state);
                 }
 
                 // Finally delete everything and insert new row.
-                transaction.execute("DELETE FROM bobstate;", params![])?;
+                transaction.execute("DELETE FROM bobstate;", ())?;
                 transaction.execute(
                     "INSERT INTO bobstate (invite, next_step, chat_id) VALUES (?, ?, ?);",
-                    params![invite, next, chat_id],
+                    (invite, next, chat_id),
                 )?;
                 let id = transaction.last_insert_rowid();
                 Ok((id, aborted))
@@ -164,7 +163,7 @@ impl BobState {
         // guaranteed to only have one row.
         sql.query_row_optional(
             "SELECT id, invite, next_step, chat_id FROM bobstate;",
-            paramsv![],
+            (),
             |row| {
                 let s = BobState {
                     id: row.get(0)?,
@@ -181,7 +180,7 @@ impl BobState {
     fn from_db_id(connection: &Connection, id: i64) -> rusqlite::Result<Self> {
         connection.query_row(
             "SELECT invite, next_step, chat_id FROM bobstate WHERE id=?;",
-            params![id],
+            (id,),
             |row| {
                 let s = BobState {
                     id,
@@ -218,12 +217,12 @@ impl BobState {
             SecureJoinStep::AuthRequired | SecureJoinStep::ContactConfirm => {
                 sql.execute(
                     "UPDATE bobstate SET next_step=? WHERE id=?;",
-                    paramsv![next, self.id],
+                    (next, self.id),
                 )
                 .await?;
             }
             SecureJoinStep::Terminated | SecureJoinStep::Completed => {
-                sql.execute("DELETE FROM bobstate WHERE id=?;", paramsv!(self.id))
+                sql.execute("DELETE FROM bobstate WHERE id=?;", (self.id,))
                     .await?;
             }
         }
@@ -237,7 +236,7 @@ impl BobState {
     /// stage is returned.  Once [`BobHandshakeStage::Completed`] or
     /// [`BobHandshakeStage::Terminated`] are reached this [`BobState`] should be destroyed,
     /// further calling it will just result in the messages being unused by this handshake.
-    pub async fn handle_message(
+    pub(crate) async fn handle_message(
         &mut self,
         context: &Context,
         mime_message: &MimeMessage,
@@ -326,7 +325,7 @@ impl BobState {
     ///
     /// This deviates from the protocol by also sending a confirmation message in response
     /// to the *vc-contact-confirm* message.  This has no specific value to the protocol and
-    /// is only done out of symmerty with *vg-member-added* handling.
+    /// is only done out of symmetry with *vg-member-added* handling.
     async fn step_contact_confirm(
         &mut self,
         context: &Context,
@@ -366,7 +365,12 @@ impl BobState {
                 "Contact confirm message not encrypted",
             )));
         }
-        mark_peer_as_verified(context, self.invite.fingerprint()).await?;
+        mark_peer_as_verified(
+            context,
+            self.invite.fingerprint().clone(),
+            mime_message.from.addr.to_string(),
+        )
+        .await?;
         Contact::scaleup_origin_by_id(context, self.invite.contact_id(), Origin::SecurejoinJoined)
             .await?;
         context.emit_event(EventType::ContactsChanged(None));
@@ -418,7 +422,7 @@ async fn send_handshake_message(
 ) -> Result<()> {
     let mut msg = Message {
         viewtype: Viewtype::Text,
-        text: Some(step.body_text(invite)),
+        text: step.body_text(invite),
         hidden: true,
         ..Default::default()
     };
@@ -535,7 +539,7 @@ impl SecureJoinStep {
                 false
             }
             SecureJoinStep::Completed => {
-                warn!(context, "Complted state for next securejoin step");
+                warn!(context, "Completed state for next securejoin step");
                 false
             }
         }

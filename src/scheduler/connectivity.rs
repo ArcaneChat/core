@@ -1,18 +1,20 @@
 use core::fmt;
-use std::{ops::Deref, sync::Arc};
+use std::{iter::once, ops::Deref, sync::Arc};
 
-use tokio::sync::{Mutex, RwLockReadGuard};
+use anyhow::{anyhow, Result};
+use humansize::{format_size, BINARY};
+use tokio::sync::Mutex;
 
 use crate::events::EventType;
-use crate::imap::scan_folders::get_watched_folder_configs;
+use crate::imap::{scan_folders::get_watched_folder_configs, FolderMeaning};
 use crate::quota::{
     QUOTA_ERROR_THRESHOLD_PERCENTAGE, QUOTA_MAX_AGE_SECONDS, QUOTA_WARN_THRESHOLD_PERCENTAGE,
 };
 use crate::tools::time;
-use crate::{config::Config, scheduler::Scheduler, stock_str, tools};
 use crate::{context::Context, log::LogExt};
-use anyhow::{anyhow, Result};
-use humansize::{file_size_opts, FileSize};
+use crate::{stock_str, tools};
+
+use super::InnerSchedulerState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumProperty, PartialOrd, Ord)]
 pub enum Connectivity {
@@ -27,9 +29,10 @@ pub enum Connectivity {
 // the top) take priority. This means that e.g. if any folder has an error - usually
 // because there is no internet connection - the connectivity for the whole
 // account will be `Notconnected`.
-#[derive(Debug, Clone, PartialEq, Eq, EnumProperty, PartialOrd)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, EnumProperty, PartialOrd)]
 enum DetailedConnectivity {
     Error(String),
+    #[default]
     Uninitialized,
     Connecting,
     Working,
@@ -38,12 +41,6 @@ enum DetailedConnectivity {
 
     /// The folder was configured not to be watched or configured_*_folder is not set
     NotConfigured,
-}
-
-impl Default for DetailedConnectivity {
-    fn default() -> Self {
-        DetailedConnectivity::Uninitialized
-    }
 }
 
 impl DetailedConnectivity {
@@ -161,22 +158,7 @@ impl ConnectivityStore {
 /// Set all folder states to InterruptingIdle in case they were `Connected` before.
 /// Called during `dc_maybe_network()` to make sure that `dc_accounts_all_work_done()`
 /// returns false immediately after `dc_maybe_network()`.
-pub(crate) async fn idle_interrupted(scheduler: RwLockReadGuard<'_, Option<Scheduler>>) {
-    let [inbox, mvbox, sentbox] = match &*scheduler {
-        Some(Scheduler {
-            inbox,
-            mvbox,
-            sentbox,
-            ..
-        }) => [
-            inbox.state.connectivity.clone(),
-            mvbox.state.connectivity.clone(),
-            sentbox.state.connectivity.clone(),
-        ],
-        None => return,
-    };
-    drop(scheduler);
-
+pub(crate) async fn idle_interrupted(inbox: ConnectivityStore, oboxes: Vec<ConnectivityStore>) {
     let mut connectivity_lock = inbox.0.lock().await;
     // For the inbox, we also have to set the connectivity to InterruptingIdle if it was
     // NotConfigured before: If all folders are NotConfigured, dc_get_connectivity()
@@ -190,7 +172,7 @@ pub(crate) async fn idle_interrupted(scheduler: RwLockReadGuard<'_, Option<Sched
     }
     drop(connectivity_lock);
 
-    for state in &[&mvbox, &sentbox] {
+    for state in oboxes {
         let mut connectivity_lock = state.0.lock().await;
         if *connectivity_lock == DetailedConnectivity::Connected {
             *connectivity_lock = DetailedConnectivity::InterruptingIdle;
@@ -203,25 +185,7 @@ pub(crate) async fn idle_interrupted(scheduler: RwLockReadGuard<'_, Option<Sched
 /// Set the connectivity to "Not connected" after a call to dc_maybe_network_lost().
 /// If we did not do this, the connectivity would stay "Connected" for quite a long time
 /// after `maybe_network_lost()` was called.
-pub(crate) async fn maybe_network_lost(
-    context: &Context,
-    scheduler: RwLockReadGuard<'_, Option<Scheduler>>,
-) {
-    let stores = match &*scheduler {
-        Some(Scheduler {
-            inbox,
-            mvbox,
-            sentbox,
-            ..
-        }) => [
-            inbox.state.connectivity.clone(),
-            mvbox.state.connectivity.clone(),
-            sentbox.state.connectivity.clone(),
-        ],
-        None => return,
-    };
-    drop(scheduler);
-
+pub(crate) async fn maybe_network_lost(context: &Context, stores: Vec<ConnectivityStore>) {
     for store in &stores {
         let mut connectivity_lock = store.0.lock().await;
         if !matches!(
@@ -263,18 +227,13 @@ impl Context {
     ///
     /// If the connectivity changes, a DC_EVENT_CONNECTIVITY_CHANGED will be emitted.
     pub async fn get_connectivity(&self) -> Connectivity {
-        let lock = self.scheduler.read().await;
-        let stores: Vec<_> = match &*lock {
-            Some(Scheduler {
-                inbox,
-                mvbox,
-                sentbox,
-                ..
-            }) => [&inbox.state, &mvbox.state, &sentbox.state]
-                .iter()
-                .map(|state| state.connectivity.clone())
+        let lock = self.scheduler.inner.read().await;
+        let stores: Vec<_> = match *lock {
+            InnerSchedulerState::Started(ref sched) => sched
+                .boxes()
+                .map(|b| b.conn_state.state.connectivity.clone())
                 .collect(),
-            None => return Connectivity::NotConnected,
+            _ => return Connectivity::NotConnected,
         };
         drop(lock);
 
@@ -351,32 +310,16 @@ impl Context {
         //                              Get the states from the RwLock
         // =============================================================================================
 
-        let lock = self.scheduler.read().await;
-        let (folders_states, smtp) = match &*lock {
-            Some(Scheduler {
-                inbox,
-                mvbox,
-                sentbox,
-                smtp,
-                ..
-            }) => (
-                [
-                    (
-                        Config::ConfiguredInboxFolder,
-                        inbox.state.connectivity.clone(),
-                    ),
-                    (
-                        Config::ConfiguredMvboxFolder,
-                        mvbox.state.connectivity.clone(),
-                    ),
-                    (
-                        Config::ConfiguredSentboxFolder,
-                        sentbox.state.connectivity.clone(),
-                    ),
-                ],
-                smtp.state.connectivity.clone(),
+        let lock = self.scheduler.inner.read().await;
+        let (folders_states, smtp) = match *lock {
+            InnerSchedulerState::Started(ref sched) => (
+                sched
+                    .boxes()
+                    .map(|b| (b.meaning, b.conn_state.state.connectivity.clone()))
+                    .collect::<Vec<_>>(),
+                sched.smtp.state.connectivity.clone(),
             ),
-            None => {
+            _ => {
                 return Err(anyhow!("Not started"));
             }
         };
@@ -391,12 +334,12 @@ impl Context {
 
         let watched_folders = get_watched_folder_configs(self).await?;
         let incoming_messages = stock_str::incoming_messages(self).await;
-        ret += &format!("<h3>{}</h3><ul>", incoming_messages);
+        ret += &format!("<h3>{incoming_messages}</h3><ul>");
         for (folder, state) in &folders_states {
             let mut folder_added = false;
 
-            if watched_folders.contains(folder) {
-                let f = self.get_config(*folder).await.ok_or_log(self).flatten();
+            if let Some(config) = folder.to_config().filter(|c| watched_folders.contains(c)) {
+                let f = self.get_config(config).await.log_err(self).ok().flatten();
 
                 if let Some(foldername) = f {
                     let detailed = &state.get_detailed().await;
@@ -412,7 +355,7 @@ impl Context {
                 }
             }
 
-            if !folder_added && folder == &Config::ConfiguredInboxFolder {
+            if !folder_added && folder == &FolderMeaning::Inbox {
                 let detailed = &state.get_detailed().await;
                 if let DetailedConnectivity::Error(_) = detailed {
                     // On the inbox thread, we also do some other things like scan_folders and run jobs
@@ -434,7 +377,7 @@ impl Context {
         // =============================================================================================
 
         let outgoing_messages = stock_str::outgoing_messages(self).await;
-        ret += &format!("<h3>{}</h3><ul><li>", outgoing_messages);
+        ret += &format!("<h3>{outgoing_messages}</h3><ul><li>");
         let detailed = smtp.get_detailed().await;
         ret += &*detailed.to_icon();
         ret += " ";
@@ -448,79 +391,83 @@ impl Context {
         //                                [======67%=====       ]
         // =============================================================================================
 
-        let domain = tools::EmailAddress::new(&self.get_primary_self_addr().await?)?.domain;
+        let domain = &tools::EmailAddress::new(&self.get_primary_self_addr().await?)?.domain;
         let storage_on_domain = stock_str::storage_on_domain(self, domain).await;
-        ret += &format!("<h3>{}</h3><ul>", storage_on_domain);
+        ret += &format!("<h3>{storage_on_domain}</h3><ul>");
         let quota = self.quota.read().await;
         if let Some(quota) = &*quota {
             match &quota.recent {
                 Ok(quota) => {
-                    let roots_cnt = quota.len();
-                    for (root_name, resources) in quota {
-                        use async_imap::types::QuotaResourceName::*;
-                        for resource in resources {
-                            ret += "<li>";
+                    if !quota.is_empty() {
+                        for (root_name, resources) in quota {
+                            use async_imap::types::QuotaResourceName::*;
+                            for resource in resources {
+                                ret += "<li>";
 
-                            // root name is empty eg. for gmail and redundant eg. for riseup.
-                            // therefore, use it only if there are really several roots.
-                            if roots_cnt > 1 && !root_name.is_empty() {
-                                ret +=
-                                    &format!("<b>{}:</b> ", &*escaper::encode_minimal(root_name));
-                            } else {
-                                info!(self, "connectivity: root name hidden: \"{}\"", root_name);
+                                // root name is empty eg. for gmail and redundant eg. for riseup.
+                                // therefore, use it only if there are really several roots.
+                                if quota.len() > 1 && !root_name.is_empty() {
+                                    ret += &format!(
+                                        "<b>{}:</b> ",
+                                        &*escaper::encode_minimal(root_name)
+                                    );
+                                } else {
+                                    info!(
+                                        self,
+                                        "connectivity: root name hidden: \"{}\"", root_name
+                                    );
+                                }
+
+                                let messages = stock_str::messages(self).await;
+                                let part_of_total_used = stock_str::part_of_total_used(
+                                    self,
+                                    &resource.usage.to_string(),
+                                    &resource.limit.to_string(),
+                                )
+                                .await;
+                                ret += &match &resource.name {
+                                    Atom(resource_name) => {
+                                        format!(
+                                            "<b>{}:</b> {}",
+                                            &*escaper::encode_minimal(resource_name),
+                                            part_of_total_used
+                                        )
+                                    }
+                                    Message => {
+                                        format!("<b>{part_of_total_used}:</b> {messages}")
+                                    }
+                                    Storage => {
+                                        // do not use a special title needed for "Storage":
+                                        // - it is usually shown directly under the "Storage" headline
+                                        // - by the units "1 MB of 10 MB used" there is some difference to eg. "Messages: 1 of 10 used"
+                                        // - the string is not longer than the other strings that way (minus title, plus units) -
+                                        //   additional linebreaks on small displays are unlikely therefore
+                                        // - most times, this is the only item anyway
+                                        let usage = &format_size(resource.usage * 1024, BINARY);
+                                        let limit = &format_size(resource.limit * 1024, BINARY);
+                                        stock_str::part_of_total_used(self, usage, limit).await
+                                    }
+                                };
+
+                                let percent = resource.get_usage_percentage();
+                                let color = if percent >= QUOTA_ERROR_THRESHOLD_PERCENTAGE {
+                                    "red"
+                                } else if percent >= QUOTA_WARN_THRESHOLD_PERCENTAGE {
+                                    "yellow"
+                                } else {
+                                    "green"
+                                };
+                                ret += &format!("<div class=\"bar\"><div class=\"progress {color}\" style=\"width: {percent}%\">{percent}%</div></div>");
+
+                                ret += "</li>";
                             }
-
-                            let messages = stock_str::messages(self).await;
-                            let part_of_total_used = stock_str::part_of_total_used(
-                                self,
-                                resource.usage.to_string(),
-                                resource.limit.to_string(),
-                            )
-                            .await;
-                            ret += &match &resource.name {
-                                Atom(resource_name) => {
-                                    format!(
-                                        "<b>{}:</b> {}",
-                                        &*escaper::encode_minimal(resource_name),
-                                        part_of_total_used
-                                    )
-                                }
-                                Message => {
-                                    format!("<b>{}:</b> {}", part_of_total_used, messages)
-                                }
-                                Storage => {
-                                    // do not use a special title needed for "Storage":
-                                    // - it is usually shown directly under the "Storage" headline
-                                    // - by the units "1 MB of 10 MB used" there is some difference to eg. "Messages: 1 of 10 used"
-                                    // - the string is not longer than the other strings that way (minus title, plus units) -
-                                    //   additional linebreaks on small displays are unlikely therefore
-                                    // - most times, this is the only item anyway
-                                    let usage = (resource.usage * 1024)
-                                        .file_size(file_size_opts::BINARY)
-                                        .unwrap_or_default();
-                                    let limit = (resource.limit * 1024)
-                                        .file_size(file_size_opts::BINARY)
-                                        .unwrap_or_default();
-                                    stock_str::part_of_total_used(self, usage, limit).await
-                                }
-                            };
-
-                            let percent = resource.get_usage_percentage();
-                            let color = if percent >= QUOTA_ERROR_THRESHOLD_PERCENTAGE {
-                                "red"
-                            } else if percent >= QUOTA_WARN_THRESHOLD_PERCENTAGE {
-                                "yellow"
-                            } else {
-                                "green"
-                            };
-                            ret += &format!("<div class=\"bar\"><div class=\"progress {}\" style=\"width: {}%\">{}%</div></div>", color, percent, percent);
-
-                            ret += "</li>";
                         }
+                    } else {
+                        ret += format!("<li>Warning: {domain} claims to support quota but gives no information</li>").as_str();
                     }
                 }
                 Err(e) => {
-                    ret += format!("<li>{}</li>", e).as_str();
+                    ret += format!("<li>{e}</li>").as_str();
                 }
             }
 
@@ -529,7 +476,7 @@ impl Context {
             }
         } else {
             let not_connected = stock_str::not_connected(self).await;
-            ret += &format!("<li>{}</li>", not_connected);
+            ret += &format!("<li>{not_connected}</li>");
             self.schedule_quota_update().await?;
         }
         ret += "</ul>";
@@ -540,20 +487,17 @@ impl Context {
         Ok(ret)
     }
 
+    /// Returns true if all background work is done.
     pub async fn all_work_done(&self) -> bool {
-        let lock = self.scheduler.read().await;
-        let stores: Vec<_> = match &*lock {
-            Some(Scheduler {
-                inbox,
-                mvbox,
-                sentbox,
-                smtp,
-                ..
-            }) => [&inbox.state, &mvbox.state, &sentbox.state, &smtp.state]
-                .iter()
+        let lock = self.scheduler.inner.read().await;
+        let stores: Vec<_> = match *lock {
+            InnerSchedulerState::Started(ref sched) => sched
+                .boxes()
+                .map(|b| &b.conn_state.state)
+                .chain(once(&sched.smtp.state))
                 .map(|state| state.connectivity.clone())
                 .collect(),
-            None => return false,
+            _ => return false,
         };
         drop(lock);
 

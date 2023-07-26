@@ -5,31 +5,34 @@ pub mod send;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{bail, format_err, Context as _, Error, Result};
-use async_smtp::smtp::client::net::ClientTlsParameters;
-use async_smtp::smtp::response::{Category, Code, Detail};
-use async_smtp::{smtp, EmailAddress, ServerAddress};
+use async_smtp::response::{Category, Code, Detail};
+use async_smtp::{self as smtp, EmailAddress, SmtpTransport};
+use tokio::io::BufStream;
 use tokio::task;
 
 use crate::config::Config;
 use crate::contact::{Contact, ContactId};
 use crate::events::EventType;
-use crate::login_param::{
-    build_tls, CertificateChecks, LoginParam, ServerLoginParam, Socks5Config,
-};
+use crate::login_param::{CertificateChecks, LoginParam, ServerLoginParam};
 use crate::message::Message;
 use crate::message::{self, MsgId};
 use crate::mimefactory::MimeFactory;
+use crate::net::connect_tcp;
+use crate::net::session::SessionBufStream;
+use crate::net::tls::wrap_tls;
 use crate::oauth2::get_oauth2_access_token;
 use crate::provider::Socket;
+use crate::socks::Socks5Config;
 use crate::sql;
 use crate::{context::Context, scheduler::connectivity::ConnectivityStore};
 
-/// SMTP write and read timeout in seconds.
-const SMTP_TIMEOUT: u64 = 30;
+/// SMTP write and read timeout.
+const SMTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Default)]
 pub(crate) struct Smtp {
-    transport: Option<smtp::SmtpTransport>,
+    /// SMTP connection.
+    transport: Option<SmtpTransport<Box<dyn SessionBufStream>>>,
 
     /// Email address we are sending from.
     from: Option<EmailAddress>,
@@ -52,12 +55,12 @@ impl Smtp {
     }
 
     /// Disconnect the SMTP transport and drop it entirely.
-    pub async fn disconnect(&mut self) {
+    pub fn disconnect(&mut self) {
         if let Some(mut transport) = self.transport.take() {
             // Closing connection with a QUIT command may take some time, especially if it's a
             // stale connection and an attempt to send the command times out. Send a command in a
             // separate task to avoid waiting for reply or timeout.
-            task::spawn(async move { transport.close().await });
+            task::spawn(async move { transport.quit().await });
         }
         self.last_success = None;
     }
@@ -78,17 +81,14 @@ impl Smtp {
 
     /// Check whether we are connected.
     pub fn is_connected(&self) -> bool {
-        self.transport
-            .as_ref()
-            .map(|t| t.is_connected())
-            .unwrap_or_default()
+        self.transport.is_some()
     }
 
     /// Connect using configured parameters.
     pub async fn connect_configured(&mut self, context: &Context) -> Result<()> {
         if self.has_maybe_stale_connection() {
             info!(context, "Closing stale connection");
-            self.disconnect().await;
+            self.disconnect();
         }
 
         if self.is_connected() {
@@ -102,10 +102,126 @@ impl Smtp {
             &lp.smtp,
             &lp.socks5_config,
             &lp.addr,
-            lp.provider
-                .map_or(lp.socks5_config.is_some(), |provider| provider.strict_tls),
+            lp.provider.map_or(lp.socks5_config.is_some(), |provider| {
+                provider.opt.strict_tls
+            }),
         )
         .await
+    }
+
+    async fn connect_secure_socks5(
+        &self,
+        context: &Context,
+        hostname: &str,
+        port: u16,
+        strict_tls: bool,
+        socks5_config: Socks5Config,
+    ) -> Result<SmtpTransport<Box<dyn SessionBufStream>>> {
+        let socks5_stream = socks5_config
+            .connect(context, hostname, port, SMTP_TIMEOUT, strict_tls)
+            .await?;
+        let tls_stream = wrap_tls(strict_tls, hostname, socks5_stream).await?;
+        let buffered_stream = BufStream::new(tls_stream);
+        let session_stream: Box<dyn SessionBufStream> = Box::new(buffered_stream);
+        let client = smtp::SmtpClient::new().smtp_utf8(true);
+        let transport = SmtpTransport::new(client, session_stream).await?;
+        Ok(transport)
+    }
+
+    async fn connect_starttls_socks5(
+        &self,
+        context: &Context,
+        hostname: &str,
+        port: u16,
+        strict_tls: bool,
+        socks5_config: Socks5Config,
+    ) -> Result<SmtpTransport<Box<dyn SessionBufStream>>> {
+        let socks5_stream = socks5_config
+            .connect(context, hostname, port, SMTP_TIMEOUT, strict_tls)
+            .await?;
+
+        // Run STARTTLS command and convert the client back into a stream.
+        let client = smtp::SmtpClient::new().smtp_utf8(true);
+        let transport = SmtpTransport::new(client, BufStream::new(socks5_stream)).await?;
+        let tcp_stream = transport.starttls().await?.into_inner();
+        let tls_stream = wrap_tls(strict_tls, hostname, tcp_stream)
+            .await
+            .context("STARTTLS upgrade failed")?;
+        let buffered_stream = BufStream::new(tls_stream);
+        let session_stream: Box<dyn SessionBufStream> = Box::new(buffered_stream);
+        let client = smtp::SmtpClient::new().smtp_utf8(true).without_greeting();
+        let transport = SmtpTransport::new(client, session_stream).await?;
+        Ok(transport)
+    }
+
+    async fn connect_insecure_socks5(
+        &self,
+        context: &Context,
+        hostname: &str,
+        port: u16,
+        socks5_config: Socks5Config,
+    ) -> Result<SmtpTransport<Box<dyn SessionBufStream>>> {
+        let socks5_stream = socks5_config
+            .connect(context, hostname, port, SMTP_TIMEOUT, false)
+            .await?;
+        let buffered_stream = BufStream::new(socks5_stream);
+        let session_stream: Box<dyn SessionBufStream> = Box::new(buffered_stream);
+        let client = smtp::SmtpClient::new().smtp_utf8(true);
+        let transport = SmtpTransport::new(client, session_stream).await?;
+        Ok(transport)
+    }
+
+    async fn connect_secure(
+        &self,
+        context: &Context,
+        hostname: &str,
+        port: u16,
+        strict_tls: bool,
+    ) -> Result<SmtpTransport<Box<dyn SessionBufStream>>> {
+        let tcp_stream = connect_tcp(context, hostname, port, SMTP_TIMEOUT, false).await?;
+        let tls_stream = wrap_tls(strict_tls, hostname, tcp_stream).await?;
+        let buffered_stream = BufStream::new(tls_stream);
+        let session_stream: Box<dyn SessionBufStream> = Box::new(buffered_stream);
+        let client = smtp::SmtpClient::new().smtp_utf8(true);
+        let transport = SmtpTransport::new(client, session_stream).await?;
+        Ok(transport)
+    }
+
+    async fn connect_starttls(
+        &self,
+        context: &Context,
+        hostname: &str,
+        port: u16,
+        strict_tls: bool,
+    ) -> Result<SmtpTransport<Box<dyn SessionBufStream>>> {
+        let tcp_stream = connect_tcp(context, hostname, port, SMTP_TIMEOUT, strict_tls).await?;
+
+        // Run STARTTLS command and convert the client back into a stream.
+        let client = smtp::SmtpClient::new().smtp_utf8(true);
+        let transport = SmtpTransport::new(client, BufStream::new(tcp_stream)).await?;
+        let tcp_stream = transport.starttls().await?.into_inner();
+        let tls_stream = wrap_tls(strict_tls, hostname, tcp_stream)
+            .await
+            .context("STARTTLS upgrade failed")?;
+        let buffered_stream = BufStream::new(tls_stream);
+        let session_stream: Box<dyn SessionBufStream> = Box::new(buffered_stream);
+        let client = smtp::SmtpClient::new().smtp_utf8(true).without_greeting();
+        let transport = SmtpTransport::new(client, session_stream).await?;
+        Ok(transport)
+    }
+
+    async fn connect_insecure(
+        &self,
+        context: &Context,
+        hostname: &str,
+        port: u16,
+    ) -> Result<SmtpTransport<Box<dyn SessionBufStream>>> {
+        let tcp_stream = connect_tcp(context, hostname, port, SMTP_TIMEOUT, false).await?;
+        let buffered_stream = BufStream::new(tcp_stream);
+        let session_stream: Box<dyn SessionBufStream> = Box::new(buffered_stream);
+        let client = smtp::SmtpClient::new().smtp_utf8(true);
+        let transport = SmtpTransport::new(client, session_stream).await?;
+        Ok(transport)
     }
 
     /// Connect using the provided login params.
@@ -127,7 +243,7 @@ impl Smtp {
         }
 
         let from = EmailAddress::new(addr.to_string())
-            .with_context(|| format!("invalid login address {}", addr))?;
+            .with_context(|| format!("invalid login address {addr}"))?;
 
         self.from = Some(from);
 
@@ -140,61 +256,83 @@ impl Smtp {
             CertificateChecks::AcceptInvalidCertificates
             | CertificateChecks::AcceptInvalidCertificates2 => false,
         };
-        let tls_config = build_tls(strict_tls);
-        let tls_parameters = ClientTlsParameters::new(domain.to_string(), tls_config);
 
-        let (creds, mechanism) = if lp.oauth2 {
-            // oauth2
-            let send_pw = &lp.password;
-            let access_token = get_oauth2_access_token(context, addr, send_pw, false).await?;
-            if access_token.is_none() {
-                bail!("SMTP OAuth 2 error {}", addr);
+        let mut transport = if let Some(socks5_config) = socks5_config {
+            match lp.security {
+                Socket::Automatic => bail!("SMTP port security is not configured"),
+                Socket::Ssl => {
+                    self.connect_secure_socks5(
+                        context,
+                        domain,
+                        port,
+                        strict_tls,
+                        socks5_config.clone(),
+                    )
+                    .await?
+                }
+                Socket::Starttls => {
+                    self.connect_starttls_socks5(
+                        context,
+                        domain,
+                        port,
+                        strict_tls,
+                        socks5_config.clone(),
+                    )
+                    .await?
+                }
+                Socket::Plain => {
+                    self.connect_insecure_socks5(context, domain, port, socks5_config.clone())
+                        .await?
+                }
             }
-            let user = &lp.user;
-            (
-                smtp::authentication::Credentials::new(
-                    user.to_string(),
-                    access_token.unwrap_or_default(),
-                ),
-                vec![smtp::authentication::Mechanism::Xoauth2],
-            )
         } else {
-            // plain
-            let user = lp.user.clone();
-            let pw = lp.password.clone();
-            (
-                smtp::authentication::Credentials::new(user, pw),
-                vec![
-                    smtp::authentication::Mechanism::Plain,
-                    smtp::authentication::Mechanism::Login,
-                ],
-            )
+            match lp.security {
+                Socket::Automatic => bail!("SMTP port security is not configured"),
+                Socket::Ssl => {
+                    self.connect_secure(context, domain, port, strict_tls)
+                        .await?
+                }
+                Socket::Starttls => {
+                    self.connect_starttls(context, domain, port, strict_tls)
+                        .await?
+                }
+                Socket::Plain => self.connect_insecure(context, domain, port).await?,
+            }
         };
 
-        let security = match lp.security {
-            Socket::Plain => smtp::ClientSecurity::None,
-            Socket::Starttls => smtp::ClientSecurity::Required(tls_parameters),
-            _ => smtp::ClientSecurity::Wrapper(tls_parameters),
-        };
-
-        let client =
-            smtp::SmtpClient::with_security(ServerAddress::new(domain.to_string(), port), security);
-
-        let mut client = client
-            .smtp_utf8(true)
-            .credentials(creds)
-            .authentication_mechanism(mechanism)
-            .connection_reuse(smtp::ConnectionReuseParameters::ReuseUnlimited)
-            .timeout(Some(Duration::from_secs(SMTP_TIMEOUT)));
-
-        if let Some(socks5_config) = socks5_config {
-            client = client.use_socks5(socks5_config.to_async_smtp_socks5_config());
+        // Authenticate.
+        {
+            let (creds, mechanism) = if lp.oauth2 {
+                // oauth2
+                let send_pw = &lp.password;
+                let access_token = get_oauth2_access_token(context, addr, send_pw, false).await?;
+                if access_token.is_none() {
+                    bail!("SMTP OAuth 2 error {}", addr);
+                }
+                let user = &lp.user;
+                (
+                    smtp::authentication::Credentials::new(
+                        user.to_string(),
+                        access_token.unwrap_or_default(),
+                    ),
+                    vec![smtp::authentication::Mechanism::Xoauth2],
+                )
+            } else {
+                // plain
+                let user = lp.user.clone();
+                let pw = lp.password.clone();
+                (
+                    smtp::authentication::Credentials::new(user, pw),
+                    vec![
+                        smtp::authentication::Mechanism::Plain,
+                        smtp::authentication::Mechanism::Login,
+                    ],
+                )
+            };
+            transport.try_login(&creds, &mechanism).await?;
         }
 
-        let mut trans = client.into_transport();
-        trans.connect().await.context("SMTP failed to connect")?;
-
-        self.transport = Some(trans);
+        self.transport = Some(transport);
         self.last_success = Some(SystemTime::now());
 
         context.emit_event(EventType::SmtpConnected(format!(
@@ -224,11 +362,10 @@ pub(crate) async fn smtp_send(
     message: &str,
     smtp: &mut Smtp,
     msg_id: MsgId,
-    rowid: i64,
 ) -> SendResult {
     if std::env::var(crate::DCC_MIME_DEBUG).is_ok() {
         info!(context, "smtp-sending out mime message:");
-        println!("{}", message);
+        println!("{message}");
     }
 
     smtp.connectivity.set_working(context).await;
@@ -238,13 +375,11 @@ pub(crate) async fn smtp_send(
         .await
         .context("Failed to open SMTP connection")
     {
-        smtp.last_send_error = Some(format!("{:#}", err));
+        smtp.last_send_error = Some(format!("{err:#}"));
         return SendResult::Retry;
     }
 
-    let send_result = smtp
-        .send(context, recipients, message.as_bytes(), rowid)
-        .await;
+    let send_result = smtp.send(context, recipients, message.as_bytes()).await;
     smtp.last_send_error = send_result.as_ref().err().map(|e| e.to_string());
 
     let status = match send_result {
@@ -253,7 +388,7 @@ pub(crate) async fn smtp_send(
             info!(context, "SMTP failed to send: {:?}", &err);
 
             let res = match err {
-                async_smtp::smtp::error::Error::Permanent(ref response) => {
+                async_smtp::error::Error::Permanent(ref response) => {
                     // Workaround for incorrectly configured servers returning permanent errors
                     // instead of temporary ones.
                     let maybe_transient = match response.code {
@@ -288,7 +423,7 @@ pub(crate) async fn smtp_send(
                         SendResult::Failure(format_err!("Permanent SMTP error: {}", err))
                     }
                 }
-                async_smtp::smtp::error::Error::Transient(ref response) => {
+                async_smtp::error::Error::Transient(ref response) => {
                     // We got a transient 4xx response from SMTP server.
                     // Give some time until the server-side error maybe goes away.
 
@@ -301,7 +436,7 @@ pub(crate) async fn smtp_send(
                             // Any extended smtp status codes like x.1.1, x.1.2 or x.1.3 that we
                             // receive as a transient error are misconfigurations of the smtp server.
                             // See <https://tools.ietf.org/html/rfc3463#section-3.2>
-                            info!(context, "Received extended status code {} for a transient error. This looks like a misconfigured smtp server, let's fail immediatly", first_word);
+                            info!(context, "Received extended status code {} for a transient error. This looks like a misconfigured SMTP server, let's fail immediately", first_word);
                             SendResult::Failure(format_err!("Permanent SMTP error: {}", err))
                         } else {
                             info!(
@@ -330,15 +465,15 @@ pub(crate) async fn smtp_send(
 
             // this clears last_success info
             info!(context, "Failed to send message over SMTP, disconnecting");
-            smtp.disconnect().await;
+            smtp.disconnect();
 
             res
         }
         Err(crate::smtp::send::Error::Envelope(err)) => {
             // Local error, job is invalid, do not retry.
-            smtp.disconnect().await;
+            smtp.disconnect();
             warn!(context, "SMTP job is invalid: {}", err);
-            SendResult::Failure(err.into())
+            SendResult::Failure(err)
         }
         Err(crate::smtp::send::Error::NoTransport) => {
             // Should never happen.
@@ -348,7 +483,7 @@ pub(crate) async fn smtp_send(
         }
         Err(crate::smtp::send::Error::Other(err)) => {
             // Local error, job is invalid, do not retry.
-            smtp.disconnect().await;
+            smtp.disconnect();
             warn!(context, "unable to load job: {}", err);
             SendResult::Failure(err)
         }
@@ -375,7 +510,7 @@ pub(crate) async fn send_msg_to_smtp(
         .await
         .context("SMTP connection failure")
     {
-        smtp.last_send_error = Some(format!("{:#}", err));
+        smtp.last_send_error = Some(format!("{err:#}"));
         return Err(err);
     }
 
@@ -385,10 +520,7 @@ pub(crate) async fn send_msg_to_smtp(
     // database.
     context
         .sql
-        .execute(
-            "UPDATE smtp SET retries=retries+1 WHERE id=?",
-            paramsv![rowid],
-        )
+        .execute("UPDATE smtp SET retries=retries+1 WHERE id=?", (rowid,))
         .await
         .context("failed to update retries count")?;
 
@@ -396,7 +528,7 @@ pub(crate) async fn send_msg_to_smtp(
         .sql
         .query_row(
             "SELECT mime, recipients, msg_id, retries FROM smtp WHERE id=?",
-            paramsv![rowid],
+            (rowid,),
             |row| {
                 let mime: String = row.get(0)?;
                 let recipients: String = row.get(1)?;
@@ -410,14 +542,14 @@ pub(crate) async fn send_msg_to_smtp(
         message::set_msg_failed(context, msg_id, "Number of retries exceeded the limit.").await;
         context
             .sql
-            .execute("DELETE FROM smtp WHERE id=?", paramsv![rowid])
+            .execute("DELETE FROM smtp WHERE id=?", (rowid,))
             .await
             .context("failed to remove message with exceeded retry limit from smtp table")?;
-        bail!("Number of retries exceeded the limit");
+        return Ok(());
     }
     info!(
         context,
-        "Try number {} to send message {} over SMTP", retries, msg_id
+        "Try number {retries} to send message {msg_id} (entry {rowid}) over SMTP"
     );
 
     let recipients_list = recipients
@@ -437,31 +569,28 @@ pub(crate) async fn send_msg_to_smtp(
     // delete_msgs() was called before the generated mime was sent out.
     if !message::exists(context, msg_id)
         .await
-        .with_context(|| format!("failed to check message {} existence", msg_id))?
+        .with_context(|| format!("failed to check message {msg_id} existence"))?
     {
         info!(
             context,
-            "Sending of message {} was cancelled by the user.", msg_id
+            "Sending of message {msg_id} (entry {rowid}) was cancelled by the user."
         );
+        context
+            .sql
+            .execute("DELETE FROM smtp WHERE id=?", (rowid,))
+            .await
+            .context("failed to remove cancelled message from smtp table")?;
         return Ok(());
     }
 
-    let status = smtp_send(
-        context,
-        &recipients_list,
-        body.as_str(),
-        smtp,
-        msg_id,
-        rowid,
-    )
-    .await;
+    let status = smtp_send(context, &recipients_list, body.as_str(), smtp, msg_id).await;
 
     match status {
         SendResult::Retry => {}
         SendResult::Success | SendResult::Failure(_) => {
             context
                 .sql
-                .execute("DELETE FROM smtp WHERE id=?", paramsv![rowid])
+                .execute("DELETE FROM smtp WHERE id=?", (rowid,))
                 .await?;
         }
     };
@@ -510,7 +639,7 @@ pub(crate) async fn send_smtp_messages(context: &Context, connection: &mut Smtp)
         .sql
         .query_map(
             "SELECT id FROM smtp ORDER BY id ASC",
-            paramsv![],
+            (),
             |row| {
                 let rowid: i64 = row.get(0)?;
                 Ok(rowid)
@@ -522,6 +651,8 @@ pub(crate) async fn send_smtp_messages(context: &Context, connection: &mut Smtp)
             },
         )
         .await?;
+
+    info!(context, "Selected rows from SMTP queue: {rowids:?}.");
     for rowid in rowids {
         send_msg_to_smtp(context, connection, rowid)
             .await
@@ -529,7 +660,7 @@ pub(crate) async fn send_smtp_messages(context: &Context, connection: &mut Smtp)
     }
 
     // although by slow sending, ratelimit may have been expired meanwhile,
-    // do not attempt to send MDNs if ratelimited happend before on status-updates/sync:
+    // do not attempt to send MDNs if ratelimited happened before on status-updates/sync:
     // instead, let the caller recall this function so that more important status-updates/sync are sent out.
     if !ratelimited {
         send_mdns(context, connection)
@@ -552,7 +683,7 @@ async fn send_mdn_msg_id(
     contact_id: ContactId,
     smtp: &mut Smtp,
 ) -> Result<()> {
-    let contact = Contact::load_from_db(context, contact_id).await?;
+    let contact = Contact::get_by_id(context, contact_id).await?;
     if contact.is_blocked() {
         return Err(format_err!("Contact is blocked"));
     }
@@ -564,7 +695,7 @@ async fn send_mdn_msg_id(
             "SELECT msg_id, rfc724_mid
              FROM smtp_mdns
              WHERE from_id=? AND msg_id!=?",
-            paramsv![contact_id, msg_id],
+            (contact_id, msg_id),
             |row| {
                 let msg_id: MsgId = row.get(0)?;
                 let rfc724_mid: String = row.get(1)?;
@@ -586,12 +717,12 @@ async fn send_mdn_msg_id(
         .map_err(|err| format_err!("invalid recipient: {} {:?}", addr, err))?;
     let recipients = vec![recipient];
 
-    match smtp_send(context, &recipients, &body, smtp, msg_id, 0).await {
+    match smtp_send(context, &recipients, &body, smtp, msg_id).await {
         SendResult::Success => {
             info!(context, "Successfully sent MDN for {}", msg_id);
             context
                 .sql
-                .execute("DELETE FROM smtp_mdns WHERE msg_id = ?", paramsv![msg_id])
+                .execute("DELETE FROM smtp_mdns WHERE msg_id = ?", (msg_id,))
                 .await?;
             if !additional_msg_ids.is_empty() {
                 let q = format!(
@@ -652,7 +783,7 @@ async fn send_mdn(context: &Context, smtp: &mut Smtp) -> Result<bool> {
         .sql
         .execute(
             "UPDATE smtp_mdns SET retries=retries+1 WHERE msg_id=?",
-            paramsv![msg_id],
+            (msg_id,),
         )
         .await
         .context("failed to update MDN retries count")?;
@@ -662,7 +793,7 @@ async fn send_mdn(context: &Context, smtp: &mut Smtp) -> Result<bool> {
         // database, do not try to send this MDN again.
         context
             .sql
-            .execute("DELETE FROM smtp_mdns WHERE msg_id = ?", paramsv![msg_id])
+            .execute("DELETE FROM smtp_mdns WHERE msg_id = ?", (msg_id,))
             .await?;
         Err(err)
     } else {

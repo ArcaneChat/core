@@ -1,13 +1,12 @@
-""" Account class implementation. """
+"""Account class implementation."""
 
-from __future__ import print_function
 
 import os
 from array import array
 from contextlib import contextmanager
 from email.utils import parseaddr
 from threading import Event
-from typing import Any, Dict, Generator, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, Generator, List, Optional, Union
 
 from . import const, hookspec
 from .capi import ffi, lib
@@ -20,9 +19,11 @@ from .cutil import (
     from_optional_dc_charpointer,
     iter_array,
 )
-from .events import EventThread, FFIEventLogger
 from .message import Message
 from .tracker import ConfigureTracker, ImexTracker
+
+if TYPE_CHECKING:
+    from .events import FFIEventTracker
 
 
 class MissingCredentials(ValueError):
@@ -39,7 +40,7 @@ def get_core_info():
             ffi.gc(
                 lib.dc_context_new(as_dc_charpointer(""), as_dc_charpointer(path.name), ffi.NULL),
                 lib.dc_context_unref,
-            )
+            ),
         )
 
 
@@ -54,7 +55,7 @@ def get_dc_info_as_dict(dc_context):
     return info_dict
 
 
-class Account(object):
+class Account:
     """Each account is tied to a sqlite database file which is fully managed
     by the underlying deltachat core library.  All public Account methods are
     meant to be memory-safe and return memory-safe objects.
@@ -62,7 +63,12 @@ class Account(object):
 
     MissingCredentials = MissingCredentials
 
+    _logid: str
+    _evtracker: "FFIEventTracker"
+
     def __init__(self, db_path, os_name=None, logging=True, closed=False) -> None:
+        from .events import EventThread
+
         """initialize account object.
 
         :param db_path: a path to the account database. The database
@@ -82,12 +88,13 @@ class Account(object):
         if hasattr(db_path, "encode"):
             db_path = db_path.encode("utf8")
 
+        ptr = lib.dc_context_new_closed(db_path) if closed else lib.dc_context_new(ffi.NULL, db_path, ffi.NULL)
+        if ptr == ffi.NULL:
+            raise ValueError(f"Could not dc_context_new: {os_name} {db_path}")
         self._dc_context = ffi.gc(
-            lib.dc_context_new_closed(db_path) if closed else lib.dc_context_new(ffi.NULL, db_path, ffi.NULL),
+            ptr,
             lib.dc_context_unref,
         )
-        if self._dc_context == ffi.NULL:
-            raise ValueError("Could not dc_context_new: {} {}".format(os_name, db_path))
 
         self._shutdown_event = Event()
         self._event_thread = EventThread(self)
@@ -114,8 +121,8 @@ class Account(object):
         """re-enable logging."""
         self._logging = True
 
-    def __repr__(self):
-        return "<Account path={}>".format(self.db_path)
+    def __repr__(self) -> str:
+        return f"<Account path={self.db_path}>"
 
     # def __del__(self):
     #    self.shutdown()
@@ -126,7 +133,7 @@ class Account(object):
 
     def _check_config_key(self, name: str) -> None:
         if name not in self._configkeys:
-            raise KeyError("{!r} not a valid config key, existing keys: {!r}".format(name, self._configkeys))
+            raise KeyError(f"{name!r} not a valid config key, existing keys: {self._configkeys!r}")
 
     def get_info(self) -> Dict[str, str]:
         """return dictionary of built config parameters."""
@@ -140,7 +147,7 @@ class Account(object):
         log("=============== " + self.get_config("displayname") + " ===============")
         cursor = 0
         for name, val in self.get_info().items():
-            entry = "{}={}".format(name.upper(), val)
+            entry = f"{name.upper()}={val}"
             if cursor + len(entry) > 80:
                 log("")
                 cursor = 0
@@ -152,7 +159,7 @@ class Account(object):
         """set stock translation string.
 
         :param id: id of stock string (const.DC_STR_*)
-        :param value: string to set as new transalation
+        :param value: string to set as new translation
         :returns: None
         """
         bytestring = string.encode("utf8")
@@ -171,10 +178,7 @@ class Account(object):
         namebytes = name.encode("utf8")
         if isinstance(value, (int, bool)):
             value = str(int(value))
-        if value is not None:
-            valuebytes = value.encode("utf8")
-        else:
-            valuebytes = ffi.NULL
+        valuebytes = value.encode("utf8") if value is not None else ffi.NULL
         lib.dc_set_config(self._dc_context, namebytes, valuebytes)
 
     def get_config(self, name: str) -> str:
@@ -188,7 +192,7 @@ class Account(object):
             self._check_config_key(name)
         namebytes = name.encode("utf8")
         res = lib.dc_get_config(self._dc_context, namebytes)
-        assert res != ffi.NULL, "config value not found for: {!r}".format(name)
+        assert res != ffi.NULL, f"config value not found for: {name!r}"
         return from_dc_charpointer(res)
 
     def _preconfigure_keypair(self, addr: str, public: str, secret: str) -> None:
@@ -224,9 +228,10 @@ class Account(object):
         return bool(lib.dc_is_configured(self._dc_context))
 
     def is_open(self) -> bool:
-        """Determine if account is open
+        """Determine if account is open.
 
-        :returns True if account is open."""
+        :returns True if account is open.
+        """
         return bool(lib.dc_context_is_open(self._dc_context))
 
     def set_avatar(self, img_path: Optional[str]) -> None:
@@ -279,9 +284,9 @@ class Account(object):
         :returns: :class:`deltachat.contact.Contact` instance.
         """
         (name, addr) = self.get_contact_addr_and_name(obj, name)
-        name = as_dc_charpointer(name)
-        addr = as_dc_charpointer(addr)
-        contact_id = lib.dc_create_contact(self._dc_context, name, addr)
+        name_c = as_dc_charpointer(name)
+        addr_c = as_dc_charpointer(addr)
+        contact_id = lib.dc_create_contact(self._dc_context, name_c, addr_c)
         return Contact(self, contact_id)
 
     def get_contact(self, obj) -> Optional[Contact]:
@@ -297,12 +302,12 @@ class Account(object):
             addr, displayname = obj.get_config("addr"), obj.get_config("displayname")
         elif isinstance(obj, Contact):
             if obj.account != self:
-                raise ValueError("account mismatch {}".format(obj))
+                raise ValueError(f"account mismatch {obj}")
             addr, displayname = obj.addr, obj.name
         elif isinstance(obj, str):
             displayname, addr = parseaddr(obj)
         else:
-            raise TypeError("don't know how to create chat for %r" % (obj,))
+            raise TypeError(f"don't know how to create chat for {obj!r}")
 
         if name is None and displayname:
             name = displayname
@@ -358,18 +363,34 @@ class Account(object):
         :returns: list of :class:`deltachat.contact.Contact` objects.
         """
         flags = 0
-        query = as_dc_charpointer(query)
+        query_c = as_dc_charpointer(query)
         if only_verified:
             flags |= const.DC_GCL_VERIFIED_ONLY
         if with_self:
             flags |= const.DC_GCL_ADD_SELF
-        dc_array = ffi.gc(lib.dc_get_contacts(self._dc_context, flags, query), lib.dc_array_unref)
+        dc_array = ffi.gc(lib.dc_get_contacts(self._dc_context, flags, query_c), lib.dc_array_unref)
         return list(iter_array(dc_array, lambda x: Contact(self, x)))
 
     def get_fresh_messages(self) -> Generator[Message, None, None]:
         """yield all fresh messages from all chats."""
         dc_array = ffi.gc(lib.dc_get_fresh_msgs(self._dc_context), lib.dc_array_unref)
-        yield from iter_array(dc_array, lambda x: Message.from_db(self, x))
+        return (x for x in iter_array(dc_array, lambda x: Message.from_db(self, x)) if x is not None)
+
+    def _wait_next_message_ids(self) -> List[int]:
+        """Return IDs of all next messages from all chats."""
+        dc_array = ffi.gc(lib.dc_wait_next_msgs(self._dc_context), lib.dc_array_unref)
+        return [lib.dc_array_get_id(dc_array, i) for i in range(lib.dc_array_get_cnt(dc_array))]
+
+    def wait_next_incoming_message(self) -> Message:
+        """Waits until the next incoming message
+        with ID higher than given is received and returns it."""
+        while True:
+            message_ids = self._wait_next_message_ids()
+            for msg_id in message_ids:
+                message = Message.from_db(self, msg_id)
+                if message and not message.is_from_self() and not message.is_from_device():
+                    self.set_config("last_msg_id", str(msg_id))
+                    return message
 
     def create_chat(self, obj) -> Chat:
         """Create a 1:1 chat with Account, Contact or e-mail address."""
@@ -414,7 +435,7 @@ class Account(object):
     def get_device_chat(self) -> Chat:
         return Contact(self, const.DC_CONTACT_ID_DEVICE).create_chat()
 
-    def get_message_by_id(self, msg_id: int) -> Message:
+    def get_message_by_id(self, msg_id: int) -> Optional[Message]:
         """return Message instance.
         :param msg_id: integer id of this message.
         :returns: :class:`deltachat.message.Message` instance.
@@ -429,7 +450,7 @@ class Account(object):
         """
         res = lib.dc_get_chat(self._dc_context, chat_id)
         if res == ffi.NULL:
-            raise ValueError("cannot get chat with id={}".format(chat_id))
+            raise ValueError(f"cannot get chat with id={chat_id}")
         lib.dc_chat_unref(res)
         return Chat(self, chat_id)
 
@@ -542,11 +563,11 @@ class Account(object):
         return from_dc_charpointer(res)
 
     def check_qr(self, qr):
-        """check qr code and return :class:`ScannedQRCode` instance representing the result"""
+        """check qr code and return :class:`ScannedQRCode` instance representing the result."""
         res = ffi.gc(lib.dc_check_qr(self._dc_context, as_dc_charpointer(qr)), lib.dc_lot_unref)
         lot = DCLot(res)
         if lot.state() == const.DC_QR_ERROR:
-            raise ValueError("invalid or unknown QR code: {}".format(lot.text1()))
+            raise ValueError(f"invalid or unknown QR code: {lot.text1()}")
         return ScannedQRCode(lot)
 
     def qr_setup_contact(self, qr):
@@ -597,6 +618,8 @@ class Account(object):
     #
 
     def run_account(self, addr=None, password=None, account_plugins=None, show_ffi=False):
+        from .events import FFIEventLogger
+
         """get the account running, configure it if necessary. add plugins if provided.
 
         :param addr: the email address of the account
@@ -617,13 +640,11 @@ class Account(object):
             assert addr and password, "you must specify email and password once to configure this database/account"
             self.set_config("addr", addr)
             self.set_config("mail_pw", password)
-            self.set_config("mvbox_move", "0")
-            self.set_config("sentbox_watch", "0")
             self.set_config("bot", "1")
             configtracker = self.configure()
             configtracker.wait_finish()
 
-        # start IO threads and configure if neccessary
+        # start IO threads and configure if necessary
         self.start_io()
 
     def add_account_plugin(self, plugin, name=None):
@@ -661,7 +682,7 @@ class Account(object):
         return lib.dc_all_work_done(self._dc_context)
 
     def start_io(self):
-        """start this account's IO scheduling (Rust-core async scheduler)
+        """start this account's IO scheduling (Rust-core async scheduler).
 
         If this account is not configured an Exception is raised.
         You need to call account.configure() and account.wait_configure_finish()
@@ -704,12 +725,10 @@ class Account(object):
         """
         lib.dc_maybe_network(self._dc_context)
 
-    def configure(self, reconfigure: bool = False) -> ConfigureTracker:
+    def configure(self) -> ConfigureTracker:
         """Start configuration process and return a Configtracker instance
         on which you can block with wait_finish() to get a True/False success
         value for the configuration process.
-
-        :param reconfigure: deprecated, doesn't need to be checked anymore.
         """
         if not self.get_config("addr") or not self.get_config("mail_pw"):
             raise MissingCredentials("addr or mail_pwd not set in config")
@@ -732,7 +751,8 @@ class Account(object):
 
     def shutdown(self) -> None:
         """shutdown and destroy account (stop callback thread, close and remove
-        underlying dc_context)."""
+        underlying dc_context).
+        """
         if self._dc_context is None:
             return
 
@@ -747,7 +767,7 @@ class Account(object):
         try:
             self._event_thread.wait(timeout=5)
         except RuntimeError as e:
-            self.log("Waiting for event thread failed: {}".format(e))
+            self.log(f"Waiting for event thread failed: {e}")
 
         if self._event_thread.is_alive():
             self.log("WARN: event thread did not terminate yet, ignoring.")
@@ -763,7 +783,7 @@ class Account(object):
 
 
 class ScannedQRCode:
-    def __init__(self, dc_lot):
+    def __init__(self, dc_lot) -> None:
         self._dc_lot = dc_lot
 
     def is_ask_verifycontact(self):

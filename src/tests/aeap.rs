@@ -4,15 +4,14 @@ use anyhow::Result;
 
 use crate::chat;
 use crate::chat::ChatId;
-use crate::constants;
 use crate::contact;
 use crate::contact::Contact;
 use crate::contact::ContactId;
 use crate::message::Message;
-use crate::peerstate;
 use crate::peerstate::Peerstate;
 use crate::receive_imf::receive_imf;
 use crate::stock_str;
+use crate::test_utils::mark_as_verified;
 use crate::test_utils::TestContext;
 use crate::test_utils::TestContextManager;
 
@@ -33,7 +32,7 @@ async fn test_change_primary_self_addr() -> Result<()> {
     // Alice set up message forwarding so that she still receives
     // the message with her new address
     let alice_msg = alice.recv_msg(&sent).await;
-    assert_eq!(alice_msg.text, Some("hi back".to_string()));
+    assert_eq!(alice_msg.text, "hi back".to_string());
     assert_eq!(alice_msg.get_showpadlock(), true);
     let alice_bob_chat = alice.create_chat(&bob).await;
     assert_eq!(alice_msg.chat_id, alice_bob_chat.id);
@@ -58,10 +57,7 @@ Message w/out In-Reply-To
 
     let alice_msg = alice.get_last_msg().await;
 
-    assert_eq!(
-        alice_msg.text,
-        Some("Message w/out In-Reply-To".to_string())
-    );
+    assert_eq!(alice_msg.text, "Message w/out In-Reply-To");
     assert_eq!(alice_msg.get_showpadlock(), false);
     assert_eq!(alice_msg.chat_id, alice_bob_chat.id);
 
@@ -217,7 +213,7 @@ async fn check_aeap_transition(
         .await;
     let recvd = bob.recv_msg(&sent).await;
     let sent_timestamp = recvd.timestamp_sent;
-    assert_eq!(recvd.text.unwrap(), "Hello from my new addr!");
+    assert_eq!(recvd.text, "Hello from my new addr!");
 
     tcm.section("Check that the AEAP transition worked");
     check_that_transition_worked(
@@ -246,7 +242,7 @@ async fn check_aeap_transition(
         .send_text(chat_to_send, "Hello from my old addr!")
         .await;
     let recvd = bob.recv_msg(&sent).await;
-    assert_eq!(recvd.text.unwrap(), "Hello from my old addr!");
+    assert_eq!(recvd.text, "Hello from my old addr!");
 
     check_that_transition_worked(
         &groups[2..],
@@ -292,13 +288,13 @@ async fn check_that_transition_worked(
         let info_msg = get_last_info_msg(bob, *group).await.unwrap();
         let expected_text =
             stock_str::aeap_addr_changed(bob, name, old_alice_addr, new_alice_addr).await;
-        assert_eq!(info_msg.text.unwrap(), expected_text);
+        assert_eq!(info_msg.text, expected_text);
         assert_eq!(info_msg.from_id, ContactId::INFO);
 
-        let msg = format!("Sending to group {}", group);
+        let msg = format!("Sending to group {group}");
         let sent = bob.send_text(*group, &msg).await;
         let recvd = alice.recv_msg(&sent).await;
-        assert_eq!(recvd.text.unwrap(), msg);
+        assert_eq!(recvd.text, msg);
     }
 }
 
@@ -326,30 +322,22 @@ async fn check_no_transition_done(groups: &[ChatId], old_alice_addr: &str, bob: 
         let last_info_msg = get_last_info_msg(bob, *group).await;
         assert!(
             last_info_msg.is_none(),
-            "{:?} shouldn't be there (or it's an unrelated info msg)",
-            last_info_msg
+            "{last_info_msg:?} shouldn't be there (or it's an unrelated info msg)"
         );
     }
 }
 
-async fn mark_as_verified(this: &TestContext, other: &TestContext) {
-    let other_addr = other.get_primary_self_addr().await.unwrap();
-    let mut peerstate = peerstate::Peerstate::from_addr(this, &other_addr)
-        .await
-        .unwrap()
-        .unwrap();
-
-    peerstate.verified_key = peerstate.public_key.clone();
-    peerstate.verified_key_fingerprint = peerstate.public_key_fingerprint.clone();
-    peerstate.to_save = Some(peerstate::ToSave::All);
-
-    peerstate.save_to_db(&this.sql, false).await.unwrap();
-}
-
 async fn get_last_info_msg(t: &TestContext, chat_id: ChatId) -> Option<Message> {
-    let msgs = chat::get_chat_msgs(&t.ctx, chat_id, constants::DC_GCM_INFO_ONLY)
-        .await
-        .unwrap();
+    let msgs = chat::get_chat_msgs_ex(
+        &t.ctx,
+        chat_id,
+        chat::MessageListOptions {
+            info_only: true,
+            add_daymarker: false,
+        },
+    )
+    .await
+    .unwrap();
     let msg_id = if let chat::ChatItem::Message { msg_id } = msgs.last()? {
         msg_id
     } else {

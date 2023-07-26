@@ -1,4 +1,4 @@
-""" The Message object. """
+"""The Message object."""
 
 import json
 import os
@@ -9,16 +9,17 @@ from typing import Optional, Union
 from . import const, props
 from .capi import ffi, lib
 from .cutil import as_dc_charpointer, from_dc_charpointer, from_optional_dc_charpointer
+from .reactions import Reactions
 
 
-class Message(object):
+class Message:
     """Message object.
 
     You obtain instances of it through :class:`deltachat.account.Account` or
     :class:`deltachat.chat.Chat`.
     """
 
-    def __init__(self, account, dc_msg):
+    def __init__(self, account, dc_msg) -> None:
         self.account = account
         assert isinstance(self.account._dc_context, ffi.CData)
         assert isinstance(dc_msg, ffi.CData)
@@ -32,24 +33,24 @@ class Message(object):
             return False
         return self.account == other.account and self.id == other.id
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         c = self.get_sender_contact()
         typ = "outgoing" if self.is_outgoing() else "incoming"
-        return "<Message {} sys={} {} id={} sender={}/{} chat={}/{}>".format(
-            typ,
-            self.is_system_message(),
-            repr(self.text[:10]),
-            self.id,
-            c.id,
-            c.addr,
-            self.chat.id,
-            self.chat.get_name(),
+        return (
+            f"<Message {typ} sys={self.is_system_message()} {repr(self.text[:100])} "
+            f"id={self.id} sender={c.id}/{c.addr} chat={self.chat.id}/{self.chat.get_name()}>"
         )
 
     @classmethod
-    def from_db(cls, account, id):
+    def from_db(cls, account, id) -> Optional["Message"]:
+        """Attempt to load the message from the database given its ID.
+
+        None is returned if the message does not exist, i.e. deleted."""
         assert id > 0
-        return cls(account, ffi.gc(lib.dc_get_msg(account._dc_context, id), lib.dc_msg_unref))
+        res = lib.dc_get_msg(account._dc_context, id)
+        if res == ffi.NULL:
+            return None
+        return cls(account, ffi.gc(res, lib.dc_msg_unref))
 
     @classmethod
     def new_empty(cls, account, view_type):
@@ -58,10 +59,7 @@ class Message(object):
         :param view_type: the message type code or one of the strings:
            "text", "audio", "video", "file", "sticker", "videochat", "webxdc"
         """
-        if isinstance(view_type, int):
-            view_type_code = view_type
-        else:
-            view_type_code = get_viewtype_code_from_name(view_type)
+        view_type_code = view_type if isinstance(view_type, int) else get_viewtype_code_from_name(view_type)
         return Message(
             account,
             ffi.gc(lib.dc_msg_new(account._dc_context, view_type_code), lib.dc_msg_unref),
@@ -117,7 +115,7 @@ class Message(object):
         """set file for this message from path and mime_type."""
         mtype = ffi.NULL if mime_type is None else as_dc_charpointer(mime_type)
         if not os.path.exists(path):
-            raise ValueError("path does not exist: {!r}".format(path))
+            raise ValueError(f"path does not exist: {path!r}")
         lib.dc_msg_set_file(self._dc_msg, as_dc_charpointer(path), mtype)
 
     @props.with_doc
@@ -128,7 +126,7 @@ class Message(object):
 
     @props.with_doc
     def filemime(self) -> str:
-        """mime type of the file (if it exists)"""
+        """mime type of the file (if it exists)."""
         return from_dc_charpointer(lib.dc_msg_get_filemime(self._dc_msg))
 
     def get_status_updates(self, serial: int = 0) -> list:
@@ -140,7 +138,7 @@ class Message(object):
         :param serial: The last known serial. Pass 0 if there are no known serials to receive all updates.
         """
         return json.loads(
-            from_dc_charpointer(lib.dc_get_webxdc_status_updates(self.account._dc_context, self.id, serial))
+            from_dc_charpointer(lib.dc_get_webxdc_status_updates(self.account._dc_context, self.id, serial)),
         )
 
     def send_status_update(self, json_data: Union[str, dict], description: str) -> bool:
@@ -157,9 +155,23 @@ class Message(object):
             json_data = json.dumps(json_data, default=str)
         return bool(
             lib.dc_send_webxdc_status_update(
-                self.account._dc_context, self.id, as_dc_charpointer(json_data), as_dc_charpointer(description)
-            )
+                self.account._dc_context,
+                self.id,
+                as_dc_charpointer(json_data),
+                as_dc_charpointer(description),
+            ),
         )
+
+    def send_reaction(self, reaction: str):
+        """Send a reaction to message and return the resulting Message instance."""
+        msg_id = lib.dc_send_reaction(self.account._dc_context, self.id, as_dc_charpointer(reaction))
+        if msg_id == 0:
+            raise ValueError("reaction could not be send")
+        return Message.from_db(self.account, msg_id)
+
+    def get_reactions(self) -> Reactions:
+        """Get :class:`deltachat.reactions.Reactions` to the message."""
+        return Reactions.from_msg(self)
 
     def is_system_message(self):
         """return True if this message is a system/info message."""
@@ -220,16 +232,18 @@ class Message(object):
         ts = lib.dc_msg_get_received_timestamp(self._dc_msg)
         if ts:
             return datetime.fromtimestamp(ts, timezone.utc)
+        return None
 
     @props.with_doc
     def ephemeral_timer(self):
-        """Ephemeral timer in seconds
+        """Ephemeral timer in seconds.
 
         :returns: timer in seconds or None if there is no timer
         """
         timer = lib.dc_msg_get_ephemeral_timer(self._dc_msg)
         if timer:
             return timer
+        return None
 
     @props.with_doc
     def ephemeral_timestamp(self):
@@ -243,23 +257,25 @@ class Message(object):
 
     @property
     def quoted_text(self) -> Optional[str]:
-        """Text inside the quote
+        """Text inside the quote.
 
-        :returns: Quoted text"""
+        :returns: Quoted text
+        """
         return from_optional_dc_charpointer(lib.dc_msg_get_quoted_text(self._dc_msg))
 
     @property
     def quote(self):
-        """Quote getter
+        """Quote getter.
 
-        :returns: Quoted message, if found in the database"""
+        :returns: Quoted message, if found in the database
+        """
         msg = lib.dc_msg_get_quoted_msg(self._dc_msg)
         if msg:
             return Message(self.account, ffi.gc(msg, lib.dc_msg_unref))
 
     @quote.setter
     def quote(self, quoted_message):
-        """Quote setter"""
+        """Quote setter."""
         lib.dc_msg_set_quote(self._dc_msg, quoted_message._dc_msg)
 
     def force_plaintext(self) -> None:
@@ -274,7 +290,7 @@ class Message(object):
 
         :returns: email-mime message object (with headers only, no body).
         """
-        import email.parser
+        import email
 
         mime_headers = lib.dc_get_mime_headers(self.account._dc_context, self.id)
         if mime_headers:
@@ -285,7 +301,7 @@ class Message(object):
 
     @property
     def error(self) -> Optional[str]:
-        """Error message"""
+        """Error message."""
         return from_optional_dc_charpointer(lib.dc_msg_get_error(self._dc_msg))
 
     @property
@@ -327,6 +343,16 @@ class Message(object):
 
         contact_id = lib.dc_msg_get_from_id(self._dc_msg)
         return Contact(self.account, contact_id)
+
+    def is_from_self(self):
+        """Return true if the message is sent by self."""
+        contact_id = lib.dc_msg_get_from_id(self._dc_msg)
+        return contact_id == const.DC_CONTACT_ID_SELF
+
+    def is_from_device(self):
+        """Return true if the message is sent by the device."""
+        contact_id = lib.dc_msg_get_from_id(self._dc_msg)
+        return contact_id == const.DC_CONTACT_ID_DEVICE
 
     #
     # Message State query methods
@@ -449,6 +475,20 @@ class Message(object):
         """mark this message as seen."""
         self.account.mark_seen_messages([self.id])
 
+    #
+    # Message download state
+    #
+    @property
+    def download_state(self):
+        assert self.id > 0
+
+        # load message from db to get a fresh/current state
+        dc_msg = ffi.gc(lib.dc_get_msg(self.account._dc_context, self.id), lib.dc_msg_unref)
+        return lib.dc_msg_get_download_state(dc_msg)
+
+    def download_full(self) -> None:
+        lib.dc_download_full_msg(self.account._dc_context, self.id)
+
 
 # some code for handling DC_MSG_* view types
 
@@ -470,7 +510,8 @@ def get_viewtype_code_from_name(view_type_name):
     if code is not None:
         return code
     raise ValueError(
-        "message typecode not found for {!r}, " "available {!r}".format(view_type_name, list(_view_type_mapping.keys()))
+        "message typecode not found for {!r}, "
+        "available {!r}".format(view_type_name, list(_view_type_mapping.keys())),
     )
 
 
@@ -483,14 +524,11 @@ def map_system_message(msg):
     if msg.is_system_message():
         res = parse_system_add_remove(msg.text)
         if not res:
-            return
+            return None
         action, affected, actor = res
         affected = msg.account.get_contact_by_addr(affected)
-        if actor == "me":
-            actor = None
-        else:
-            actor = msg.account.get_contact_by_addr(actor)
-        d = dict(chat=msg.chat, contact=affected, actor=actor, message=msg)
+        actor = None if actor == "me" else msg.account.get_contact_by_addr(actor)
+        d = {"chat": msg.chat, "contact": affected, "actor": actor, "message": msg}
         return "ac_member_" + res[0], d
 
 
@@ -505,8 +543,8 @@ def extract_addr(text):
 def parse_system_add_remove(text):
     """return add/remove info from parsing the given system message text.
 
-    returns a (action, affected, actor) triple"""
-
+    returns a (action, affected, actor) triple
+    """
     # You removed member a@b.
     # You added member a@b.
     # Member Me (x@y) removed by a@b.

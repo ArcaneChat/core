@@ -62,12 +62,14 @@
 //! the database entries which are expired either according to their
 //! ephemeral message timers or global `delete_server_after` setting.
 
+use std::cmp::max;
+use std::collections::BTreeSet;
 use std::convert::{TryFrom, TryInto};
 use std::num::ParseIntError;
 use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{ensure, Context as _, Result};
+use anyhow::{ensure, Result};
 use async_channel::Receiver;
 use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
@@ -84,15 +86,26 @@ use crate::mimeparser::SystemMessage;
 use crate::sql::{self, params_iter};
 use crate::stock_str;
 use crate::tools::{duration_to_str, time};
-use std::cmp::max;
 
+/// Ephemeral timer value.
 #[derive(Debug, PartialEq, Eq, Copy, Clone, Serialize, Deserialize)]
 pub enum Timer {
+    /// Timer is disabled.
     Disabled,
-    Enabled { duration: u32 },
+
+    /// Timer is enabled.
+    Enabled {
+        /// Timer duration in seconds.
+        ///
+        /// The value cannot be 0.
+        duration: u32,
+    },
 }
 
 impl Timer {
+    /// Converts epehmeral timer value to integer.
+    ///
+    /// If the timer is disabled, return 0.
     pub fn to_u32(self) -> u32 {
         match self {
             Self::Disabled => 0,
@@ -100,6 +113,9 @@ impl Timer {
         }
     }
 
+    /// Converts integer to ephemeral timer value.
+    ///
+    /// 0 value is treated as disabled timer.
     pub fn from_u32(duration: u32) -> Self {
         if duration == 0 {
             Self::Disabled
@@ -159,10 +175,7 @@ impl ChatId {
     pub async fn get_ephemeral_timer(self, context: &Context) -> Result<Timer> {
         let timer = context
             .sql
-            .query_get_value(
-                "SELECT ephemeral_timer FROM chats WHERE id=?;",
-                paramsv![self],
-            )
+            .query_get_value("SELECT ephemeral_timer FROM chats WHERE id=?;", (self,))
             .await?;
         Ok(timer.unwrap_or_default())
     }
@@ -184,7 +197,7 @@ impl ChatId {
                 "UPDATE chats
              SET ephemeral_timer=?
              WHERE id=?;",
-                paramsv![timer, self],
+                (timer, self),
             )
             .await?;
 
@@ -203,14 +216,17 @@ impl ChatId {
             return Ok(());
         }
         self.inner_set_ephemeral_timer(context, timer).await?;
-        let mut msg = Message::new(Viewtype::Text);
-        msg.text = Some(stock_ephemeral_timer_changed(context, timer, ContactId::SELF).await);
-        msg.param.set_cmd(SystemMessage::EphemeralTimerChanged);
-        if let Err(err) = send_msg(context, self, &mut msg).await {
-            error!(
-                context,
-                "Failed to send a message about ephemeral message timer change: {:?}", err
-            );
+
+        if self.is_promoted(context).await? {
+            let mut msg = Message::new(Viewtype::Text);
+            msg.text = stock_ephemeral_timer_changed(context, timer, ContactId::SELF).await;
+            msg.param.set_cmd(SystemMessage::EphemeralTimerChanged);
+            if let Err(err) = send_msg(context, self, &mut msg).await {
+                error!(
+                    context,
+                    "Failed to send a message about ephemeral message timer change: {:?}", err
+                );
+            }
         }
         Ok(())
     }
@@ -226,13 +242,13 @@ pub(crate) async fn stock_ephemeral_timer_changed(
         Timer::Disabled => stock_str::msg_ephemeral_timer_disabled(context, from_id).await,
         Timer::Enabled { duration } => match duration {
             0..=59 => {
-                stock_str::msg_ephemeral_timer_enabled(context, timer.to_string(), from_id).await
+                stock_str::msg_ephemeral_timer_enabled(context, &timer.to_string(), from_id).await
             }
             60 => stock_str::msg_ephemeral_timer_minute(context, from_id).await,
             61..=3599 => {
                 stock_str::msg_ephemeral_timer_minutes(
                     context,
-                    format!("{}", (f64::from(duration) / 6.0).round() / 10.0),
+                    &format!("{}", (f64::from(duration) / 6.0).round() / 10.0),
                     from_id,
                 )
                 .await
@@ -241,7 +257,7 @@ pub(crate) async fn stock_ephemeral_timer_changed(
             3601..=86399 => {
                 stock_str::msg_ephemeral_timer_hours(
                     context,
-                    format!("{}", (f64::from(duration) / 360.0).round() / 10.0),
+                    &format!("{}", (f64::from(duration) / 360.0).round() / 10.0),
                     from_id,
                 )
                 .await
@@ -250,7 +266,7 @@ pub(crate) async fn stock_ephemeral_timer_changed(
             86401..=604_799 => {
                 stock_str::msg_ephemeral_timer_days(
                     context,
-                    format!("{}", (f64::from(duration) / 8640.0).round() / 10.0),
+                    &format!("{}", (f64::from(duration) / 8640.0).round() / 10.0),
                     from_id,
                 )
                 .await
@@ -259,7 +275,7 @@ pub(crate) async fn stock_ephemeral_timer_changed(
             _ => {
                 stock_str::msg_ephemeral_timer_weeks(
                     context,
-                    format!("{}", (f64::from(duration) / 60480.0).round() / 10.0),
+                    &format!("{}", (f64::from(duration) / 60480.0).round() / 10.0),
                     from_id,
                 )
                 .await
@@ -273,10 +289,7 @@ impl MsgId {
     pub(crate) async fn ephemeral_timer(self, context: &Context) -> Result<Timer> {
         let res = match context
             .sql
-            .query_get_value(
-                "SELECT ephemeral_timer FROM msgs WHERE id=?",
-                paramsv![self],
-            )
+            .query_get_value("SELECT ephemeral_timer FROM msgs WHERE id=?", (self,))
             .await?
         {
             None | Some(0) => Timer::Disabled,
@@ -296,10 +309,10 @@ impl MsgId {
                     "UPDATE msgs SET ephemeral_timestamp = ? \
                 WHERE (ephemeral_timestamp == 0 OR ephemeral_timestamp > ?) \
                 AND id = ?",
-                    paramsv![ephemeral_timestamp, ephemeral_timestamp, self],
+                    (ephemeral_timestamp, ephemeral_timestamp, self),
                 )
                 .await?;
-            context.interrupt_ephemeral_task().await;
+            context.scheduler.interrupt_ephemeral_task().await;
         }
         Ok(())
     }
@@ -320,14 +333,14 @@ pub(crate) async fn start_ephemeral_timers_msgids(
                 sql::repeat_vars(msg_ids.len())
             ),
             rusqlite::params_from_iter(
-                std::iter::once(&now as &dyn crate::ToSql)
-                    .chain(std::iter::once(&now as &dyn crate::ToSql))
+                std::iter::once(&now as &dyn crate::sql::ToSql)
+                    .chain(std::iter::once(&now as &dyn crate::sql::ToSql))
                     .chain(params_iter(msg_ids)),
             ),
         )
         .await?;
     if count > 0 {
-        context.interrupt_ephemeral_task().await;
+        context.scheduler.interrupt_ephemeral_task().await;
     }
     Ok(())
 }
@@ -351,7 +364,7 @@ WHERE
   AND ephemeral_timestamp <= ?
   AND chat_id != ?
 "#,
-            paramsv![now, DC_CHAT_ID_TRASH],
+            (now, DC_CHAT_ID_TRASH),
             |row| {
                 let id: MsgId = row.get("id")?;
                 let chat_id: ChatId = row.get("chat_id")?;
@@ -384,12 +397,12 @@ WHERE
   AND chat_id != ?
   AND chat_id != ?
 "#,
-                paramsv![
+                (
                     threshold_timestamp,
                     DC_CHAT_ID_LAST_SPECIAL,
                     self_chat_id,
-                    device_chat_id
-                ],
+                    device_chat_id,
+                ),
                 |row| {
                     let id: MsgId = row.get("id")?;
                     let chat_id: ChatId = row.get("chat_id")?;
@@ -415,37 +428,47 @@ pub(crate) async fn delete_expired_messages(context: &Context, now: i64) -> Resu
     let rows = select_expired_messages(context, now).await?;
 
     if !rows.is_empty() {
-        context
+        info!(context, "Attempting to delete {} messages.", rows.len());
+
+        let (msgs_changed, webxdc_deleted) = context
             .sql
-            .execute(
+            .transaction(|transaction| {
+                let mut msgs_changed = Vec::with_capacity(rows.len());
+                let mut webxdc_deleted = Vec::new();
+
                 // If you change which information is removed here, also change MsgId::trash() and
                 // which information receive_imf::add_parts() still adds to the db if the chat_id is TRASH
-                &format!(
-                    r#"
-UPDATE msgs
-SET
-  chat_id=?, txt='', subject='', txt_raw='',
-  mime_headers='', from_id=0, to_id=0, param=''
-WHERE id IN ({})
-"#,
-                    sql::repeat_vars(rows.len())
-                ),
-                rusqlite::params_from_iter(
-                    std::iter::once(&DC_CHAT_ID_TRASH as &dyn crate::ToSql).chain(
-                        rows.iter()
-                            .map(|(msg_id, _chat_id, _viewtype)| msg_id as &dyn crate::ToSql),
-                    ),
-                ),
-            )
-            .await
-            .context("update failed")?;
+                for (msg_id, chat_id, viewtype) in rows {
+                    transaction.execute(
+                        "UPDATE msgs
+                     SET chat_id=?, txt='', subject='', txt_raw='',
+                         mime_headers='', from_id=0, to_id=0, param=''
+                     WHERE id=?",
+                        (DC_CHAT_ID_TRASH, msg_id),
+                    )?;
 
-        for (msg_id, chat_id, viewtype) in rows {
-            context.emit_msgs_changed(chat_id, msg_id);
+                    msgs_changed.push((chat_id, msg_id));
+                    if viewtype == Viewtype::Webxdc {
+                        webxdc_deleted.push(msg_id)
+                    }
+                }
+                Ok((msgs_changed, webxdc_deleted))
+            })
+            .await?;
 
-            if viewtype == Viewtype::Webxdc {
-                context.emit_event(EventType::WebxdcInstanceDeleted { msg_id });
-            }
+        let mut modified_chat_ids = BTreeSet::new();
+
+        for (chat_id, msg_id) in msgs_changed {
+            context.emit_event(EventType::MsgDeleted { chat_id, msg_id });
+            modified_chat_ids.insert(chat_id);
+        }
+
+        for modified_chat_id in modified_chat_ids {
+            context.emit_msgs_changed(modified_chat_id, MsgId::new(0));
+        }
+
+        for msg_id in webxdc_deleted {
+            context.emit_event(EventType::WebxdcInstanceDeleted { msg_id });
         }
     }
 
@@ -473,7 +496,7 @@ async fn next_delete_device_after_timestamp(context: &Context) -> Result<Option<
                   AND chat_id != ?
                   AND chat_id != ?;
                 "#,
-                paramsv![DC_CHAT_ID_TRASH, self_chat_id, device_chat_id],
+                (DC_CHAT_ID_TRASH, self_chat_id, device_chat_id),
             )
             .await?;
 
@@ -497,7 +520,7 @@ async fn next_expiration_timestamp(context: &Context) -> Option<i64> {
             WHERE ephemeral_timestamp != 0
               AND chat_id != ?;
             "#,
-            paramsv![DC_CHAT_ID_TRASH], // Trash contains already deleted messages, skip them
+            (DC_CHAT_ID_TRASH,), // Trash contains already deleted messages, skip them
         )
         .await
     {
@@ -522,7 +545,7 @@ async fn next_expiration_timestamp(context: &Context) -> Option<i64> {
 
     ephemeral_timestamp
         .into_iter()
-        .chain(delete_device_after_timestamp.into_iter())
+        .chain(delete_device_after_timestamp)
         .min()
 }
 
@@ -554,7 +577,8 @@ pub(crate) async fn ephemeral_loop(context: &Context, interrupt_receiver: Receiv
 
         delete_expired_messages(context, time())
             .await
-            .ok_or_log(context);
+            .log_err(context)
+            .ok();
     }
 }
 
@@ -570,19 +594,25 @@ pub(crate) async fn delete_expired_imap_messages(context: &Context) -> Result<()
                 now - max(delete_server_after, MIN_DELETE_SERVER_AFTER),
             ),
         };
+    let target = context.get_delete_msgs_target().await?;
 
     context
         .sql
         .execute(
             "UPDATE imap
-             SET target=''
+             SET target=?
              WHERE rfc724_mid IN (
                SELECT rfc724_mid FROM msgs
                WHERE ((download_state = 0 AND timestamp < ?) OR
                       (download_state != 0 AND timestamp < ?) OR
                       (ephemeral_timestamp != 0 AND ephemeral_timestamp <= ?))
              )",
-            paramsv![threshold_timestamp, threshold_timestamp_extended, now],
+            (
+                &target,
+                threshold_timestamp,
+                threshold_timestamp_extended,
+                now,
+            ),
         )
         .await?;
 
@@ -607,12 +637,12 @@ pub(crate) async fn start_ephemeral_timers(context: &Context) -> Result<()> {
     WHERE ephemeral_timer > 0 \
     AND ephemeral_timestamp = 0 \
     AND state NOT IN (?, ?, ?)",
-            paramsv![
+            (
                 time(),
                 MessageState::InFresh,
                 MessageState::InNoticed,
-                MessageState::OutDraft
-            ],
+                MessageState::OutDraft,
+            ),
         )
         .await?;
 
@@ -626,9 +656,9 @@ mod tests {
     use crate::download::DownloadState;
     use crate::receive_imf::receive_imf;
     use crate::test_utils::TestContext;
-    use crate::tools::MAX_SECONDS_TO_LEND_FROM_FUTURE;
+    use crate::timesmearing::MAX_SECONDS_TO_LEND_FROM_FUTURE;
     use crate::{
-        chat::{self, Chat, ChatItem},
+        chat::{self, create_group_chat, send_text_msg, Chat, ChatItem, ProtectionStatus},
         tools::IsNoneOrEmpty,
     };
 
@@ -789,6 +819,42 @@ mod tests {
             chat_bob.get_ephemeral_timer(&bob.ctx).await?,
             Timer::Disabled
         );
+
+        Ok(())
+    }
+
+    /// Test that enabling ephemeral timer in unpromoted group does not send a message.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_ephemeral_unpromoted() -> Result<()> {
+        let alice = TestContext::new_alice().await;
+
+        let chat_id =
+            create_group_chat(&alice, ProtectionStatus::Unprotected, "Group name").await?;
+
+        // Group is unpromoted, the timer can be changed without sending a message.
+        assert!(chat_id.is_unpromoted(&alice).await?);
+        chat_id
+            .set_ephemeral_timer(&alice, Timer::Enabled { duration: 60 })
+            .await?;
+        let sent = alice.pop_sent_msg_opt(Duration::from_secs(1)).await;
+        assert!(sent.is_none());
+        assert_eq!(
+            chat_id.get_ephemeral_timer(&alice).await?,
+            Timer::Enabled { duration: 60 }
+        );
+
+        // Promote the group.
+        send_text_msg(&alice, chat_id, "hi!".to_string()).await?;
+        assert!(chat_id.is_promoted(&alice).await?);
+        let sent = alice.pop_sent_msg_opt(Duration::from_secs(1)).await;
+        assert!(sent.is_some());
+
+        chat_id
+            .set_ephemeral_timer(&alice.ctx, Timer::Disabled)
+            .await?;
+        let sent = alice.pop_sent_msg_opt(Duration::from_secs(1)).await;
+        assert!(sent.is_some());
+        assert_eq!(chat_id.get_ephemeral_timer(&alice).await?, Timer::Disabled);
 
         Ok(())
     }
@@ -996,7 +1062,7 @@ mod tests {
         delete_expired_messages(t, not_deleted_at).await?;
 
         let loaded = Message::load_from_db(t, msg_id).await?;
-        assert_eq!(loaded.text.unwrap(), "Message text");
+        assert_eq!(loaded.text, "Message text");
         assert_eq!(loaded.chat_id, chat.id);
 
         assert!(next_expiration < deleted_at);
@@ -1016,7 +1082,7 @@ mod tests {
             .await;
 
         let loaded = Message::load_from_db(t, msg_id).await?;
-        assert_eq!(loaded.text.unwrap(), "");
+        assert_eq!(loaded.text, "");
         assert_eq!(loaded.chat_id, DC_CHAT_ID_TRASH);
 
         // Check that the msg was deleted locally.
@@ -1026,7 +1092,7 @@ mod tests {
     }
 
     async fn check_msg_is_deleted(t: &TestContext, chat: &Chat, msg_id: MsgId) {
-        let chat_items = chat::get_chat_msgs(t, chat.id, 0).await.unwrap();
+        let chat_items = chat::get_chat_msgs(t, chat.id).await.unwrap();
         // Check that the chat is empty except for possibly info messages:
         for item in &chat_items {
             if let ChatItem::Message { msg_id } = item {
@@ -1039,13 +1105,13 @@ mod tests {
         if let Ok(msg) = Message::load_from_db(t, msg_id).await {
             assert_eq!(msg.from_id, ContactId::UNDEFINED);
             assert_eq!(msg.to_id, ContactId::UNDEFINED);
-            assert!(msg.text.is_none_or_empty(), "{:?}", msg.text);
+            assert_eq!(msg.text, "");
             let rawtxt: Option<String> = t
                 .sql
-                .query_get_value("SELECT txt_raw FROM msgs WHERE id=?;", paramsv![msg_id])
+                .query_get_value("SELECT txt_raw FROM msgs WHERE id=?;", (msg_id,))
                 .await
                 .unwrap();
-            assert!(rawtxt.is_none_or_empty(), "{:?}", rawtxt);
+            assert!(rawtxt.is_none_or_empty(), "{rawtxt:?}");
         }
     }
 
@@ -1067,13 +1133,13 @@ mod tests {
             t.sql
                    .execute(
                        "INSERT INTO msgs (id, rfc724_mid, timestamp, ephemeral_timestamp) VALUES (?,?,?,?);",
-                       paramsv![id, message_id, timestamp, ephemeral_timestamp],
+                       (id, &message_id, timestamp, ephemeral_timestamp),
                    )
                    .await?;
             t.sql
                    .execute(
                        "INSERT INTO imap (rfc724_mid, folder, uid, target) VALUES (?,'INBOX',?, 'INBOX');",
-                       paramsv![message_id, id],
+                       (&message_id, id),
                    )
                    .await?;
         }
@@ -1084,7 +1150,7 @@ mod tests {
                     .sql
                     .count(
                         "SELECT COUNT(*) FROM imap WHERE target='' AND rfc724_mid=?",
-                        paramsv![id.to_string()],
+                        (id.to_string(),),
                     )
                     .await?,
                 1
@@ -1095,10 +1161,7 @@ mod tests {
         async fn remove_uid(context: &Context, id: u32) -> Result<()> {
             context
                 .sql
-                .execute(
-                    "DELETE FROM imap WHERE rfc724_mid=?",
-                    paramsv![id.to_string()],
-                )
+                .execute("DELETE FROM imap WHERE rfc724_mid=?", (id.to_string(),))
                 .await?;
             Ok(())
         }
@@ -1110,7 +1173,7 @@ mod tests {
         // No other messages are marked for deletion.
         assert_eq!(
             t.sql
-                .count("SELECT COUNT(*) FROM imap WHERE target=''", paramsv![],)
+                .count("SELECT COUNT(*) FROM imap WHERE target=''", ())
                 .await?,
             0
         );
@@ -1124,10 +1187,7 @@ mod tests {
             .update_download_state(&t, DownloadState::Available)
             .await?;
         t.sql
-            .execute(
-                "UPDATE imap SET target=folder WHERE rfc724_mid='1000'",
-                paramsv![],
-            )
+            .execute("UPDATE imap SET target=folder WHERE rfc724_mid='1000'", ())
             .await?;
         delete_expired_imap_messages(&t).await?;
         test_marked_for_deletion(&t, 1000).await?; // Delete downloadable anyway.
@@ -1138,10 +1198,7 @@ mod tests {
         delete_expired_imap_messages(&t).await?;
         test_marked_for_deletion(&t, 1010).await?;
         t.sql
-            .execute(
-                "UPDATE imap SET target=folder WHERE rfc724_mid='1010'",
-                paramsv![],
-            )
+            .execute("UPDATE imap SET target=folder WHERE rfc724_mid='1010'", ())
             .await?;
 
         MsgId::new(1010)
@@ -1151,7 +1208,7 @@ mod tests {
         // Keep downloadable for now.
         assert_eq!(
             t.sql
-                .count("SELECT COUNT(*) FROM imap WHERE target=''", paramsv![],)
+                .count("SELECT COUNT(*) FROM imap WHERE target=''", ())
                 .await?,
             0
         );
@@ -1213,7 +1270,7 @@ mod tests {
         // protection.
         //
         // Previously Delta Chat fallen back to using <first@example.com> in this case and
-        // compared received timer value to the timer value of the <first@examle.com>. Because
+        // compared received timer value to the timer value of the <first@example.com>. Because
         // their timer values are the same ("disabled"), Delta Chat assumed that the timer was not
         // changed explicitly and the change should be ignored.
         //

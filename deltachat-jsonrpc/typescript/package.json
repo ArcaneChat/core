@@ -3,7 +3,7 @@
   "dependencies": {
     "@deltachat/tiny-emitter": "3.0.0",
     "isomorphic-ws": "^4.0.1",
-    "yerpc": "^0.3.3"
+    "yerpc": "^0.4.3"
   },
   "devDependencies": {
     "@types/chai": "^4.2.21",
@@ -14,7 +14,7 @@
     "c8": "^7.10.0",
     "chai": "^4.3.4",
     "chai-as-promised": "^7.1.1",
-    "esbuild": "^0.14.11",
+    "esbuild": "^0.17.9",
     "http-server": "^14.1.1",
     "mocha": "^9.1.1",
     "node-fetch": "^2.6.1",
@@ -24,12 +24,19 @@
     "typescript": "^4.5.5",
     "ws": "^8.5.0"
   },
+  "exports": {
+    ".": {
+      "import": "./dist/deltachat.js",
+      "require": "./dist/deltachat.cjs"
+    }
+  },
   "license": "MPL-2.0",
   "main": "dist/deltachat.js",
   "name": "@deltachat/jsonrpc-client",
   "scripts": {
-    "build": "run-s generate-bindings extract-constants build:tsc build:bundle",
+    "build": "run-s generate-bindings extract-constants build:tsc build:bundle build:cjs",
     "build:bundle": "esbuild --format=esm --bundle dist/deltachat.js --outfile=dist/deltachat.bundle.js",
+    "build:cjs": "esbuild --format=cjs --bundle --packages=external dist/deltachat.js --outfile=dist/deltachat.cjs",
     "build:tsc": "tsc",
     "docs": "typedoc --out docs deltachat.ts",
     "example": "run-s build example:build example:start",
@@ -38,8 +45,8 @@
     "example:start": "http-server .",
     "extract-constants": "node ./scripts/generate-constants.js",
     "generate-bindings": "cargo test",
-    "prettier:check": "prettier --check **.ts",
-    "prettier:fix": "prettier --write **.ts",
+    "prettier:check": "prettier --check .",
+    "prettier:fix": "prettier --write .",
     "test": "run-s test:prepare test:run-coverage test:report-coverage",
     "test:prepare": "cargo build --package deltachat-rpc-server --bin deltachat-rpc-server",
     "test:report-coverage": "node report_api_coverage.mjs",
@@ -48,5 +55,5 @@
   },
   "type": "module",
   "types": "dist/deltachat.d.ts",
-  "version": "1.101.0"
+  "version": "1.118.0"
 }

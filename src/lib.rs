@@ -1,4 +1,4 @@
-//! # Delta Chat Core Library.
+//! # Delta Chat Core Library
 
 #![recursion_limit = "256"]
 #![forbid(unsafe_code)]
@@ -6,23 +6,24 @@
     unused,
     clippy::correctness,
     missing_debug_implementations,
+    missing_docs,
     clippy::all,
-    clippy::indexing_slicing,
     clippy::wildcard_imports,
     clippy::needless_borrow,
     clippy::cast_lossless,
-    clippy::unused_async
+    clippy::unused_async,
+    clippy::explicit_iter_loop,
+    clippy::explicit_into_iter_loop,
+    clippy::cloned_instead_of_copied
 )]
+#![cfg_attr(not(test), warn(clippy::indexing_slicing))]
 #![allow(
     clippy::match_bool,
     clippy::mixed_read_write_in_expression,
     clippy::bool_assert_comparison,
     clippy::manual_split_once,
     clippy::format_push_string,
-    clippy::bool_to_int_with_if,
-    // This lint can be re-enabled once we don't target
-    // Rust 1.56 anymore:
-    clippy::collapsible_str_replace
+    clippy::bool_to_int_with_if
 )]
 
 #[macro_use]
@@ -33,10 +34,6 @@ extern crate smallvec;
 extern crate rusqlite;
 #[macro_use]
 extern crate strum_macros;
-
-pub trait ToSql: rusqlite::ToSql + Send + Sync {}
-
-impl<T: rusqlite::ToSql + Send + Sync> ToSql for T {}
 
 #[macro_use]
 pub mod log;
@@ -68,12 +65,11 @@ mod e2ee;
 pub mod ephemeral;
 mod imap;
 pub mod imex;
+pub mod release;
 mod scheduler;
 #[macro_use]
 mod job;
-mod format_flowed;
 pub mod key;
-mod keyring;
 pub mod location;
 mod login_param;
 pub mod message;
@@ -90,8 +86,10 @@ pub mod quota;
 pub mod securejoin;
 mod simplify;
 mod smtp;
+mod socks;
 pub mod stock_str;
 mod sync;
+mod timesmearing;
 mod token;
 mod update_helper;
 pub mod webxdc;
@@ -100,20 +98,24 @@ mod dehtml;
 mod authres;
 mod color;
 pub mod html;
+pub mod net;
 pub mod plaintext;
-mod ratelimit;
 pub mod summary;
 
+mod debug_logging;
 pub mod receive_imf;
 pub mod tools;
 
 pub mod accounts;
 pub mod reaction;
 
-/// if set imap/incoming and smtp/outgoing MIME messages will be printed
+/// If set IMAP/incoming and SMTP/outgoing MIME messages will be printed.
 pub const DCC_MIME_DEBUG: &str = "DCC_MIME_DEBUG";
 
 #[cfg(test)]
 mod test_utils;
 #[cfg(test)]
 mod tests;
+
+#[cfg(fuzzing)]
+pub mod fuzzing;

@@ -1,5 +1,3 @@
-from __future__ import print_function
-
 import fnmatch
 import io
 import os
@@ -11,7 +9,7 @@ import threading
 import time
 import weakref
 from queue import Queue
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional, Set
 
 import pytest
 import requests
@@ -29,7 +27,7 @@ def pytest_addoption(parser):
         "--liveconfig",
         action="store",
         default=None,
-        help="a file with >=2 lines where each line " "contains NAME=VALUE config settings for one account",
+        help="a file with >=2 lines where each line contains NAME=VALUE config settings for one account",
     )
     group.addoption(
         "--ignored",
@@ -62,13 +60,13 @@ def pytest_configure(config):
 
     # Make sure we don't get garbled output because threads keep running
     # collect all ever created accounts in a weakref-set (so we don't
-    # keep objects unneccessarily alive) and enable/disable logging
+    # keep objects unnecessarily alive) and enable/disable logging
     # for each pytest test phase # (setup/call/teardown).
     # Additionally make the acfactory use a logging/no-logging default.
 
     class LoggingAspect:
-        def __init__(self):
-            self._accounts = weakref.WeakSet()
+        def __init__(self) -> None:
+            self._accounts: weakref.WeakSet = weakref.WeakSet()
 
         @deltachat.global_hookimpl
         def dc_account_init(self, account):
@@ -124,31 +122,36 @@ def pytest_report_header(config, startdir):
             info["deltachat_core_version"],
             info["sqlite_version"],
             info["journal_mode"],
-        )
+        ),
     ]
 
     cfg = config.option.liveconfig
     if cfg:
         if "?" in cfg:
             url, token = cfg.split("?", 1)
-            summary.append("Liveconfig provider: {}?<token ommitted>".format(url))
+            summary.append(f"Liveconfig provider: {url}?<token omitted>")
         else:
-            summary.append("Liveconfig file: {}".format(cfg))
+            summary.append(f"Liveconfig file: {cfg}")
     return summary
 
 
 @pytest.fixture(scope="session")
 def testprocess(request):
+    """Return live account configuration manager.
+
+    The returned object is a :class:`TestProcess` object."""
     return TestProcess(pytestconfig=request.config)
 
 
 class TestProcess:
     """A pytest session-scoped instance to help with managing "live" account configurations."""
 
-    def __init__(self, pytestconfig):
+    _addr2files: Dict[str, Dict[pathlib.Path, bytes]]
+
+    def __init__(self, pytestconfig) -> None:
         self.pytestconfig = pytestconfig
         self._addr2files = {}
-        self._configlist = []
+        self._configlist: List[Dict[str, str]] = []
 
     def get_liveconfig_producer(self):
         """provide live account configs, cached on a per-test-process scope
@@ -176,15 +179,15 @@ class TestProcess:
                 try:
                     yield self._configlist[index]
                 except IndexError:
-                    res = requests.post(liveconfig_opt)
+                    res = requests.post(liveconfig_opt, timeout=60)
                     if res.status_code != 200:
-                        pytest.fail("newtmpuser count={} code={}: '{}'".format(index, res.status_code, res.text))
+                        pytest.fail(f"newtmpuser count={index} code={res.status_code}: '{res.text}'")
                     d = res.json()
-                    config = dict(addr=d["email"], mail_pw=d["password"])
+                    config = {"addr": d["email"], "mail_pw": d["password"]}
                     print("newtmpuser {}: addr={}".format(index, config["addr"]))
                     self._configlist.append(config)
                     yield config
-            pytest.fail("more than {} live accounts requested.".format(MAX_LIVE_CREATED_ACCOUNTS))
+            pytest.fail(f"more than {MAX_LIVE_CREATED_ACCOUNTS} live accounts requested.")
 
     def cache_maybe_retrieve_configured_db_files(self, cache_addr, db_target_path):
         db_target_path = pathlib.Path(db_target_path)
@@ -229,8 +232,10 @@ def write_dict_to_dir(dic, target_dir):
         path.write_bytes(content)
 
 
-@pytest.fixture
+@pytest.fixture()
 def data(request):
+    """Test data."""
+
     class Data:
         def __init__(self) -> None:
             # trying to find test data heuristically
@@ -252,7 +257,8 @@ def data(request):
                 fn = os.path.join(path, *bn.split("/"))
                 if os.path.exists(fn):
                     return fn
-            print("WARNING: path does not exist: {!r}".format(fn))
+            print(f"WARNING: path does not exist: {fn!r}")
+            return None
 
         def read_path(self, bn, mode="r"):
             fn = self.get_path(bn)
@@ -264,8 +270,11 @@ def data(request):
 
 
 class ACSetup:
-    """accounts setup helper to deal with multiple configure-process
-    and io & imap initialization phases. From tests, use the higher level
+    """
+    Accounts setup helper to deal with multiple configure-process
+    and io & imap initialization phases.
+
+    From tests, use the higher level
     public ACFactory methods instead of its private helper class.
     """
 
@@ -273,15 +282,17 @@ class ACSetup:
     CONFIGURED = "CONFIGURED"
     IDLEREADY = "IDLEREADY"
 
-    def __init__(self, testprocess, init_time):
+    _configured_events: Queue
+
+    def __init__(self, testprocess, init_time) -> None:
         self._configured_events = Queue()
-        self._account2state = {}
-        self._imap_cleaned = set()
+        self._account2state: Dict[Account, str] = {}
+        self._imap_cleaned: Set[str] = set()
         self.testprocess = testprocess
         self.init_time = init_time
 
     def log(self, *args):
-        print("[acsetup]", "{:.3f}".format(time.time() - self.init_time), *args)
+        print("[acsetup]", f"{time.time() - self.init_time:.3f}", *args)
 
     def add_configured(self, account):
         """add an already configured account."""
@@ -289,7 +300,7 @@ class ACSetup:
         self._account2state[account] = self.CONFIGURED
         self.log("added already configured account", account, account.get_config("addr"))
 
-    def start_configure(self, account, reconfigure=False):
+    def start_configure(self, account):
         """add an account and start its configure process."""
 
         class PendingTracker:
@@ -299,13 +310,13 @@ class ACSetup:
 
         account.add_account_plugin(PendingTracker(), name="pending_tracker")
         self._account2state[account] = self.CONFIGURING
-        account.configure(reconfigure=reconfigure)
+        account.configure()
         self.log("started configure on", account)
 
     def wait_one_configured(self, account):
         """wait until this account has successfully configured."""
         if self._account2state[account] == self.CONFIGURING:
-            while 1:
+            while True:
                 acc = self._pop_config_success()
                 if acc == account:
                     break
@@ -335,7 +346,7 @@ class ACSetup:
     def _pop_config_success(self):
         acc, success, comment = self._configured_events.get()
         if not success:
-            pytest.fail("configuring online account {} failed: {}".format(acc, comment))
+            pytest.fail(f"configuring online account {acc} failed: {comment}")
         self._account2state[acc] = self.CONFIGURED
         return acc
 
@@ -369,13 +380,18 @@ class ACSetup:
                     imap.delete("1:*", expunge=True)
                 else:
                     imap.conn.folder.delete(folder)
-            acc.log("imap cleaned for addr {}".format(addr))
+            acc.log(f"imap cleaned for addr {addr}")
             self._imap_cleaned.add(addr)
 
 
 class ACFactory:
+    """Account factory"""
+
+    init_time: float
     _finalizers: List[Callable[[], None]]
     _accounts: List[Account]
+    _acsetup: ACSetup
+    _preconfigured_keys: List[str]
 
     def __init__(self, request, testprocess, tmpdir, data) -> None:
         self.init_time = time.time()
@@ -393,7 +409,7 @@ class ACFactory:
         request.addfinalizer(self.finalize)
 
     def log(self, *args):
-        print("[acfactory]", "{:.3f}".format(time.time() - self.init_time), *args)
+        print("[acfactory]", f"{time.time() - self.init_time:.3f}", *args)
 
     def finalize(self):
         while self._finalizers:
@@ -411,7 +427,8 @@ class ACFactory:
                 acc.disable_logging()
 
     def get_next_liveconfig(self):
-        """Base function to get functional online configurations
+        """
+        Base function to get functional online configurations
         where we can make valid SMTP and IMAP connections with.
         """
         configdict = next(self._liveconfig_producer).copy()
@@ -426,15 +443,16 @@ class ACFactory:
         assert "addr" in configdict and "mail_pw" in configdict
         return configdict
 
-    def _get_cached_account(self, addr):
+    def _get_cached_account(self, addr) -> Optional[Account]:
         if addr in self.testprocess._addr2files:
             return self._getaccount(addr)
+        return None
 
-    def get_unconfigured_account(self, closed=False):
+    def get_unconfigured_account(self, closed=False) -> Account:
         return self._getaccount(closed=closed)
 
-    def _getaccount(self, try_cache_addr=None, closed=False):
-        logid = "ac{}".format(len(self._accounts) + 1)
+    def _getaccount(self, try_cache_addr=None, closed=False) -> Account:
+        logid = f"ac{len(self._accounts) + 1}"
         # we need to use fixed database basename for maybe_cache_* functions to work
         path = self.tmpdir.mkdir(logid).join("dc.db")
         if try_cache_addr:
@@ -447,10 +465,10 @@ class ACFactory:
         self._accounts.append(ac)
         return ac
 
-    def set_logging_default(self, logging):
+    def set_logging_default(self, logging) -> None:
         self._logging = bool(logging)
 
-    def remove_preconfigured_keys(self):
+    def remove_preconfigured_keys(self) -> None:
         self._preconfigured_keys = []
 
     def _preconfigure_key(self, account, addr):
@@ -460,13 +478,12 @@ class ACFactory:
         except IndexError:
             pass
         else:
-            fname_pub = self.data.read_path("key/{name}-public.asc".format(name=keyname))
-            fname_sec = self.data.read_path("key/{name}-secret.asc".format(name=keyname))
+            fname_pub = self.data.read_path(f"key/{keyname}-public.asc")
+            fname_sec = self.data.read_path(f"key/{keyname}-secret.asc")
             if fname_pub and fname_sec:
                 account._preconfigure_keypair(addr, fname_pub, fname_sec)
                 return True
-            else:
-                print("WARN: could not use preconfigured keys for {!r}".format(addr))
+            print(f"WARN: could not use preconfigured keys for {addr!r}")
 
     def get_pseudo_configured_account(self, passphrase: Optional[str] = None) -> Account:
         # do a pseudo-configured account
@@ -474,32 +491,32 @@ class ACFactory:
         if passphrase:
             ac.open(passphrase)
         acname = ac._logid
-        addr = "{}@offline.org".format(acname)
+        addr = f"{acname}@offline.org"
         ac.update_config(
-            dict(
-                addr=addr,
-                displayname=acname,
-                mail_pw="123",
-                configured_addr=addr,
-                configured_mail_pw="123",
-                configured="1",
-            )
+            {
+                "addr": addr,
+                "displayname": acname,
+                "mail_pw": "123",
+                "configured_addr": addr,
+                "configured_mail_pw": "123",
+                "configured": "1",
+            },
         )
         self._preconfigure_key(ac, addr)
         self._acsetup.init_logging(ac)
         return ac
 
-    def new_online_configuring_account(self, cloned_from=None, cache=False, **kwargs):
+    def new_online_configuring_account(self, cloned_from=None, cache=False, **kwargs) -> Account:
         if cloned_from is None:
             configdict = self.get_next_liveconfig()
         else:
             # XXX we might want to transfer the key to the new account
-            configdict = dict(
-                addr=cloned_from.get_config("addr"),
-                mail_pw=cloned_from.get_config("mail_pw"),
-                imap_certificate_checks=cloned_from.get_config("imap_certificate_checks"),
-                smtp_certificate_checks=cloned_from.get_config("smtp_certificate_checks"),
-            )
+            configdict = {
+                "addr": cloned_from.get_config("addr"),
+                "mail_pw": cloned_from.get_config("mail_pw"),
+                "imap_certificate_checks": cloned_from.get_config("imap_certificate_checks"),
+                "smtp_certificate_checks": cloned_from.get_config("smtp_certificate_checks"),
+            }
         configdict.update(kwargs)
         ac = self._get_cached_account(addr=configdict["addr"]) if cache else None
         if ac is not None:
@@ -511,7 +528,7 @@ class ACFactory:
         self._acsetup.start_configure(ac)
         return ac
 
-    def prepare_account_from_liveconfig(self, configdict):
+    def prepare_account_from_liveconfig(self, configdict) -> Account:
         ac = self.get_unconfigured_account()
         assert "addr" in configdict and "mail_pw" in configdict, configdict
         configdict.setdefault("bcc_self", False)
@@ -521,11 +538,11 @@ class ACFactory:
         self._preconfigure_key(ac, configdict["addr"])
         return ac
 
-    def wait_configured(self, account):
+    def wait_configured(self, account) -> None:
         """Wait until the specified account has successfully completed configure."""
         self._acsetup.wait_one_configured(account)
 
-    def bring_accounts_online(self):
+    def bring_accounts_online(self) -> None:
         print("bringing accounts online")
         self._acsetup.bring_online()
         print("all accounts online")
@@ -600,8 +617,9 @@ class ACFactory:
             acc._evtracker.wait_next_incoming_message()
 
 
-@pytest.fixture
+@pytest.fixture()
 def acfactory(request, tmpdir, testprocess, data):
+    """Account factory."""
     am = ACFactory(request=request, tmpdir=tmpdir, testprocess=testprocess, data=data)
     yield am
     if hasattr(request.node, "rep_call") and request.node.rep_call.failed:
@@ -628,7 +646,7 @@ class BotProcess:
 
     def _run_stdout_thread(self) -> None:
         try:
-            while 1:
+            while True:
                 line = self.popen.stdout.readline()
                 if not line:
                     break
@@ -649,7 +667,7 @@ class BotProcess:
         for next_pattern in patterns:
             print("+++FNMATCH:", next_pattern)
             ignored = []
-            while 1:
+            while True:
                 line = self.stdout_queue.get()
                 if line is None:
                     if ignored:
@@ -665,13 +683,16 @@ class BotProcess:
                     ignored.append(line)
 
 
-@pytest.fixture
+@pytest.fixture()
 def tmp_db_path(tmpdir):
+    """Return a path inside the temporary directory where the database can be created."""
     return tmpdir.join("test.db").strpath
 
 
-@pytest.fixture
+@pytest.fixture()
 def lp():
+    """Log printer fixture."""
+
     class Printer:
         def sec(self, msg: str) -> None:
             print()

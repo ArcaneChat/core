@@ -2,85 +2,161 @@
 
 mod data;
 
-use crate::config::Config;
-use crate::context::Context;
-use crate::provider::data::{PROVIDER_DATA, PROVIDER_IDS, PROVIDER_UPDATED};
 use anyhow::Result;
-use chrono::{NaiveDateTime, NaiveTime};
 use trust_dns_resolver::{config, AsyncResolver, TokioAsyncResolver};
 
+use crate::config::Config;
+use crate::context::Context;
+use crate::provider::data::{PROVIDER_DATA, PROVIDER_IDS};
+
+/// Provider status according to manual testing.
 #[derive(Debug, Display, Copy, Clone, PartialEq, Eq, FromPrimitive, ToPrimitive)]
 #[repr(u8)]
 pub enum Status {
+    /// Provider is known to be working with Delta Chat.
     Ok = 1,
+
+    /// Provider works with Delta Chat, but requires some preparation,
+    /// such as changing the settings in the web interface.
     Preparation = 2,
+
+    /// Provider is known not to work with Delta Chat.
     Broken = 3,
 }
 
+/// Server protocol.
 #[derive(Debug, Display, PartialEq, Eq, Copy, Clone, FromPrimitive, ToPrimitive)]
 #[repr(u8)]
 pub enum Protocol {
+    /// SMTP protocol.
     Smtp = 1,
+
+    /// IMAP protocol.
     Imap = 2,
 }
 
-#[derive(Debug, Display, PartialEq, Eq, Copy, Clone, FromPrimitive, ToPrimitive)]
+/// Socket security.
+#[derive(Debug, Default, Display, PartialEq, Eq, Copy, Clone, FromPrimitive, ToPrimitive)]
 #[repr(u8)]
 pub enum Socket {
+    /// Unspecified socket security, select automatically.
+    #[default]
     Automatic = 0,
+
+    /// TLS connection.
     Ssl = 1,
+
+    /// STARTTLS connection.
     Starttls = 2,
+
+    /// No TLS, plaintext connection.
     Plain = 3,
 }
 
-impl Default for Socket {
-    fn default() -> Self {
-        Socket::Automatic
-    }
-}
-
+/// Pattern used to construct login usernames from email addresses.
 #[derive(Debug, PartialEq, Eq, Clone)]
 #[repr(u8)]
 pub enum UsernamePattern {
+    /// Whole email is used as username.
     Email = 1,
+
+    /// Part of address before `@` is used as username.
     Emaillocalpart = 2,
 }
 
+/// Type of OAuth 2 authorization.
 #[derive(Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Oauth2Authorizer {
+    /// Yandex.
     Yandex = 1,
+
+    /// Gmail.
     Gmail = 2,
 }
 
+/// Email server endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Server {
+    /// Server protocol, e.g. SMTP or IMAP.
     pub protocol: Protocol,
+
+    /// Port security, e.g. TLS or STARTTLS.
     pub socket: Socket,
+
+    /// Server host.
     pub hostname: &'static str,
+
+    /// Server port.
     pub port: u16,
+
+    /// Pattern used to construct login usernames from email addresses.
     pub username_pattern: UsernamePattern,
 }
 
+/// Pair of key and value for default configuration.
 #[derive(Debug, PartialEq, Eq)]
 pub struct ConfigDefault {
+    /// Configuration variable name.
     pub key: Config,
+
+    /// Configuration variable value.
     pub value: &'static str,
 }
 
+/// Provider database entry.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Provider {
     /// Unique ID, corresponding to provider database filename.
     pub id: &'static str,
+
+    /// Provider status according to manual testing.
     pub status: Status,
+
+    /// Hint to be shown to the user on the login screen.
     pub before_login_hint: &'static str,
+
+    /// Hint to be added to the device chat after provider configuration.
     pub after_login_hint: &'static str,
+
+    /// URL of the page with provider overview.
     pub overview_page: &'static str,
+
+    /// List of provider servers.
     pub server: Vec<Server>,
+
+    /// Default configuration values to set when provider is configured.
     pub config_defaults: Option<Vec<ConfigDefault>>,
-    pub strict_tls: bool,
-    pub max_smtp_rcpt_to: Option<u16>,
+
+    /// Type of OAuth 2 authorization if provider supports it.
     pub oauth2_authorizer: Option<Oauth2Authorizer>,
+
+    /// Options with good defaults.
+    pub opt: ProviderOptions,
+}
+
+/// Provider options with good defaults.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ProviderOptions {
+    /// True if provider is known to use use proper,
+    /// not self-signed certificates.
+    pub strict_tls: bool,
+
+    /// Maximum number of recipients the provider allows to send a single email to.
+    pub max_smtp_rcpt_to: Option<u16>,
+
+    /// Move messages to the Trash folder instead of marking them "\Deleted".
+    pub delete_to_trash: bool,
+}
+
+impl Default for ProviderOptions {
+    fn default() -> Self {
+        Self {
+            strict_tls: true,
+            max_smtp_rcpt_to: None,
+            delete_to_trash: false,
+        }
+    }
 }
 
 /// Get resolver to query MX records.
@@ -147,7 +223,7 @@ pub async fn get_provider_by_mx(context: &Context, domain: &str) -> Option<&'sta
         }
 
         if let Ok(mx_domains) = resolver.mx_lookup(fqdn).await {
-            for (provider_domain, provider) in PROVIDER_DATA.iter() {
+            for (provider_domain, provider) in &*PROVIDER_DATA {
                 if provider.id != "gmail" {
                     // MX lookup is limited to Gmail for security reasons
                     continue;
@@ -172,8 +248,7 @@ pub async fn get_provider_by_mx(context: &Context, domain: &str) -> Option<&'sta
     None
 }
 
-// TODO: uncomment when clippy starts complaining about it
-//#[allow(clippy::manual_map)] // Can't use .map() because the lifetime is not propagated
+/// Returns a provider with the given ID from the database.
 pub fn get_provider_by_id(id: &str) -> Option<&'static Provider> {
     if let Some(provider) = PROVIDER_IDS.get(id) {
         Some(provider)
@@ -182,19 +257,12 @@ pub fn get_provider_by_id(id: &str) -> Option<&'static Provider> {
     }
 }
 
-// returns update timestamp in seconds, UTC, compatible for comparison with time() and database times
-pub fn get_provider_update_timestamp() -> i64 {
-    NaiveDateTime::new(*PROVIDER_UPDATED, NaiveTime::from_hms(0, 0, 0)).timestamp_millis() / 1_000
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::indexing_slicing)]
 
     use super::*;
     use crate::test_utils::TestContext;
-    use crate::tools::time;
-    use chrono::NaiveDate;
 
     #[test]
     fn test_get_provider_by_domain_unexistant() {
@@ -255,18 +323,6 @@ mod tests {
                 .id
                 == "gmail"
         );
-    }
-
-    #[test]
-    fn test_get_provider_update_timestamp() {
-        let timestamp_past = NaiveDateTime::new(
-            NaiveDate::from_ymd(2020, 9, 9),
-            NaiveTime::from_hms(0, 0, 0),
-        )
-        .timestamp_millis()
-            / 1_000;
-        assert!(get_provider_update_timestamp() <= time());
-        assert!(get_provider_update_timestamp() > timestamp_past);
     }
 
     #[test]

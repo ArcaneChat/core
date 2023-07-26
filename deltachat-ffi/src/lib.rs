@@ -23,34 +23,36 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::Context as _;
-use deltachat::qr_code_generator::get_securejoin_qr_svg;
-use num_traits::{FromPrimitive, ToPrimitive};
-use once_cell::sync::Lazy;
-use rand::Rng;
-use tokio::runtime::Runtime;
-use tokio::sync::RwLock;
-
-use deltachat::chat::{ChatId, ChatVisibility, MuteDuration, ProtectionStatus};
+use deltachat::chat::{ChatId, ChatVisibility, MessageListOptions, MuteDuration, ProtectionStatus};
 use deltachat::constants::DC_MSG_ID_LAST_SPECIAL;
 use deltachat::contact::{Contact, ContactId, Origin};
 use deltachat::context::Context;
 use deltachat::ephemeral::Timer as EphemeralTimer;
+use deltachat::imex::BackupProvider;
 use deltachat::key::DcKey;
 use deltachat::message::MsgId;
+use deltachat::net::read_url_blob;
+use deltachat::qr_code_generator::{generate_backup_qr, get_securejoin_qr_svg};
 use deltachat::reaction::{get_msg_reactions, send_reaction, Reactions};
 use deltachat::stock_str::StockMessage;
 use deltachat::stock_str::StockStrings;
 use deltachat::webxdc::StatusUpdateSerial;
 use deltachat::*;
 use deltachat::{accounts::Accounts, log::LogExt};
+use num_traits::{FromPrimitive, ToPrimitive};
+use once_cell::sync::Lazy;
+use rand::Rng;
+use tokio::runtime::Runtime;
+use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
 mod dc_array;
 mod lot;
 
 mod string;
-use self::string::*;
 use deltachat::chatlist::Chatlist;
+
+use self::string::*;
 
 // as C lacks a good and portable error handling,
 // in general, the C Interface is forgiving wrt to bad parameters.
@@ -60,7 +62,8 @@ use deltachat::chatlist::Chatlist;
 //   this avoids panics if the ui just forgets to handle a case
 // - finally, this behaviour matches the old core-c API and UIs already depend on it
 
-// TODO: constants
+const DC_GCM_ADDDAYMARKER: u32 = 0x01;
+const DC_GCM_INFO_ONLY: u32 = 0x02;
 
 // dc_context_t
 
@@ -115,7 +118,7 @@ pub unsafe extern "C" fn dc_context_new(
     match ctx {
         Ok(ctx) => Box::into_raw(Box::new(ctx)),
         Err(err) => {
-            eprintln!("failed to create context: {:#}", err);
+            eprintln!("failed to create context: {err:#}");
             ptr::null_mut()
         }
     }
@@ -139,7 +142,7 @@ pub unsafe extern "C" fn dc_context_new_closed(dbfile: *const libc::c_char) -> *
     )) {
         Ok(context) => Box::into_raw(Box::new(context)),
         Err(err) => {
-            eprintln!("failed to create context: {:#}", err);
+            eprintln!("failed to create context: {err:#}");
             ptr::null_mut()
         }
     }
@@ -158,7 +161,8 @@ pub unsafe extern "C" fn dc_context_open(
     let ctx = &*context;
     let passphrase = to_string_lossy(passphrase);
     block_on(ctx.open(passphrase))
-        .log_err(ctx, "dc_context_open() failed")
+        .context("dc_context_open() failed")
+        .log_err(ctx)
         .map(|b| b as libc::c_int)
         .unwrap_or(0)
 }
@@ -214,16 +218,18 @@ pub unsafe extern "C" fn dc_set_config(
         if key.starts_with("ui.") {
             ctx.set_ui_config(&key, value.as_deref())
                 .await
-                .with_context(|| format!("Can't set {} to {:?}", key, value))
-                .log_err(ctx, "dc_set_config() failed")
+                .with_context(|| format!("dc_set_config failed: Can't set {key} to {value:?}"))
+                .log_err(ctx)
                 .is_ok() as libc::c_int
         } else {
             match config::Config::from_str(&key) {
                 Ok(key) => ctx
                     .set_config(key, value.as_deref())
                     .await
-                    .with_context(|| format!("Can't set {} to {:?}", key, value))
-                    .log_err(ctx, "dc_set_config() failed")
+                    .with_context(|| {
+                        format!("dc_set_config() failed: Can't set {key} to {value:?}")
+                    })
+                    .log_err(ctx)
                     .is_ok() as libc::c_int,
                 Err(_) => {
                     warn!(ctx, "dc_set_config(): invalid key");
@@ -251,7 +257,8 @@ pub unsafe extern "C" fn dc_get_config(
         if key.starts_with("ui.") {
             ctx.get_ui_config(&key)
                 .await
-                .log_err(ctx, "Can't get ui-config")
+                .context("Can't get ui-config")
+                .log_err(ctx)
                 .unwrap_or_default()
                 .unwrap_or_default()
                 .strdup()
@@ -260,7 +267,8 @@ pub unsafe extern "C" fn dc_get_config(
                 Ok(key) => ctx
                     .get_config(key)
                     .await
-                    .log_err(ctx, "Can't get config")
+                    .context("Can't get config")
+                    .log_err(ctx)
                     .unwrap_or_default()
                     .unwrap_or_default()
                     .strdup(),
@@ -291,12 +299,12 @@ pub unsafe extern "C" fn dc_set_stock_translation(
             Some(id) => match ctx.set_stock_translation(id, msg).await {
                 Ok(()) => 1,
                 Err(err) => {
-                    warn!(ctx, "set_stock_translation failed: {}", err);
+                    warn!(ctx, "set_stock_translation failed: {err:#}");
                     0
                 }
             },
             None => {
-                warn!(ctx, "invalid stock message id {}", stock_id);
+                warn!(ctx, "invalid stock message id {stock_id}");
                 0
             }
         }
@@ -319,7 +327,7 @@ pub unsafe extern "C" fn dc_set_config_from_qr(
         match qr::set_config_from_qr(ctx, &qr).await {
             Ok(()) => 1,
             Err(err) => {
-                error!(ctx, "Failed to create account from QR code: {}", err);
+                error!(ctx, "Failed to create account from QR code: {err:#}");
                 0
             }
         }
@@ -337,7 +345,7 @@ pub unsafe extern "C" fn dc_get_info(context: *const dc_context_t) -> *mut libc:
         match ctx.get_info().await {
             Ok(info) => render_info(info).unwrap_or_default().strdup(),
             Err(err) => {
-                warn!(ctx, "failed to get info: {}", err);
+                warn!(ctx, "failed to get info: {err:#}");
                 "".strdup()
             }
         }
@@ -349,7 +357,7 @@ fn render_info(
 ) -> std::result::Result<String, std::fmt::Error> {
     let mut res = String::new();
     for (key, value) in &info {
-        writeln!(&mut res, "{}={}", key, value)?;
+        writeln!(&mut res, "{key}={value}")?;
     }
 
     Ok(res)
@@ -378,7 +386,7 @@ pub unsafe extern "C" fn dc_get_connectivity_html(
         match ctx.get_connectivity_html().await {
             Ok(html) => html.strdup(),
             Err(err) => {
-                error!(ctx, "Failed to get connectivity html: {}", err);
+                error!(ctx, "Failed to get connectivity html: {err:#}");
                 "".strdup()
             }
         }
@@ -412,12 +420,22 @@ pub unsafe extern "C" fn dc_get_oauth2_url(
     block_on(async move {
         match oauth2::get_oauth2_url(ctx, &addr, &redirect)
             .await
-            .log_err(ctx, "dc_get_oauth2_url failed")
+            .context("dc_get_oauth2_url failed")
+            .log_err(ctx)
         {
             Ok(Some(res)) => res.strdup(),
             Ok(None) | Err(_) => ptr::null_mut(),
         }
     })
+}
+
+fn spawn_configure(ctx: Context) {
+    spawn(async move {
+        ctx.configure()
+            .await
+            .context("Configure failed")
+            .log_err(&ctx)
+    });
 }
 
 #[no_mangle]
@@ -428,8 +446,7 @@ pub unsafe extern "C" fn dc_configure(context: *mut dc_context_t) {
     }
 
     let ctx = &*context;
-
-    spawn(async move { ctx.configure().await.log_err(ctx, "Configure failed") });
+    spawn_configure(ctx.clone());
 }
 
 #[no_mangle]
@@ -443,7 +460,8 @@ pub unsafe extern "C" fn dc_is_configured(context: *mut dc_context_t) -> libc::c
     block_on(async move {
         ctx.is_configured()
             .await
-            .log_err(ctx, "failed to get configured state")
+            .context("failed to get configured state")
+            .log_err(ctx)
             .unwrap_or_default() as libc::c_int
     })
 }
@@ -495,6 +513,7 @@ pub unsafe extern "C" fn dc_event_get_id(event: *mut dc_event_t) -> libc::c_int 
         EventType::SmtpMessageSent(_) => 103,
         EventType::ImapMessageDeleted(_) => 104,
         EventType::ImapMessageMoved(_) => 105,
+        EventType::ImapInboxIdle => 106,
         EventType::NewBlobFile(_) => 150,
         EventType::DeletedBlobFile(_) => 151,
         EventType::Warning(_) => 300,
@@ -508,6 +527,7 @@ pub unsafe extern "C" fn dc_event_get_id(event: *mut dc_event_t) -> libc::c_int 
         EventType::MsgDelivered { .. } => 2010,
         EventType::MsgFailed { .. } => 2012,
         EventType::MsgRead { .. } => 2015,
+        EventType::MsgDeleted { .. } => 2016,
         EventType::ChatModified(_) => 2020,
         EventType::ChatEphemeralTimerModified { .. } => 2021,
         EventType::ContactsChanged(_) => 2030,
@@ -539,6 +559,7 @@ pub unsafe extern "C" fn dc_event_get_data1_int(event: *mut dc_event_t) -> libc:
         | EventType::SmtpMessageSent(_)
         | EventType::ImapMessageDeleted(_)
         | EventType::ImapMessageMoved(_)
+        | EventType::ImapInboxIdle
         | EventType::NewBlobFile(_)
         | EventType::DeletedBlobFile(_)
         | EventType::Warning(_)
@@ -554,6 +575,7 @@ pub unsafe extern "C" fn dc_event_get_data1_int(event: *mut dc_event_t) -> libc:
         | EventType::MsgDelivered { chat_id, .. }
         | EventType::MsgFailed { chat_id, .. }
         | EventType::MsgRead { chat_id, .. }
+        | EventType::MsgDeleted { chat_id, .. }
         | EventType::ChatModified(chat_id)
         | EventType::ChatEphemeralTimerModified { chat_id, .. } => chat_id.to_u32() as libc::c_int,
         EventType::ContactsChanged(id) | EventType::LocationChanged(id) => {
@@ -589,6 +611,7 @@ pub unsafe extern "C" fn dc_event_get_data2_int(event: *mut dc_event_t) -> libc:
         | EventType::SmtpMessageSent(_)
         | EventType::ImapMessageDeleted(_)
         | EventType::ImapMessageMoved(_)
+        | EventType::ImapInboxIdle
         | EventType::NewBlobFile(_)
         | EventType::DeletedBlobFile(_)
         | EventType::Warning(_)
@@ -610,7 +633,8 @@ pub unsafe extern "C" fn dc_event_get_data2_int(event: *mut dc_event_t) -> libc:
         | EventType::IncomingMsg { msg_id, .. }
         | EventType::MsgDelivered { msg_id, .. }
         | EventType::MsgFailed { msg_id, .. }
-        | EventType::MsgRead { msg_id, .. } => msg_id.to_u32() as libc::c_int,
+        | EventType::MsgRead { msg_id, .. }
+        | EventType::MsgDeleted { msg_id, .. } => msg_id.to_u32() as libc::c_int,
         EventType::SecurejoinInviterProgress { progress, .. }
         | EventType::SecurejoinJoinerProgress { progress, .. } => *progress as libc::c_int,
         EventType::ChatEphemeralTimerModified { timer, .. } => timer.to_u32() as libc::c_int,
@@ -648,10 +672,12 @@ pub unsafe extern "C" fn dc_event_get_data2_str(event: *mut dc_event_t) -> *mut 
         EventType::MsgsChanged { .. }
         | EventType::ReactionsChanged { .. }
         | EventType::IncomingMsg { .. }
+        | EventType::ImapInboxIdle
         | EventType::MsgsNoticed(_)
         | EventType::MsgDelivered { .. }
         | EventType::MsgFailed { .. }
         | EventType::MsgRead { .. }
+        | EventType::MsgDeleted { .. }
         | EventType::ChatModified(_)
         | EventType::ContactsChanged(_)
         | EventType::LocationChanged(_)
@@ -781,7 +807,8 @@ pub unsafe extern "C" fn dc_preconfigure_keypair(
         key::store_self_keypair(ctx, &keypair, key::KeyPairUse::Default).await?;
         Ok::<_, anyhow::Error>(1)
     })
-    .log_err(ctx, "Failed to save keypair")
+    .context("Failed to save keypair")
+    .log_err(ctx)
     .unwrap_or(0)
 }
 
@@ -808,7 +835,8 @@ pub unsafe extern "C" fn dc_get_chatlist(
     block_on(async move {
         match chatlist::Chatlist::try_load(ctx, flags as usize, qs.as_deref(), qi)
             .await
-            .log_err(ctx, "Failed to get chatlist")
+            .context("Failed to get chatlist")
+            .log_err(ctx)
         {
             Ok(list) => {
                 let ffi_list = ChatlistWrapper { context, list };
@@ -833,7 +861,8 @@ pub unsafe extern "C" fn dc_create_chat_by_contact_id(
     block_on(async move {
         ChatId::create_for_contact(ctx, ContactId::new(contact_id))
             .await
-            .log_err(ctx, "Failed to create chat from contact_id")
+            .context("Failed to create chat from contact_id")
+            .log_err(ctx)
             .map(|id| id.to_u32())
             .unwrap_or(0)
     })
@@ -853,7 +882,8 @@ pub unsafe extern "C" fn dc_get_chat_id_by_contact_id(
     block_on(async move {
         ChatId::lookup_by_contact(ctx, ContactId::new(contact_id))
             .await
-            .log_err(ctx, "Failed to get chat for contact_id")
+            .context("Failed to get chat for contact_id")
+            .log_err(ctx)
             .unwrap_or_default() // unwraps the Result
             .map(|id| id.to_u32())
             .unwrap_or(0) // unwraps the Option
@@ -995,7 +1025,8 @@ pub unsafe extern "C" fn dc_get_msg_reactions(
     let ctx = &*context;
 
     let reactions = if let Ok(reactions) = block_on(get_msg_reactions(ctx, MsgId::new(msg_id)))
-        .log_err(ctx, "failed dc_get_msg_reactions() call")
+        .context("failed dc_get_msg_reactions() call")
+        .log_err(ctx)
     {
         reactions
     } else {
@@ -1023,7 +1054,8 @@ pub unsafe extern "C" fn dc_send_webxdc_status_update(
         &to_string_lossy(json),
         &to_string_lossy(descr),
     ))
-    .log_err(ctx, "Failed to send webxdc update")
+    .context("Failed to send webxdc update")
+    .log_err(ctx)
     .is_ok() as libc::c_int
 }
 
@@ -1136,7 +1168,7 @@ pub unsafe extern "C" fn dc_get_draft(context: *mut dc_context_t, chat_id: u32) 
             }
             Ok(None) => ptr::null_mut(),
             Err(err) => {
-                error!(ctx, "Failed to get draft for chat #{}: {}", chat_id, err);
+                error!(ctx, "Failed to get draft for chat #{chat_id}: {err:#}");
                 ptr::null_mut()
             }
         }
@@ -1156,12 +1188,21 @@ pub unsafe extern "C" fn dc_get_chat_msgs(
     }
     let ctx = &*context;
 
+    let info_only = (flags & DC_GCM_INFO_ONLY) != 0;
+    let add_daymarker = (flags & DC_GCM_ADDDAYMARKER) != 0;
     block_on(async move {
         Box::into_raw(Box::new(
-            chat::get_chat_msgs(ctx, ChatId::new(chat_id), flags)
-                .await
-                .unwrap_or_log_default(ctx, "failed to get chat msgs")
-                .into(),
+            chat::get_chat_msgs_ex(
+                ctx,
+                ChatId::new(chat_id),
+                MessageListOptions {
+                    info_only,
+                    add_daymarker,
+                },
+            )
+            .await
+            .unwrap_or_log_default(ctx, "failed to get chat msgs")
+            .into(),
         ))
     })
 }
@@ -1233,7 +1274,8 @@ pub unsafe extern "C" fn dc_get_fresh_msgs(
         let arr = dc_array_t::from(
             ctx.get_fresh_msgs()
                 .await
-                .log_err(ctx, "Failed to get fresh messages")
+                .context("Failed to get fresh messages")
+                .log_err(ctx)
                 .unwrap_or_default()
                 .iter()
                 .map(|msg_id| msg_id.to_u32())
@@ -1241,6 +1283,50 @@ pub unsafe extern "C" fn dc_get_fresh_msgs(
         );
         Box::into_raw(Box::new(arr))
     })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_get_next_msgs(context: *mut dc_context_t) -> *mut dc_array::dc_array_t {
+    if context.is_null() {
+        eprintln!("ignoring careless call to dc_get_next_msgs()");
+        return ptr::null_mut();
+    }
+    let ctx = &*context;
+
+    let msg_ids = block_on(ctx.get_next_msgs())
+        .context("failed to get next messages")
+        .log_err(ctx)
+        .unwrap_or_default();
+    let arr = dc_array_t::from(
+        msg_ids
+            .iter()
+            .map(|msg_id| msg_id.to_u32())
+            .collect::<Vec<u32>>(),
+    );
+    Box::into_raw(Box::new(arr))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_wait_next_msgs(
+    context: *mut dc_context_t,
+) -> *mut dc_array::dc_array_t {
+    if context.is_null() {
+        eprintln!("ignoring careless call to dc_wait_next_msgs()");
+        return ptr::null_mut();
+    }
+    let ctx = &*context;
+
+    let msg_ids = block_on(ctx.wait_next_msgs())
+        .context("failed to wait for next messages")
+        .log_err(ctx)
+        .unwrap_or_default();
+    let arr = dc_array_t::from(
+        msg_ids
+            .iter()
+            .map(|msg_id| msg_id.to_u32())
+            .collect::<Vec<u32>>(),
+    );
+    Box::into_raw(Box::new(arr))
 }
 
 #[no_mangle]
@@ -1254,7 +1340,8 @@ pub unsafe extern "C" fn dc_marknoticed_chat(context: *mut dc_context_t, chat_id
     block_on(async move {
         chat::marknoticed_chat(ctx, ChatId::new(chat_id))
             .await
-            .log_err(ctx, "Failed marknoticed chat")
+            .context("Failed marknoticed chat")
+            .log_err(ctx)
             .unwrap_or(())
     })
 }
@@ -1285,11 +1372,11 @@ pub unsafe extern "C" fn dc_get_chat_media(
     } else {
         Some(ChatId::new(chat_id))
     };
-    let msg_type = from_prim(msg_type).expect(&format!("invalid msg_type = {}", msg_type));
+    let msg_type = from_prim(msg_type).expect(&format!("invalid msg_type = {msg_type}"));
     let or_msg_type2 =
-        from_prim(or_msg_type2).expect(&format!("incorrect or_msg_type2 = {}", or_msg_type2));
+        from_prim(or_msg_type2).expect(&format!("incorrect or_msg_type2 = {or_msg_type2}"));
     let or_msg_type3 =
-        from_prim(or_msg_type3).expect(&format!("incorrect or_msg_type3 = {}", or_msg_type3));
+        from_prim(or_msg_type3).expect(&format!("incorrect or_msg_type3 = {or_msg_type3}"));
 
     block_on(async move {
         Box::into_raw(Box::new(
@@ -1321,11 +1408,11 @@ pub unsafe extern "C" fn dc_get_next_media(
     };
 
     let ctx = &*context;
-    let msg_type = from_prim(msg_type).expect(&format!("invalid msg_type = {}", msg_type));
+    let msg_type = from_prim(msg_type).expect(&format!("invalid msg_type = {msg_type}"));
     let or_msg_type2 =
-        from_prim(or_msg_type2).expect(&format!("incorrect or_msg_type2 = {}", or_msg_type2));
+        from_prim(or_msg_type2).expect(&format!("incorrect or_msg_type2 = {or_msg_type2}"));
     let or_msg_type3 =
-        from_prim(or_msg_type3).expect(&format!("incorrect or_msg_type3 = {}", or_msg_type3));
+        from_prim(or_msg_type3).expect(&format!("incorrect or_msg_type3 = {or_msg_type3}"));
 
     block_on(async move {
         chat::get_next_media(
@@ -1339,32 +1426,6 @@ pub unsafe extern "C" fn dc_get_next_media(
         .await
         .map(|msg_id| msg_id.map(|id| id.to_u32()).unwrap_or_default())
         .unwrap_or(0)
-    })
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn dc_set_chat_protection(
-    context: *mut dc_context_t,
-    chat_id: u32,
-    protect: libc::c_int,
-) -> libc::c_int {
-    if context.is_null() {
-        eprintln!("ignoring careless call to dc_set_chat_protection()");
-        return 0;
-    }
-    let ctx = &*context;
-    let protect = if let Some(s) = ProtectionStatus::from_i32(protect) {
-        s
-    } else {
-        warn!(ctx, "bad protect-value for dc_set_chat_protection()");
-        return 0;
-    };
-
-    block_on(async move {
-        match ChatId::new(chat_id).set_protection(ctx, protect).await {
-            Ok(()) => 1,
-            Err(_) => 0,
-        }
     })
 }
 
@@ -1396,7 +1457,8 @@ pub unsafe extern "C" fn dc_set_chat_visibility(
         ChatId::new(chat_id)
             .set_visibility(ctx, visibility)
             .await
-            .log_err(ctx, "Failed setting chat visibility")
+            .context("Failed setting chat visibility")
+            .log_err(ctx)
             .unwrap_or(())
     })
 }
@@ -1413,7 +1475,9 @@ pub unsafe extern "C" fn dc_delete_chat(context: *mut dc_context_t, chat_id: u32
         ChatId::new(chat_id)
             .delete(ctx)
             .await
-            .ok_or_log_msg(ctx, "Failed chat delete");
+            .context("Failed chat delete")
+            .log_err(ctx)
+            .ok();
     })
 }
 
@@ -1429,7 +1493,9 @@ pub unsafe extern "C" fn dc_block_chat(context: *mut dc_context_t, chat_id: u32)
         ChatId::new(chat_id)
             .block(ctx)
             .await
-            .ok_or_log_msg(ctx, "Failed chat block");
+            .context("Failed chat block")
+            .log_err(ctx)
+            .ok();
     })
 }
 
@@ -1445,7 +1511,9 @@ pub unsafe extern "C" fn dc_accept_chat(context: *mut dc_context_t, chat_id: u32
         ChatId::new(chat_id)
             .accept(ctx)
             .await
-            .ok_or_log_msg(ctx, "Failed chat accept");
+            .context("Failed chat accept")
+            .log_err(ctx)
+            .ok();
     })
 }
 
@@ -1543,7 +1611,8 @@ pub unsafe extern "C" fn dc_create_group_chat(
     block_on(async move {
         chat::create_group_chat(ctx, protect, &to_string_lossy(name))
             .await
-            .log_err(ctx, "Failed to create group chat")
+            .context("Failed to create group chat")
+            .log_err(ctx)
             .map(|id| id.to_u32())
             .unwrap_or(0)
     })
@@ -1557,7 +1626,8 @@ pub unsafe extern "C" fn dc_create_broadcast_list(context: *mut dc_context_t) ->
     }
     let ctx = &*context;
     block_on(chat::create_broadcast_list(ctx))
-        .log_err(ctx, "Failed to create broadcast list")
+        .context("Failed to create broadcast list")
+        .log_err(ctx)
         .map(|id| id.to_u32())
         .unwrap_or(0)
 }
@@ -1579,7 +1649,8 @@ pub unsafe extern "C" fn dc_is_contact_in_chat(
         ChatId::new(chat_id),
         ContactId::new(contact_id),
     ))
-    .log_err(ctx, "is_contact_in_chat failed")
+    .context("is_contact_in_chat failed")
+    .log_err(ctx)
     .unwrap_or_default() as libc::c_int
 }
 
@@ -1600,7 +1671,8 @@ pub unsafe extern "C" fn dc_add_contact_to_chat(
         ChatId::new(chat_id),
         ContactId::new(contact_id),
     ))
-    .log_err(ctx, "Failed to add contact")
+    .context("Failed to add contact")
+    .log_err(ctx)
     .is_ok() as libc::c_int
 }
 
@@ -1621,7 +1693,8 @@ pub unsafe extern "C" fn dc_remove_contact_from_chat(
         ChatId::new(chat_id),
         ContactId::new(contact_id),
     ))
-    .log_err(ctx, "Failed to remove contact")
+    .context("Failed to remove contact")
+    .log_err(ctx)
     .is_ok() as libc::c_int
 }
 
@@ -1659,7 +1732,7 @@ pub unsafe extern "C" fn dc_set_chat_profile_image(
     let ctx = &*context;
 
     block_on(async move {
-        chat::set_chat_profile_image(ctx, ChatId::new(chat_id), to_string_lossy(image))
+        chat::set_chat_profile_image(ctx, ChatId::new(chat_id), &to_string_lossy(image))
             .await
             .map(|_| 1)
             .unwrap_or_log_default(ctx, "Failed to set profile image")
@@ -1717,7 +1790,7 @@ pub unsafe extern "C" fn dc_get_chat_encrinfo(
             .await
             .map(|s| s.strdup())
             .unwrap_or_else(|e| {
-                error!(ctx, "{}", e);
+                error!(ctx, "{e:#}");
                 ptr::null_mut()
             })
     })
@@ -1740,7 +1813,8 @@ pub unsafe extern "C" fn dc_get_chat_ephemeral_timer(
     // ignored when ephemeral timer value is used to construct
     // message headers.
     block_on(async move { ChatId::new(chat_id).get_ephemeral_timer(ctx).await })
-        .log_err(ctx, "Failed to get ephemeral timer")
+        .context("Failed to get ephemeral timer")
+        .log_err(ctx)
         .unwrap_or_default()
         .to_u32()
 }
@@ -1761,7 +1835,8 @@ pub unsafe extern "C" fn dc_set_chat_ephemeral_timer(
         ChatId::new(chat_id)
             .set_ephemeral_timer(ctx, EphemeralTimer::from_u32(timer))
             .await
-            .log_err(ctx, "Failed to set ephemeral timer")
+            .context("Failed to set ephemeral timer")
+            .log_err(ctx)
             .is_ok() as libc::c_int
     })
 }
@@ -1776,13 +1851,10 @@ pub unsafe extern "C" fn dc_get_msg_info(
         return "".strdup();
     }
     let ctx = &*context;
-
-    block_on(async move {
-        message::get_msg_info(ctx, MsgId::new(msg_id))
-            .await
-            .unwrap_or_log_default(ctx, "failed to get msg id")
-            .strdup()
-    })
+    let msg_id = MsgId::new(msg_id);
+    block_on(msg_id.get_info(ctx))
+        .unwrap_or_log_default(ctx, "failed to get msg id")
+        .strdup()
 }
 
 #[no_mangle]
@@ -1837,7 +1909,8 @@ pub unsafe extern "C" fn dc_delete_msgs(
     let msg_ids = convert_and_prune_message_ids(msg_ids, msg_cnt);
 
     block_on(message::delete_msgs(ctx, &msg_ids))
-        .log_err(ctx, "failed dc_delete_msgs() call")
+        .context("failed dc_delete_msgs() call")
+        .log_err(ctx)
         .ok();
 }
 
@@ -1880,7 +1953,7 @@ pub unsafe extern "C" fn dc_resend_msgs(
     let msg_ids = convert_and_prune_message_ids(msg_ids, msg_cnt);
 
     if let Err(err) = block_on(chat::resend_msgs(ctx, &msg_ids)) {
-        error!(ctx, "Resending failed: {}", err);
+        error!(ctx, "Resending failed: {err:#}");
         0
     } else {
         1
@@ -1901,7 +1974,8 @@ pub unsafe extern "C" fn dc_markseen_msgs(
     let ctx = &*context;
 
     block_on(message::markseen_msgs(ctx, msg_ids))
-        .log_err(ctx, "failed dc_markseen_msgs() call")
+        .context("failed dc_markseen_msgs() call")
+        .log_err(ctx)
         .ok();
 }
 
@@ -1921,14 +1995,11 @@ pub unsafe extern "C" fn dc_get_msg(context: *mut dc_context_t, msg_id: u32) -> 
                     // C-core API returns empty messages, do the same
                     warn!(
                         ctx,
-                        "dc_get_msg called with special msg_id={}, returning empty msg", msg_id
+                        "dc_get_msg called with special msg_id={msg_id}, returning empty msg"
                     );
                     message::Message::default()
                 } else {
-                    error!(
-                        ctx,
-                        "dc_get_msg could not retrieve msg_id {}: {}", msg_id, e
-                    );
+                    error!(ctx, "dc_get_msg could not retrieve msg_id {msg_id}: {e:#}");
                     return ptr::null_mut();
                 }
             }
@@ -1946,7 +2017,8 @@ pub unsafe extern "C" fn dc_download_full_msg(context: *mut dc_context_t, msg_id
     }
     let ctx = &*context;
     block_on(MsgId::new(msg_id).download_full(ctx))
-        .log_err(ctx, "Failed to download message fully.")
+        .context("Failed to download message fully.")
+        .log_err(ctx)
         .ok();
 }
 
@@ -1993,12 +2065,11 @@ pub unsafe extern "C" fn dc_create_contact(
     let ctx = &*context;
     let name = to_string_lossy(name);
 
-    block_on(async move {
-        Contact::create(ctx, &name, &to_string_lossy(addr))
-            .await
-            .map(|id| id.to_u32())
-            .unwrap_or(0)
-    })
+    block_on(Contact::create(ctx, &name, &to_string_lossy(addr)))
+        .context("Cannot create contact")
+        .log_err(ctx)
+        .map(|id| id.to_u32())
+        .unwrap_or(0)
 }
 
 #[no_mangle]
@@ -2073,7 +2144,8 @@ pub unsafe extern "C" fn dc_get_blocked_contacts(
         Box::into_raw(Box::new(dc_array_t::from(
             Contact::get_all_blocked(ctx)
                 .await
-                .log_err(ctx, "Can't get blocked contacts")
+                .context("Can't get blocked contacts")
+                .log_err(ctx)
                 .unwrap_or_default()
                 .iter()
                 .map(|id| id.to_u32())
@@ -2098,11 +2170,15 @@ pub unsafe extern "C" fn dc_block_contact(
         if block == 0 {
             Contact::unblock(ctx, contact_id)
                 .await
-                .ok_or_log_msg(ctx, "Can't unblock contact");
+                .context("Can't unblock contact")
+                .log_err(ctx)
+                .ok();
         } else {
             Contact::block(ctx, contact_id)
                 .await
-                .ok_or_log_msg(ctx, "Can't block contact");
+                .context("Can't block contact")
+                .log_err(ctx)
+                .ok();
         }
     });
 }
@@ -2123,7 +2199,7 @@ pub unsafe extern "C" fn dc_get_contact_encrinfo(
             .await
             .map(|s| s.strdup())
             .unwrap_or_else(|e| {
-                error!(ctx, "{}", e);
+                error!(ctx, "{e:#}");
                 ptr::null_mut()
             })
     })
@@ -2145,7 +2221,7 @@ pub unsafe extern "C" fn dc_delete_contact(
         match Contact::delete(ctx, contact_id).await {
             Ok(_) => 1,
             Err(err) => {
-                error!(ctx, "cannot delete contact: {}", err);
+                error!(ctx, "cannot delete contact: {err:#}");
                 0
             }
         }
@@ -2171,6 +2247,15 @@ pub unsafe extern "C" fn dc_get_contact(
     })
 }
 
+fn spawn_imex(ctx: Context, what: imex::ImexMode, param1: String, passphrase: Option<String>) {
+    spawn(async move {
+        imex::imex(&ctx, what, param1.as_ref(), passphrase)
+            .await
+            .context("IMEX failed")
+            .log_err(&ctx)
+    });
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn dc_imex(
     context: *mut dc_context_t,
@@ -2182,10 +2267,10 @@ pub unsafe extern "C" fn dc_imex(
         eprintln!("ignoring careless call to dc_imex()");
         return;
     }
-    let what = match imex::ImexMode::from_i32(what_raw as i32) {
+    let what = match imex::ImexMode::from_i32(what_raw) {
         Some(what) => what,
         None => {
-            eprintln!("ignoring invalid argument {} to dc_imex", what_raw);
+            eprintln!("ignoring invalid argument {what_raw} to dc_imex");
             return;
         }
     };
@@ -2194,11 +2279,7 @@ pub unsafe extern "C" fn dc_imex(
     let ctx = &*context;
 
     if let Some(param1) = to_opt_string_lossy(param1) {
-        spawn(async move {
-            imex::imex(ctx, what, param1.as_ref(), passphrase)
-                .await
-                .log_err(ctx, "IMEX failed")
-        });
+        spawn_imex(ctx.clone(), what, param1, passphrase);
     } else {
         eprintln!("dc_imex called without a valid directory");
     }
@@ -2221,7 +2302,7 @@ pub unsafe extern "C" fn dc_imex_has_backup(
             Err(err) => {
                 // do not bubble up error to the user,
                 // the ui will expect that the file does not exist or cannot be accessed
-                warn!(ctx, "dc_imex_has_backup: {}", err);
+                warn!(ctx, "dc_imex_has_backup: {err:#}");
                 ptr::null_mut()
             }
         }
@@ -2240,7 +2321,7 @@ pub unsafe extern "C" fn dc_initiate_key_transfer(context: *mut dc_context_t) ->
         match imex::initiate_key_transfer(ctx).await {
             Ok(res) => res.strdup(),
             Err(err) => {
-                error!(ctx, "dc_initiate_key_transfer(): {}", err);
+                error!(ctx, "dc_initiate_key_transfer(): {err:#}");
                 ptr::null_mut()
             }
         }
@@ -2253,10 +2334,7 @@ pub unsafe extern "C" fn dc_continue_key_transfer(
     msg_id: u32,
     setup_code: *const libc::c_char,
 ) -> libc::c_int {
-    if context.is_null()
-        || msg_id <= constants::DC_MSG_ID_LAST_SPECIAL as u32
-        || setup_code.is_null()
-    {
+    if context.is_null() || msg_id <= constants::DC_MSG_ID_LAST_SPECIAL || setup_code.is_null() {
         eprintln!("ignoring careless call to dc_continue_key_transfer()");
         return 0;
     }
@@ -2268,7 +2346,7 @@ pub unsafe extern "C" fn dc_continue_key_transfer(
         {
             Ok(()) => 1,
             Err(err) => {
-                warn!(ctx, "dc_continue_key_transfer: {}", err);
+                warn!(ctx, "dc_continue_key_transfer: {err:#}");
                 0
             }
         }
@@ -2360,7 +2438,8 @@ pub unsafe extern "C" fn dc_join_securejoin(
         securejoin::join_securejoin(ctx, &to_string_lossy(qr))
             .await
             .map(|chatid| chatid.to_u32())
-            .log_err(ctx, "failed dc_join_securejoin() call")
+            .context("failed dc_join_securejoin() call")
+            .log_err(ctx)
             .unwrap_or_default()
     })
 }
@@ -2382,7 +2461,8 @@ pub unsafe extern "C" fn dc_send_locations_to_chat(
         ChatId::new(chat_id),
         seconds as i64,
     ))
-    .log_err(ctx, "Failed dc_send_locations_to_chat()")
+    .context("Failed dc_send_locations_to_chat()")
+    .log_err(ctx)
     .ok();
 }
 
@@ -2447,15 +2527,9 @@ pub unsafe extern "C" fn dc_get_locations(
     };
 
     block_on(async move {
-        let res = location::get_range(
-            ctx,
-            chat_id,
-            contact_id,
-            timestamp_begin as i64,
-            timestamp_end as i64,
-        )
-        .await
-        .unwrap_or_log_default(ctx, "Failed get_locations");
+        let res = location::get_range(ctx, chat_id, contact_id, timestamp_begin, timestamp_end)
+            .await
+            .unwrap_or_log_default(ctx, "Failed get_locations");
         Box::into_raw(Box::new(dc_array_t::from(res)))
     })
 }
@@ -2471,7 +2545,8 @@ pub unsafe extern "C" fn dc_delete_all_locations(context: *mut dc_context_t) {
     block_on(async move {
         location::delete_all(ctx)
             .await
-            .log_err(ctx, "Failed to delete locations")
+            .context("Failed to delete locations")
+            .log_err(ctx)
             .ok()
     });
 }
@@ -2662,7 +2737,7 @@ pub unsafe fn dc_array_is_independent(
 ///
 /// This is the structure behind [dc_chatlist_t] which is the opaque
 /// structure representing a chatlist in the FFI API.  It exists
-/// because the FFI API has a refernce from the message to the
+/// because the FFI API has a reference from the message to the
 /// context, but the Rust API does not, so the FFI layer needs to glue
 /// these together.
 pub struct ChatlistWrapper {
@@ -2702,10 +2777,10 @@ pub unsafe extern "C" fn dc_chatlist_get_chat_id(
     }
     let ffi_list = &*chatlist;
     let ctx = &*ffi_list.context;
-    match ffi_list.list.get_chat_id(index as usize) {
+    match ffi_list.list.get_chat_id(index) {
         Ok(chat_id) => chat_id.to_u32(),
         Err(err) => {
-            warn!(ctx, "get_chat_id failed: {}", err);
+            warn!(ctx, "get_chat_id failed: {err:#}");
             0
         }
     }
@@ -2722,10 +2797,10 @@ pub unsafe extern "C" fn dc_chatlist_get_msg_id(
     }
     let ffi_list = &*chatlist;
     let ctx = &*ffi_list.context;
-    match ffi_list.list.get_msg_id(index as usize) {
+    match ffi_list.list.get_msg_id(index) {
         Ok(msg_id) => msg_id.map_or(0, |msg_id| msg_id.to_u32()),
         Err(err) => {
-            warn!(ctx, "get_msg_id failed: {}", err);
+            warn!(ctx, "get_msg_id failed: {err:#}");
             0
         }
     }
@@ -2753,9 +2828,10 @@ pub unsafe extern "C" fn dc_chatlist_get_summary(
     block_on(async move {
         let summary = ffi_list
             .list
-            .get_summary(ctx, index as usize, maybe_chat)
+            .get_summary(ctx, index, maybe_chat)
             .await
-            .log_err(ctx, "get_summary failed")
+            .context("get_summary failed")
+            .log_err(ctx)
             .unwrap_or_default();
         Box::into_raw(Box::new(summary.into()))
     })
@@ -2783,7 +2859,8 @@ pub unsafe extern "C" fn dc_chatlist_get_summary2(
         msg_id,
         None,
     ))
-    .log_err(ctx, "get_summary2 failed")
+    .context("get_summary2 failed")
+    .log_err(ctx)
     .unwrap_or_default();
     Box::into_raw(Box::new(summary.into()))
 }
@@ -2806,7 +2883,7 @@ pub unsafe extern "C" fn dc_chatlist_get_context(
 ///
 /// This is the structure behind [dc_chat_t] which is the opaque
 /// structure representing a chat in the FFI API.  It exists
-/// because the FFI API has a refernce from the message to the
+/// because the FFI API has a reference from the message to the
 /// context, but the Rust API does not, so the FFI layer needs to glue
 /// these together.
 pub struct ChatWrapper {
@@ -2884,7 +2961,7 @@ pub unsafe extern "C" fn dc_chat_get_profile_image(chat: *mut dc_chat_t) -> *mut
             Ok(Some(p)) => p.to_string_lossy().strdup(),
             Ok(None) => ptr::null_mut(),
             Err(err) => {
-                error!(ctx, "failed to get profile image: {:?}", err);
+                error!(ctx, "failed to get profile image: {err:#}");
                 ptr::null_mut()
             }
         }
@@ -2966,7 +3043,8 @@ pub unsafe extern "C" fn dc_chat_can_send(chat: *mut dc_chat_t) -> libc::c_int {
     let ffi_chat = &*chat;
     let ctx = &*ffi_chat.context;
     block_on(ffi_chat.chat.can_send(ctx))
-        .log_err(ctx, "can_send failed")
+        .context("can_send failed")
+        .log_err(ctx)
         .unwrap_or_default() as libc::c_int
 }
 
@@ -2978,6 +3056,16 @@ pub unsafe extern "C" fn dc_chat_is_protected(chat: *mut dc_chat_t) -> libc::c_i
     }
     let ffi_chat = &*chat;
     ffi_chat.chat.is_protected() as libc::c_int
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_chat_is_protection_broken(chat: *mut dc_chat_t) -> libc::c_int {
+    if chat.is_null() {
+        eprintln!("ignoring careless call to dc_chat_is_protection_broken()");
+        return 0;
+    }
+    let ffi_chat = &*chat;
+    ffi_chat.chat.is_protection_broken() as libc::c_int
 }
 
 #[no_mangle]
@@ -3036,7 +3124,7 @@ pub unsafe extern "C" fn dc_chat_get_info_json(
         let chat = match chat::Chat::load_from_db(ctx, ChatId::new(chat_id)).await {
             Ok(chat) => chat,
             Err(err) => {
-                error!(ctx, "dc_get_chat_info_json() failed to load chat: {}", err);
+                error!(ctx, "dc_get_chat_info_json() failed to load chat: {err:#}");
                 return "".strdup();
             }
         };
@@ -3045,7 +3133,7 @@ pub unsafe extern "C" fn dc_chat_get_info_json(
             Err(err) => {
                 error!(
                     ctx,
-                    "dc_get_chat_info_json() failed to get chat info: {}", err
+                    "dc_get_chat_info_json() failed to get chat info: {err:#}"
                 );
                 return "".strdup();
             }
@@ -3062,7 +3150,7 @@ pub unsafe extern "C" fn dc_chat_get_info_json(
 ///
 /// This is the structure behind [dc_msg_t] which is the opaque
 /// structure representing a message in the FFI API.  It exists
-/// because the FFI API has a refernce from the message to the
+/// because the FFI API has a reference from the message to the
 /// context, but the Rust API does not, so the FFI layer needs to glue
 /// these together.
 pub struct MessageWrapper {
@@ -3082,7 +3170,7 @@ pub unsafe extern "C" fn dc_msg_new(
         return ptr::null_mut();
     }
     let context = &*context;
-    let viewtype = from_prim(viewtype).expect(&format!("invalid viewtype = {}", viewtype));
+    let viewtype = from_prim(viewtype).expect(&format!("invalid viewtype = {viewtype}"));
     let msg = MessageWrapper {
         context,
         message: message::Message::new(viewtype),
@@ -3201,7 +3289,7 @@ pub unsafe extern "C" fn dc_msg_get_text(msg: *mut dc_msg_t) -> *mut libc::c_cha
         return "".strdup();
     }
     let ffi_msg = &*msg;
-    ffi_msg.message.get_text().unwrap_or_default().strdup()
+    ffi_msg.message.get_text().strdup()
 }
 
 #[no_mangle]
@@ -3265,7 +3353,7 @@ pub unsafe extern "C" fn dc_msg_get_webxdc_blob(
             ptr as *mut libc::c_char
         }
         Err(err) => {
-            eprintln!("failed read blob from archive: {}", err);
+            eprintln!("failed read blob from archive: {err}");
             ptr::null_mut()
         }
     }
@@ -3284,7 +3372,7 @@ pub unsafe extern "C" fn dc_msg_get_webxdc_info(msg: *mut dc_msg_t) -> *mut libc
         let info = match ffi_msg.message.get_webxdc_info(ctx).await {
             Ok(info) => info,
             Err(err) => {
-                error!(ctx, "dc_msg_get_webxdc_info() failed to get info: {}", err);
+                error!(ctx, "dc_msg_get_webxdc_info() failed to get info: {err:#}");
                 return "".strdup();
             }
         };
@@ -3318,6 +3406,8 @@ pub unsafe extern "C" fn dc_msg_get_filebytes(msg: *mut dc_msg_t) -> u64 {
     let ctx = &*ffi_msg.context;
 
     block_on(ffi_msg.message.get_filebytes(ctx))
+        .unwrap_or_log_default(ctx, "Cannot get file size")
+        .unwrap_or_default()
 }
 
 #[no_mangle]
@@ -3409,7 +3499,8 @@ pub unsafe extern "C" fn dc_msg_get_summary(
     let ctx = &*ffi_msg.context;
 
     let summary = block_on(ffi_msg.message.get_summary(ctx, maybe_chat))
-        .log_err(ctx, "dc_msg_get_summary failed")
+        .context("dc_msg_get_summary failed")
+        .log_err(ctx)
         .unwrap_or_default();
     Box::into_raw(Box::new(summary.into()))
 }
@@ -3427,7 +3518,8 @@ pub unsafe extern "C" fn dc_msg_get_summarytext(
     let ctx = &*ffi_msg.context;
 
     let summary = block_on(ffi_msg.message.get_summary(ctx, None))
-        .log_err(ctx, "dc_msg_get_summarytext failed")
+        .context("dc_msg_get_summarytext failed")
+        .log_err(ctx)
         .unwrap_or_default();
     match usize::try_from(approx_characters) {
         Ok(chars) => summary.truncated_text(chars).strdup(),
@@ -3582,7 +3674,7 @@ pub unsafe extern "C" fn dc_msg_set_text(msg: *mut dc_msg_t, text: *const libc::
         return;
     }
     let ffi_msg = &mut *msg;
-    ffi_msg.message.set_text(to_opt_string_lossy(text))
+    ffi_msg.message.set_text(to_string_lossy(text))
 }
 
 #[no_mangle]
@@ -3593,6 +3685,16 @@ pub unsafe extern "C" fn dc_msg_set_html(msg: *mut dc_msg_t, html: *const libc::
     }
     let ffi_msg = &mut *msg;
     ffi_msg.message.set_html(to_opt_string_lossy(html))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_msg_set_subject(msg: *mut dc_msg_t, subject: *const libc::c_char) {
+    if msg.is_null() {
+        eprintln!("ignoring careless call to dc_msg_get_subject()");
+        return;
+    }
+    let ffi_msg = &mut *msg;
+    ffi_msg.message.set_subject(to_string_lossy(subject));
 }
 
 #[no_mangle]
@@ -3684,7 +3786,9 @@ pub unsafe extern "C" fn dc_msg_latefiling_mediasize(
             .message
             .latefiling_mediasize(ctx, width, height, duration)
     })
-    .ok_or_log_msg(ctx, "Cannot set media size");
+    .context("Cannot set media size")
+    .log_err(ctx)
+    .ok();
 }
 
 #[no_mangle]
@@ -3723,7 +3827,8 @@ pub unsafe extern "C" fn dc_msg_set_quote(msg: *mut dc_msg_t, quote: *const dc_m
             .message
             .set_quote(&*ffi_msg.context, quote_msg)
             .await
-            .log_err(&*ffi_msg.context, "failed to set quote")
+            .context("failed to set quote")
+            .log_err(&*ffi_msg.context)
             .ok();
     });
 }
@@ -3754,7 +3859,8 @@ pub unsafe extern "C" fn dc_msg_get_quoted_msg(msg: *const dc_msg_t) -> *mut dc_
             .message
             .quoted_message(context)
             .await
-            .log_err(context, "failed to get quoted message")
+            .context("failed to get quoted message")
+            .log_err(context)
             .unwrap_or(None)
     });
 
@@ -3777,7 +3883,8 @@ pub unsafe extern "C" fn dc_msg_get_parent(msg: *const dc_msg_t) -> *mut dc_msg_
             .message
             .parent(context)
             .await
-            .log_err(context, "failed to get parent message")
+            .context("failed to get parent message")
+            .log_err(context)
             .unwrap_or(None)
     });
 
@@ -3803,7 +3910,7 @@ pub unsafe extern "C" fn dc_msg_force_plaintext(msg: *mut dc_msg_t) {
 ///
 /// This is the structure behind [dc_contact_t] which is the opaque
 /// structure representing a contact in the FFI API.  It exists
-/// because the FFI API has a refernce from the message to the
+/// because the FFI API has a reference from the message to the
 /// context, but the Rust API does not, so the FFI layer needs to glue
 /// these together.
 pub struct ContactWrapper {
@@ -3968,10 +4075,44 @@ pub unsafe extern "C" fn dc_contact_is_verified(contact: *mut dc_contact_t) -> l
     let ctx = &*ffi_contact.context;
 
     block_on(ffi_contact.contact.is_verified(ctx))
-        .log_err(ctx, "is_verified failed")
+        .context("is_verified failed")
+        .log_err(ctx)
         .unwrap_or_default() as libc::c_int
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn dc_contact_get_verifier_addr(
+    contact: *mut dc_contact_t,
+) -> *mut libc::c_char {
+    if contact.is_null() {
+        eprintln!("ignoring careless call to dc_contact_get_verifier_addr()");
+        return "".strdup();
+    }
+    let ffi_contact = &*contact;
+    let ctx = &*ffi_contact.context;
+    block_on(ffi_contact.contact.get_verifier_addr(ctx))
+        .context("failed to get verifier for contact")
+        .log_err(ctx)
+        .unwrap_or_default()
+        .strdup()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_contact_get_verifier_id(contact: *mut dc_contact_t) -> u32 {
+    if contact.is_null() {
+        eprintln!("ignoring careless call to dc_contact_get_verifier_id()");
+        return 0;
+    }
+    let ffi_contact = &*contact;
+    let ctx = &*ffi_contact.context;
+    let verifier_contact_id = block_on(ffi_contact.contact.get_verifier_id(ctx))
+        .context("failed to get verifier")
+        .log_err(ctx)
+        .unwrap_or_default()
+        .unwrap_or_default();
+
+    verifier_contact_id.to_u32()
+}
 // dc_lot_t
 
 pub type dc_lot_t = lot::Lot;
@@ -4096,6 +4237,131 @@ pub unsafe extern "C" fn dc_str_unref(s: *mut libc::c_char) {
     libc::free(s as *mut _)
 }
 
+pub struct BackupProviderWrapper {
+    context: *const dc_context_t,
+    provider: BackupProvider,
+}
+
+pub type dc_backup_provider_t = BackupProviderWrapper;
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_backup_provider_new(
+    context: *mut dc_context_t,
+) -> *mut dc_backup_provider_t {
+    if context.is_null() {
+        eprintln!("ignoring careless call to dc_backup_provider_new()");
+        return ptr::null_mut();
+    }
+    let ctx = &*context;
+    block_on(BackupProvider::prepare(ctx))
+        .map(|provider| BackupProviderWrapper {
+            context: ctx,
+            provider,
+        })
+        .map(|ffi_provider| Box::into_raw(Box::new(ffi_provider)))
+        .context("BackupProvider failed")
+        .log_err(ctx)
+        .set_last_error(ctx)
+        .unwrap_or(ptr::null_mut())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_backup_provider_get_qr(
+    provider: *const dc_backup_provider_t,
+) -> *mut libc::c_char {
+    if provider.is_null() {
+        eprintln!("ignoring careless call to dc_backup_provider_qr");
+        return "".strdup();
+    }
+    let ffi_provider = &*provider;
+    let ctx = &*ffi_provider.context;
+    deltachat::qr::format_backup(&ffi_provider.provider.qr())
+        .context("BackupProvider get_qr failed")
+        .log_err(ctx)
+        .set_last_error(ctx)
+        .unwrap_or_default()
+        .strdup()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_backup_provider_get_qr_svg(
+    provider: *const dc_backup_provider_t,
+) -> *mut libc::c_char {
+    if provider.is_null() {
+        eprintln!("ignoring careless call to dc_backup_provider_qr_svg()");
+        return "".strdup();
+    }
+    let ffi_provider = &*provider;
+    let ctx = &*ffi_provider.context;
+    let provider = &ffi_provider.provider;
+    block_on(generate_backup_qr(ctx, &provider.qr()))
+        .context("BackupProvider get_qr_svg failed")
+        .log_err(ctx)
+        .set_last_error(ctx)
+        .unwrap_or_default()
+        .strdup()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_backup_provider_wait(provider: *mut dc_backup_provider_t) {
+    if provider.is_null() {
+        eprintln!("ignoring careless call to dc_backup_provider_wait()");
+        return;
+    }
+    let ffi_provider = &mut *provider;
+    let ctx = &*ffi_provider.context;
+    let provider = &mut ffi_provider.provider;
+    block_on(provider)
+        .context("Failed to await BackupProvider")
+        .log_err(ctx)
+        .set_last_error(ctx)
+        .ok();
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_backup_provider_unref(provider: *mut dc_backup_provider_t) {
+    if provider.is_null() {
+        eprintln!("ignoring careless call to dc_backup_provider_unref()");
+        return;
+    }
+    drop(Box::from_raw(provider));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_receive_backup(
+    context: *mut dc_context_t,
+    qr: *const libc::c_char,
+) -> libc::c_int {
+    if context.is_null() {
+        eprintln!("ignoring careless call to dc_receive_backup()");
+        return 0;
+    }
+    let ctx = &*context;
+    let qr_text = to_string_lossy(qr);
+    receive_backup(ctx.clone(), qr_text)
+}
+
+// Because this is a long-running operation make sure we own the Context.  This stops a FFI
+// user from deallocating it by calling unref on the object while we are using it.
+fn receive_backup(ctx: Context, qr_text: String) -> libc::c_int {
+    let qr = match block_on(qr::check_qr(&ctx, &qr_text))
+        .context("Invalid QR code")
+        .log_err(&ctx)
+        .set_last_error(&ctx)
+    {
+        Ok(qr) => qr,
+        Err(_) => return 0,
+    };
+    match block_on(imex::get_backup(&ctx, qr))
+        .context("Get backup failed")
+        .log_err(&ctx)
+        .set_last_error(&ctx)
+    {
+        Ok(_) => 1,
+        Err(_) => 0,
+    }
+}
+
 trait ResultExt<T, E> {
     /// Like `log_err()`, but:
     /// - returns the default value instead of an Err value.
@@ -4109,10 +4375,60 @@ impl<T: Default, E: std::fmt::Display> ResultExt<T, E> for Result<T, E> {
         match self {
             Ok(t) => t,
             Err(err) => {
-                error!(context, "{}: {}", message, err);
+                error!(context, "{message}: {err:#}");
                 Default::default()
             }
         }
+    }
+}
+
+trait ResultLastError<T, E>
+where
+    E: std::fmt::Display,
+{
+    /// Sets this `Err` value using [`Context::set_last_error`].
+    ///
+    /// Normally each FFI-API *should* call this if it handles an error from the Rust API:
+    /// errors which need to be reported to users in response to an API call need to be
+    /// propagated up the Rust API and at the FFI boundary need to be stored into the "last
+    /// error" so the FFI users can retrieve an appropriate error message on failure.  Often
+    /// you will want to combine this with a call to [`LogExt::log_err`].
+    ///
+    /// Since historically calls to the `deltachat::log::error!()` macro were (and sometimes
+    /// still are) shown as error toasts to the user, this macro also calls
+    /// [`Context::set_last_error`].  It is preferable however to rely on normal error
+    /// propagation in Rust code however and only use this `ResultExt::set_last_error` call
+    /// in the FFI layer.
+    ///
+    /// # Example
+    ///
+    /// Fully handling an error in the FFI code looks like this currently:
+    ///
+    /// ```no_compile
+    /// some_dc_rust_api_call_returning_result()
+    ///     .context("My API call failed")
+    ///     .log_err(&context)
+    ///     .set_last_error(&context)
+    ///     .unwrap_or_default()
+    /// ```
+    ///
+    /// As shows it is a shame the `.log_err()` call currently needs a message instead of
+    /// relying on an implicit call to the [`anyhow::Context`] call if needed.  This stems
+    /// from a time before we fully embraced anyhow.  Some day we'll also fix that.
+    ///
+    /// [`Context::set_last_error`]: context::Context::set_last_error
+    fn set_last_error(self, context: &context::Context) -> Result<T, E>;
+}
+
+impl<T, E> ResultLastError<T, E> for Result<T, E>
+where
+    E: std::fmt::Display,
+{
+    fn set_last_error(self, context: &context::Context) -> Result<T, E> {
+        if let Err(ref err) = self {
+            context.set_last_error(&format!("{err:#}"));
+        }
+        self
     }
 }
 
@@ -4178,7 +4494,8 @@ pub unsafe extern "C" fn dc_provider_new_from_email_with_dns(
     let socks5_enabled = block_on(async move {
         ctx.get_config_bool(config::Config::Socks5Enabled)
             .await
-            .log_err(ctx, "Can't get config")
+            .context("Can't get config")
+            .log_err(ctx)
     });
 
     match socks5_enabled {
@@ -4241,6 +4558,96 @@ pub unsafe extern "C" fn dc_provider_unref(provider: *mut dc_provider_t) {
     // this may change once we start localizing string.
 }
 
+// dc_http_response_t
+
+pub type dc_http_response_t = net::HttpResponse;
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_get_http_response(
+    context: *const dc_context_t,
+    url: *const libc::c_char,
+) -> *mut dc_http_response_t {
+    if context.is_null() || url.is_null() {
+        eprintln!("ignoring careless call to dc_get_http_response()");
+        return ptr::null_mut();
+    }
+
+    let context = &*context;
+    let url = to_string_lossy(url);
+    if let Ok(response) = block_on(read_url_blob(context, &url))
+        .context("read_url_blob")
+        .log_err(context)
+    {
+        Box::into_raw(Box::new(response))
+    } else {
+        ptr::null_mut()
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_http_response_get_mimetype(
+    response: *const dc_http_response_t,
+) -> *mut libc::c_char {
+    if response.is_null() {
+        eprintln!("ignoring careless call to dc_http_response_get_mimetype()");
+        return ptr::null_mut();
+    }
+
+    let response = &*response;
+    response.mimetype.strdup()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_http_response_get_encoding(
+    response: *const dc_http_response_t,
+) -> *mut libc::c_char {
+    if response.is_null() {
+        eprintln!("ignoring careless call to dc_http_response_get_encoding()");
+        return ptr::null_mut();
+    }
+
+    let response = &*response;
+    response.encoding.strdup()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_http_response_get_blob(
+    response: *const dc_http_response_t,
+) -> *mut libc::c_char {
+    if response.is_null() {
+        eprintln!("ignoring careless call to dc_http_response_get_blob()");
+        return ptr::null_mut();
+    }
+
+    let response = &*response;
+    let blob_len = response.blob.len();
+    let ptr = libc::malloc(blob_len);
+    libc::memcpy(ptr, response.blob.as_ptr() as *mut libc::c_void, blob_len);
+    ptr as *mut libc::c_char
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_http_response_get_size(
+    response: *const dc_http_response_t,
+) -> libc::size_t {
+    if response.is_null() {
+        eprintln!("ignoring careless call to dc_http_response_get_size()");
+        return 0;
+    }
+
+    let response = &*response;
+    response.blob.len()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_http_response_unref(response: *mut dc_http_response_t) {
+    if response.is_null() {
+        eprintln!("ignoring careless call to dc_http_response_unref()");
+        return;
+    }
+    drop(Box::from_raw(response));
+}
+
 // -- Accounts
 
 /// Reader-writer lock wrapper for accounts manager to guarantee thread safety when using
@@ -4285,7 +4692,7 @@ pub unsafe extern "C" fn dc_accounts_new(
         Ok(accs) => Box::into_raw(Box::new(AccountsWrapper::new(accs))),
         Err(err) => {
             // We are using Anyhow's .context() and to show the inner error, too, we need the {:#}:
-            eprintln!("failed to create accounts: {:#}", err);
+            eprintln!("failed to create accounts: {err:#}");
             ptr::null_mut()
         }
     }
@@ -4353,8 +4760,7 @@ pub unsafe extern "C" fn dc_accounts_select_account(
             Ok(()) => 1,
             Err(err) => {
                 accounts.emit_event(EventType::Error(format!(
-                    "Failed to select account: {:#}",
-                    err
+                    "Failed to select account: {err:#}"
                 )));
                 0
             }
@@ -4376,10 +4782,7 @@ pub unsafe extern "C" fn dc_accounts_add_account(accounts: *mut dc_accounts_t) -
         match accounts.add_account().await {
             Ok(id) => id,
             Err(err) => {
-                accounts.emit_event(EventType::Error(format!(
-                    "Failed to add account: {:#}",
-                    err
-                )));
+                accounts.emit_event(EventType::Error(format!("Failed to add account: {err:#}")));
                 0
             }
         }
@@ -4400,10 +4803,7 @@ pub unsafe extern "C" fn dc_accounts_add_closed_account(accounts: *mut dc_accoun
         match accounts.add_closed_account().await {
             Ok(id) => id,
             Err(err) => {
-                accounts.emit_event(EventType::Error(format!(
-                    "Failed to add account: {:#}",
-                    err
-                )));
+                accounts.emit_event(EventType::Error(format!("Failed to add account: {err:#}")));
                 0
             }
         }
@@ -4428,8 +4828,7 @@ pub unsafe extern "C" fn dc_accounts_remove_account(
             Ok(()) => 1,
             Err(err) => {
                 accounts.emit_event(EventType::Error(format!(
-                    "Failed to remove account: {:#}",
-                    err
+                    "Failed to remove account: {err:#}"
                 )));
                 0
             }
@@ -4459,8 +4858,7 @@ pub unsafe extern "C" fn dc_accounts_migrate_account(
             Ok(id) => id,
             Err(err) => {
                 accounts.emit_event(EventType::Error(format!(
-                    "Failed to migrate account: {:#}",
-                    err
+                    "Failed to migrate account: {err:#}"
                 )));
                 0
             }
@@ -4553,15 +4951,14 @@ pub unsafe extern "C" fn dc_accounts_get_event_emitter(
 
 #[cfg(feature = "jsonrpc")]
 mod jsonrpc {
-    use super::*;
     use deltachat_jsonrpc::api::CommandApi;
-    use deltachat_jsonrpc::events::event_to_json_rpc_notification;
-    use deltachat_jsonrpc::yerpc::{OutReceiver, RpcClient, RpcSession};
+    use deltachat_jsonrpc::yerpc::{OutReceiver, RpcClient, RpcServer, RpcSession};
+
+    use super::*;
 
     pub struct dc_jsonrpc_instance_t {
         receiver: OutReceiver,
         handle: RpcSession<CommandApi>,
-        event_thread: JoinHandle<Result<(), anyhow::Error>>,
     }
 
     #[no_mangle]
@@ -4573,40 +4970,13 @@ mod jsonrpc {
             return ptr::null_mut();
         }
 
-        let cmd_api =
-            deltachat_jsonrpc::api::CommandApi::from_arc((*account_manager).inner.clone());
+        let account_manager = &*account_manager;
+        let cmd_api = deltachat_jsonrpc::api::CommandApi::from_arc(account_manager.inner.clone());
 
         let (request_handle, receiver) = RpcClient::new();
-        let request_handle2 = request_handle.clone();
         let handle = RpcSession::new(request_handle, cmd_api);
 
-        let events = block_on({
-            async {
-                let am = (*account_manager).inner.clone();
-                let ev = am.read().await.get_event_emitter();
-                drop(am);
-                ev
-            }
-        });
-
-        let event_thread = spawn({
-            async move {
-                while let Some(event) = events.recv().await {
-                    let event = event_to_json_rpc_notification(event);
-                    request_handle2
-                        .send_notification("event", Some(event))
-                        .await?;
-                }
-                let res: Result<(), anyhow::Error> = Ok(());
-                res
-            }
-        });
-
-        let instance = dc_jsonrpc_instance_t {
-            receiver,
-            handle,
-            event_thread,
-        };
+        let instance = dc_jsonrpc_instance_t { receiver, handle };
 
         Box::into_raw(Box::new(instance))
     }
@@ -4617,8 +4987,13 @@ mod jsonrpc {
             eprintln!("ignoring careless call to dc_jsonrpc_unref()");
             return;
         }
-        (*jsonrpc_instance).event_thread.abort();
         drop(Box::from_raw(jsonrpc_instance));
+    }
+
+    fn spawn_handle_jsonrpc_request(handle: RpcSession<CommandApi>, request: String) {
+        spawn(async move {
+            handle.handle_incoming(&request).await;
+        });
     }
 
     #[no_mangle]
@@ -4631,12 +5006,9 @@ mod jsonrpc {
             return;
         }
 
-        let api = &*jsonrpc_instance;
-        let handle = &api.handle;
+        let handle = &(*jsonrpc_instance).handle;
         let request = to_string_lossy(request);
-        spawn(async move {
-            handle.handle_incoming(&request).await;
-        });
+        spawn_handle_jsonrpc_request(handle.clone(), request);
     }
 
     #[no_mangle]
@@ -4651,5 +5023,30 @@ mod jsonrpc {
         block_on(api.receiver.recv())
             .map(|result| serde_json::to_string(&result).unwrap_or_default().strdup())
             .unwrap_or(ptr::null_mut())
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn dc_jsonrpc_blocking_call(
+        jsonrpc_instance: *mut dc_jsonrpc_instance_t,
+        method: *const libc::c_char,
+        params: *const libc::c_char,
+    ) -> *mut libc::c_char {
+        if jsonrpc_instance.is_null() {
+            eprintln!("ignoring careless call to dc_jsonrpc_blocking_call()");
+            return ptr::null_mut();
+        }
+        let api = &*jsonrpc_instance;
+        let method = to_string_lossy(method);
+        let params = to_string_lossy(params);
+        let params: Option<yerpc::Params> = match serde_json::from_str(&params) {
+            Ok(params) => Some(params),
+            Err(_) => None,
+        };
+        let params = params.map(yerpc::Params::into_value).unwrap_or_default();
+        let res = block_on(api.handle.server().handle_request(method, params));
+        match res {
+            Ok(res) => res.to_string().strdup(),
+            Err(_) => ptr::null_mut(),
+        }
     }
 }

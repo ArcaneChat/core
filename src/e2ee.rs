@@ -7,7 +7,6 @@ use crate::aheader::{Aheader, EncryptPreference};
 use crate::config::Config;
 use crate::context::Context;
 use crate::key::{DcKey, SignedPublicKey, SignedSecretKey};
-use crate::keyring::Keyring;
 use crate::peerstate::{Peerstate, PeerstateVerifiedStatus};
 use crate::pgp;
 
@@ -78,7 +77,7 @@ impl EncryptHelper {
                     };
                 }
                 None => {
-                    let msg = format!("peerstate for {:?} missing, cannot encrypt", addr);
+                    let msg = format!("peerstate for {addr:?} missing, cannot encrypt");
                     if e2ee_guaranteed {
                         return Err(format_err!("{}", msg));
                     } else {
@@ -104,7 +103,7 @@ impl EncryptHelper {
         mail_to_encrypt: lettre_email::PartBuilder,
         peerstates: Vec<(Option<Peerstate>, &str)>,
     ) -> Result<String> {
-        let mut keyring: Keyring<SignedPublicKey> = Keyring::new();
+        let mut keyring: Vec<SignedPublicKey> = Vec::new();
 
         for (peerstate, addr) in peerstates
             .into_iter()
@@ -112,10 +111,10 @@ impl EncryptHelper {
         {
             let key = peerstate
                 .take_key(min_verified)
-                .with_context(|| format!("proper enc-key for {} missing, cannot encrypt", addr))?;
-            keyring.add(key);
+                .with_context(|| format!("proper enc-key for {addr} missing, cannot encrypt"))?;
+            keyring.push(key);
         }
-        keyring.add(self.public_key.clone());
+        keyring.push(self.public_key.clone());
         let sign_key = SignedSecretKey::load_self(context).await?;
 
         let raw_message = mail_to_encrypt.build().as_string().into_bytes();
@@ -123,6 +122,19 @@ impl EncryptHelper {
         let ctext = pgp::pk_encrypt(&raw_message, keyring, Some(sign_key)).await?;
 
         Ok(ctext)
+    }
+
+    /// Signs the passed-in `mail` using the private key from `context`.
+    /// Returns the payload and the signature.
+    pub async fn sign(
+        self,
+        context: &Context,
+        mail: lettre_email::PartBuilder,
+    ) -> Result<(lettre_email::MimeMessage, String)> {
+        let sign_key = SignedSecretKey::load_self(context).await?;
+        let mime_message = mail.build();
+        let signature = pgp::pk_calc_signature(mime_message.as_string().as_bytes(), &sign_key)?;
+        Ok((mime_message, signature))
     }
 }
 
@@ -144,13 +156,11 @@ pub async fn ensure_secret_key_exists(context: &Context) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::chat;
     use crate::message::{Message, Viewtype};
     use crate::param::Param;
-    use crate::peerstate::ToSave;
     use crate::test_utils::{bob_keypair, TestContext};
-
-    use super::*;
 
     mod ensure_secret_key_exists {
         use super::*;
@@ -297,8 +307,8 @@ Sent with my Delta Chat Messenger: https://delta.chat";
             gossip_key_fingerprint: Some(pub_key.fingerprint()),
             verified_key: Some(pub_key.clone()),
             verified_key_fingerprint: Some(pub_key.fingerprint()),
-            to_save: Some(ToSave::All),
             fingerprint_changed: false,
+            verifier: None,
         };
         vec![(Some(peerstate), addr)]
     }

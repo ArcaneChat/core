@@ -2,7 +2,7 @@ use deltachat::qr::Qr;
 use serde::Serialize;
 use typescript_type_def::TypeDef;
 
-#[derive(Serialize, TypeDef)]
+#[derive(Serialize, TypeDef, schemars::JsonSchema)]
 #[serde(rename = "Qr", rename_all = "camelCase")]
 #[serde(tag = "type")]
 pub enum QrObject {
@@ -31,6 +31,9 @@ pub enum QrObject {
     },
     Account {
         domain: String,
+    },
+    Backup {
+        ticket: String,
     },
     WebrtcInstance {
         domain: String,
@@ -126,6 +129,9 @@ impl From<Qr> for QrObject {
             }
             Qr::FprWithoutAddr { fingerprint } => QrObject::FprWithoutAddr { fingerprint },
             Qr::Account { domain } => QrObject::Account { domain },
+            Qr::Backup { ticket } => QrObject::Backup {
+                ticket: ticket.to_string(),
+            },
             Qr::WebrtcInstance {
                 domain,
                 instance_pattern,

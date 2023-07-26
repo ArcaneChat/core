@@ -12,7 +12,7 @@ describe("online tests", function () {
   let accountId1: number, accountId2: number;
 
   before(async function () {
-    this.timeout(12000);
+    this.timeout(60000);
     if (!process.env.DCC_NEW_TMP_EMAIL) {
       if (process.env.COVERAGE && !process.env.COVERAGE_OFFLINE) {
         console.error(
@@ -22,12 +22,12 @@ describe("online tests", function () {
         process.exit(1);
       }
       console.log(
-        "Missing DCC_NEW_TMP_EMAIL environment variable!, skip intergration tests"
+        "Missing DCC_NEW_TMP_EMAIL environment variable!, skip integration tests"
       );
       this.skip();
     }
     serverHandle = await startServer();
-    dc = new DeltaChat(serverHandle.stdin, serverHandle.stdout);
+    dc = new DeltaChat(serverHandle.stdin, serverHandle.stdout, true);
 
     dc.on("ALL", (contextId, { type }) => {
       if (type !== "Info") console.log(contextId, type);
@@ -36,7 +36,7 @@ describe("online tests", function () {
     account1 = await createTempUser(process.env.DCC_NEW_TMP_EMAIL);
     if (!account1 || !account1.email || !account1.password) {
       console.log(
-        "We didn't got back an account from the api, skip intergration tests"
+        "We didn't got back an account from the api, skip integration tests"
       );
       this.skip();
     }
@@ -44,7 +44,7 @@ describe("online tests", function () {
     account2 = await createTempUser(process.env.DCC_NEW_TMP_EMAIL);
     if (!account2 || !account2.email || !account2.password) {
       console.log(
-        "We didn't got back an account2 from the api, skip intergration tests"
+        "We didn't got back an account2 from the api, skip integration tests"
       );
       this.skip();
     }
@@ -74,7 +74,7 @@ describe("online tests", function () {
     accountsConfigured = true;
   });
 
-  it("send and recieve text message", async function () {
+  it("send and receive text message", async function () {
     if (!accountsConfigured) {
       this.skip();
     }
@@ -97,7 +97,8 @@ describe("online tests", function () {
     const messageList = await dc.rpc.getMessageIds(
       accountId2,
       chatIdOnAccountB,
-      0
+      false,
+      false
     );
 
     expect(messageList).have.length(1);
@@ -105,7 +106,7 @@ describe("online tests", function () {
     expect(message.text).equal("Hello");
   });
 
-  it("send and recieve text message roundtrip, encrypted on answer onwards", async function () {
+  it("send and receive text message roundtrip, encrypted on answer onwards", async function () {
     if (!accountsConfigured) {
       this.skip();
     }
@@ -133,7 +134,8 @@ describe("online tests", function () {
     const messageList = await dc.rpc.getMessageIds(
       accountId2,
       chatIdOnAccountB,
-      0
+      false,
+      false
     );
     const message = await dc.rpc.getMessage(
       accountId2,
@@ -150,7 +152,7 @@ describe("online tests", function () {
     await eventPromise2;
 
     const messageId = (
-      await dc.rpc.getMessageIds(accountId1, chatId, 0)
+      await dc.rpc.getMessageIds(accountId1, chatId, false, false)
     ).reverse()[0];
     const message2 = await dc.rpc.getMessage(accountId1, messageId);
     expect(message2.text).equal("super secret message");

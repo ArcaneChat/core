@@ -5,6 +5,9 @@
 
 use anyhow::{Context as _, Result};
 
+use super::bobstate::{BobHandshakeStage, BobState};
+use super::qrinvite::QrInvite;
+use super::HandshakeMessage;
 use crate::chat::{is_contact_in_chat, ChatId, ProtectionStatus};
 use crate::constants::{Blocked, Chattype};
 use crate::contact::Contact;
@@ -13,10 +16,6 @@ use crate::events::EventType;
 use crate::mimeparser::MimeMessage;
 use crate::tools::time;
 use crate::{chat, stock_str};
-
-use super::bobstate::{BobHandshakeStage, BobState};
-use super::qrinvite::QrInvite;
-use super::HandshakeMessage;
 
 /// Starts the securejoin protocol with the QR `invite`.
 ///
@@ -60,7 +59,7 @@ pub(super) async fn start_protocol(context: &Context, invite: QrInvite) -> Resul
             // TODO: how does this group become usable?
             let group_chat_id = state.joining_chat_id(context).await?;
             if !is_contact_in_chat(context, group_chat_id, invite.contact_id()).await? {
-                chat::add_to_chat_contacts_table(context, group_chat_id, invite.contact_id())
+                chat::add_to_chat_contacts_table(context, group_chat_id, &[invite.contact_id()])
                     .await?;
             }
             let msg = stock_str::secure_join_started(context, invite.contact_id()).await;
@@ -223,6 +222,14 @@ impl BobState {
         let msg = stock_str::contact_verified(context, &contact).await;
         let chat_id = self.joining_chat_id(context).await?;
         chat::add_info_msg(context, chat_id, &msg, time()).await?;
+        chat_id
+            .set_protection(
+                context,
+                ProtectionStatus::Protected,
+                time(),
+                Some(contact.id),
+            )
+            .await?;
         context.emit_event(EventType::ChatModified(chat_id));
         Ok(())
     }

@@ -1,4 +1,7 @@
+//! # QR code generation module.
+
 use anyhow::Result;
+use base64::Engine as _;
 use qrcodegen::{QrCode, QrCodeEcc};
 
 use crate::{
@@ -8,9 +11,15 @@ use crate::{
     config::Config,
     contact::{Contact, ContactId},
     context::Context,
-    securejoin, stock_str,
+    qr::{self, Qr},
+    securejoin,
+    stock_str::{self, backup_transfer_qr},
 };
 
+/// Returns SVG of the QR code to join the group or verify contact.
+///
+/// If `chat_id` is `None`, returns verification QR code.
+/// Otherwise, returns secure join QR code.
 pub async fn get_securejoin_qr_svg(context: &Context, chat_id: Option<ChatId>) -> Result<String> {
     if let Some(chat_id) = chat_id {
         generate_join_group_qr_code(context, chat_id).await
@@ -40,6 +49,34 @@ async fn generate_join_group_qr_code(context: &Context, chat_id: ChatId) -> Resu
 }
 
 async fn generate_verification_qr(context: &Context) -> Result<String> {
+    let (avatar, displayname, addr, color) = self_info(context).await?;
+
+    inner_generate_secure_join_qr_code(
+        &stock_str::setup_contact_qr_description(context, &displayname, &addr).await,
+        &securejoin::get_securejoin_qr(context, None).await?,
+        &color,
+        avatar,
+        displayname.chars().next().unwrap_or('#'),
+    )
+}
+
+/// Renders a [`Qr::Backup`] QR code as an SVG image.
+pub async fn generate_backup_qr(context: &Context, qr: &Qr) -> Result<String> {
+    let content = qr::format_backup(qr)?;
+    let (avatar, displayname, _addr, color) = self_info(context).await?;
+    let description = backup_transfer_qr(context).await?;
+
+    inner_generate_secure_join_qr_code(
+        &description,
+        &content,
+        &color,
+        avatar,
+        displayname.chars().next().unwrap_or('#'),
+    )
+}
+
+/// Returns `(avatar, displayname, addr, color) of the configured account.
+async fn self_info(context: &Context) -> Result<(Option<Vec<u8>>, String, String, String)> {
     let contact = Contact::get_by_id(context, ContactId::SELF).await?;
 
     let avatar = match contact.get_profile_image(context).await? {
@@ -52,16 +89,11 @@ async fn generate_verification_qr(context: &Context) -> Result<String> {
 
     let displayname = match context.get_config(Config::Displayname).await? {
         Some(name) => name,
-        None => contact.get_addr().to_owned(),
+        None => contact.get_addr().to_string(),
     };
-
-    inner_generate_secure_join_qr_code(
-        &stock_str::setup_contact_qr_description(context, &displayname, contact.get_addr()).await,
-        &securejoin::get_securejoin_qr(context, None).await?,
-        &color_int_to_hex_string(contact.get_color()),
-        avatar,
-        displayname.chars().next().unwrap_or('#'),
-    )
+    let addr = contact.get_addr().to_string();
+    let color = color_int_to_hex_string(contact.get_color());
+    Ok((avatar, displayname, addr, color))
 }
 
 fn inner_generate_secure_join_qr_code(
@@ -88,11 +120,12 @@ fn inner_generate_secure_join_qr_code(
 
     w.elem("svg", |d| {
         d.attr("xmlns", "http://www.w3.org/2000/svg")?;
-        d.attr("viewBox", format_args!("0 0 {} {}", width, height))?;
+        d.attr("viewBox", format_args!("0 0 {width} {height}"))?;
+        d.attr("xmlns:xlink", "http://www.w3.org/1999/xlink")?; // required for enabling xlink:href on browsers
         Ok(())
     })?
     .build(|w| {
-        // White Background apears like a card
+        // White Background appears like a card
         w.single("rect", |d| {
             d.attr("x", card_border_size)?;
             d.attr("y", card_border_size)?;
@@ -127,14 +160,14 @@ fn inner_generate_secure_join_qr_code(
                 for y in 0..qr.size() {
                     for x in 0..qr.size() {
                         if qr.get_module(x, y) {
-                            path_data += &format!("M{},{}h1v1h-1z", x, y);
+                            path_data += &format!("M{x},{y}h1v1h-1z");
                         }
                     }
                 }
 
                 d.attr("style", "fill:#000000")?;
                 d.attr("d", path_data)?;
-                d.attr("transform", format!("scale({})", scale))
+                d.attr("transform", format!("scale({scale})"))
             })
         })?;
 
@@ -165,10 +198,9 @@ fn inner_generate_secure_join_qr_code(
                     format!(
                         "font-family:sans-serif;\
                         font-weight:bold;\
-                        font-size:{}px;\
+                        font-size:{text_font_size}px;\
                         fill:#000000;\
-                        stroke:none",
-                        text_font_size
+                        stroke:none"
                     ),
                 )
             })?
@@ -209,8 +241,11 @@ fn inner_generate_secure_join_qr_code(
                 d.attr("preserveAspectRatio", "none")?;
                 d.attr("clip-path", "url(#avatar-cut)")?;
                 d.attr(
-                    "href", /*might need xlink:href instead if it doesn't work on older devices?*/
-                    format!("data:image/jpeg;base64,{}", base64::encode(img)),
+                    "xlink:href", /* xlink:href is needed otherwise it won't even display in inkscape not to mention qt's QSvgHandler */
+                    format!(
+                        "data:image/jpeg;base64,{}",
+                        base64::engine::general_purpose::STANDARD.encode(img)
+                    ),
                 )
             })?;
         } else {
@@ -234,9 +269,8 @@ fn inner_generate_secure_join_qr_code(
                     format!(
                         "font-family:sans-serif;\
                             font-weight:400;\
-                            font-size:{}px;\
-                            fill:#ffffff;",
-                        avatar_font_size
+                            font-size:{avatar_font_size}px;\
+                            fill:#ffffff;"
                     ),
                 )
             })?
@@ -264,6 +298,12 @@ fn inner_generate_secure_join_qr_code(
 
 #[cfg(test)]
 mod tests {
+    use testdir::testdir;
+
+    use crate::imex::BackupProvider;
+    use crate::qr::format_backup;
+    use crate::test_utils::TestContextManager;
+
     use super::*;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -277,5 +317,21 @@ mod tests {
         )
         .unwrap();
         assert!(svg.contains("descr123 &quot; &lt; &gt; &amp;"))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_generate_backup_qr() {
+        let dir = testdir!();
+        let mut tcm = TestContextManager::new();
+        let ctx = tcm.alice().await;
+        let provider = BackupProvider::prepare(&ctx).await.unwrap();
+        let qr = provider.qr();
+
+        println!("{}", format_backup(&qr).unwrap());
+        let rendered = generate_backup_qr(&ctx, &qr).await.unwrap();
+        tokio::fs::write(dir.join("qr.svg"), &rendered)
+            .await
+            .unwrap();
+        assert_eq!(rendered.get(..4), Some("<svg"));
     }
 }

@@ -1,0 +1,138 @@
+# GitHub Actions workflow
+# to build `deltachat-rpc-server` binaries
+# and upload them to the release.
+#
+# The workflow is automatically triggered on releases.
+# It can also be triggered manually
+# to produce binary artifacts for testing.
+
+name: Build deltachat-rpc-server binaries
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+jobs:
+  # Build a version statically linked against musl libc
+  # to avoid problems with glibc version incompatibility.
+  build_linux:
+    name: Cross-compile deltachat-rpc-server for x86_64, i686, aarch64 and armv7 Linux
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Build
+        run: sh scripts/zig-rpc-server.sh
+
+      - name: Upload x86_64 binary
+        uses: actions/upload-artifact@v3
+        with:
+          name: deltachat-rpc-server-x86_64
+          path: target/x86_64-unknown-linux-musl/release/deltachat-rpc-server
+          if-no-files-found: error
+
+      - name: Upload i686 binary
+        uses: actions/upload-artifact@v3
+        with:
+          name: deltachat-rpc-server-i686
+          path: target/i686-unknown-linux-musl/release/deltachat-rpc-server
+          if-no-files-found: error
+
+      - name: Upload aarch64 binary
+        uses: actions/upload-artifact@v3
+        with:
+          name: deltachat-rpc-server-aarch64
+          path: target/aarch64-unknown-linux-musl/release/deltachat-rpc-server
+          if-no-files-found: error
+
+      - name: Upload armv7 binary
+        uses: actions/upload-artifact@v3
+        with:
+          name: deltachat-rpc-server-armv7
+          path: target/armv7-unknown-linux-musleabihf/release/deltachat-rpc-server
+          if-no-files-found: error
+
+  build_windows:
+    name: Build deltachat-rpc-server for Windows
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: win32.exe
+            path: deltachat-rpc-server.exe
+            target: i686-pc-windows-msvc
+
+          - os: windows-latest
+            artifact: win64.exe
+            path: deltachat-rpc-server.exe
+            target: x86_64-pc-windows-msvc
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Setup rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --package deltachat-rpc-server --target ${{ matrix.target }} --features vendored
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v3
+        with:
+          name: deltachat-rpc-server-${{ matrix.artifact }}
+          path: target/${{ matrix.target}}/release/${{ matrix.path }}
+          if-no-files-found: error
+
+  build_macos:
+    name: Build deltachat-rpc-server for macOS
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Setup rust target
+        run: rustup target add x86_64-apple-darwin
+
+      - name: Build
+        run: cargo build --release --package deltachat-rpc-server --target x86_64-apple-darwin --features vendored
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v3
+        with:
+          name: deltachat-rpc-server-x86_64-macos
+          path: target/x86_64-apple-darwin/release/deltachat-rpc-server
+          if-no-files-found: error
+
+  publish:
+    name: Upload binaries to the release
+    needs: ["build_linux", "build_windows", "build_macos"]
+    permissions:
+      contents: write
+    runs-on: "ubuntu-latest"
+    steps:
+      - name: Download built binaries
+        uses: "actions/download-artifact@v3"
+
+      - name: Compose dist/ directory
+        run: |
+          mkdir dist
+          for x in x86_64 i686 aarch64 armv7 win32.exe win64.exe x86_64-macos; do
+            mv "deltachat-rpc-server-$x"/* "dist/deltachat-rpc-server-$x"
+          done
+
+      - name: List downloaded artifacts
+        run: ls -l dist/
+
+      - name: Upload binaries to the GitHub release
+        env:
+          GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+        run: |
+          gh release upload ${{ github.ref_name }} \
+            --repo ${{ github.repository }} \
+            dist/*

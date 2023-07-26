@@ -3,12 +3,12 @@ use num_traits::cast::ToPrimitive;
 use serde::Serialize;
 use typescript_type_def::TypeDef;
 
-#[derive(Serialize, TypeDef)]
+#[derive(Serialize, TypeDef, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderInfo {
     pub before_login_hint: String,
     pub overview_page: String,
-    pub status: u32, // in reality this is an enum, but for simlicity and because it gets converted into a number anyway, we use an u32 here.
+    pub status: u32, // in reality this is an enum, but for simplicity and because it gets converted into a number anyway, we use an u32 here.
 }
 
 impl ProviderInfo {

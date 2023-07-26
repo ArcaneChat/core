@@ -1,13 +1,599 @@
 # Changelog
 
-## Unreleased
+## [1.118.0] - 2023-07-07
+
+### API-Changes
+
+- [**breaking**] Remove `Contact::load_from_db()` in favor of `Contact::get_by_id()`.
+- Add `Contact::get_by_id_optional()` API.
+- [**breaking**] Make `Message.text` non-optional.
+- [**breaking**] Replace `message::get_msg_info()` with `MsgId.get_info()`.
+- Move `handle_mdn` and `handle_ndn` to mimeparser and make them private.
+  Previously `handle_mdn` was erroneously exposed in the public API.
+- python: flatten the API of `deltachat` module.
+
+### Fixes
+
+- Use different member added/removal messages locally and on the network.
+- Update tokio to 1.29.1 to fix core panic after sending 29 offline messages ([#4414](https://github.com/deltachat/deltachat-core-rust/issues/4414)).
+- Make SVG avatar image work on more platforms (use `xlink:href`).
+- Preserve indentation when converting plaintext to HTML.
+- Do not run simplify() on dehtml() output.
+- Rewrite member added/removed messages even if the change is not allowed PR ([#4529](https://github.com/deltachat/deltachat-core-rust/pull/4529)).
+
+### Documentation
+
+- Document how to regenerate Node.js constants before the release.
+
+### Build system
+
+- git-cliff: Do not fail if commit.footers is undefined.
+
+### Other
+
+- Dependency updates.
+- Update MPL 2.0 license text.
+- Add LICENSE file to deltachat-rpc-client.
+- deltachat-rpc-client: Add Trove classifiers.
+- python: Change bindings status to production/stable.
+
+### Tests
+
+- Add `make-python-testenv.sh` script.
+
+## [1.117.0] - 2023-06-15
+
+### Features
+
+- New group membership update algorithm.
+
+  New algorithm improves group consistency
+  in cases of missing messages,
+  restored old backups and replies from classic MUAs.
+
+- Add `DC_EVENT_MSG_DELETED` event.
+
+  This event notifies the UI about the message
+  being deleted from the messagelist, e.g. when the message expires
+  or the user deletes it.
+
+### Fixes
+
+- Emit `DC_EVENT_MSGS_CHANGED` without IDs when the message expires.
+
+  Specifying msg IDs that cannot be loaded in the event payload
+  results in an error when the UI tries to load the message.
+  Instead, emit an event without IDs
+  to make the UI reload the whole messagelist.
+
+- Ignore address case when comparing the `To:` field to `Autocrypt-Gossip:`.
+
+  This bug resulted in failure to propagate verification
+  if the contact list already contained a new verified group member
+  with a non-lowercase address.
+
+- dehtml: skip links with empty text.
+
+  Links like `<a href="https://delta.chat/"></a>` in HTML mails are now skipped
+  instead of being converted to a link without a label like `[](https://delta.chat/)`.
+
+- dehtml: Do not insert unnecessary newlines when parsing `<p>` tags.
+
+- Update from yanked `libc` 0.2.145 to 0.2.146.
+- Update to async-imap 0.9.0 to remove deprecated `ouroboros` dependency.
+
+### API-Changes
+
+- Emit `DC_EVENT_MSGS_CHANGED` per chat when messages are deleted.
+
+  Previously a single event with zero chat ID was emitted.
+
+- python: make `Contact.is_verified()` return bool.
+
+- rust: add API endpoint `get_status_update` ([#4468](https://github.com/deltachat/deltachat-core-rust/pull/4468)).
+
+- rust: make `WebxdcManifest` type public.
+
+### Build system
+
+- Use Rust 1.70.0 to compile deltachat-rpc-server releases.
+- Disable unused `brotli` feature `ffi-api` and use 1 codegen-units for release builds to reduce the size of the binaries.
+
+### CI
+
+- Run `cargo check` with musl libc.
+- concourse: Install devpi in a virtual environment.
+- Remove [mergeable](https://mergeable.us/) configuration.
+
+### Documentation
+
+- README: mark napi.rs bindings as experimental. CFFI bindings are not legacy and are the recommended Node.js bindings currently.
+- CONTRIBUTING: document how conventional commits interact with squash merges.
+
+### Refactor
+
+- Rename `MimeMessage.header` into `MimeMessage.headers`.
+
+- Derive `Default` trait for `WebxdcManifest`.
+
+### Tests
+
+- Regression test for case-sensitive comparison of gossip header to contact address.
+- Multiple new group consistency tests in Rust.
+- python: Replace legacy `tmpdir` fixture with `tmp_path`.
+
+## [1.116.0] - 2023-06-05
+
+### API-Changes
+
+- Add `dc_jsonrpc_blocking_call()`.
 
 ### Changes
+
+- Generate OpenRPC definitions for JSON-RPC.
+- Add more context to message loading errors.
+
+### Fixes
+
+- Build deltachat-node prebuilds on Debian 10.
+
+### Documentation
+
+- Document release process in `RELEASE.md`.
+- Add contributing guidelines `CONTRIBUTING.md`.
+- Update instructions for python devenv.
+- python: Document pytest fixtures.
+
+### Tests
+
+- python: Make `test_mdn_asymmetric` less flaky.
+- Make `test_group_with_removed_message_id` less flaky.
+- Add golden tests infrastructure ([#4395](https://github.com/deltachat/deltachat-core-rust/pull/4395)).
+
+### Build system
+
+- git-cliff: Changelog generation improvements.
+- `set_core_version.py`: Expect release date in the changelog.
+
+### CI
+
+- Require Python 3.8 for deltachat-rpc-client.
+- mergeable: Allow PR titles to start with "ci" and "build".
+- Remove incorrect comment.
+- dependabot: Use `chore` prefix for dependency updates.
+- Remove broken `node-delete-preview.yml` workflow.
+- Add top comments to GH Actions workflows.
+- Run node.js lint on Windows.
+- Update clippy to 1.70.0.
+
+### Miscellaneous Tasks
+
+- Remove release.toml.
+- gitattributes: Configure LF line endings for JavaScript files.
+- Update dependencies
+
+## [1.112.10] - 2023-06-01
+
+### Fixes
+
+- Disable `fetch_existing_msgs` setting by default.
+- Update `h2` to fix RUSTSEC-2023-0034.
+
+## [1.115.0] - 2023-05-12
+
+### JSON-RPC API Changes
+
+- Sort reactions in descending order ([#4388](https://github.com/deltachat/deltachat-core-rust/pull/4388)).
+- Add API to get reactions outside the message snapshot.
+- `get_chatlist_items_by_entries` now takes only chatids instead of `ChatListEntries`.
+- `get_chatlist_entries` now returns `Vec<u32>` of chatids instead of `ChatListEntries`.
+- `JSONRPCReactions.reactions` is now a `Vec<JSONRPCReaction>` with unique reactions and their count, sorted in descending order.
+- `Event`: `context_id` property is now called `contextId`.
+- Expand `MessageSearchResult`:
+  - Always include `chat_name`(not an option anymore).
+  - Add `author_id`, `chat_type`, `chat_color`, `is_chat_protected`, `is_chat_contact_request`, `is_chat_archived`.
+  - `author_name` now contains the overridden sender name.
+- `ChatListItemFetchResult` gets new properties: `summary_preview_image`, `last_message_type` and `last_message_id`
+- New `MessageReadReceipt` type and `get_message_read_receipts(account_id, message_id)` jsonrpc method.
+
+### API Changes
+
+- New rust API `send_webxdc_status_update_struct` to send a `StatusUpdateItem`.
+- Add `get_msg_read_receipts(context, msg_id)` - get the contacts that send read receipts for a message.
+
+### Features / Changes
+
+- Build deltachat-rpc-server releases for x86\_64 macOS.
+- Generate changelogs using git-cliff ([#4393](https://github.com/deltachat/deltachat-core-rust/pull/4393), [#4396](https://github.com/deltachat/deltachat-core-rust/pull/4396)).
+- Improve SMTP logging.
+- Do not cut incoming text if "bot" config is set.
+
+### Fixes
+
+- JSON-RPC: typescript client: fix types of events in event emitter ([#4373](https://github.com/deltachat/deltachat-core-rust/pull/4373)).
+- Fetch at most 100 existing messages even if EXISTS was not received ([#4383](https://github.com/deltachat/deltachat-core-rust/pull/4383)).
+- Don't put a double dot at the end of error messages ([#4398](https://github.com/deltachat/deltachat-core-rust/pull/4398)).
+- Recreate `smtp` table with AUTOINCREMENT `id` ([#4390](https://github.com/deltachat/deltachat-core-rust/pull/4390)).
+- Do not return an error from `send_msg_to_smtp` if retry limit is exceeded.
+- Make the bots automatically accept group chat contact requests ([#4377](https://github.com/deltachat/deltachat-core-rust/pull/4377)).
+- Delete `smtp` rows when message sending is cancelled ([#4391](https://github.com/deltachat/deltachat-core-rust/pull/4391)).
+
+### Refactor
+
+- Iterate over `msg_ids` without .iter().
+
+## [1.112.9] - 2023-05-12
+
+### Fixes
+
+- Fetch at most 100 existing messages even if EXISTS was not received.
+- Delete `smtp` rows when message sending is cancelled.
+
+### Changes
+
+- Improve SMTP logging.
+
+## [1.114.0] - 2023-04-24
+
+### Changes
+- JSON-RPC: Use long polling instead of server-sent notifications to retrieve events.
+  This better corresponds to JSON-RPC 2.0 server-client distinction
+  and is expected to simplify writing new bindings
+  because dispatching events can be done on higher level.
+- JSON-RPC: TS: Client now has a mandatory argument whether you want to start listening for events.
+
+### Fixes
+- JSON-RPC: do not print to stdout on failure to find an account.
+
+
+## [1.113.0] - 2023-04-18
+
+### Added
+- New JSON-RPC API `can_send()`.
+- New `dc_get_next_msgs()` and `dc_wait_next_msgs()` C APIs.
+  New `get_next_msgs()` and `wait_next_msgs()` JSON-RPC API.
+  These APIs can be used by bots to get all unprocessed messages
+  in the order of their arrival and wait for them without relying on events.
+- New Python bindings API `Account.wait_next_incoming_message()`.
+- New Python bindings APIs `Message.is_from_self()` and `Message.is_from_device()`.
+
+### Changes
+- Increase MSRV to 1.65.0. #4236
+- Remove upper limit on the attachment size. #4253
+- Update rPGP to 0.10.1. #4236
+- Compress HTML emails stored in the `mime_headers` column of the database.
+- Strip BIDI characters in system messages, files, group names and contact names. #3479
+- Use release date instead of the provider database update date in `maybe_add_time_based_warnings()`.
+- Gracefully terminate `deltachat-rpc-server` on Ctrl+C (`SIGINT`), `SIGTERM` and EOF.
+- Async Python API `get_fresh_messages_in_arrival_order()` is deprecated
+  in favor of `get_next_msgs()` and `wait_next_msgs()`.
+- Remove metadata from avatars and JPEG images before sending. #4037
+- Recode PNG and other supported image formats to JPEG if they are > 500K in size. #4037
+
+### Fixes
+- Don't let blocking be bypassed using groups. #4316
+- Show a warning if quota list is empty. #4261
+- Do not reset status on other devices when sending signed reaction messages. #3692
+- Update `accounts.toml` atomically.
+- Fix python bindings README documentation on installing the bindings from source.
+- Remove confusing log line "ignoring unsolicited response Recent(…)". #3934
+
+## [1.112.8] - 2023-04-20
+
+### Changes
+- Add `get_http_response` JSON-RPC API.
+- Add C API to get HTTP responses.
+
+## [1.112.7] - 2023-04-17
+
+### Fixes
+
+- Updated `async-imap` to v0.8.0 to fix erroneous EOF detection in long IMAP responses.
+
+## [1.112.6] - 2023-04-04
+
+### Changes
+
+- Add a device message after backup transfer #4301
+
+### Fixed
+
+- Updated `iroh` from 0.4.0 to 0.4.1 to fix transfer of large accounts with many blob files.
+
+## [1.112.5] - 2023-04-02
+
+### Fixes
+
+- Run SQL database migrations after receiving a backup from the network. #4287
+
+## [1.112.4] - 2023-03-31
+
+### Fixes
+- Fix call to `auditwheel` in `scripts/run_all.sh`.
+
+## [1.112.3] - 2023-03-30
+
+### Fixes
+- `transfer::get_backup` now frees ongoing process when cancelled. #4249
+
+## [1.112.2] - 2023-03-30
+
+### Changes
+- Update iroh, remove `default-net` from `[patch.crates-io]` section.
+- transfer backup: Connect to multiple provider addresses concurrently.  This should speed up connection time significantly on the getter side.  #4240
+- Make sure BackupProvider is cancelled on drop (or `dc_backup_provider_unref`).  The BackupProvider will now always finish with an IMEX event of 1000 or 0, previously it would sometimes finished with 1000 (success) when it really was 0 (failure). #4242
+
+### Fixes
+- Do not return media from trashed messages in the "All media" view. #4247
+
+## [1.112.1] - 2023-03-27
+
+### Changes
+- Add support for `--version` argument to `deltachat-rpc-server`. #4224
+  It can be used to check the installed version without starting the server.
+
+### Fixes
+- deltachat-rpc-client: fix bug in `Chat.send_message()`: invalid `MessageData` field `quotedMsg` instead of `quotedMsgId`
+- `receive_imf`: Mark special messages as seen. Exactly: delivery reports, webxdc status updates. #4230
+
+
+## [1.112.0] - 2023-03-23
+
+### Changes
+- Increase MSRV to 1.64. #4167
+- Core takes care of stopping and re-starting IO itself where needed,
+  e.g. during backup creation.
+  It is no longer needed to call `dc_stop_io()`.
+  `dc_start_io()` can now be called at any time without harm. #4138
+- Pick up system's light/dark mode in generated message HTML. #4150
+- More accurate `maybe_add_bcc_self` device message text. #4175
+- "Full message view" not needed because of footers that go to contact status. #4151
+- Support non-persistent configuration with `DELTACHAT_*` env. #4154
+- Print deltachat-repl errors with causes. #4166
+
+### Fixes
+- Fix segmentation fault if `dc_context_unref()` is called during
+  background process spawned by `dc_configure()` or `dc_imex()`
+  or `dc_jsonrpc_instance_t` is unreferenced
+  during handling the JSON-RPC request. #4153
+- Delete expired messages using multiple SQL requests. #4158
+- Do not emit "Failed to run incremental vacuum" warnings on success. #4160
+- Ability to send backup over network and QR code to setup second device #4007
+- Disable buffering during STARTTLS setup. #4190
+- Add `DC_EVENT_IMAP_INBOX_IDLE` event to wait until the account
+  is ready for testing.
+  It is used to fix race condition between fetching
+  existing messages and starting the test. #4208
+
+
+## [1.111.0] - 2023-03-05
+
+### Changes
+- Make smeared timestamp generation non-async. #4075
+- Set minimum TLS version to 1.2. #4096
+- Run `cargo-deny` in CI. #4101
+- Check provider database with CI. #4099 
+- Switch to DEFERRED transactions #4100
+
+### Fixes
+- Do not block async task executor while decrypting the messages. #4079
+- Housekeeping: delete the blobs backup dir #4123
+
+### API-Changes
+- jsonrpc: add more advanced API to send a message. #4097
+- jsonrpc: add get webxdc blob API `getWebxdcBlob` #4070
+
+
+## 1.110.0
+
+### Changes
+- use transaction in `Contact::add_or_lookup()` #4059
+- Organize the connection pool as a stack rather than a queue to ensure that
+  connection page cache is reused more often.
+  This speeds up tests by 28%, real usage will have lower speedup. #4065
+- Use transaction in `update_blocked_mailinglist_contacts`. #4058
+- Remove `Sql.get_conn()` interface in favor of `.call()` and `.transaction()`. #4055
+- Updated provider database.
+- Disable DKIM-Checks again #4076
+- Switch from "X.Y.Z" and "py-X.Y.Z" to "vX.Y.Z" tags. #4089
+- mimeparser: handle headers from the signed part of unencrypted signed message #4013
+
+### Fixes
+- Start SQL transactions with IMMEDIATE behaviour rather than default DEFERRED one. #4063
+- Fix a problem with Gmail where (auto-)deleted messages would get archived instead of deleted.
+  Move them to the Trash folder for Gmail which auto-deletes trashed messages in 30 days #3972
+- Clear config cache after backup import. This bug sometimes resulted in the import to seemingly work at first. #4067
+- Update timestamps in `param` columns with transactions. #4083
+
+### API-Changes
+
+
+## 1.109.0
+
+### Changes
+- deltachat-rpc-client: use `dataclass` for `Account`, `Chat`, `Contact` and `Message` #4042
+
+### Fixes
+- deltachat-rpc-server: do not block stdin while processing the request. #4041
+  deltachat-rpc-server now reads the next request as soon as previous request handler is spawned.
+- Enable `auto_vacuum` on all SQL connections. #2955
+- Replace `r2d2` connection pool with an own implementation. #4050 #4053 #4043 #4061
+  This change improves reliability
+  by closing all database connections immediately when the context is closed.
+
+### API-Changes
+
+- Remove `MimeMessage::from_bytes()` public interface. #4033
+- BREAKING Types: jsonrpc: `get_messages` now returns a map with `MessageLoadResult` instead of failing completely if one of the requested messages could not be loaded. #4038
+- Add `dc_msg_set_subject()`. C-FFI #4057
+- Mark python bindings as supporting typing according to PEP 561 #4045
+
+
+## 1.108.0
+
+### Changes
+- Use read/write timeouts instead of per-command timeouts for SMTP #3985
+- Cache DNS results for SMTP connections #3985
+- Prefer TLS over STARTTLS during autoconfiguration #4021
+- Use SOCKS5 configuration for HTTP requests #4017
+- Show non-deltachat emails by default for new installations #4019
+- Re-enabled SMTP pipelining after disabling it in #4006
+
+### Fixes
+- Fix Securejoin for multiple devices on a joining side #3982
+- python: handle NULL value returned from `dc_get_msg()` #4020
+  Account.`get_message_by_id` may return `None` in this case.
+
+### API-Changes
+- Remove bitflags from `get_chat_msgs()` interface #4022
+  C interface is not changed.
+  Rust and JSON-RPC API have `flags` integer argument
+  replaced with two boolean flags `info_only` and `add_daymarker`.
+- jsonrpc: add API to check if the message is sent by a bot #3877
+
+
+## 1.107.1
+
+### Changes
+- Log server security (TLS/STARTTLS/plain) type #4005
+
+### Fixes
+- Disable SMTP pipelining #4006
+
+
+## 1.107.0
+
+### Changes
+- Pipeline SMTP commands #3924
+- Cache DNS results for IMAP connections #3970
+
+### Fixes
+- Securejoin: Fix adding and handling Autocrypt-Gossip headers #3914
+- fix verifier-by addr was empty string instead of None #3961
+- Emit DC_EVENT_MSGS_CHANGED for DC_CHAT_ID_ARCHIVED_LINK when the number of archived chats with
+  unread messages increases #3959
+- Fix Peerstate comparison #3962
+- Log SOCKS5 configuration for IMAP like already done for SMTP #3964
+- Fix SOCKS5 usage for IMAP #3965
+- Exit from recently seen loop on interrupt channel errors to avoid busy looping #3966
+
+### API-Changes
+- jsonrpc: add verified-by information to `Contact`-Object
+- Remove `attach_selfavatar` config #3951
+
+### Changes
+- add debug logging support for webxdcs #3296
+
+## 1.106.0
+
+### Changes
+- Only send IncomingMsgBunch if there are more than 0 new messages #3941
+
+### Fixes
+- fix: only send contact changed event for recently seen if it is relevant (not too old to matter) #3938
+- Immediately save `accounts.toml` if it was modified by a migration from absolute paths to relative paths #3943
+- Do not treat invalid email addresses as an exception #3942
+- Add timeouts to HTTP requests #3948
+
+## 1.105.0
+
+### Changes
+- Validate signatures in try_decrypt() even if the message isn't encrypted #3859
+- Don't parse the message again after detached signatures validation #3862
+- Move format=flowed support to a separate crate #3869
+- cargo: bump quick-xml from 0.23.0 to 0.26.0 #3722
+- Add fuzzing tests #3853
+- Add mappings for some file types to Viewtype / MIME type #3881
+- Buffer IMAP client writes #3888
+- move `DC_CHAT_ID_ARCHIVED_LINK` to the top of chat lists
+  and make `dc_get_fresh_msg_cnt()` work for `DC_CHAT_ID_ARCHIVED_LINK` #3918
+- make `dc_marknoticed_chat()` work for `DC_CHAT_ID_ARCHIVED_LINK` #3919
+- Update provider database
+
+### API-Changes
+- jsonrpc: add python API for webxdc updates #3872
+- jsonrpc: add fresh message count to ChatListItemFetchResult::ArchiveLink
+- Add ffi functions to retrieve `verified by` information #3786
+- resultify `Message::get_filebytes()` #3925
+
+### Fixes
+- Do not add an error if the message is encrypted but not signed #3860
+- Do not strip leading spaces from message lines #3867
+- Fix uncaught exception in JSON-RPC tests #3884
+- Fix STARTTLS connection and add a test for it #3907
+- Trigger reconnection when failing to fetch existing messages #3911
+- Do not retry fetching existing messages after failure, prevents infinite reconnection loop #3913
+- Ensure format=flowed formatting is always reversible on the receiver side #3880
+
+
+## 1.104.0
+
+### Changes
+- Don't use deprecated `chrono` functions #3798
+- Document accounts manager #3837
+- If a classical-email-user sends an email to a group and adds new recipients,
+  add the new recipients as group members #3781
+- Remove `pytest-async` plugin #3846
+- Only send the message about ephemeral timer change if the chat is promoted #3847
+- Use relative paths in `accounts.toml` #3838
+
+### Fixes
+- Set read/write timeouts for IMAP over SOCKS5 #3833
+- Treat attached PGP keys as peer keys with mutual encryption preference #3832
+- fix migration of old databases #3842
+- Fix cargo clippy and doc errors after Rust update to 1.66 #3850
+- Don't send GroupNameChanged message if the group name doesn't change in terms of
+  `improve_single_line_input()` #3852
+- Prefer encryption for the peer if the message is encrypted or signed with the known key #3849
+
+
+## 1.103.0
+
+### Changes
+- Disable Autocrypt & Authres-checking for mailing lists,
+  because they don't work well with mailing lists #3765
+- Refactor: Remove the remaining AsRef<str> #3669
+- Add more logging to `fetch_many_msgs` and refactor it #3811
+- Small speedup #3780
+- Log the reason when the message cannot be sent to the chat #3810
+- Add IMAP server ID line to the context info only when it is known #3814
+- Remove autogenerated typescript files #3815
+- Move functions that require an IMAP session from `Imap` to `Session`
+  to reduce the number of code paths where IMAP session may not exist.
+  Drop connection on error instead of trying to disconnect,
+  potentially preventing IMAP task from getting stuck. #3812
+
+### API-Changes
+- Add Python API to send reactions #3762
+- jsonrpc: add message errors to MessageObject #3788
+- jsonrpc: Add async Python client #3734
+
+### Fixes
+- Make sure malformed messages will never block receiving further messages anymore #3771
+- strip leading/trailing whitespace from "Chat-Group-Name{,-Changed}:" headers content #3650
+- Assume all Thunderbird users prefer encryption #3774
+- refactor peerstate handling to ensure no duplicate peerstates #3776
+- Fetch messages in order of their INTERNALDATE (fixes reactions for Gmail f.e.) #3789
+- python: do not pass NULL to ffi.gc if the context can't be created #3818
+- Add read/write timeouts to IMAP sockets #3820
+- Add connection timeout to IMAP sockets #3828
+- Disable read timeout during IMAP IDLE #3826
+- Bots automatically accept mailing lists #3831
+
+## 1.102.0
+
+### Changes
+
+- If an email has multiple From addresses, handle this as if there was
+  no From address, to prevent from forgery attacks. Also, improve
+  handling of emails with invalid From addresses in general #3667
 
 ### API-Changes
 
 ### Fixes
 - fix detection of "All mail", "Trash", "Junk" etc folders. #3760
+- fetch messages sequentially to fix reactions on partially downloaded messages #3688
+- Fix a bug where one malformed message blocked receiving any further messages #3769
 
 
 ## 1.101.0
@@ -134,7 +720,7 @@
   - `importBackup()`
   - `getMessageHtml()` #3671
   - `miscGetStickerFolder` and `miscGetStickers` #3672
-- breaking: jsonrpc: remove function `messageListGetMessageIds()`, it is replaced by `getMessageIds()` and `getMessageListItems()` the latter returns a new `MessageListItem` type, which is the now prefered way of using the message list.
+- breaking: jsonrpc: remove function `messageListGetMessageIds()`, it is replaced by `getMessageIds()` and `getMessageListItems()` the latter returns a new `MessageListItem` type, which is the now preferred way of using the message list.
 - jsonrpc: add type: #3641, #3645
   - `MessageSearchResult`
   - `Location`
@@ -160,7 +746,7 @@
 - jsonrpc js client:
   - Change package name from `deltachat-jsonrpc-client` to `@deltachat/jsonrpc-client`
   - remove relative file dependency to it from `deltachat-node` (because it did not work anyway and broke the nix build of desktop)
-  - ci: add github ci action to upload it to our download server automaticaly on realease
+  - ci: add github ci action to upload it to our download server automatically on release
 
 ## 1.95.0
 
@@ -237,7 +823,7 @@
 - Auto accept contact requests if `Config::Bot` is set for a client #3567 
 - Don't prepend the subject to chat messages in mailinglists
 - fix `set_core_version.py` script to also update version in `deltachat-jsonrpc/typescript/package.json` #3585
-- Reject webxcd-updates from contacts who are not group members #3568
+- Reject webxdc-updates from contacts who are not group members #3568
 
 
 ## 1.93.0
@@ -460,7 +1046,7 @@
 
 ### Fixes
 - node: throw error when getting context with an invalid account id
-- node: throw error when instanciating a wrapper class on `null` (Context, Message, Chat, ChatList and so on)
+- node: throw error when instantiating a wrapper class on `null` (Context, Message, Chat, ChatList and so on)
 - use same contact-color if email address differ only in upper-/lowercase #3327
 - repair encrypted mails "mixed up" by Google Workspace "Append footer" function #3315
 
@@ -548,7 +1134,7 @@
 - hopefully fix a bug where outgoing messages appear twice with Amazon SES #3077
 - do not delete messages without Message-IDs as duplicates #3095
 - assign replies from a different email address to the correct chat #3119
-- assing outgoing private replies to the correct chat #3177
+- assign outgoing private replies to the correct chat #3177
 - start ephemeral timer when seen status is synchronized via IMAP #3122
 - do not create empty contact requests with "setup changed" messages;
   instead, send a "setup changed" message into all chats we share with the peer #3187
@@ -601,7 +1187,7 @@
 - don't watch Sent folder by default #3025
 - use webxdc app name in chatlist/quotes/replies etc. #3027
 - make it possible to cancel message sending by removing the message #3034,
-  this was previosuly removed in 1.71.0 #2939
+  this was previously removed in 1.71.0 #2939
 - synchronize Seen flags only on watched folders to speed up
   folder scanning #3041
 - remove direct dependency on `byteorder` crate #3031
@@ -1823,7 +2409,7 @@
 - #1043 avoid potential crashes in malformed From/Chat-Disposition... headers  
 
 - #1045 #1041 #1038 #1035 #1034 #1029 #1025 various cleanups and doc
-  improvments 
+  improvements
 
 ## 1.0.0-beta.16
 
@@ -1902,7 +2488,7 @@
 - trigger reconnect more often on imap error states.  Should fix an 
   issue observed when trying to empty a folder.  @hpk42
 
-- un-split qr tests: we fixed qr-securejoin protocol flakyness 
+- un-split qr tests: we fixed qr-securejoin protocol flakiness 
   last weeks. @hpk42
 
 ## 1.0.0-beta.10
@@ -1940,7 +2526,7 @@
 
 - fix moving self-sent messages, thanks @r10s, @flub, @hpk42
 
-- fix flakyness/sometimes-failing verified/join-protocols, 
+- fix flakiness/sometimes-failing verified/join-protocols, 
   thanks @flub, @r10s, @hpk42
 
 - fix reply-to-encrypted message to keep encryption 
@@ -1959,7 +2545,7 @@
 
 - fixes imap-protocol parsing bugs that lead to infinitely
   repeated crashing while trying to receive messages with
-  a subjec that contained non-utf8. thanks @link2xt
+  a subject that contained non-utf8. thanks @link2xt
 
 - fixed logic to find encryption subkey -- previously 
   delta chat would use the primary key for encryption
@@ -2067,3 +2653,22 @@
 For a full list of changes, please see our closed Pull Requests: 
 
 https://github.com/deltachat/deltachat-core-rust/pulls?q=is%3Apr+is%3Aclosed
+
+[1.111.0]: https://github.com/deltachat/deltachat-core-rust/compare/v1.110.0...v1.111.0
+[1.112.0]: https://github.com/deltachat/deltachat-core-rust/compare/v1.111.0...v1.112.0
+[1.112.1]: https://github.com/deltachat/deltachat-core-rust/compare/v1.112.0...v1.112.1
+[1.112.2]: https://github.com/deltachat/deltachat-core-rust/compare/v1.112.1...v1.112.2
+[1.112.3]: https://github.com/deltachat/deltachat-core-rust/compare/v1.112.2...v1.112.3
+[1.112.4]: https://github.com/deltachat/deltachat-core-rust/compare/v1.112.3...v1.112.4
+[1.112.5]: https://github.com/deltachat/deltachat-core-rust/compare/v1.112.4...v1.112.5
+[1.112.6]: https://github.com/deltachat/deltachat-core-rust/compare/v1.112.5...v1.112.6
+[1.112.7]: https://github.com/deltachat/deltachat-core-rust/compare/v1.112.6...v1.112.7
+[1.112.8]: https://github.com/deltachat/deltachat-core-rust/compare/v1.112.7...v1.112.8
+[1.112.9]: https://github.com/deltachat/deltachat-core-rust/compare/v1.112.8...v1.112.9
+[1.112.10]: https://github.com/deltachat/deltachat-core-rust/compare/v1.112.9...v1.112.10
+[1.113.0]: https://github.com/deltachat/deltachat-core-rust/compare/v1.112.9...v1.113.0
+[1.114.0]: https://github.com/deltachat/deltachat-core-rust/compare/v1.113.0...v1.114.0
+[1.115.0]: https://github.com/deltachat/deltachat-core-rust/compare/v1.114.0...v1.115.0
+[1.116.0]: https://github.com/deltachat/deltachat-core-rust/compare/v1.115.0...v1.116.0
+[1.117.0]: https://github.com/deltachat/deltachat-core-rust/compare/v1.116.0...v1.117.0
+[1.118.0]: https://github.com/deltachat/deltachat-core-rust/compare/v1.117.0...v1.118.0

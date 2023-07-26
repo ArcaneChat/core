@@ -1,51 +1,65 @@
+# GitHub Actions workflow to
+# lint Rust and Python code
+# and run Rust tests, Python tests and async Python tests.
+
 name: Rust CI
+
+# Cancel previously started workflow runs
+# when the branch is updated.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 on:
   pull_request:
   push:
     branches:
       - master
-      - staging
-      - trying
 
 env:
   RUSTFLAGS: -Dwarnings
-   
+
 jobs:
+  lint_rust:
+    name: Lint Rust
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: 1.71.0
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install rustfmt and clippy
+        run: rustup toolchain install $RUSTUP_TOOLCHAIN --profile minimal --component rustfmt --component clippy
+      - name: Cache rust cargo artifacts
+        uses: swatinem/rust-cache@v2
+      - name: Run rustfmt
+        run: cargo fmt --all -- --check
+      - name: Run clippy
+        run: scripts/clippy.sh
+      - name: Check
+        run: cargo check --workspace --all-targets --all-features
 
-  fmt:
-    name: Rustfmt
+      # Check with musl libc target which is used for `deltachat-rpc-server` releases.
+      - name: Check musl
+        run: scripts/zig-musl-check.sh
+
+  cargo_deny:
+    name: cargo deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions-rs/toolchain@v1
+      - uses: actions/checkout@v3
+      - uses: EmbarkStudios/cargo-deny-action@v1
         with:
-          profile: minimal
-          toolchain: stable
-          override: true
-      - run: rustup component add rustfmt
-      - name: Cache rust cargo artifacts
-        uses: swatinem/rust-cache@v1
-      - uses: actions-rs/cargo@v1
-        with:
-          command: fmt
-          args: --all -- --check
+          arguments: --all-features --workspace
+          command: check
+          command-arguments: "-Dwarnings"
 
-  run_clippy:
+  provider_database:
+    name: Check provider database
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions-rs/toolchain@v1
-        with:
-            toolchain: stable
-            components: clippy
-            override: true
-      - name: Cache rust cargo artifacts
-        uses: swatinem/rust-cache@v1
-      - uses: actions-rs/clippy-check@v1
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          args: --workspace --tests --examples --benches --features repl -- -D warnings
+      - uses: actions/checkout@v3
+      - name: Check provider database
+        run: scripts/update-provider-database.sh
 
   docs:
     name: Rust doc comments
@@ -54,110 +68,208 @@ jobs:
       RUSTDOCFLAGS: -Dwarnings
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v2
-      - name: Install rust stable toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          profile: minimal
-          components: rust-docs
-          override: true
+        uses: actions/checkout@v3
       - name: Cache rust cargo artifacts
-        uses: swatinem/rust-cache@v1
+        uses: swatinem/rust-cache@v2
       - name: Rustdoc
-        uses: actions-rs/cargo@v1
-        with:
-          command: doc
-          args: --document-private-items --no-deps
+        run: cargo doc --document-private-items --no-deps
 
-  build_and_test:
-    name: Build and test
+  rust_tests:
+    name: Rust tests
     strategy:
       matrix:
         include:
-          # Currently used Rust version, same as in `rust-toolchain` file.
           - os: ubuntu-latest
-            rust: 1.61.0
-            python: 3.9
+            rust: 1.71.0
           - os: windows-latest
-            rust: 1.61.0
-            python: false # Python bindings compilation on Windows is not supported.
+            rust: 1.71.0
+          - os: macos-latest
+            rust: 1.71.0
 
-          # Minimum Supported Rust Version = 1.57.0
-          #
-          # Minimum Supported Python Version = 3.7
-          # This is the minimum version for which manylinux Python wheels are
-          # built.
+          # Minimum Supported Rust Version = 1.66.0
           - os: ubuntu-latest
-            rust: 1.57.0
-            python: 3.7
+            rust: 1.66.0
     runs-on: ${{ matrix.os }}
     steps:
-    - uses: actions/checkout@master
+      - uses: actions/checkout@v3
 
-    - name: Install ${{ matrix.rust }}
-      uses: actions-rs/toolchain@v1
-      with:
-        toolchain: ${{ matrix.rust }}
-        override: true
+      - name: Install Rust ${{ matrix.rust }}
+        run: rustup toolchain install --profile minimal ${{ matrix.rust }}
+      - run: rustup override set ${{ matrix.rust }}
 
-    - name: Cache rust cargo artifacts
-      uses: swatinem/rust-cache@v1
+      - name: Cache rust cargo artifacts
+        uses: swatinem/rust-cache@v2
 
-    - name: check
-      uses: actions-rs/cargo@v1
-      with:
-        command: check
-        args: --all --bins --examples --tests --features repl --benches
+      - name: Tests
+        run: cargo test --workspace
 
-    - name: tests
-      uses: actions-rs/cargo@v1
-      with:
-        command: test
-        args: --all
+      - name: Test cargo vendor
+        run: cargo vendor
 
-    - name: test cargo vendor
-      uses: actions-rs/cargo@v1
-      with:
-        command: vendor
+  c_library:
+    name: Build C library
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v3
 
-    - name: install python
-      if: ${{ matrix.python }}
-      uses: actions/setup-python@v4
-      with:
-        python-version: ${{ matrix.python }}
+      - name: Cache rust cargo artifacts
+        uses: swatinem/rust-cache@v2
 
-    - name: install tox
-      if: ${{ matrix.python }}
-      run: pip install tox
+      - name: Build C library
+        run: cargo build -p deltachat_ffi --features jsonrpc
 
-    - name: build C library
-      if: ${{ matrix.python }}
-      uses: actions-rs/cargo@v1
-      with:
-        command: build
-        args: -p deltachat_ffi --features jsonrpc
+      - name: Upload C library
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ matrix.os }}-libdeltachat.a
+          path: target/debug/libdeltachat.a
+          retention-days: 1
 
-    - name: run python tests
-      if: ${{ matrix.python }}
-      env:
-        DCC_NEW_TMP_EMAIL: ${{ secrets.DCC_NEW_TMP_EMAIL }}
-        DCC_RS_TARGET: debug
-        DCC_RS_DEV: ${{ github.workspace }}
-      working-directory: python
-      run: tox -e lint,mypy,doc,py3
+  rpc_server:
+    name: Build deltachat-rpc-server
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v3
 
-    - name: install pypy
-      if: ${{ matrix.python }}
-      uses: actions/setup-python@v4
-      with:
-        python-version: 'pypy${{ matrix.python }}'
+      - name: Cache rust cargo artifacts
+        uses: swatinem/rust-cache@v2
 
-    - name: run pypy tests
-      if: ${{ matrix.python }}
-      env:
-        DCC_NEW_TMP_EMAIL: ${{ secrets.DCC_NEW_TMP_EMAIL }}
-        DCC_RS_TARGET: debug
-        DCC_RS_DEV: ${{ github.workspace }}
-      working-directory: python
-      run: tox -e pypy3
+      - name: Build deltachat-rpc-server
+        run: cargo build -p deltachat-rpc-server
+
+      - name: Upload deltachat-rpc-server
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ matrix.os }}-deltachat-rpc-server
+          path: target/debug/deltachat-rpc-server
+          retention-days: 1
+
+  python_lint:
+    name: Python lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v3
+
+      - name: Install tox
+        run: pip install tox
+
+      - name: Lint Python bindings
+        working-directory: python
+        run: tox -e lint
+
+      - name: Lint deltachat-rpc-client
+        working-directory: deltachat-rpc-client
+        run: tox -e lint
+
+  python_tests:
+    name: Python tests
+    needs: ["c_library", "python_lint"]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Currently used Rust version.
+          - os: ubuntu-latest
+            python: 3.11
+          - os: macos-latest
+            python: 3.11
+
+          # PyPy tests
+          - os: ubuntu-latest
+            python: pypy3.9
+          - os: macos-latest
+            python: pypy3.9
+
+          # Minimum Supported Python Version = 3.7
+          # This is the minimum version for which manylinux Python wheels are
+          # built. Test it with minimum supported Rust version.
+          - os: ubuntu-latest
+            python: 3.7
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Download libdeltachat.a
+        uses: actions/download-artifact@v3
+        with:
+          name: ${{ matrix.os }}-libdeltachat.a
+          path: target/debug
+
+      - name: Install python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install tox
+        run: pip install tox
+
+      - name: Run python tests
+        env:
+          DCC_NEW_TMP_EMAIL: ${{ secrets.DCC_NEW_TMP_EMAIL }}
+          DCC_RS_TARGET: debug
+          DCC_RS_DEV: ${{ github.workspace }}
+        working-directory: python
+        run: tox -e mypy,doc,py
+
+  aysnc_python_tests:
+    name: Async Python tests
+    needs: ["python_lint", "rpc_server"]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: 3.11
+          - os: macos-latest
+            python: 3.11
+
+          # PyPy tests
+          - os: ubuntu-latest
+            python: pypy3.9
+          - os: macos-latest
+            python: pypy3.9
+
+          # Minimum Supported Python Version = 3.8
+          #
+          # Python 3.7 has at least one known bug related to starting subprocesses
+          # in asyncio programs: <https://bugs.python.org/issue35621>
+          - os: ubuntu-latest
+            python: 3.8
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install tox
+        run: pip install tox
+
+      - name: Download deltachat-rpc-server
+        uses: actions/download-artifact@v3
+        with:
+          name: ${{ matrix.os }}-deltachat-rpc-server
+          path: target/debug
+
+      - name: Make deltachat-rpc-server executable
+        run: chmod +x target/debug/deltachat-rpc-server
+
+      - name: Add deltachat-rpc-server to path
+        run: echo ${{ github.workspace }}/target/debug >> $GITHUB_PATH
+
+      - name: Run deltachat-rpc-client tests
+        env:
+          DCC_NEW_TMP_EMAIL: ${{ secrets.DCC_NEW_TMP_EMAIL }}
+        working-directory: deltachat-rpc-client
+        run: tox -e py

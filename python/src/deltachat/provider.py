@@ -8,8 +8,9 @@ class ProviderNotFoundError(Exception):
     """The provider information was not found."""
 
 
-class Provider(object):
-    """Provider information.
+class Provider:
+    """
+    Provider information.
 
     :param domain: The email to get the provider info for.
     """

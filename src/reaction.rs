@@ -14,6 +14,7 @@
 //! possible to remove all reactions by sending an empty string as a reaction,
 //! even though RFC 9078 requires at least one emoji to be sent.
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -30,7 +31,7 @@ use crate::message::{rfc724_mid_exists, Message, MsgId, Viewtype};
 /// It is guaranteed to have all emojis sorted and deduplicated inside.
 #[derive(Debug, Default, Clone)]
 pub struct Reaction {
-    /// Canonical represntation of reaction as a string of space-separated emojis.
+    /// Canonical representation of reaction as a string of space-separated emojis.
     reaction: String,
 }
 
@@ -116,10 +117,9 @@ impl Reactions {
     pub fn is_empty(&self) -> bool {
         self.reactions.is_empty()
     }
-}
 
-impl fmt::Display for Reactions {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    /// Returns a map from emojis to their frequencies.
+    pub fn emoji_frequencies(&self) -> BTreeMap<String, usize> {
         let mut emoji_frequencies: BTreeMap<String, usize> = BTreeMap::new();
         for reaction in self.reactions.values() {
             for emoji in reaction.emojis() {
@@ -129,13 +129,37 @@ impl fmt::Display for Reactions {
                     .or_insert(1);
             }
         }
+        emoji_frequencies
+    }
+
+    /// Returns a vector of emojis
+    /// sorted in descending order of frequencies.
+    ///
+    /// This function can be used to display the reactions in
+    /// the message bubble in the UIs.
+    pub fn emoji_sorted_by_frequency(&self) -> Vec<(String, usize)> {
+        let mut emoji_frequencies: Vec<(String, usize)> =
+            self.emoji_frequencies().into_iter().collect();
+        emoji_frequencies.sort_by(|(a, a_count), (b, b_count)| {
+            match a_count.cmp(b_count).reverse() {
+                Ordering::Equal => a.cmp(b),
+                other => other,
+            }
+        });
+        emoji_frequencies
+    }
+}
+
+impl fmt::Display for Reactions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let emoji_frequencies = self.emoji_sorted_by_frequency();
         let mut first = true;
         for (emoji, frequency) in emoji_frequencies {
             if !first {
                 write!(f, " ")?;
             }
             first = false;
-            write!(f, "{}{}", emoji, frequency)?;
+            write!(f, "{emoji}{frequency}")?;
         }
         Ok(())
     }
@@ -156,7 +180,7 @@ async fn set_msg_id_reaction(
                 "DELETE FROM reactions
                  WHERE msg_id = ?1
                  AND contact_id = ?2",
-                paramsv![msg_id, contact_id],
+                (msg_id, contact_id),
             )
             .await?;
     } else {
@@ -167,7 +191,7 @@ async fn set_msg_id_reaction(
                  VALUES (?1, ?2, ?3)
                  ON CONFLICT(msg_id, contact_id)
                  DO UPDATE SET reaction=excluded.reaction",
-                paramsv![msg_id, contact_id, reaction.as_str()],
+                (msg_id, contact_id, reaction.as_str()),
             )
             .await?;
     }
@@ -190,12 +214,12 @@ pub async fn send_reaction(context: &Context, msg_id: MsgId, reaction: &str) -> 
 
     let reaction: Reaction = reaction.into();
     let mut reaction_msg = Message::new(Viewtype::Text);
-    reaction_msg.text = Some(reaction.as_str().to_string());
+    reaction_msg.text = reaction.as_str().to_string();
     reaction_msg.set_reaction();
     reaction_msg.in_reply_to = Some(msg.rfc724_mid);
     reaction_msg.hidden = true;
 
-    // Send messsage first.
+    // Send message first.
     let reaction_msg_id = send_msg(context, chat_id, &mut reaction_msg).await?;
 
     // Only set reaction if we successfully sent the message.
@@ -247,7 +271,7 @@ async fn get_self_reaction(context: &Context, msg_id: MsgId) -> Result<Reaction>
             "SELECT reaction
              FROM reactions
              WHERE msg_id=? AND contact_id=?",
-            paramsv![msg_id, ContactId::SELF],
+            (msg_id, ContactId::SELF),
         )
         .await?;
     Ok(reaction_str
@@ -262,7 +286,7 @@ pub async fn get_msg_reactions(context: &Context, msg_id: MsgId) -> Result<React
         .sql
         .query_map(
             "SELECT contact_id, reaction FROM reactions WHERE msg_id=?",
-            paramsv![msg_id],
+            (msg_id,),
             |row| {
                 let contact_id: ContactId = row.get(0)?;
                 let reaction: String = row.get(1)?;
@@ -287,14 +311,14 @@ pub async fn get_msg_reactions(context: &Context, msg_id: MsgId) -> Result<React
 mod tests {
     use super::*;
     use crate::chat::get_chat_msgs;
-
     use crate::config::Config;
     use crate::constants::DC_CHAT_ID_TRASH;
-    use crate::contact::{Contact, Origin};
+    use crate::contact::{Contact, ContactAddress, Origin};
     use crate::download::DownloadState;
     use crate::message::MessageState;
     use crate::receive_imf::{receive_imf, receive_imf_inner};
     use crate::test_utils::TestContext;
+    use crate::test_utils::TestContextManager;
 
     #[test]
     fn test_parse_reaction() {
@@ -344,7 +368,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_receive_reaction() -> Result<()> {
         let alice = TestContext::new_alice().await;
-        alice.set_config(Config::ShowEmails, Some("2")).await?;
 
         // Alice receives BCC-self copy of a message sent to Bob.
         receive_imf(
@@ -366,9 +389,14 @@ Can we chat at 1pm pacific, today?"
         let contacts = reactions.contacts();
         assert_eq!(contacts.len(), 0);
 
-        let bob_id = Contact::add_or_lookup(&alice, "", "bob@example.net", Origin::ManuallyCreated)
-            .await?
-            .0;
+        let bob_id = Contact::add_or_lookup(
+            &alice,
+            "",
+            ContactAddress::new("bob@example.net")?,
+            Origin::ManuallyCreated,
+        )
+        .await?
+        .0;
         let bob_reaction = reactions.get(bob_id);
         assert!(bob_reaction.is_empty()); // Bob has not reacted to message yet.
 
@@ -439,24 +467,24 @@ Content-Disposition: reaction\n\
         let chat_alice = alice.create_chat(&bob).await;
         let alice_msg = alice.send_text(chat_alice.id, "Hi!").await;
         let bob_msg = bob.recv_msg(&alice_msg).await;
-        assert_eq!(get_chat_msgs(&alice, chat_alice.id, 0).await?.len(), 1);
-        assert_eq!(get_chat_msgs(&bob, bob_msg.chat_id, 0).await?.len(), 1);
+        assert_eq!(get_chat_msgs(&alice, chat_alice.id).await?.len(), 1);
+        assert_eq!(get_chat_msgs(&bob, bob_msg.chat_id).await?.len(), 1);
 
         let alice_msg2 = alice.send_text(chat_alice.id, "Hi again!").await;
         bob.recv_msg(&alice_msg2).await;
-        assert_eq!(get_chat_msgs(&alice, chat_alice.id, 0).await?.len(), 2);
-        assert_eq!(get_chat_msgs(&bob, bob_msg.chat_id, 0).await?.len(), 2);
+        assert_eq!(get_chat_msgs(&alice, chat_alice.id).await?.len(), 2);
+        assert_eq!(get_chat_msgs(&bob, bob_msg.chat_id).await?.len(), 2);
 
         bob_msg.chat_id.accept(&bob).await?;
 
         send_reaction(&bob, bob_msg.id, "👍").await.unwrap();
         expect_reactions_changed_event(&bob, bob_msg.chat_id, bob_msg.id, ContactId::SELF).await?;
-        assert_eq!(get_chat_msgs(&bob, bob_msg.chat_id, 0).await?.len(), 2);
+        assert_eq!(get_chat_msgs(&bob, bob_msg.chat_id).await?.len(), 2);
 
         let bob_reaction_msg = bob.pop_sent_msg().await;
         let alice_reaction_msg = alice.recv_msg_opt(&bob_reaction_msg).await.unwrap();
         assert_eq!(alice_reaction_msg.chat_id, DC_CHAT_ID_TRASH);
-        assert_eq!(get_chat_msgs(&alice, chat_alice.id, 0).await?.len(), 2);
+        assert_eq!(get_chat_msgs(&alice, chat_alice.id).await?.len(), 2);
 
         let reactions = get_msg_reactions(&alice, alice_msg.sender_msg_id).await?;
         assert_eq!(reactions.to_string(), "👍1");
@@ -477,6 +505,11 @@ Content-Disposition: reaction\n\
         let reactions = get_msg_reactions(&alice, alice_msg.sender_msg_id).await?;
         assert_eq!(reactions.to_string(), "👍2 😀1");
 
+        assert_eq!(
+            reactions.emoji_sorted_by_frequency(),
+            vec![("👍".to_string(), 2), ("😀".to_string(), 1)]
+        );
+
         Ok(())
     }
 
@@ -496,7 +529,7 @@ Content-Disposition: reaction\n\
                     Message-ID: <first@example.org>\n\
                     Date: Sun, 14 Nov 2021 00:10:00 +0000\
                     Content-Type: text/plain";
-        let msg_full = format!("{}\n\n100k text...", msg_header);
+        let msg_full = format!("{msg_header}\n\n100k text...");
 
         // Alice downloads message from Bob partially.
         let alice_received_message = receive_imf_inner(
@@ -546,6 +579,42 @@ Content-Disposition: reaction\n\
         let reactions = get_msg_reactions(&alice, alice_msg_id).await?;
         assert_eq!(reactions.to_string(), "👍1");
 
+        Ok(())
+    }
+
+    /// Regression test for reaction resetting self-status.
+    ///
+    /// Reactions do not contain the status,
+    /// but should not result in self-status being reset on other devices.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_reaction_status_multidevice() -> Result<()> {
+        let mut tcm = TestContextManager::new();
+        let alice1 = tcm.alice().await;
+        let alice2 = tcm.alice().await;
+
+        alice1
+            .set_config(Config::Selfstatus, Some("New status"))
+            .await?;
+
+        let alice2_msg = tcm.send_recv(&alice1, &alice2, "Hi!").await;
+        assert_eq!(
+            alice2.get_config(Config::Selfstatus).await?.as_deref(),
+            Some("New status")
+        );
+
+        // Alice reacts to own message from second device,
+        // first device receives rection.
+        {
+            send_reaction(&alice2, alice2_msg.id, "👍").await?;
+            let msg = alice2.pop_sent_msg().await;
+            alice1.recv_msg(&msg).await;
+        }
+
+        // Check that the status is still the same.
+        assert_eq!(
+            alice1.get_config(Config::Selfstatus).await?.as_deref(),
+            Some("New status")
+        );
         Ok(())
     }
 }

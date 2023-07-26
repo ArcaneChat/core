@@ -1,22 +1,25 @@
 //! # SMTP message sending
 
-use super::Smtp;
-use async_smtp::{EmailAddress, Envelope, SendableEmail, Transport};
+use async_smtp::{EmailAddress, Envelope, SendableEmail};
 
+use super::Smtp;
 use crate::config::Config;
-use crate::constants::DEFAULT_MAX_SMTP_RCPT_TO;
 use crate::context::Context;
 use crate::events::EventType;
-use std::time::Duration;
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+// if more recipients are needed in SMTP's `RCPT TO:` header, recipient-list is split to chunks.
+// this does not affect MIME'e `To:` header.
+// can be overwritten by the setting `max_smtp_rcpt_to` in provider-db.
+pub(crate) const DEFAULT_MAX_SMTP_RCPT_TO: usize = 50;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("Envelope error: {}", _0)]
-    Envelope(#[from] async_smtp::error::Error),
+    Envelope(anyhow::Error),
     #[error("Send error: {}", _0)]
-    SmtpSend(#[from] async_smtp::smtp::error::Error),
+    SmtpSend(async_smtp::error::Error),
     #[error("SMTP has no transport")]
     NoTransport,
     #[error("{}", _0)]
@@ -31,7 +34,6 @@ impl Smtp {
         context: &Context,
         recipients: &[EmailAddress],
         message: &[u8],
-        rowid: i64,
     ) -> Result<()> {
         if !context.get_config_bool(Config::Bot).await? {
             // Notify ratelimiter about sent message regardless of whether quota is exceeded or not.
@@ -42,14 +44,11 @@ impl Smtp {
 
         let message_len_bytes = message.len();
 
-        let mut chunk_size = DEFAULT_MAX_SMTP_RCPT_TO;
-        if let Some(provider) = context.get_configured_provider().await? {
-            if let Some(max_smtp_rcpt_to) = provider.max_smtp_rcpt_to {
-                chunk_size = max_smtp_rcpt_to as usize;
-            }
-        } else if self.from.clone().unwrap().to_string().ends_with("@nauta.cu") {
-	    chunk_size = 20;
-	}
+        let chunk_size = context
+            .get_configured_provider()
+            .await?
+            .and_then(|provider| provider.opt.max_smtp_rcpt_to)
+            .map_or(DEFAULT_MAX_SMTP_RCPT_TO, usize::from);
 
         for recipients_chunk in recipients.chunks(chunk_size) {
             let recipients_display = recipients_chunk
@@ -60,24 +59,16 @@ impl Smtp {
 
             let envelope = Envelope::new(self.from.clone(), recipients_chunk.to_vec())
                 .map_err(Error::Envelope)?;
-            let mail = SendableEmail::new(
-                envelope,
-                rowid.to_string(), // only used for internal logging
-                message,
-            );
+            let mail = SendableEmail::new(envelope, message);
 
             if let Some(ref mut transport) = self.transport {
-                // The timeout is 1min + 3min per MB.
-                let timeout = 60 + (180 * message_len_bytes / 1_000_000) as u64;
-                transport
-                    .send_with_timeout(mail, Some(&Duration::from_secs(timeout)))
-                    .await
-                    .map_err(Error::SmtpSend)?;
+                transport.send(mail).await.map_err(Error::SmtpSend)?;
 
-                context.emit_event(EventType::SmtpMessageSent(format!(
-                    "Message len={} was smtp-sent to {}",
-                    message_len_bytes, recipients_display
-                )));
+                let info_msg = format!(
+                    "Message len={message_len_bytes} was SMTP-sent to {recipients_display}"
+                );
+                info!(context, "{info_msg}.");
+                context.emit_event(EventType::SmtpMessageSent(info_msg));
                 self.last_success = Some(std::time::SystemTime::now());
             } else {
                 warn!(

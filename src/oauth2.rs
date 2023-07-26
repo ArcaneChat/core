@@ -10,6 +10,7 @@ use crate::config::Config;
 use crate::context::Context;
 use crate::provider;
 use crate::provider::Oauth2Authorizer;
+use crate::socks::Socks5Config;
 use crate::tools::time;
 
 const OAUTH2_GMAIL: Oauth2 = Oauth2 {
@@ -53,6 +54,8 @@ struct Response {
     scope: Option<String>,
 }
 
+/// Returns URL that should be opened in the browser
+/// if OAuth 2 is supported for this address.
 pub async fn get_oauth2_url(
     context: &Context,
     addr: &str,
@@ -73,7 +76,7 @@ pub async fn get_oauth2_url(
     }
 }
 
-pub async fn get_oauth2_access_token(
+pub(crate) async fn get_oauth2_access_token(
     context: &Context,
     addr: &str,
     code: &str,
@@ -156,7 +159,8 @@ pub async fn get_oauth2_access_token(
         }
 
         // ... and POST
-        let client = reqwest::Client::new();
+        let socks5_config = Socks5Config::from_database(&context.sql).await?;
+        let client = crate::net::http::get_client(socks5_config)?;
 
         let response: Response = match client.post(post_url).form(&post_param).send().await {
             Ok(resp) => match resp.json().await {
@@ -224,7 +228,11 @@ pub async fn get_oauth2_access_token(
     }
 }
 
-pub async fn get_oauth2_addr(context: &Context, addr: &str, code: &str) -> Result<Option<String>> {
+pub(crate) async fn get_oauth2_addr(
+    context: &Context,
+    addr: &str,
+    code: &str,
+) -> Result<Option<String>> {
     let socks5_enabled = context.get_config_bool(Config::Socks5Enabled).await?;
     let oauth2 = match Oauth2::from_address(context, addr, socks5_enabled).await {
         Some(o) => o,
@@ -282,7 +290,15 @@ impl Oauth2 {
         //   "verified_email": true,
         //   "picture": "https://lh4.googleusercontent.com/-Gj5jh_9R0BY/AAAAAAAAAAI/AAAAAAAAAAA/IAjtjfjtjNA/photo.jpg"
         // }
-        let response = match reqwest::get(userinfo_url).await {
+        let socks5_config = Socks5Config::from_database(&context.sql).await.ok()?;
+        let client = match crate::net::http::get_client(socks5_config) {
+            Ok(cl) => cl,
+            Err(err) => {
+                warn!(context, "failed to get HTTP client: {}", err);
+                return None;
+            }
+        };
+        let response = match client.get(userinfo_url).send().await {
             Ok(response) => response,
             Err(err) => {
                 warn!(context, "failed to get userinfo: {}", err);
@@ -343,7 +359,6 @@ fn normalize_addr(addr: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     use crate::test_utils::TestContext;
 
     #[test]

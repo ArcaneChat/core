@@ -1,6 +1,9 @@
 import sys
 
-from pkg_resources import DistributionNotFound, get_distribution
+if sys.version_info >= (3, 8):
+    from importlib.metadata import PackageNotFoundError, version
+else:
+    from importlib_metadata import PackageNotFoundError, version
 
 from . import capi, events, hookspec  # noqa
 from .account import Account, get_core_info  # noqa
@@ -11,8 +14,8 @@ from .hookspec import account_hookimpl, global_hookimpl  # noqa
 from .message import Message  # noqa
 
 try:
-    __version__ = get_distribution(__name__).version
-except DistributionNotFound:
+    __version__ = version(__name__)
+except PackageNotFoundError:
     # package is not installed
     __version__ = "0.0.0.dev0-unknown"
 
@@ -36,7 +39,8 @@ register_global_plugin(events)
 
 def run_cmdline(argv=None, account_plugins=None):
     """Run a simple default command line app, registering the specified
-    account plugins."""
+    account plugins.
+    """
     import argparse
 
     if argv is None:
@@ -54,6 +58,7 @@ def run_cmdline(argv=None, account_plugins=None):
 
     ac.run_account(addr=args.email, password=args.password, account_plugins=account_plugins, show_ffi=args.show_ffi)
 
-    print("{}: waiting for message".format(ac.get_config("addr")))
+    addr = ac.get_config("addr")
+    print(f"{addr}: waiting for message")
 
     ac.wait_shutdown()

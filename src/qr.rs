@@ -1,26 +1,27 @@
 //! # QR code module.
 
 mod dclogin_scheme;
-pub use dclogin_scheme::LoginOptions;
+use std::collections::BTreeMap;
 
-use anyhow::{anyhow, bail, ensure, Context as _, Error, Result};
+use anyhow::{anyhow, bail, ensure, Context as _, Result};
+pub use dclogin_scheme::LoginOptions;
 use once_cell::sync::Lazy;
 use percent_encoding::percent_decode_str;
 use serde::Deserialize;
-use std::collections::BTreeMap;
 
-use crate::chat::{self, get_chat_id_by_grpid, ChatIdBlocked};
+use self::dclogin_scheme::configure_from_login_qr;
+use crate::chat::{get_chat_id_by_grpid, ChatIdBlocked};
 use crate::config::Config;
 use crate::constants::Blocked;
-use crate::contact::{addr_normalize, may_be_valid_addr, Contact, ContactId, Origin};
+use crate::contact::{
+    addr_normalize, may_be_valid_addr, Contact, ContactAddress, ContactId, Origin,
+};
 use crate::context::Context;
 use crate::key::Fingerprint;
 use crate::message::Message;
 use crate::peerstate::Peerstate;
-use crate::tools::time;
+use crate::socks::Socks5Config;
 use crate::{token, EventType};
-
-use self::dclogin_scheme::configure_from_login_qr;
 
 const OPENPGP4FPR_SCHEME: &str = "OPENPGP4FPR:"; // yes: uppercase
 const DCACCOUNT_SCHEME: &str = "DCACCOUNT:";
@@ -32,79 +33,206 @@ const VCARD_SCHEME: &str = "BEGIN:VCARD";
 const SMTP_SCHEME: &str = "SMTP:";
 const HTTP_SCHEME: &str = "http://";
 const HTTPS_SCHEME: &str = "https://";
+pub(crate) const DCBACKUP_SCHEME: &str = "DCBACKUP:";
 
+/// Scanned QR code.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Qr {
+    /// Ask the user whether to verify the contact.
+    ///
+    /// If the user agrees, pass this QR code to [`crate::securejoin::join_securejoin`].
     AskVerifyContact {
+        /// ID of the contact.
         contact_id: ContactId,
+
+        /// Fingerprint of the contact key as scanned from the QR code.
         fingerprint: Fingerprint,
+
+        /// Invite number.
         invitenumber: String,
+
+        /// Authentication code.
         authcode: String,
     },
+
+    /// Ask the user whether to join the group.
     AskVerifyGroup {
+        /// Group name.
         grpname: String,
+
+        /// Group ID.
         grpid: String,
+
+        /// ID of the contact.
         contact_id: ContactId,
+
+        /// Fingerprint of the contact key as scanned from the QR code.
         fingerprint: Fingerprint,
+
+        /// Invite number.
         invitenumber: String,
+
+        /// Authentication code.
         authcode: String,
     },
+
+    /// Contact fingerprint is verified.
+    ///
+    /// Ask the user if they want to start chatting.
     FprOk {
+        /// Contact ID.
         contact_id: ContactId,
     },
+
+    /// Scanned fingerprint does not match the last seen fingerprint.
     FprMismatch {
+        /// Contact ID.
         contact_id: Option<ContactId>,
     },
+
+    /// The scanned QR code contains a fingerprint but no e-mail address.
     FprWithoutAddr {
+        /// Key fingerprint.
         fingerprint: String,
     },
+
+    /// Ask the user if they want to create an account on the given domain.
     Account {
+        /// Server domain name.
         domain: String,
     },
+
+    /// Provides a backup that can be retrieve.
+    ///
+    /// This contains all the data needed to connect to a device and download a backup from
+    /// it to configure the receiving device with the same account.
+    Backup {
+        /// Printable version of the provider information.
+        ///
+        /// This is the printable version of a `sendme` ticket, which contains all the
+        /// information to connect to and authenticate a backup provider.
+        ///
+        /// The format is somewhat opaque, but `sendme` can deserialise this.
+        ticket: iroh::provider::Ticket,
+    },
+
+    /// Ask the user if they want to use the given service for video chats.
     WebrtcInstance {
+        /// Server domain name.
         domain: String,
+
+        /// URL pattern for video chat rooms.
         instance_pattern: String,
     },
+
+    /// Contact address is scanned.
+    ///
+    /// Optionally, a draft message could be provided.
+    /// Ask the user if they want to start chatting.
     Addr {
+        /// Contact ID.
         contact_id: ContactId,
+
+        /// Draft message.
         draft: Option<String>,
     },
+
+    /// URL scanned.
+    ///
+    /// Ask the user if they want to open a browser or copy the URL to clipboard.
     Url {
+        /// URL.
         url: String,
     },
+
+    /// Text scanned.
+    ///
+    /// Ask the user if they want to copy the text to clipboard.
     Text {
+        /// Scanned text.
         text: String,
     },
+
+    /// Ask the user if they want to withdraw their own QR code.
     WithdrawVerifyContact {
+        /// Contact ID.
         contact_id: ContactId,
+
+        /// Fingerprint of the contact key as scanned from the QR code.
         fingerprint: Fingerprint,
+
+        /// Invite number.
         invitenumber: String,
+
+        /// Authentication code.
         authcode: String,
     },
+
+    /// Ask the user if they want to withdraw their own group invite QR code.
     WithdrawVerifyGroup {
+        /// Group name.
         grpname: String,
+
+        /// Group ID.
         grpid: String,
+
+        /// Contact ID.
         contact_id: ContactId,
+
+        /// Fingerprint of the contact key as scanned from the QR code.
         fingerprint: Fingerprint,
+
+        /// Invite number.
         invitenumber: String,
+
+        /// Authentication code.
         authcode: String,
     },
+
+    /// Ask the user if they want to revive their own QR code.
     ReviveVerifyContact {
+        /// Contact ID.
         contact_id: ContactId,
+
+        /// Fingerprint of the contact key as scanned from the QR code.
         fingerprint: Fingerprint,
+
+        /// Invite number.
         invitenumber: String,
+
+        /// Authentication code.
         authcode: String,
     },
+
+    /// Ask the user if they want to revive their own group invite QR code.
     ReviveVerifyGroup {
+        /// Group name.
         grpname: String,
+
+        /// Group ID.
         grpid: String,
+
+        /// Contact ID.
         contact_id: ContactId,
+
+        /// Fingerprint of the contact key as scanned from the QR code.
         fingerprint: Fingerprint,
+
+        /// Invite number.
         invitenumber: String,
+
+        /// Authentication code.
         authcode: String,
     },
+
+    /// `dclogin:` scheme parameters.
+    ///
+    /// Ask the user if they want to login with the email address.
     Login {
+        /// Email address.
         address: String,
+
+        /// Login parameters.
         options: LoginOptions,
     },
 }
@@ -113,7 +241,8 @@ fn starts_with_ignore_case(string: &str, pattern: &str) -> bool {
     string.to_lowercase().starts_with(&pattern.to_lowercase())
 }
 
-/// Check a scanned QR code.
+/// Checks a scanned QR code.
+///
 /// The function should be called after a QR code is scanned.
 /// The function takes the raw text scanned and checks what can be done with it.
 pub async fn check_qr(context: &Context, qr: &str) -> Result<Qr> {
@@ -129,6 +258,8 @@ pub async fn check_qr(context: &Context, qr: &str) -> Result<Qr> {
         dclogin_scheme::decode_login(qr)?
     } else if starts_with_ignore_case(qr, DCWEBRTC_SCHEME) {
         decode_webrtc_instance(context, qr)?
+    } else if starts_with_ignore_case(qr, DCBACKUP_SCHEME) {
+        decode_backup(qr)?
     } else if qr.starts_with(MAILTO_SCHEME) {
         decode_mailto(context, qr).await?
     } else if qr.starts_with(SMTP_SCHEME) {
@@ -147,6 +278,19 @@ pub async fn check_qr(context: &Context, qr: &str) -> Result<Qr> {
         }
     };
     Ok(qrcode)
+}
+
+/// Formats the text of the [`Qr::Backup`] variant.
+///
+/// This is the inverse of [`check_qr`] for that variant only.
+///
+/// TODO: Refactor this so all variants have a correct [`Display`] and transform `check_qr`
+/// into `FromStr`.
+pub fn format_backup(qr: &Qr) -> Result<String> {
+    match qr {
+        Qr::Backup { ref ticket } => Ok(format!("{DCBACKUP_SCHEME}{ticket}")),
+        _ => Err(anyhow!("Not a backup QR code")),
+    }
 }
 
 /// scheme: `OPENPGP4FPR:FINGERPRINT#a=ADDR&n=NAME&i=INVITENUMBER&s=AUTH`
@@ -219,16 +363,16 @@ async fn decode_openpgp(context: &Context, qr: &str) -> Result<Qr> {
         .context("Can't load peerstate")?;
 
     if let (Some(addr), Some(invitenumber), Some(authcode)) = (&addr, invitenumber, authcode) {
-        let contact_id = Contact::add_or_lookup(context, &name, addr, Origin::UnhandledQrScan)
+        let addr = ContactAddress::new(addr)?;
+        let (contact_id, _) = Contact::add_or_lookup(context, &name, addr, Origin::UnhandledQrScan)
             .await
-            .map(|(id, _)| id)
-            .with_context(|| format!("failed to add or lookup contact for address {:?}", addr))?;
+            .with_context(|| format!("failed to add or lookup contact for address {addr:?}"))?;
 
         if let (Some(grpid), Some(grpname)) = (grpid, grpname) {
             if context
-                .is_self_addr(addr)
+                .is_self_addr(&addr)
                 .await
-                .with_context(|| format!("can't check if address {:?} is our address", addr))?
+                .with_context(|| format!("can't check if address {addr:?} is our address"))?
             {
                 if token::exists(context, token::Namespace::InviteNumber, &invitenumber).await {
                     Ok(Qr::WithdrawVerifyGroup {
@@ -259,7 +403,7 @@ async fn decode_openpgp(context: &Context, qr: &str) -> Result<Qr> {
                     authcode,
                 })
             }
-        } else if context.is_self_addr(addr).await? {
+        } else if context.is_self_addr(&addr).await? {
             if token::exists(context, token::Namespace::InviteNumber, &invitenumber).await {
                 Ok(Qr::WithdrawVerifyContact {
                     contact_id,
@@ -285,25 +429,19 @@ async fn decode_openpgp(context: &Context, qr: &str) -> Result<Qr> {
         }
     } else if let Some(addr) = addr {
         if let Some(peerstate) = peerstate {
-            let contact_id =
-                Contact::add_or_lookup(context, &name, &peerstate.addr, Origin::UnhandledQrScan)
+            let peerstate_addr = ContactAddress::new(&peerstate.addr)?;
+            let (contact_id, _) =
+                Contact::add_or_lookup(context, &name, peerstate_addr, Origin::UnhandledQrScan)
                     .await
-                    .map(|(id, _)| id)?;
-            let chat = ChatIdBlocked::get_for_contact(context, contact_id, Blocked::Request)
+                    .context("add_or_lookup")?;
+            ChatIdBlocked::get_for_contact(context, contact_id, Blocked::Request)
                 .await
                 .context("Failed to create (new) chat for contact")?;
-            chat::add_info_msg(
-                context,
-                chat.id,
-                &format!("{} verified.", peerstate.addr),
-                time(),
-            )
-            .await?;
             Ok(Qr::FprOk { contact_id })
         } else {
             let contact_id = Contact::lookup_id_by_addr(context, &addr, Origin::Unknown)
                 .await
-                .with_context(|| format!("Error looking up contact {:?}", addr))?;
+                .with_context(|| format!("Error looking up contact {addr:?}"))?;
             Ok(Qr::FprMismatch { contact_id })
         }
     } else {
@@ -319,7 +457,7 @@ fn decode_account(qr: &str) -> Result<Qr> {
         .get(DCACCOUNT_SCHEME.len()..)
         .context("invalid DCACCOUNT payload")?;
     let url =
-        url::Url::parse(payload).with_context(|| format!("Invalid account URL: {:?}", payload))?;
+        url::Url::parse(payload).with_context(|| format!("Invalid account URL: {payload:?}"))?;
     if url.scheme() == "http" || url.scheme() == "https" {
         Ok(Qr::Account {
             domain: url
@@ -340,7 +478,7 @@ fn decode_webrtc_instance(_context: &Context, qr: &str) -> Result<Qr> {
 
     let (_type, url) = Message::parse_webrtc_instance(payload);
     let url =
-        url::Url::parse(&url).with_context(|| format!("Invalid WebRTC instance: {:?}", payload))?;
+        url::Url::parse(&url).with_context(|| format!("Invalid WebRTC instance: {payload:?}"))?;
 
     if url.scheme() == "http" || url.scheme() == "https" {
         Ok(Qr::WebrtcInstance {
@@ -355,13 +493,29 @@ fn decode_webrtc_instance(_context: &Context, qr: &str) -> Result<Qr> {
     }
 }
 
+/// Decodes a [`DCBACKUP_SCHEME`] QR code.
+///
+/// The format of this scheme is `DCBACKUP:<encoded ticket>`.  The encoding is the
+/// [`iroh::provider::Ticket`]'s `Display` impl.
+fn decode_backup(qr: &str) -> Result<Qr> {
+    let payload = qr
+        .strip_prefix(DCBACKUP_SCHEME)
+        .ok_or_else(|| anyhow!("invalid DCBACKUP scheme"))?;
+    let ticket: iroh::provider::Ticket = payload.parse().context("invalid DCBACKUP payload")?;
+    Ok(Qr::Backup { ticket })
+}
+
 #[derive(Debug, Deserialize)]
 struct CreateAccountSuccessResponse {
+    /// Email address.
     email: String,
+
+    /// Password.
     password: String,
 }
 #[derive(Debug, Deserialize)]
 struct CreateAccountErrorResponse {
+    /// Reason for the failure to create account returned by the server.
     reason: String,
 }
 
@@ -371,21 +525,21 @@ struct CreateAccountErrorResponse {
 #[allow(clippy::indexing_slicing)]
 async fn set_account_from_qr(context: &Context, qr: &str) -> Result<()> {
     let url_str = &qr[DCACCOUNT_SCHEME.len()..];
-    let response = reqwest::Client::new().post(url_str).send().await?;
+    let socks5_config = Socks5Config::from_database(&context.sql).await?;
+    let response = crate::net::http::get_client(socks5_config)?
+        .post(url_str)
+        .send()
+        .await?;
     let response_status = response.status();
     let response_text = response.text().await.with_context(|| {
-        format!(
-            "Cannot create account, request to {:?} failed: empty response",
-            url_str
-        )
+        format!("Cannot create account, request to {url_str:?} failed: empty response")
     })?;
 
     if response_status.is_success() {
         let CreateAccountSuccessResponse { password, email } = serde_json::from_str(&response_text)
             .with_context(|| {
                 format!(
-                    "Cannot create account, response from {:?} is malformed:\n{:?}",
-                    url_str, response_text
+                    "Cannot create account, response from {url_str:?} is malformed:\n{response_text:?}"
                 )
             })?;
         context.set_config(Config::Addr, Some(&email)).await?;
@@ -397,8 +551,7 @@ async fn set_account_from_qr(context: &Context, qr: &str) -> Result<()> {
             Ok(error) => Err(anyhow!(error.reason)),
             Err(parse_error) => {
                 context.emit_event(EventType::Error(format!(
-                    "Cannot create account, server response could not be parsed:\n{:#}\nraw response:\n{}",
-                    parse_error, response_text
+                    "Cannot create account, server response could not be parsed:\n{parse_error:#}\nraw response:\n{response_text}"
                 )));
                 bail!(
                     "Cannot create account, unexpected server response:\n{:?}",
@@ -409,6 +562,7 @@ async fn set_account_from_qr(context: &Context, qr: &str) -> Result<()> {
     }
 }
 
+/// Sets configuration values from a QR code.
 pub async fn set_config_from_qr(context: &Context, qr: &str) -> Result<()> {
     match check_qr(context, qr).await? {
         Qr::Account { .. } => set_account_from_qr(context, qr).await?,
@@ -528,11 +682,11 @@ async fn decode_mailto(context: &Context, qr: &str) -> Result<Qr> {
     };
 
     let addr = normalize_address(addr)?;
-    let name = "".to_string();
+    let name = "";
     Qr::from_address(
         context,
         name,
-        addr,
+        &addr,
         if draft.is_empty() { None } else { Some(draft) },
     )
     .await
@@ -552,8 +706,8 @@ async fn decode_smtp(context: &Context, qr: &str) -> Result<Qr> {
     };
 
     let addr = normalize_address(addr)?;
-    let name = "".to_string();
-    Qr::from_address(context, name, addr, None).await
+    let name = "";
+    Qr::from_address(context, name, &addr, None).await
 }
 
 /// Extract address for the matmsg scheme.
@@ -577,8 +731,8 @@ async fn decode_matmsg(context: &Context, qr: &str) -> Result<Qr> {
     };
 
     let addr = normalize_address(addr)?;
-    let name = "".to_string();
-    Qr::from_address(context, name, addr, None).await
+    let name = "";
+    Qr::from_address(context, name, &addr, None).await
 }
 
 static VCARD_NAME_RE: Lazy<regex::Regex> =
@@ -597,7 +751,7 @@ async fn decode_vcard(context: &Context, qr: &str) -> Result<Qr> {
             let last_name = caps.get(1)?.as_str().trim();
             let first_name = caps.get(2)?.as_str().trim();
 
-            Some(format!("{} {}", first_name, last_name))
+            Some(format!("{first_name} {last_name}"))
         })
         .unwrap_or_default();
 
@@ -607,24 +761,28 @@ async fn decode_vcard(context: &Context, qr: &str) -> Result<Qr> {
         bail!("Bad e-mail address");
     };
 
-    Qr::from_address(context, name, addr, None).await
+    Qr::from_address(context, &name, &addr, None).await
 }
 
 impl Qr {
+    /// Creates a new scanned QR code of a contact address.
+    ///
+    /// May contain a message draft.
     pub async fn from_address(
         context: &Context,
-        name: String,
-        addr: String,
+        name: &str,
+        addr: &str,
         draft: Option<String>,
     ) -> Result<Self> {
+        let addr = ContactAddress::new(addr)?;
         let (contact_id, _) =
-            Contact::add_or_lookup(context, &name, &addr, Origin::UnhandledQrScan).await?;
+            Contact::add_or_lookup(context, name, addr, Origin::UnhandledQrScan).await?;
         Ok(Qr::Addr { contact_id, draft })
     }
 }
 
 /// URL decodes a given address, does basic email validation on the result.
-fn normalize_address(addr: &str) -> Result<String, Error> {
+fn normalize_address(addr: &str) -> Result<String> {
     // urldecoding is needed at least for OPENPGP4FPR but should not hurt in the other cases
     let new_addr = percent_decode_str(addr).decode_utf8()?;
     let new_addr = addr_normalize(&new_addr);
@@ -636,15 +794,14 @@ fn normalize_address(addr: &str) -> Result<String, Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use anyhow::Result;
 
+    use super::*;
     use crate::aheader::EncryptPreference;
     use crate::chat::{create_group_chat, ProtectionStatus};
     use crate::key::DcKey;
-    use crate::peerstate::ToSave;
     use crate::securejoin::get_securejoin_qr;
     use crate::test_utils::{alice_keypair, TestContext};
-    use anyhow::Result;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_decode_http() -> Result<()> {
@@ -894,11 +1051,11 @@ mod tests {
             gossip_key_fingerprint: None,
             verified_key: None,
             verified_key_fingerprint: None,
-            to_save: Some(ToSave::All),
             fingerprint_changed: false,
+            verifier: None,
         };
         assert!(
-            peerstate.save_to_db(&ctx.ctx.sql, true).await.is_ok(),
+            peerstate.save_to_db(&ctx.ctx.sql).await.is_ok(),
             "failed to save peerstate"
         );
 

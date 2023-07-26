@@ -1,13 +1,13 @@
 //! # Simplify incoming plaintext.
 
-// protect lines starting with `--` against being treated as a footer.
-// for that, we insert a ZERO WIDTH SPACE (ZWSP, 0x200B);
-// this should be invisible on most systems and there is no need to unescape it again
-// (which won't be done by non-deltas anyway)
-//
-// this escapes a bit more than actually needed by delta (eg. also lines as "-- footer"),
-// but for non-delta-compatibility, that seems to be better.
-// (to be only compatible with delta, only "[\r\n|\n]-- {0,2}[\r\n|\n]" needs to be replaced)
+/// Protects lines starting with `--` against being treated as a footer.
+/// for that, we insert a ZERO WIDTH SPACE (ZWSP, 0x200B);
+/// this should be invisible on most systems and there is no need to unescape it again
+/// (which won't be done by non-deltas anyway).
+///
+/// This escapes a bit more than actually needed by delta (e.g. also lines as "-- footer"),
+/// but for non-delta-compatibility, that seems to be better.
+/// (to be only compatible with delta, only "[\r\n|\n]-- {0,2}[\r\n|\n]" needs to be replaced)
 pub fn escape_message_footer_marks(text: &str) -> String {
     if let Some(text) = text.strip_prefix("--") {
         "-\u{200B}-".to_string() + &text.replace("\n--", "\n-\u{200B}-")
@@ -72,14 +72,16 @@ pub(crate) fn split_lines(buf: &str) -> Vec<&str> {
 }
 
 /// Simplified text and some additional information gained from the input.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct SimplifiedText {
+    /// The text itself.
     pub text: String,
 
     /// True if the message is forwarded.
     pub is_forwarded: bool,
 
-    /// True if nonstandard footer was removed.
+    /// True if nonstandard footer was removed
+    /// or if the message contains quotes other than `top_quote`.
     pub is_cut: bool,
 
     /// Top quote, if any.
@@ -87,6 +89,14 @@ pub(crate) struct SimplifiedText {
 
     /// Footer, if any.
     pub footer: Option<String>,
+}
+
+pub(crate) fn simplify_quote(quote: &str) -> (String, bool) {
+    let quote_lines = split_lines(quote);
+    let (quote_lines, quote_footer_lines) = remove_message_footer(&quote_lines);
+    let is_cut = quote_footer_lines.is_some();
+
+    (render_message(quote_lines, false), is_cut)
 }
 
 /// Simplify message text for chat display.
@@ -102,7 +112,6 @@ pub(crate) fn simplify(mut input: String, is_chat_message: bool) -> SimplifiedTe
     let original_lines = &lines;
     let (lines, footer_lines) = remove_message_footer(lines);
     let footer = footer_lines.map(|footer_lines| render_message(footer_lines, false));
-    is_cut = is_cut || footer.is_some();
 
     let text = if is_chat_message {
         render_message(lines, false)
@@ -124,11 +133,9 @@ pub(crate) fn simplify(mut input: String, is_chat_message: bool) -> SimplifiedTe
 
     if !is_chat_message {
         top_quote = top_quote.map(|quote| {
-            let quote_lines = split_lines(&quote);
-            let (quote_lines, quote_footer_lines) = remove_message_footer(&quote_lines);
-            is_cut = is_cut || quote_footer_lines.is_some();
-
-            render_message(quote_lines, false)
+            let (quote, quote_cut) = simplify_quote(&quote);
+            is_cut |= quote_cut;
+            quote
         });
     }
 
@@ -234,12 +241,11 @@ fn render_message(lines: &[&str], is_cut_at_end: bool) -> String {
     let mut ret = String::new();
     /* we write empty lines only in case and non-empty line follows */
     let mut pending_linebreaks = 0;
-    let mut empty_body = true;
     for line in lines {
         if is_empty_line(line) {
             pending_linebreaks += 1
         } else {
-            if !empty_body {
+            if !ret.is_empty() {
                 if pending_linebreaks > 2 {
                     pending_linebreaks = 2
                 }
@@ -250,11 +256,10 @@ fn render_message(lines: &[&str], is_cut_at_end: bool) -> String {
             }
             // the incoming message might contain invalid UTF8
             ret += line;
-            empty_body = false;
             pending_linebreaks = 1
         }
     }
-    if is_cut_at_end && !empty_body {
+    if is_cut_at_end && !ret.is_empty() {
         ret += " [...]";
     }
     // redo escaping done by escape_message_footer_marks()
@@ -284,8 +289,9 @@ fn is_plain_quote(buf: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use proptest::prelude::*;
+
+    use super::*;
 
     proptest! {
         #[test]
@@ -328,7 +334,7 @@ mod tests {
         } = simplify(input, true);
         assert_eq!(text, "Hi! How are you?\n\n---\n\nI am good.");
         assert!(!is_forwarded);
-        assert!(is_cut);
+        assert!(!is_cut);
         assert_eq!(
             footer.unwrap(),
             "Sent with my Delta Chat Messenger: https://delta.chat"
@@ -363,7 +369,7 @@ mod tests {
 
         assert_eq!(text, "Forwarded message");
         assert!(is_forwarded);
-        assert!(is_cut);
+        assert!(!is_cut);
         assert_eq!(footer.unwrap(), "Signature goes here");
     }
 
@@ -440,7 +446,7 @@ mod tests {
             ..
         } = simplify(input, true);
         assert_eq!(text, "text\n\n--\nno footer");
-        assert!(is_cut);
+        assert!(!is_cut);
         assert_eq!(footer.unwrap(), "footer");
 
         let input = "text\n\n--\ntreated as footer when unescaped".to_string();
@@ -451,7 +457,7 @@ mod tests {
             ..
         } = simplify(input.clone(), true);
         assert_eq!(text, "text"); // see remove_message_footer() for some explanations
-        assert!(is_cut);
+        assert!(!is_cut);
         assert_eq!(footer.unwrap(), "treated as footer when unescaped");
         let escaped = escape_message_footer_marks(&input);
         let SimplifiedText {
@@ -493,7 +499,7 @@ mod tests {
             ..
         } = simplify(input.clone(), true);
         assert_eq!(text, ""); // see remove_message_footer() for some explanations
-        assert!(is_cut);
+        assert!(!is_cut);
         assert_eq!(footer.unwrap(), "treated as footer when unescaped");
 
         let escaped = escape_message_footer_marks(&input);

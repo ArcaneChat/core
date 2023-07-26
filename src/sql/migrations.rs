@@ -30,7 +30,7 @@ pub async fn run(context: &Context, sql: &Sql) -> Result<(bool, bool, bool, bool
             // set raw config inside the transaction
             transaction.execute(
                 "INSERT INTO config (keyname, value) VALUES (?, ?);",
-                paramsv![VERSION_CFG, format!("{}", dbversion_before_update)],
+                (VERSION_CFG, format!("{dbversion_before_update}")),
             )?;
             Ok(())
         })
@@ -40,7 +40,7 @@ pub async fn run(context: &Context, sql: &Sql) -> Result<(bool, bool, bool, bool
         let mut lock = context.sql.config_cache.write().await;
         lock.insert(
             VERSION_CFG.to_string(),
-            Some(format!("{}", dbversion_before_update)),
+            Some(format!("{dbversion_before_update}")),
         );
         drop(lock);
     } else {
@@ -320,11 +320,11 @@ ALTER TABLE msgs ADD COLUMN ephemeral_timestamp INTEGER DEFAULT 0;"#,
     if dbversion < 67 {
         for prefix in &["", "configured_"] {
             if let Some(server_flags) = sql
-                .get_raw_config_int(format!("{}server_flags", prefix))
+                .get_raw_config_int(&format!("{prefix}server_flags"))
                 .await?
             {
                 let imap_socket_flags = server_flags & 0x700;
-                let key = format!("{}mail_security", prefix);
+                let key = &format!("{prefix}mail_security");
                 match imap_socket_flags {
                     0x100 => sql.set_raw_config_int(key, 2).await?, // STARTTLS
                     0x200 => sql.set_raw_config_int(key, 1).await?, // SSL/TLS
@@ -332,7 +332,7 @@ ALTER TABLE msgs ADD COLUMN ephemeral_timestamp INTEGER DEFAULT 0;"#,
                     _ => sql.set_raw_config_int(key, 0).await?,
                 }
                 let smtp_socket_flags = server_flags & 0x70000;
-                let key = format!("{}send_security", prefix);
+                let key = &format!("{prefix}send_security");
                 match smtp_socket_flags {
                     0x10000 => sql.set_raw_config_int(key, 2).await?, // STARTTLS
                     0x20000 => sql.set_raw_config_int(key, 1).await?, // SSL/TLS
@@ -391,7 +391,7 @@ UPDATE chats SET protected=1, type=120 WHERE type=130;"#,
         sql.execute(
             r#"
 CREATE TABLE imap_sync (folder TEXT PRIMARY KEY, uidvalidity INTEGER DEFAULT 0, uid_next INTEGER DEFAULT 0);"#,
-paramsv![]
+()
         )
             .await?;
         for c in &[
@@ -616,6 +616,119 @@ CREATE INDEX smtp_messageid ON imap(rfc724_mid);
         )
         .await?;
     }
+    if dbversion < 94 {
+        sql.execute_migration(
+            // Create new `acpeerstates` table, same as before but with unique constraint.
+            //
+            // This allows to use `UPSERT` to update existing or insert a new peerstate
+            // depending on whether one exists already.
+            "CREATE TABLE new_acpeerstates (
+             id INTEGER PRIMARY KEY,
+             addr TEXT DEFAULT '' COLLATE NOCASE,
+             last_seen INTEGER DEFAULT 0,
+             last_seen_autocrypt INTEGER DEFAULT 0,
+             public_key,
+             prefer_encrypted INTEGER DEFAULT 0,
+             gossip_timestamp INTEGER DEFAULT 0,
+             gossip_key,
+             public_key_fingerprint TEXT DEFAULT '',
+             gossip_key_fingerprint TEXT DEFAULT '',
+             verified_key,
+             verified_key_fingerprint TEXT DEFAULT '',
+             UNIQUE (addr) -- Only one peerstate per address
+             );
+            INSERT OR IGNORE INTO new_acpeerstates SELECT
+                id, addr, last_seen, last_seen_autocrypt, public_key, prefer_encrypted,
+                gossip_timestamp, gossip_key, public_key_fingerprint,
+                gossip_key_fingerprint, verified_key, verified_key_fingerprint
+            FROM acpeerstates;
+            DROP TABLE acpeerstates;
+            ALTER TABLE new_acpeerstates RENAME TO acpeerstates;
+            CREATE INDEX acpeerstates_index1 ON acpeerstates (addr);
+            CREATE INDEX acpeerstates_index3 ON acpeerstates (public_key_fingerprint);
+            CREATE INDEX acpeerstates_index4 ON acpeerstates (gossip_key_fingerprint);
+            CREATE INDEX acpeerstates_index5 ON acpeerstates (verified_key_fingerprint);
+            ",
+            94,
+        )
+        .await?;
+    }
+    if dbversion < 95 {
+        sql.execute_migration(
+            "CREATE TABLE new_chats_contacts (chat_id INTEGER, contact_id INTEGER, UNIQUE(chat_id, contact_id));\
+            INSERT OR IGNORE INTO new_chats_contacts SELECT chat_id, contact_id FROM chats_contacts;\
+            DROP TABLE chats_contacts;\
+            ALTER TABLE new_chats_contacts RENAME TO chats_contacts;\
+            CREATE INDEX chats_contacts_index1 ON chats_contacts (chat_id);\
+            CREATE INDEX chats_contacts_index2 ON chats_contacts (contact_id);",
+            95
+        ).await?;
+    }
+    if dbversion < 96 {
+        sql.execute_migration(
+            "ALTER TABLE acpeerstates ADD COLUMN verifier TEXT DEFAULT '';",
+            96,
+        )
+        .await?;
+    }
+    if dbversion < 97 {
+        sql.execute_migration(
+            "CREATE TABLE dns_cache (
+               hostname TEXT NOT NULL,
+               address TEXT NOT NULL, -- IPv4 or IPv6 address
+               timestamp INTEGER NOT NULL,
+               UNIQUE (hostname, address)
+             )",
+            97,
+        )
+        .await?;
+    }
+    if dbversion < 98 {
+        if exists_before_update && sql.get_raw_config_int("show_emails").await?.is_none() {
+            sql.set_raw_config_int("show_emails", ShowEmails::Off as i32)
+                .await?;
+        }
+        sql.set_db_version(98).await?;
+    }
+    if dbversion < 99 {
+        // sql.execute_migration(
+        //     "ALTER TABLE msgs DROP COLUMN server_folder;
+        //      ALTER TABLE msgs DROP COLUMN server_uid;
+        //      ALTER TABLE msgs DROP COLUMN move_state;
+        //      ALTER TABLE chats DROP COLUMN draft_timestamp;
+        //      ALTER TABLE chats DROP COLUMN draft_txt",
+        //     99,
+        // )
+        // .await?;
+
+        // Reverted above, as it requires to load the whole DB in memory.
+        sql.set_db_version(99).await?;
+    }
+    if dbversion < 100 {
+        sql.execute_migration(
+            "ALTER TABLE msgs ADD COLUMN mime_compressed INTEGER NOT NULL DEFAULT 0",
+            100,
+        )
+        .await?;
+    }
+    if dbversion < 101 {
+        // Recreate `smtp` table with autoincrement.
+        // rfc724_mid index is not recreated, because it is not used.
+        sql.execute_migration(
+            "DROP TABLE smtp;
+             CREATE TABLE smtp (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             rfc724_mid TEXT NOT NULL,          -- Message-ID
+             mime TEXT NOT NULL,                -- SMTP payload
+             msg_id INTEGER NOT NULL,           -- ID of the message in `msgs` table
+             recipients TEXT NOT NULL,          -- List of recipients separated by space
+             retries INTEGER NOT NULL DEFAULT 0 -- Number of failed attempts to send the message
+            );
+            ",
+            101,
+        )
+        .await?;
+    }
 
     let new_version = sql
         .get_raw_config_int(VERSION_CFG)
@@ -647,23 +760,27 @@ impl Sql {
         Ok(())
     }
 
-    async fn execute_migration(&self, query: &'static str, version: i32) -> Result<()> {
-        self.transaction(move |transaction| {
-            transaction.execute_batch(query)?;
+    // Sets db `version` in the `transaction`.
+    fn set_db_version_trans(transaction: &mut rusqlite::Transaction, version: i32) -> Result<()> {
+        transaction.execute(
+            "UPDATE config SET value=? WHERE keyname=?;",
+            (format!("{version}"), VERSION_CFG),
+        )?;
+        Ok(())
+    }
 
-            // set raw config inside the transaction
-            transaction.execute(
-                "UPDATE config SET value=? WHERE keyname=?;",
-                paramsv![format!("{}", version), VERSION_CFG],
-            )?;
+    async fn execute_migration(&self, query: &str, version: i32) -> Result<()> {
+        self.transaction(move |transaction| {
+            Self::set_db_version_trans(transaction, version)?;
+            transaction.execute_batch(query)?;
 
             Ok(())
         })
         .await
-        .with_context(|| format!("execute_migration failed for version {}", version))?;
+        .with_context(|| format!("execute_migration failed for version {version}"))?;
 
         let mut lock = self.config_cache.write().await;
-        lock.insert(VERSION_CFG.to_string(), Some(format!("{}", version)));
+        lock.insert(VERSION_CFG.to_string(), Some(format!("{version}")));
         drop(lock);
 
         Ok(())

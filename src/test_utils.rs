@@ -3,8 +3,10 @@
 //! This private module is only compiled for test runs.
 #![allow(clippy::indexing_slicing)]
 use std::collections::BTreeMap;
+use std::fmt::Write;
 use std::ops::{Deref, DerefMut};
 use std::panic;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -12,23 +14,31 @@ use ansi_term::Color;
 use async_channel::{self as channel, Receiver, Sender};
 use chat::ChatItem;
 use once_cell::sync::Lazy;
+use pretty_assertions::assert_eq;
 use rand::Rng;
 use tempfile::{tempdir, TempDir};
+use tokio::runtime::Handle;
 use tokio::sync::RwLock;
-use tokio::task;
+use tokio::{fs, task};
 
-use crate::chat::{self, Chat, ChatId};
+use crate::chat::{
+    self, add_to_chat_contacts_table, create_group_chat, Chat, ChatId, MessageListOptions,
+    ProtectionStatus,
+};
 use crate::chatlist::Chatlist;
 use crate::config::Config;
 use crate::constants::Chattype;
-use crate::constants::{DC_GCM_ADDDAYMARKER, DC_MSG_ID_DAYMARKER};
-use crate::contact::{Contact, ContactId, Modifier, Origin};
+use crate::constants::{DC_GCL_NO_SPECIALS, DC_MSG_ID_DAYMARKER};
+use crate::contact::{Contact, ContactAddress, ContactId, Modifier, Origin};
 use crate::context::Context;
+use crate::e2ee::EncryptHelper;
 use crate::events::{Event, EventType, Events};
 use crate::key::{self, DcKey, KeyPair, KeyPairUse};
 use crate::message::{update_msg_state, Message, MessageState, MsgId, Viewtype};
-use crate::mimeparser::MimeMessage;
+use crate::mimeparser::{MimeMessage, SystemMessage};
+use crate::peerstate::Peerstate;
 use crate::receive_imf::receive_imf;
+use crate::securejoin::{get_securejoin_qr, join_securejoin};
 use crate::stock_str::StockStrings;
 use crate::tools::EmailAddress;
 
@@ -39,6 +49,11 @@ pub const AVATAR_900x900_BYTES: &[u8] = include_bytes!("../test-data/image/avata
 static CONTEXT_NAMES: Lazy<std::sync::RwLock<BTreeMap<u32, String>>> =
     Lazy::new(|| std::sync::RwLock::new(BTreeMap::new()));
 
+/// Manage multiple [`TestContext`]s in one place.
+///
+/// The main advantage is that the log records of the contexts will appear in the order they
+/// occurred rather than grouped by context like would happen when you use separate
+/// [`TestContext`]s without managing your own [`LogSink`].
 pub struct TestContextManager {
     log_tx: Sender<LogEvent>,
     _log_sink: LogSink,
@@ -96,10 +111,24 @@ impl TestContextManager {
     /// - Let one TestContext send a message
     /// - Let the other TestContext receive it and accept the chat
     /// - Assert that the message arrived
-    pub async fn send_recv_accept(&self, from: &TestContext, to: &TestContext, msg: &str) {
-        let received_msg = self.try_send_recv(from, to, msg).await;
-        assert_eq!(received_msg.text.as_ref().unwrap(), msg);
+    pub async fn send_recv_accept(
+        &self,
+        from: &TestContext,
+        to: &TestContext,
+        msg: &str,
+    ) -> Message {
+        let received_msg = self.send_recv(from, to, msg).await;
         received_msg.chat_id.accept(to).await.unwrap();
+        received_msg
+    }
+
+    /// - Let one TestContext send a message
+    /// - Let the other TestContext receive it
+    /// - Assert that the message arrived
+    pub async fn send_recv(&self, from: &TestContext, to: &TestContext, msg: &str) -> Message {
+        let received_msg = self.try_send_recv(from, to, msg).await;
+        assert_eq!(received_msg.text, msg);
+        received_msg
     }
 
     /// - Let one TestContext send a message
@@ -131,6 +160,27 @@ impl TestContextManager {
             test_context.get_primary_self_addr().await.unwrap(),
             new_addr
         );
+    }
+
+    pub async fn execute_securejoin(&self, scanner: &TestContext, scanned: &TestContext) {
+        self.section(&format!(
+            "{} scans {}'s QR code",
+            scanner.name(),
+            scanned.name()
+        ));
+
+        let qr = get_securejoin_qr(&scanned.ctx, None).await.unwrap();
+        join_securejoin(&scanner.ctx, &qr).await.unwrap();
+
+        loop {
+            if let Some(sent) = scanner.pop_sent_msg_opt(Duration::ZERO).await {
+                scanned.recv_msg(&sent).await;
+            } else if let Some(sent) = scanned.pop_sent_msg_opt(Duration::ZERO).await {
+                scanner.recv_msg(&sent).await;
+            } else {
+                break;
+            }
+        }
     }
 }
 
@@ -244,6 +294,7 @@ impl TestContext {
     ///
     /// This is a shortcut which automatically calls [`TestContext::configure_alice`] after
     /// creating the context.
+    /// alice-email: alice@example.org
     pub async fn new_alice() -> Self {
         Self::builder().configure_alice().build().await
     }
@@ -262,13 +313,12 @@ impl TestContext {
         Self::builder().configure_fiona().build().await
     }
 
-    #[allow(dead_code)]
     /// Print current chat state.
     pub async fn print_chats(&self) {
         println!("\n========== Chats of {}: ==========", self.name());
         if let Ok(chats) = Chatlist::try_load(self, 0, None, None).await {
             for (chat, _) in chats.iter() {
-                self.print_chat(*chat).await;
+                print!("{}", self.display_chat(*chat).await);
             }
         }
         println!();
@@ -380,13 +430,13 @@ impl TestContext {
     /// table.  Messages are returned in the order they have been sent.
     ///
     /// Panics if there is no message or on any error.
-    pub async fn pop_sent_msg(&self) -> SentMessage {
+    pub async fn pop_sent_msg(&self) -> SentMessage<'_> {
         self.pop_sent_msg_opt(Duration::from_secs(3))
             .await
             .expect("no sent message found in jobs table")
     }
 
-    pub async fn pop_sent_msg_opt(&self, timeout: Duration) -> Option<SentMessage> {
+    pub async fn pop_sent_msg_opt(&self, timeout: Duration) -> Option<SentMessage<'_>> {
         let start = Instant::now();
         let (rowid, msg_id, payload, recipients) = loop {
             let row = self
@@ -397,7 +447,7 @@ impl TestContext {
                     SELECT id, msg_id, mime, recipients
                     FROM smtp
                     ORDER BY id DESC"#,
-                    paramsv![],
+                    (),
                     |row| {
                         let rowid: i64 = row.get(0)?;
                         let msg_id: MsgId = row.get(1)?;
@@ -419,7 +469,7 @@ impl TestContext {
         };
         self.ctx
             .sql
-            .execute("DELETE FROM smtp WHERE id=?;", paramsv![rowid])
+            .execute("DELETE FROM smtp WHERE id=?;", (rowid,))
             .await
             .expect("failed to remove job");
         update_msg_state(&self.ctx, msg_id, MessageState::OutDelivered)
@@ -428,6 +478,7 @@ impl TestContext {
         Some(SentMessage {
             payload,
             sender_msg_id: msg_id,
+            sender_context: &self.ctx,
             recipients,
         })
     }
@@ -439,15 +490,15 @@ impl TestContext {
     /// peerstates will be updated.  Later receiving the message using [recv_msg] is
     /// unlikely to be affected as the peerstate would be processed again in exactly the
     /// same way.
-    pub async fn parse_msg(&self, msg: &SentMessage) -> MimeMessage {
-        MimeMessage::from_bytes(&self.ctx, msg.payload().as_bytes())
+    pub(crate) async fn parse_msg(&self, msg: &SentMessage<'_>) -> MimeMessage {
+        MimeMessage::from_bytes(&self.ctx, msg.payload().as_bytes(), None)
             .await
             .unwrap()
     }
 
     /// Receive a message using the `receive_imf()` pipeline. Panics if it's not shown
     /// in the chat as exactly one message.
-    pub async fn recv_msg(&self, msg: &SentMessage) -> Message {
+    pub async fn recv_msg(&self, msg: &SentMessage<'_>) -> Message {
         let received = self
             .recv_msg_opt(msg)
             .await
@@ -462,9 +513,7 @@ impl TestContext {
             .await
             .unwrap();
 
-        let chat_msgs = chat::get_chat_msgs(self, received.chat_id, 0)
-            .await
-            .unwrap();
+        let chat_msgs = chat::get_chat_msgs(self, received.chat_id).await.unwrap();
         assert!(
             chat_msgs.contains(&ChatItem::Message { msg_id: msg.id }),
             "received message is not shown in chat, maybe it's hidden (you may have \
@@ -476,7 +525,10 @@ impl TestContext {
 
     /// Receive a message using the `receive_imf()` pipeline. This is similar
     /// to `recv_msg()`, but doesn't assume that the message is shown in the chat.
-    pub async fn recv_msg_opt(&self, msg: &SentMessage) -> Option<crate::receive_imf::ReceivedMsg> {
+    pub async fn recv_msg_opt(
+        &self,
+        msg: &SentMessage<'_>,
+    ) -> Option<crate::receive_imf::ReceivedMsg> {
         receive_imf(self, msg.payload().as_bytes(), false)
             .await
             .unwrap()
@@ -486,7 +538,7 @@ impl TestContext {
     ///
     /// Panics on errors or if the most recent message is a marker.
     pub async fn get_last_msg_in(&self, chat_id: ChatId) -> Message {
-        let msgs = chat::get_chat_msgs(&self.ctx, chat_id, 0).await.unwrap();
+        let msgs = chat::get_chat_msgs(&self.ctx, chat_id).await.unwrap();
         let msg_id = if let ChatItem::Message { msg_id } = msgs.last().unwrap() {
             msg_id
         } else {
@@ -497,7 +549,7 @@ impl TestContext {
 
     /// Gets the most recent message over all chats.
     pub async fn get_last_msg(&self) -> Message {
-        let chats = Chatlist::try_load(&self.ctx, 0, None, None)
+        let chats = Chatlist::try_load(&self.ctx, DC_GCL_NO_SPECIALS, None, None)
             .await
             .expect("failed to load chatlist");
         // 0 is correct in the next line (as opposed to `chats.len() - 1`, which would be the last element):
@@ -518,19 +570,20 @@ impl TestContext {
             .await
             .unwrap_or_default()
             .unwrap_or_default();
-        let addr = other.ctx.get_primary_self_addr().await.unwrap();
+        let primary_self_addr = other.ctx.get_primary_self_addr().await.unwrap();
+        let addr = ContactAddress::new(&primary_self_addr).unwrap();
         // MailinglistAddress is the lowest allowed origin, we'd prefer to not modify the
         // origin when creating this contact.
         let (contact_id, modified) =
-            Contact::add_or_lookup(self, &name, &addr, Origin::MailinglistAddress)
+            Contact::add_or_lookup(self, &name, addr, Origin::MailinglistAddress)
                 .await
-                .unwrap();
+                .expect("add_or_lookup");
         match modified {
             Modifier::None => (),
             Modifier::Modified => warn!(&self.ctx, "Contact {} modified by TestContext", &addr),
             Modifier::Created => warn!(&self.ctx, "Contact {} created by TestContext", &addr),
         }
-        Contact::load_from_db(&self.ctx, contact_id).await.unwrap()
+        Contact::get_by_id(&self.ctx, contact_id).await.unwrap()
     }
 
     /// Returns 1:1 [`Chat`] with another account, if it exists.
@@ -583,9 +636,9 @@ impl TestContext {
     /// This is not hooked up to any SMTP-IMAP pipeline, so the other account must call
     /// [`TestContext::recv_msg`] with the returned [`SentMessage`] if it wants to receive
     /// the message.
-    pub async fn send_text(&self, chat_id: ChatId, txt: &str) -> SentMessage {
+    pub async fn send_text(&self, chat_id: ChatId, txt: &str) -> SentMessage<'_> {
         let mut msg = Message::new(Viewtype::Text);
-        msg.set_text(Some(txt.to_string()));
+        msg.text = txt.to_string();
         self.send_msg(chat_id, &mut msg).await
     }
 
@@ -594,8 +647,7 @@ impl TestContext {
     /// This is not hooked up to any SMTP-IMAP pipeline, so the other account must call
     /// [`TestContext::recv_msg`] with the returned [`SentMessage`] if it wants to receive
     /// the message.
-    pub async fn send_msg(&self, chat_id: ChatId, msg: &mut Message) -> SentMessage {
-        chat::prepare_msg(self, chat_id, msg).await.unwrap();
+    pub async fn send_msg(&self, chat_id: ChatId, msg: &mut Message) -> SentMessage<'_> {
         let msg_id = chat::send_msg(self, chat_id, msg).await.unwrap();
         let res = self.pop_sent_msg().await;
         assert_eq!(
@@ -605,6 +657,28 @@ impl TestContext {
         res
     }
 
+    #[allow(unused)]
+    pub async fn golden_test_chat(&self, chat_id: ChatId, filename: &str) {
+        let filename = Path::new("test-data/golden/").join(filename);
+
+        let actual = self.display_chat(chat_id).await;
+
+        // We're using `unwrap_or_default()` here so that if the file doesn't exist,
+        // it can be created using `write` below.
+        let expected = fs::read(&filename).await.unwrap_or_default();
+        let expected = String::from_utf8(expected).unwrap().replace("\r\n", "\n");
+        if (std::env::var("UPDATE_GOLDEN_TESTS") == Ok("1".to_string())) && actual != expected {
+            fs::write(&filename, &actual)
+                .await
+                .unwrap_or_else(|e| panic!("Error writing {filename:?}: {e}"));
+        } else {
+            assert_eq!(
+                actual, expected,
+                "To update the expected value, run `UPDATE_GOLDEN_TESTS=1 cargo test`"
+            );
+        }
+    }
+
     /// Prints out the entire chat to stdout.
     ///
     /// You can use this to debug your test by printing the entire chat conversation.
@@ -612,10 +686,19 @@ impl TestContext {
     // merge them to a public function in the `deltachat` crate.
     #[allow(dead_code)]
     #[allow(clippy::indexing_slicing)]
-    pub async fn print_chat(&self, chat_id: ChatId) {
-        let msglist = chat::get_chat_msgs(self, chat_id, DC_GCM_ADDDAYMARKER)
-            .await
-            .unwrap();
+    async fn display_chat(&self, chat_id: ChatId) -> String {
+        let mut res = String::new();
+
+        let msglist = chat::get_chat_msgs_ex(
+            self,
+            chat_id,
+            MessageListOptions {
+                info_only: false,
+                add_daymarker: true,
+            },
+        )
+        .await
+        .unwrap();
         let msglist: Vec<MsgId> = msglist
             .into_iter()
             .map(|x| match x {
@@ -636,7 +719,8 @@ impl TestContext {
         } else {
             format!("{} member(s)", members.len())
         };
-        println!(
+        writeln!(
+            res,
             "{}#{}: {} [{}]{}{}{} {}",
             sel_chat.typ,
             sel_chat.get_id(),
@@ -650,7 +734,7 @@ impl TestContext {
             },
             match sel_chat.get_profile_image(self).await.unwrap() {
                 Some(icon) => match icon.to_str() {
-                    Some(icon) => format!(" Icon: {}", icon),
+                    Some(icon) => format!(" Icon: {icon}"),
                     _ => " Icon: Err".to_string(),
                 },
                 _ => "".to_string(),
@@ -660,32 +744,57 @@ impl TestContext {
             } else {
                 ""
             },
-        );
+        )
+        .unwrap();
 
         let mut lines_out = 0;
         for msg_id in msglist {
             if msg_id == MsgId::new(DC_MSG_ID_DAYMARKER) {
-                println!(
+                writeln!(res,
                 "--------------------------------------------------------------------------------"
-            );
+            )
+                .unwrap();
 
                 lines_out += 1
             } else if !msg_id.is_special() {
                 if lines_out == 0 {
-                    println!(
+                    writeln!(res,
                     "--------------------------------------------------------------------------------",
-                );
+                ).unwrap();
                     lines_out += 1
                 }
                 let msg = Message::load_from_db(self, msg_id).await.unwrap();
-                log_msg(self, "", &msg).await;
+                write_msg(self, "", &msg, &mut res).await;
             }
         }
         if lines_out > 0 {
-            println!(
+            writeln!(
+                res,
                 "--------------------------------------------------------------------------------"
-            );
+            )
+            .unwrap();
         }
+
+        res
+    }
+
+    pub async fn create_group_with_members(
+        &self,
+        protect: ProtectionStatus,
+        chat_name: &str,
+        members: &[&TestContext],
+    ) -> ChatId {
+        let chat_id = create_group_chat(self, protect, chat_name).await.unwrap();
+        let mut to_add = vec![];
+        for member in members {
+            let contact = self.add_or_lookup_contact(member).await;
+            to_add.push(contact.id);
+        }
+        add_to_chat_contacts_table(self, chat_id, &to_add)
+            .await
+            .unwrap();
+
+        chat_id
     }
 }
 
@@ -694,6 +803,19 @@ impl Deref for TestContext {
 
     fn deref(&self) -> &Context {
         &self.ctx
+    }
+}
+
+impl Drop for TestContext {
+    fn drop(&mut self) {
+        task::block_in_place(move || {
+            if let Ok(handle) = Handle::try_current() {
+                // Print the chats if runtime still exists.
+                handle.block_on(async move {
+                    self.print_chats().await;
+                });
+            }
+        });
     }
 }
 
@@ -742,13 +864,14 @@ impl Drop for LogSink {
 /// This is a raw message, probably in the shape DC was planning to send it but not having
 /// passed through a SMTP-IMAP pipeline.
 #[derive(Debug, Clone)]
-pub struct SentMessage {
+pub struct SentMessage<'a> {
     pub payload: String,
     recipients: String,
     pub sender_msg_id: MsgId,
+    sender_context: &'a Context,
 }
 
-impl SentMessage {
+impl SentMessage<'_> {
     /// A recipient the message was destined for.
     ///
     /// If there are multiple recipients this is just a random one, so is not very useful.
@@ -764,6 +887,12 @@ impl SentMessage {
     /// The raw message payload.
     pub fn payload(&self) -> &str {
         &self.payload
+    }
+
+    pub async fn load_from_db(&self) -> Message {
+        Message::load_from_db(self.sender_context, self.sender_msg_id)
+            .await
+            .unwrap()
     }
 }
 
@@ -892,7 +1021,7 @@ pub(crate) async fn get_chat_msg(
     index: usize,
     asserted_msgs_count: usize,
 ) -> Message {
-    let msgs = chat::get_chat_msgs(&t.ctx, chat_id, 0).await.unwrap();
+    let msgs = chat::get_chat_msgs(&t.ctx, chat_id).await.unwrap();
     assert_eq!(msgs.len(), asserted_msgs_count);
     let msg_id = if let ChatItem::Message { msg_id } = msgs[index] {
         msg_id
@@ -905,8 +1034,28 @@ pub(crate) async fn get_chat_msg(
 fn print_logevent(logevent: &LogEvent) {
     match logevent {
         LogEvent::Event(event) => print_event(event),
-        LogEvent::Section(msg) => println!("\n========== {} ==========", msg),
+        LogEvent::Section(msg) => println!("\n========== {msg} =========="),
     }
+}
+
+/// Saves the other account's public key as verified.
+pub(crate) async fn mark_as_verified(this: &TestContext, other: &TestContext) {
+    let mut peerstate = Peerstate::from_header(
+        &EncryptHelper::new(other).await.unwrap().get_aheader(),
+        // We have to give 0 as the time, not the current time:
+        // The time is going to be saved in peerstate.last_seen.
+        // The code in `peerstate.rs` then compares `if message_time > self.last_seen`,
+        // and many similar checks in peerstate.rs, and doesn't allow changes otherwise.
+        // Giving the current time would mean that message_time == peerstate.last_seen,
+        // so changes would not be allowed.
+        // This might lead to flaky tests.
+        0,
+    );
+
+    peerstate.verified_key = peerstate.public_key.clone();
+    peerstate.verified_key_fingerprint = peerstate.public_key_fingerprint.clone();
+
+    peerstate.save_to_db(&this.sql).await.unwrap();
 }
 
 /// Pretty-print an event to stdout
@@ -918,60 +1067,57 @@ fn print_event(event: &Event) {
     let red = Color::Red.normal();
 
     let msg = match &event.typ {
-        EventType::Info(msg) => format!("INFO: {}", msg),
-        EventType::SmtpConnected(msg) => format!("[SMTP_CONNECTED] {}", msg),
-        EventType::ImapConnected(msg) => format!("[IMAP_CONNECTED] {}", msg),
-        EventType::SmtpMessageSent(msg) => format!("[SMTP_MESSAGE_SENT] {}", msg),
+        EventType::Info(msg) => format!("INFO: {msg}"),
+        EventType::SmtpConnected(msg) => format!("[SMTP_CONNECTED] {msg}"),
+        EventType::ImapConnected(msg) => format!("[IMAP_CONNECTED] {msg}"),
+        EventType::SmtpMessageSent(msg) => format!("[SMTP_MESSAGE_SENT] {msg}"),
         EventType::Warning(msg) => format!("WARN: {}", yellow.paint(msg)),
         EventType::Error(msg) => format!("ERROR: {}", red.paint(msg)),
         EventType::ErrorSelfNotInGroup(msg) => {
-            format!("{}", red.paint(format!("[SELF_NOT_IN_GROUP] {}", msg)))
+            format!("{}", red.paint(format!("[SELF_NOT_IN_GROUP] {msg}")))
         }
         EventType::MsgsChanged { chat_id, msg_id } => format!(
             "{}",
             green.paint(format!(
-                "Received MSGS_CHANGED(chat_id={}, msg_id={})",
-                chat_id, msg_id,
+                "Received MSGS_CHANGED(chat_id={chat_id}, msg_id={msg_id})",
             ))
         ),
         EventType::ContactsChanged(_) => format!("{}", green.paint("Received CONTACTS_CHANGED()")),
         EventType::LocationChanged(contact) => format!(
             "{}",
-            green.paint(format!("Received LOCATION_CHANGED(contact={:?})", contact))
+            green.paint(format!("Received LOCATION_CHANGED(contact={contact:?})"))
         ),
         EventType::ConfigureProgress { progress, comment } => {
             if let Some(comment) = comment {
                 format!(
                     "{}",
                     green.paint(format!(
-                        "Received CONFIGURE_PROGRESS({} ‰, {})",
-                        progress, comment
+                        "Received CONFIGURE_PROGRESS({progress} ‰, {comment})"
                     ))
                 )
             } else {
                 format!(
                     "{}",
-                    green.paint(format!("Received CONFIGURE_PROGRESS({} ‰)", progress))
+                    green.paint(format!("Received CONFIGURE_PROGRESS({progress} ‰)"))
                 )
             }
         }
         EventType::ImexProgress(progress) => format!(
             "{}",
-            green.paint(format!("Received IMEX_PROGRESS({} ‰)", progress))
+            green.paint(format!("Received IMEX_PROGRESS({progress} ‰)"))
         ),
         EventType::ImexFileWritten(file) => format!(
             "{}",
             green.paint(format!("Received IMEX_FILE_WRITTEN({})", file.display()))
         ),
-        EventType::ChatModified(chat) => format!(
-            "{}",
-            green.paint(format!("Received CHAT_MODIFIED({})", chat))
-        ),
-        _ => format!("Received {:?}", event),
+        EventType::ChatModified(chat) => {
+            format!("{}", green.paint(format!("Received CHAT_MODIFIED({chat})")))
+        }
+        _ => format!("Received {event:?}"),
     };
     let context_names = CONTEXT_NAMES.read().unwrap();
     match context_names.get(&event.id) {
-        Some(name) => println!("{} {}", name, msg),
+        Some(name) => println!("{name} {msg}"),
         None => println!("{} {}", event.id, msg),
     }
 }
@@ -979,11 +1125,11 @@ fn print_event(event: &Event) {
 /// Logs an individual message to stdout.
 ///
 /// This includes a bunch of the message meta-data as well.
-async fn log_msg(context: &Context, prefix: impl AsRef<str>, msg: &Message) {
+async fn write_msg(context: &Context, prefix: &str, msg: &Message, buf: &mut String) {
     let contact = match Contact::get_by_id(context, msg.get_from_id()).await {
         Ok(contact) => contact,
         Err(e) => {
-            println!("Can't log message: invalid contact: {}", e);
+            println!("Can't log message: invalid contact: {e}");
             return;
         }
     };
@@ -999,15 +1145,16 @@ async fn log_msg(context: &Context, prefix: impl AsRef<str>, msg: &Message) {
         _ => "",
     };
     let msgtext = msg.get_text();
-    println!(
+    writeln!(
+        buf,
         "{}{}{}{}: {} (Contact#{}): {} {}{}{}{}{}",
-        prefix.as_ref(),
+        prefix,
         msg.get_id(),
         if msg.get_showpadlock() { "🔒" } else { "" },
         if msg.has_location() { "📍" } else { "" },
         &contact_name,
         contact_id,
-        msgtext.unwrap_or_default(),
+        msgtext,
         if msg.get_from_id() == ContactId::SELF {
             ""
         } else if msg.get_state() == MessageState::InSeen {
@@ -1017,7 +1164,17 @@ async fn log_msg(context: &Context, prefix: impl AsRef<str>, msg: &Message) {
         } else {
             "[FRESH]"
         },
-        if msg.is_info() { "[INFO]" } else { "" },
+        if msg.is_info() {
+            if msg.get_info_type() == SystemMessage::ChatProtectionEnabled {
+                "[INFO 🛡️]"
+            } else if msg.get_info_type() == SystemMessage::ChatProtectionDisabled {
+                "[INFO 🛡️❌]"
+            } else {
+                "[INFO]"
+            }
+        } else {
+            ""
+        },
         if msg.get_viewtype() == Viewtype::VideochatInvitation {
             format!(
                 "[VIDEOCHAT-INVITATION: {}, type={}]",
@@ -1033,7 +1190,8 @@ async fn log_msg(context: &Context, prefix: impl AsRef<str>, msg: &Message) {
             ""
         },
         statestr,
-    );
+    )
+    .unwrap();
 }
 
 #[cfg(test)]
@@ -1066,5 +1224,13 @@ mod tests {
         alice.ctx.emit_event(EventType::Info("hello".into()));
         bob.ctx.emit_event(EventType::Info("there".into()));
         // panic!("Both fail");
+    }
+
+    /// Checks that dropping the `TestContext` after the runtime does not panic,
+    /// e.g. that `TestContext::drop` does not assume the runtime still exists.
+    #[test]
+    fn test_new_test_context() {
+        let runtime = tokio::runtime::Runtime::new().expect("unable to create tokio runtime");
+        runtime.block_on(TestContext::new());
     }
 }

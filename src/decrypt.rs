@@ -1,76 +1,95 @@
 //! End-to-end decryption support.
 
 use std::collections::HashSet;
+use std::str::FromStr;
 
-use anyhow::{Context as _, Result};
+use anyhow::Result;
 use mailparse::ParsedMail;
-use mailparse::SingleInfo;
 
 use crate::aheader::Aheader;
-use crate::authres;
 use crate::authres::handle_authres;
+use crate::authres::{self, DkimResults};
 use crate::contact::addr_cmp;
 use crate::context::Context;
+use crate::headerdef::{HeaderDef, HeaderDefMap};
 use crate::key::{DcKey, Fingerprint, SignedPublicKey, SignedSecretKey};
-use crate::keyring::Keyring;
-use crate::log::LogExt;
 use crate::peerstate::Peerstate;
 use crate::pgp;
 
-/// Tries to decrypt a message, but only if it is structured as an
-/// Autocrypt message.
+/// Tries to decrypt a message, but only if it is structured as an Autocrypt message.
 ///
-/// Returns decrypted body and a set of valid signature fingerprints
-/// if successful.
+/// If successful and the message is encrypted, returns decrypted body and a set of valid
+/// signature fingerprints.
 ///
-/// If the message is wrongly signed, this will still return the decrypted
-/// message but the HashSet will be empty.
-pub async fn try_decrypt(
+/// If the message is wrongly signed, HashSet will be empty.
+pub fn try_decrypt(
     context: &Context,
     mail: &ParsedMail<'_>,
-    decryption_info: &DecryptionInfo,
+    private_keyring: &[SignedSecretKey],
+    public_keyring_for_validate: &[SignedPublicKey],
 ) -> Result<Option<(Vec<u8>, HashSet<Fingerprint>)>> {
-    // Possibly perform decryption
-    let public_keyring_for_validate = keyring_from_peerstate(&decryption_info.peerstate);
-
     let encrypted_data_part = match get_autocrypt_mime(mail)
         .or_else(|| get_mixed_up_mime(mail))
         .or_else(|| get_attachment_mime(mail))
     {
-        None => {
-            // not an autocrypt mime message, abort and ignore
-            return Ok(None);
-        }
+        None => return Ok(None),
         Some(res) => res,
     };
     info!(context, "Detected Autocrypt-mime message");
-    let private_keyring: Keyring<SignedSecretKey> = Keyring::new_self(context)
-        .await
-        .context("failed to get own keyring")?;
 
     decrypt_part(
         encrypted_data_part,
         private_keyring,
         public_keyring_for_validate,
     )
-    .await
 }
 
-pub async fn prepare_decryption(
+pub(crate) async fn prepare_decryption(
     context: &Context,
     mail: &ParsedMail<'_>,
-    from: &[SingleInfo],
+    from: &str,
     message_time: i64,
 ) -> Result<DecryptionInfo> {
-    let from = if let Some(f) = from.first() {
-        &f.addr
-    } else {
-        return Ok(DecryptionInfo::default());
-    };
+    if mail.headers.get_header(HeaderDef::ListPost).is_some() {
+        if mail.headers.get_header(HeaderDef::Autocrypt).is_some() {
+            info!(
+                context,
+                "Ignoring autocrypt header since this is a mailing list message. \
+                NOTE: For privacy reasons, the mailing list software should remove Autocrypt headers."
+            );
+        }
+        return Ok(DecryptionInfo {
+            from: from.to_string(),
+            autocrypt_header: None,
+            peerstate: None,
+            message_time,
+            dkim_results: DkimResults {
+                dkim_passed: false,
+                dkim_should_work: false,
+                allow_keychange: true,
+            },
+        });
+    }
 
-    let autocrypt_header = Aheader::from_headers(from, &mail.headers)
-        .ok_or_log_msg(context, "Failed to parse Autocrypt header")
-        .flatten();
+    let autocrypt_header =
+        if let Some(autocrypt_header_value) = mail.headers.get_header_value(HeaderDef::Autocrypt) {
+            match Aheader::from_str(&autocrypt_header_value) {
+                Ok(header) if addr_cmp(&header.addr, from) => Some(header),
+                Ok(header) => {
+                    warn!(
+                        context,
+                        "Autocrypt header address {:?} is not {:?}.", header.addr, from
+                    );
+                    None
+                }
+                Err(err) => {
+                    warn!(context, "Failed to parse Autocrypt header: {:#}.", err);
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
     let dkim_results = handle_authres(context, mail, from, message_time).await?;
 
@@ -93,7 +112,7 @@ pub async fn prepare_decryption(
     })
 }
 
-#[derive(Default, Debug)]
+#[derive(Debug)]
 pub struct DecryptionInfo {
     /// The From address. This is the address from the unnencrypted, outer
     /// From header.
@@ -189,30 +208,17 @@ fn get_autocrypt_mime<'a, 'b>(mail: &'a ParsedMail<'b>) -> Option<&'a ParsedMail
 }
 
 /// Returns Ok(None) if nothing encrypted was found.
-async fn decrypt_part(
+fn decrypt_part(
     mail: &ParsedMail<'_>,
-    private_keyring: Keyring<SignedSecretKey>,
-    public_keyring_for_validate: Keyring<SignedPublicKey>,
+    private_keyring: &[SignedSecretKey],
+    public_keyring_for_validate: &[SignedPublicKey],
 ) -> Result<Option<(Vec<u8>, HashSet<Fingerprint>)>> {
     let data = mail.get_body_raw()?;
 
     if has_decrypted_pgp_armor(&data) {
         let (plain, ret_valid_signatures) =
-            pgp::pk_decrypt(data, private_keyring, &public_keyring_for_validate).await?;
-
-        // Check for detached signatures.
-        // If decrypted part is a multipart/signed, then there is a detached signature.
-        let decrypted_part = mailparse::parse_mail(&plain)?;
-        if let Some((content, valid_detached_signatures)) =
-            validate_detached_signature(&decrypted_part, &public_keyring_for_validate)?
-        {
-            return Ok(Some((content, valid_detached_signatures)));
-        } else {
-            // If the message was wrongly or not signed, still return the plain text.
-            // The caller has to check if the signatures set is empty then.
-
-            return Ok(Some((plain, ret_valid_signatures)));
-        }
+            pgp::pk_decrypt(data, private_keyring, public_keyring_for_validate)?;
+        return Ok(Some((plain, ret_valid_signatures)));
     }
 
     Ok(None)
@@ -234,36 +240,39 @@ fn has_decrypted_pgp_armor(input: &[u8]) -> bool {
 
 /// Validates signatures of Multipart/Signed message part, as defined in RFC 1847.
 ///
-/// Returns `None` if the part is not a Multipart/Signed part, otherwise retruns the set of key
+/// Returns the signed part and the set of key
 /// fingerprints for which there is a valid signature.
-fn validate_detached_signature(
-    mail: &ParsedMail<'_>,
-    public_keyring_for_validate: &Keyring<SignedPublicKey>,
-) -> Result<Option<(Vec<u8>, HashSet<Fingerprint>)>> {
+///
+/// Returns None if the message is not Multipart/Signed or doesn't contain necessary parts.
+pub(crate) fn validate_detached_signature<'a, 'b>(
+    mail: &'a ParsedMail<'b>,
+    public_keyring_for_validate: &[SignedPublicKey],
+) -> Option<(&'a ParsedMail<'b>, HashSet<Fingerprint>)> {
     if mail.ctype.mimetype != "multipart/signed" {
-        return Ok(None);
+        return None;
     }
 
     if let [first_part, second_part] = &mail.subparts[..] {
         // First part is the content, second part is the signature.
         let content = first_part.raw_bytes;
-        let signature = second_part.get_body_raw()?;
-        let ret_valid_signatures =
-            pgp::pk_validate(content, &signature, public_keyring_for_validate)?;
-
-        Ok(Some((content.to_vec(), ret_valid_signatures)))
+        let ret_valid_signatures = match second_part.get_body_raw() {
+            Ok(signature) => pgp::pk_validate(content, &signature, public_keyring_for_validate)
+                .unwrap_or_default(),
+            Err(_) => Default::default(),
+        };
+        Some((first_part, ret_valid_signatures))
     } else {
-        Ok(None)
+        None
     }
 }
 
-fn keyring_from_peerstate(peerstate: &Option<Peerstate>) -> Keyring<SignedPublicKey> {
-    let mut public_keyring_for_validate: Keyring<SignedPublicKey> = Keyring::new();
-    if let Some(ref peerstate) = *peerstate {
+pub(crate) fn keyring_from_peerstate(peerstate: Option<&Peerstate>) -> Vec<SignedPublicKey> {
+    let mut public_keyring_for_validate = Vec::new();
+    if let Some(peerstate) = peerstate {
         if let Some(key) = &peerstate.public_key {
-            public_keyring_for_validate.add(key.clone());
+            public_keyring_for_validate.push(key.clone());
         } else if let Some(key) = &peerstate.gossip_key {
-            public_keyring_for_validate.add(key.clone());
+            public_keyring_for_validate.push(key.clone());
         }
     }
     public_keyring_for_validate
@@ -306,7 +315,7 @@ pub(crate) async fn get_autocrypt_peerstate(
             if addr_cmp(&peerstate.addr, from) {
                 if allow_change {
                     peerstate.apply_header(header, message_time);
-                    peerstate.save_to_db(&context.sql, false).await?;
+                    peerstate.save_to_db(&context.sql).await?;
                 } else {
                     info!(
                         context,
@@ -322,7 +331,7 @@ pub(crate) async fn get_autocrypt_peerstate(
             // to the database.
         } else {
             let p = Peerstate::from_header(header, message_time);
-            p.save_to_db(&context.sql, true).await?;
+            p.save_to_db(&context.sql).await?;
             peerstate = Some(p);
         }
     } else {
@@ -334,10 +343,9 @@ pub(crate) async fn get_autocrypt_peerstate(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::receive_imf::receive_imf;
     use crate::test_utils::TestContext;
-
-    use super::*;
 
     #[test]
     fn test_has_decrypted_pgp_armor() {
@@ -390,7 +398,7 @@ mod tests {
         let bob = TestContext::new_bob().await;
         receive_imf(&bob, attachment_mime, false).await?;
         let msg = bob.get_last_msg().await;
-        assert_eq!(msg.text.as_deref(), Some("Hello from Thunderbird!"));
+        assert_eq!(msg.text, "Hello from Thunderbird!");
 
         Ok(())
     }

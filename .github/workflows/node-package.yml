@@ -1,25 +1,24 @@
-name: 'node.js build'
+name: "node.js build"
 on:
   pull_request:
   push:
     tags:
-    - '*'
-    - '!py-*'
-
+      - "*"
+      - "!py-*"
 
 jobs:
   prebuild:
-    name: 'prebuild'
+    name: Prebuild
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-18.04, macos-latest, windows-latest]
+        os: [macos-latest, windows-latest]
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
-      - uses: actions/setup-node@v2
+        uses: actions/checkout@v3
+      - uses: actions/setup-node@v3
         with:
-          node-version: '16'
+          node-version: "16"
       - name: System info
         run: |
           rustc -vV
@@ -29,7 +28,7 @@ jobs:
           node --version
 
       - name: Cache node modules
-        uses: actions/cache@v2
+        uses: actions/cache@v3
         with:
           path: |
             ${{ env.APPDATA }}/npm-cache
@@ -37,7 +36,7 @@ jobs:
           key: ${{ matrix.os }}-node-${{ hashFiles('**/package.json') }}
 
       - name: Cache cargo index
-        uses: actions/cache@v2
+        uses: actions/cache@v3
         with:
           path: |
             ~/.cargo/registry/
@@ -47,39 +46,107 @@ jobs:
 
       - name: Install dependencies & build
         if: steps.cache.outputs.cache-hit != 'true'
-        run: |
-          cd node
-          npm install --verbose
+        working-directory: node
+        run: npm install --verbose
 
       - name: Build Prebuild
+        working-directory: node
         run: |
-          cd node
           npm run prebuildify
           tar -zcvf "${{ matrix.os }}.tar.gz" -C prebuilds .
 
       - name: Upload Prebuild
-        uses: actions/upload-artifact@v1
+        uses: actions/upload-artifact@v3
         with:
           name: ${{ matrix.os }}
           path: node/${{ matrix.os }}.tar.gz
 
-  pack-module:
-    needs: prebuild
-    name: 'Package deltachat-node and upload to download.delta.chat'
-    runs-on: ubuntu-18.04
+  prebuild-linux:
+    name: Prebuild Linux
+    runs-on: ubuntu-latest
+
+    # Build Linux prebuilds inside a container with old glibc for backwards compatibility.
+    # Debian 10 contained glibc 2.28 at the time of the writing (2023-06-04): https://packages.debian.org/buster/libc6
+    container: debian:10
     steps:
-      - name: install tree
+      # Working directory is owned by 1001:1001 by default.
+      # Change it to our user.
+      - name: Change working directory owner
+        run: chown root:root .
+
+      - name: Checkout
+        uses: actions/checkout@v3
+      - uses: actions/setup-node@v3
+        with:
+          node-version: "16"
+      - run: apt-get update
+
+      # Python is needed for node-gyp
+      - name: Install curl, python and compilers
+        run: apt-get install -y curl build-essential python3
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+      - name: System info
+        run: |
+          rustc -vV
+          rustup -vV
+          cargo -vV
+          npm --version
+          node --version
+
+      - name: Cache node modules
+        uses: actions/cache@v3
+        with:
+          path: |
+            ${{ env.APPDATA }}/npm-cache
+            ~/.npm
+          key: ${{ matrix.os }}-node-${{ hashFiles('**/package.json') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry/
+            ~/.cargo/git
+            target
+          key: ${{ matrix.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}-2
+
+      - name: Install dependencies & build
+        if: steps.cache.outputs.cache-hit != 'true'
+        working-directory: node
+        run: npm install --verbose
+
+      - name: Build Prebuild
+        working-directory: node
+        run: |
+          npm run prebuildify
+          tar -zcvf "linux.tar.gz" -C prebuilds .
+
+      - name: Upload Prebuild
+        uses: actions/upload-artifact@v3
+        with:
+          name: linux
+          path: node/linux.tar.gz
+
+  pack-module:
+    needs: [prebuild, prebuild-linux]
+    name: Package deltachat-node and upload to download.delta.chat
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install tree
         run: sudo apt install tree
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
       - uses: actions/setup-node@v2
         with:
-          node-version: '16'
-      - name: get tag
+          node-version: "16"
+      - name: Get tag
         id: tag
         uses: dawidd6/action-get-tag@v1
         continue-on-error: true
-      - name: Get Pullrequest ID
+      - name: Get Pull Request ID
         id: prepare
         run: |
           tag=${{ steps.tag.outputs.tag }}
@@ -97,44 +164,44 @@ jobs:
           npm --version
           node --version
           echo $DELTACHAT_NODE_TAR_GZ
-      - name: Download ubuntu prebuild
+      - name: Download Linux prebuild
         uses: actions/download-artifact@v1
         with:
-          name: ubuntu-18.04
-      - name: Download macos prebuild
+          name: linux
+      - name: Download macOS prebuild
         uses: actions/download-artifact@v1
         with:
           name: macos-latest
-      - name: Download windows prebuild
+      - name: Download Windows prebuild
         uses: actions/download-artifact@v1
         with:
           name: windows-latest
       - shell: bash
         run: |
           mkdir node/prebuilds
-          tar -xvzf ubuntu-18.04/ubuntu-18.04.tar.gz -C node/prebuilds
+          tar -xvzf linux/linux.tar.gz -C node/prebuilds
           tar -xvzf macos-latest/macos-latest.tar.gz -C node/prebuilds
           tar -xvzf windows-latest/windows-latest.tar.gz -C node/prebuilds
           tree node/prebuilds
-          rm -rf ubuntu-18.04 macos-latest windows-latest
-      - name: install dependencies without running scripts
+          rm -rf linux macos-latest windows-latest
+      - name: Install dependencies without running scripts
         run: |
           npm install --ignore-scripts
-      - name: build constants
+      - name: Build constants
         run: |
           npm run build:core:constants
-      - name: build typescript part
+      - name: Build TypeScript part
         run: |
           npm run build:bindings:ts
-      - name: package
+      - name: Package
         shell: bash
         run: |
           mv node/README.md README.md
           npm pack .
           ls -lah
           mv $(find deltachat-node-*) $DELTACHAT_NODE_TAR_GZ
-      - name: Upload Prebuild
-        uses: actions/upload-artifact@v1
+      - name: Upload prebuild
+        uses: actions/upload-artifact@v3
         with:
           name: deltachat-node.tgz
           path: ${{ env.DELTACHAT_NODE_TAR_GZ }}
@@ -148,12 +215,12 @@ jobs:
           chmod 600 __TEMP_INPUT_KEY_FILE
           scp -o StrictHostKeyChecking=no -v -i __TEMP_INPUT_KEY_FILE -P "22" -r $DELTACHAT_NODE_TAR_GZ "${{ secrets.USERNAME }}"@"download.delta.chat":"/var/www/html/download/node/preview/"
         continue-on-error: true
-      - name: "Post links to details"
+      - name: Post links to details
         if: steps.upload-preview.outcome == 'success'
         run: node ./node/scripts/postLinksToDetails.js
         env:
-         URL: preview/${{ env.DELTACHAT_NODE_TAR_GZ }}
-         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          URL: preview/${{ env.DELTACHAT_NODE_TAR_GZ }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       # Upload to download.delta.chat/node/
       - name: Upload deltachat-node build to download.delta.chat/node/
         if: ${{ steps.tag.outputs.tag }}

@@ -3,12 +3,11 @@ use std::{collections::BTreeMap, time::Instant};
 use anyhow::{Context as _, Result};
 use futures::stream::StreamExt;
 
+use super::{get_folder_meaning_by_attrs, get_folder_meaning_by_name};
 use crate::config::Config;
 use crate::imap::Imap;
 use crate::log::LogExt;
 use crate::{context::Context, imap::FolderMeaning};
-
-use super::{get_folder_meaning, get_folder_meaning_by_name};
 
 impl Imap {
     /// Returns true if folders were scanned, false if scanning was postponed.
@@ -34,7 +33,7 @@ impl Imap {
         let mut folder_configs = BTreeMap::new();
 
         for folder in folders {
-            let folder_meaning = get_folder_meaning(&folder);
+            let folder_meaning = get_folder_meaning_by_attrs(folder.attributes());
             if folder_meaning == FolderMeaning::Virtual {
                 // Gmail has virtual folders that should be skipped. For example,
                 // emails appear in the inbox and under "All Mail" as soon as it is
@@ -54,40 +53,45 @@ impl Imap {
                     .or_insert_with(|| folder.name().to_string());
             }
 
-            let is_drafts = folder_meaning == FolderMeaning::Drafts
-                || (folder_meaning == FolderMeaning::Unknown
-                    && folder_name_meaning == FolderMeaning::Drafts);
-            let is_spam_folder = folder_meaning == FolderMeaning::Spam
-                || (folder_meaning == FolderMeaning::Unknown
-                    && folder_name_meaning == FolderMeaning::Spam);
+            let folder_meaning = match folder_meaning {
+                FolderMeaning::Unknown => folder_name_meaning,
+                _ => folder_meaning,
+            };
 
             // Don't scan folders that are watched anyway
-            if !watched_folders.contains(&folder.name().to_string()) && !is_drafts {
+            if !watched_folders.contains(&folder.name().to_string())
+                && folder_meaning != FolderMeaning::Drafts
+                && folder_meaning != FolderMeaning::Trash
+            {
+                let session = self.session.as_mut().context("no session")?;
                 // Drain leftover unsolicited EXISTS messages
-                self.server_sent_unsolicited_exists(context)?;
+                session.server_sent_unsolicited_exists(context)?;
 
                 loop {
-                    self.fetch_move_delete(context, folder.name(), is_spam_folder)
+                    self.fetch_move_delete(context, folder.name(), folder_meaning)
                         .await
-                        .ok_or_log_msg(context, "Can't fetch new msgs in scanned folder");
+                        .context("Can't fetch new msgs in scanned folder")
+                        .log_err(context)
+                        .ok();
 
+                    let session = self.session.as_mut().context("no session")?;
                     // If the server sent an unsocicited EXISTS during the fetch, we need to fetch again
-                    if !self.server_sent_unsolicited_exists(context)? {
+                    if !session.server_sent_unsolicited_exists(context)? {
                         break;
                     }
                 }
             }
         }
 
-        // Set the `ConfiguredSentboxFolder` or set it to `None` if the folder was deleted.
-        context
-            .set_config(
-                Config::ConfiguredSentboxFolder,
-                folder_configs
-                    .get(&Config::ConfiguredSentboxFolder)
-                    .map(|s| s.as_str()),
-            )
-            .await?;
+        // Set configs for necessary folders. Or reset if the folder was deleted.
+        for conf in [
+            Config::ConfiguredSentboxFolder,
+            Config::ConfiguredTrashFolder,
+        ] {
+            context
+                .set_config(conf, folder_configs.get(&conf).map(|s| s.as_str()))
+                .await?;
+        }
 
         last_scan.replace(Instant::now());
         Ok(true)
@@ -103,7 +107,11 @@ impl Imap {
         let list = session
             .list(Some(""), Some("*"))
             .await?
-            .filter_map(|f| async { f.ok_or_log_msg(context, "list_folders() can't get folder") });
+            .filter_map(|f| async {
+                f.context("list_folders() can't get folder")
+                    .log_err(context)
+                    .ok()
+            });
         Ok(list.collect().await)
     }
 }

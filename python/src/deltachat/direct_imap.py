@@ -79,15 +79,17 @@ class DirectImap:
 
     def select_config_folder(self, config_name: str):
         """Return info about selected folder if it is
-        configured, otherwise None."""
+        configured, otherwise None.
+        """
         if "_" not in config_name:
-            config_name = "configured_{}_folder".format(config_name)
+            config_name = f"configured_{config_name}_folder"
         foldername = self.account.get_config(config_name)
         if foldername:
             return self.select_folder(foldername)
+        return None
 
     def list_folders(self) -> List[str]:
-        """return list of all existing folder names"""
+        """return list of all existing folder names."""
         assert not self._idling
         return [folder.name for folder in self.conn.folder.list()]
 
@@ -103,7 +105,7 @@ class DirectImap:
 
     def get_all_messages(self) -> List[MailMessage]:
         assert not self._idling
-        return [mail for mail in self.conn.fetch()]
+        return list(self.conn.fetch())
 
     def get_unread_messages(self) -> List[str]:
         assert not self._idling
@@ -189,7 +191,7 @@ class DirectImap:
 
 
 class IdleManager:
-    def __init__(self, direct_imap):
+    def __init__(self, direct_imap) -> None:
         self.direct_imap = direct_imap
         self.log = direct_imap.account.log
         # fetch latest messages before starting idle so that it only
@@ -201,18 +203,18 @@ class IdleManager:
         """(blocking) wait for next idle message from server."""
         self.log("imap-direct: calling idle_check")
         res = self.direct_imap.conn.idle.poll(timeout=timeout)
-        self.log("imap-direct: idle_check returned {!r}".format(res))
+        self.log(f"imap-direct: idle_check returned {res!r}")
         return res
 
     def wait_for_new_message(self, timeout=None) -> bytes:
-        while 1:
+        while True:
             for item in self.check(timeout=timeout):
                 if b"EXISTS" in item or b"RECENT" in item:
                     return item
 
     def wait_for_seen(self, timeout=None) -> int:
         """Return first message with SEEN flag from a running idle-stream."""
-        while 1:
+        while True:
             for item in self.check(timeout=timeout):
                 if FETCH in item:
                     self.log(str(item))
@@ -221,5 +223,4 @@ class IdleManager:
 
     def done(self):
         """send idle-done to server if we are currently in idle mode."""
-        res = self.direct_imap.conn.idle.stop()
-        return res
+        return self.direct_imap.conn.idle.stop()

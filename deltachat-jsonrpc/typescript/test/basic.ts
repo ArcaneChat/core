@@ -4,10 +4,7 @@ import chaiAsPromised from "chai-as-promised";
 chai.use(chaiAsPromised);
 import { StdioDeltaChat as DeltaChat } from "../deltachat.js";
 
-import {
-  RpcServerHandle,
-  startServer,
-} from "./test_base.js";
+import { RpcServerHandle, startServer } from "./test_base.js";
 
 describe("basic tests", () => {
   let serverHandle: RpcServerHandle;
@@ -15,9 +12,9 @@ describe("basic tests", () => {
 
   before(async () => {
     serverHandle = await startServer();
-    dc = new DeltaChat(serverHandle.stdin, serverHandle.stdout)
+    dc = new DeltaChat(serverHandle.stdin, serverHandle.stdout, true);
     // dc.on("ALL", (event) => {
-      //console.log("event", event);
+    //console.log("event", event);
     // });
   });
 
@@ -56,7 +53,7 @@ describe("basic tests", () => {
     ]);
   });
 
-  describe("account managment", () => {
+  describe("account management", () => {
     it("should create account", async () => {
       const res = await dc.rpc.addAccount();
       assert((await dc.rpc.getAllAccountIds()).length === 1);
@@ -76,7 +73,7 @@ describe("basic tests", () => {
     });
   });
 
-  describe("contact managment", function () {
+  describe("contact management", function () {
     let accountId: number;
     before(async () => {
       accountId = await dc.rpc.addAccount();
@@ -106,38 +103,44 @@ describe("basic tests", () => {
       accountId = await dc.rpc.addAccount();
     });
 
-    it("set and retrive", async function () {
+    it("set and retrieve", async function () {
       await dc.rpc.setConfig(accountId, "addr", "valid@email");
       assert((await dc.rpc.getConfig(accountId, "addr")) == "valid@email");
     });
     it("set invalid key should throw", async function () {
-      await expect(dc.rpc.setConfig(accountId, "invalid_key", "some value")).to.be
-        .eventually.rejected;
+      await expect(dc.rpc.setConfig(accountId, "invalid_key", "some value")).to
+        .be.eventually.rejected;
     });
     it("get invalid key should throw", async function () {
       await expect(dc.rpc.getConfig(accountId, "invalid_key")).to.be.eventually
         .rejected;
     });
-    it("set and retrive ui.*", async function () {
+    it("set and retrieve ui.*", async function () {
       await dc.rpc.setConfig(accountId, "ui.chat_bg", "color:red");
       assert((await dc.rpc.getConfig(accountId, "ui.chat_bg")) == "color:red");
     });
-    it("set and retrive (batch)", async function () {
+    it("set and retrieve (batch)", async function () {
       const config = { addr: "valid@email", mail_pw: "1234" };
       await dc.rpc.batchSetConfig(accountId, config);
-      const retrieved = await dc.rpc.batchGetConfig(accountId, Object.keys(config));
+      const retrieved = await dc.rpc.batchGetConfig(
+        accountId,
+        Object.keys(config)
+      );
       expect(retrieved).to.deep.equal(config);
     });
-    it("set and retrive ui.* (batch)", async function () {
+    it("set and retrieve ui.* (batch)", async function () {
       const config = {
         "ui.chat_bg": "color:green",
         "ui.enter_key_sends": "true",
       };
       await dc.rpc.batchSetConfig(accountId, config);
-      const retrieved = await dc.rpc.batchGetConfig(accountId, Object.keys(config));
+      const retrieved = await dc.rpc.batchGetConfig(
+        accountId,
+        Object.keys(config)
+      );
       expect(retrieved).to.deep.equal(config);
     });
-    it("set and retrive mixed(ui and core) (batch)", async function () {
+    it("set and retrieve mixed(ui and core) (batch)", async function () {
       const config = {
         "ui.chat_bg": "color:yellow",
         "ui.enter_key_sends": "false",
@@ -145,7 +148,10 @@ describe("basic tests", () => {
         mail_pw: "123456",
       };
       await dc.rpc.batchSetConfig(accountId, config);
-      const retrieved = await dc.rpc.batchGetConfig(accountId, Object.keys(config));
+      const retrieved = await dc.rpc.batchGetConfig(
+        accountId,
+        Object.keys(config)
+      );
       expect(retrieved).to.deep.equal(config);
     });
   });

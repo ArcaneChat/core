@@ -14,7 +14,7 @@ class GroupTrackingPlugin:
             message.create_chat()
             addr = message.get_sender_contact().addr
             text = message.text
-            message.chat.send_text("echoing from {}:\n{}".format(addr, text))
+            message.chat.send_text(f"echoing from {addr}:\n{text}")
 
     @account_hookimpl
     def ac_outgoing_message(self, message):
@@ -28,25 +28,17 @@ class GroupTrackingPlugin:
     def ac_chat_modified(self, chat):
         print("ac_chat_modified:", chat.id, chat.get_name())
         for member in chat.get_contacts():
-            print("chat member: {}".format(member.addr))
+            print(f"chat member: {member.addr}")
 
     @account_hookimpl
     def ac_member_added(self, chat, contact, actor, message):
-        print(
-            "ac_member_added {} to chat {} from {}".format(
-                contact.addr, chat.id, actor or message.get_sender_contact().addr
-            )
-        )
+        print(f"ac_member_added {contact.addr} to chat {chat.id} from {actor or message.get_sender_contact().addr}")
         for member in chat.get_contacts():
-            print("chat member: {}".format(member.addr))
+            print(f"chat member: {member.addr}")
 
     @account_hookimpl
     def ac_member_removed(self, chat, contact, actor, message):
-        print(
-            "ac_member_removed {} from chat {} by {}".format(
-                contact.addr, chat.id, actor or message.get_sender_contact().addr
-            )
-        )
+        print(f"ac_member_removed {contact.addr} from chat {chat.id} by {actor or message.get_sender_contact().addr}")
 
 
 def main(argv=None):
