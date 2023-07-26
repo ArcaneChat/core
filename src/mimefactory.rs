@@ -514,6 +514,21 @@ impl<'a> MimeFactory<'a> {
             .unprotected
             .push(Header::new_with_value("To".into(), to).unwrap());
 
+        let subject_str = self.subject_str(context).await?;
+        let encoded_subject = if subject_str
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == ' ')
+        // We do not use needs_encoding() here because needs_encoding() returns true if the string contains a space
+        // but we do not want to encode all subjects just because they contain a space.
+        {
+            subject_str.clone()
+        } else {
+            encode_words(&subject_str)
+        };
+        headers
+            .protected
+            .push(Header::new("Subject".into(), encoded_subject));
+
         let date = chrono::Utc
             .from_local_datetime(
                 &chrono::NaiveDateTime::from_timestamp_opt(self.timestamp, 0)
@@ -738,6 +753,7 @@ impl<'a> MimeFactory<'a> {
                         .body(encrypted)
                         .build(),
                 )
+                .header(("Subject".to_string(), "...".to_string()))
         } else {
             let message = if headers.hidden.is_empty() {
                 message
@@ -813,7 +829,7 @@ impl<'a> MimeFactory<'a> {
             last_added_location_id,
             sync_ids_to_delete: self.sync_ids_to_delete,
             rfc724_mid,
-            subject: "".to_string(),
+            subject: subject_str,
         })
     }
 

@@ -165,7 +165,7 @@ pub enum Config {
     ///
     /// Value 1 is treated as "delete at once": messages are deleted
     /// immediately, without moving to DeltaChat folder.
-    #[strum(props(default = "1"))]
+    #[strum(props(default = "0"))]
     DeleteServerAfter,
 
     /// Timer in seconds after which the message is deleted from the
