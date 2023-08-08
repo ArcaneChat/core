@@ -27,7 +27,7 @@ use crate::decrypt::{
 use crate::dehtml::dehtml;
 use crate::events::EventType;
 use crate::headerdef::{HeaderDef, HeaderDefMap};
-use crate::key::{DcKey, Fingerprint, SignedPublicKey, SignedSecretKey};
+use crate::key::{load_self_secret_key, DcKey, Fingerprint, SignedPublicKey};
 use crate::message::{self, set_msg_failed, update_msg_state, MessageState, MsgId, Viewtype};
 use crate::param::{Param, Params};
 use crate::peerstate::Peerstate;
@@ -275,7 +275,7 @@ impl MimeMessage {
         headers.remove("chat-verified");
 
         let from = from.context("No from in message")?;
-        let private_keyring = vec![SignedSecretKey::load_self(context)
+        let private_keyring = vec![load_self_secret_key(context)
             .await
             .context("Failed to get own key")?];
 
@@ -1266,6 +1266,7 @@ impl MimeMessage {
         part.mimetype = Some(mime_type);
         part.bytes = decoded_data.len();
         part.param.set(Param::File, blob.as_name());
+        part.param.set(Param::Filename, filename);
         part.param.set(Param::MimeType, raw_mime);
         part.is_related = is_related;
 
@@ -2178,7 +2179,7 @@ async fn ndn_maybe_add_info_msg(
             // If we get an NDN for the mailing list, just issue a warning.
             warn!(context, "ignoring NDN for mailing list.");
         }
-        Chattype::Single | Chattype::Undefined => {}
+        Chattype::Single => {}
     }
     Ok(())
 }

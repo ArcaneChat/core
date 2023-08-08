@@ -1110,7 +1110,7 @@ dc_reactions_t* dc_get_msg_reactions (dc_context_t *context, int msg_id);
  *
  * In JS land, that would be mapped to something as:
  * ```
- * success = window.webxdc.sendUpdate('{"action":"move","src":"A3","dest":"B4"}', 'move A3 B4');
+ * success = window.webxdc.sendUpdate('{payload: {"action":"move","src":"A3","dest":"B4"}}', 'move A3 B4');
  * ```
  * `context` and `msg_id` are not needed in JS as those are unique within a webxdc instance.
  * See dc_get_webxdc_status_updates() for the receiving counterpart.
@@ -2915,12 +2915,15 @@ int dc_receive_backup (dc_context_t* context, const char* qr);
  * @param dir The directory to create the context-databases in.
  *     If the directory does not exist,
  *     dc_accounts_new() will try to create it.
+ * @param writable Whether the returned account manager is writable, i.e. calling these functions on
+ *     it is possible: dc_accounts_add_account(), dc_accounts_add_closed_account(),
+ *     dc_accounts_migrate_account(), dc_accounts_remove_account(), dc_accounts_select_account().
  * @return An account manager object.
  *     The object must be passed to the other account manager functions
  *     and must be freed using dc_accounts_unref() after usage.
  *     On errors, NULL is returned.
  */
-dc_accounts_t* dc_accounts_new                  (const char* os_name, const char* dir);
+dc_accounts_t* dc_accounts_new                  (const char* dir, int writable);
 
 
 /**
@@ -3986,16 +3989,17 @@ char*           dc_msg_get_text               (const dc_msg_t* msg);
  */
 char*           dc_msg_get_subject            (const dc_msg_t* msg);
 
+
 /**
- * Find out full path, file name and extension of the file associated with a
- * message.
+ * Find out full path of the file associated with a message.
  *
  * Typically files are associated with images, videos, audios, documents.
  * Plain text messages do not have a file.
+ * File name may be mangled. To obtain the original attachment filename use dc_msg_get_filename().
  *
  * @memberof dc_msg_t
  * @param msg The message object.
- * @return The full path, the file name, and the extension of the file associated with the message.
+ * @return The full path (with file name and extension) of the file associated with the message.
  *     If there is no file associated with the message, an empty string is returned.
  *     NULL is never returned and the returned value must be released using dc_str_unref().
  */
@@ -4003,14 +4007,13 @@ char*           dc_msg_get_file               (const dc_msg_t* msg);
 
 
 /**
- * Get a base file name without the path. The base file name includes the extension; the path
- * is not returned. To get the full path, use dc_msg_get_file().
+ * Get an original attachment filename, with extension but without the path. To get the full path,
+ * use dc_msg_get_file().
  *
  * @memberof dc_msg_t
  * @param msg The message object.
- * @return The base file name plus the extension without part. If there is no file
- *     associated with the message, an empty string is returned. The returned
- *     value must be released using dc_str_unref().
+ * @return The attachment filename. If there is no file associated with the message, an empty string
+ *     is returned. The returned value must be released using dc_str_unref().
  */
 char*           dc_msg_get_filename           (const dc_msg_t* msg);
 

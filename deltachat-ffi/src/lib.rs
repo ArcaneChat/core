@@ -29,7 +29,7 @@ use deltachat::contact::{Contact, ContactId, Origin};
 use deltachat::context::Context;
 use deltachat::ephemeral::Timer as EphemeralTimer;
 use deltachat::imex::BackupProvider;
-use deltachat::key::DcKey;
+use deltachat::key::preconfigure_keypair;
 use deltachat::message::MsgId;
 use deltachat::net::read_url_blob;
 use deltachat::qr_code_generator::{generate_backup_qr, get_securejoin_qr_svg};
@@ -795,21 +795,13 @@ pub unsafe extern "C" fn dc_preconfigure_keypair(
         return 0;
     }
     let ctx = &*context;
-    block_on(async move {
-        let addr = tools::EmailAddress::new(&to_string_lossy(addr))?;
-        let public = key::SignedPublicKey::from_asc(&to_string_lossy(public_data))?.0;
-        let secret = key::SignedSecretKey::from_asc(&to_string_lossy(secret_data))?.0;
-        let keypair = key::KeyPair {
-            addr,
-            public,
-            secret,
-        };
-        key::store_self_keypair(ctx, &keypair, key::KeyPairUse::Default).await?;
-        Ok::<_, anyhow::Error>(1)
-    })
-    .context("Failed to save keypair")
-    .log_err(ctx)
-    .unwrap_or(0)
+    let addr = to_string_lossy(addr);
+    let public_data = to_string_lossy(public_data);
+    let secret_data = to_string_lossy(secret_data);
+    block_on(preconfigure_keypair(ctx, &addr, &public_data, &secret_data))
+        .context("Failed to save keypair")
+        .log_err(ctx)
+        .is_ok() as libc::c_int
 }
 
 #[no_mangle]
@@ -4676,17 +4668,17 @@ pub type dc_accounts_t = AccountsWrapper;
 
 #[no_mangle]
 pub unsafe extern "C" fn dc_accounts_new(
-    _os_name: *const libc::c_char,
-    dbfile: *const libc::c_char,
+    dir: *const libc::c_char,
+    writable: libc::c_int,
 ) -> *mut dc_accounts_t {
     setup_panic!();
 
-    if dbfile.is_null() {
+    if dir.is_null() {
         eprintln!("ignoring careless call to dc_accounts_new()");
         return ptr::null_mut();
     }
 
-    let accs = block_on(Accounts::new(as_path(dbfile).into()));
+    let accs = block_on(Accounts::new(as_path(dir).into(), writable != 0));
 
     match accs {
         Ok(accs) => Box::into_raw(Box::new(AccountsWrapper::new(accs))),

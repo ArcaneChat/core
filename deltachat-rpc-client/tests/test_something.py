@@ -1,4 +1,6 @@
 import asyncio
+import json
+import subprocess
 from unittest.mock import MagicMock
 
 import pytest
@@ -43,7 +45,7 @@ async def test_acfactory(acfactory) -> None:
     account = await acfactory.new_configured_account()
     while True:
         event = await account.wait_for_event()
-        if event.type == EventType.CONFIGURE_PROGRESS:
+        if event.kind == EventType.CONFIGURE_PROGRESS:
             assert event.progress != 0  # Progress 0 indicates error.
             if event.progress == 1000:  # Success
                 break
@@ -74,7 +76,7 @@ async def test_account(acfactory) -> None:
 
     while True:
         event = await bob.wait_for_event()
-        if event.type == EventType.INCOMING_MSG:
+        if event.kind == EventType.INCOMING_MSG:
             chat_id = event.chat_id
             msg_id = event.msg_id
             break
@@ -144,7 +146,7 @@ async def test_chat(acfactory) -> None:
 
     while True:
         event = await bob.wait_for_event()
-        if event.type == EventType.INCOMING_MSG:
+        if event.kind == EventType.INCOMING_MSG:
             chat_id = event.chat_id
             msg_id = event.msg_id
             break
@@ -230,7 +232,7 @@ async def test_message(acfactory) -> None:
 
     while True:
         event = await bob.wait_for_event()
-        if event.type == EventType.INCOMING_MSG:
+        if event.kind == EventType.INCOMING_MSG:
             chat_id = event.chat_id
             msg_id = event.msg_id
             break
@@ -270,7 +272,7 @@ async def test_is_bot(acfactory) -> None:
 
     while True:
         event = await bob.wait_for_event()
-        if event.type == EventType.INCOMING_MSG:
+        if event.kind == EventType.INCOMING_MSG:
             msg_id = event.msg_id
             message = bob.get_message_by_id(msg_id)
             snapshot = await message.get_snapshot()
@@ -355,3 +357,13 @@ async def test_import_export(acfactory, tmp_path) -> None:
     files = list(tmp_path.glob("*.tar"))
     alice2 = await acfactory.get_unconfigured_account()
     await alice2.import_backup(files[0])
+
+    assert await alice2.manager.get_system_info()
+
+
+def test_openrpc_command_line() -> None:
+    """Test that "deltachat-rpc-server --openrpc" command returns an OpenRPC specification."""
+    out = subprocess.run(["deltachat-rpc-server", "--openrpc"], capture_output=True).stdout
+    openrpc = json.loads(out)
+    assert "openrpc" in openrpc
+    assert "methods" in openrpc

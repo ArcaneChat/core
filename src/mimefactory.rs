@@ -66,7 +66,7 @@ pub struct MimeFactory<'a> {
     in_reply_to: String,
     references: String,
     req_mdn: bool,
-    last_added_location_id: u32,
+    last_added_location_id: Option<u32>,
 
     /// If the created mime-structure contains sync-items,
     /// the IDs of these items are listed here.
@@ -85,7 +85,7 @@ pub struct RenderedEmail {
     // pub envelope: Envelope,
     pub is_encrypted: bool,
     pub is_gossiped: bool,
-    pub last_added_location_id: u32,
+    pub last_added_location_id: Option<u32>,
 
     /// A comma-separated string of sync-IDs that are used by the rendered email
     /// and must be deleted once the message is actually queued for sending
@@ -223,7 +223,7 @@ impl<'a> MimeFactory<'a> {
             in_reply_to,
             references,
             req_mdn,
-            last_added_location_id: 0,
+            last_added_location_id: None,
             sync_ids_to_delete: None,
             attach_selfavatar,
         };
@@ -264,7 +264,7 @@ impl<'a> MimeFactory<'a> {
             in_reply_to: String::default(),
             references: String::default(),
             req_mdn: false,
-            last_added_location_id: 0,
+            last_added_location_id: None,
             sync_ids_to_delete: None,
             attach_selfavatar: false,
         };
@@ -871,7 +871,7 @@ impl<'a> MimeFactory<'a> {
             .body(kml_content);
         if !self.msg.param.exists(Param::SetLatitude) {
             // otherwise, the independent location is already filed
-            self.last_added_location_id = last_added_location_id;
+            self.last_added_location_id = Some(last_added_location_id);
         }
         Ok(part)
     }
@@ -892,7 +892,6 @@ impl<'a> MimeFactory<'a> {
         let mut meta_part = None;
 
         let send_verified_headers = match chat.typ {
-            Chattype::Undefined => bail!("Undefined chat type"),
             // In single chats, the protection status isn't necessarily the same for both sides,
             // so we don't send the Chat-Verified header:
             Chattype::Single => false,
@@ -1373,7 +1372,7 @@ impl<'a> MimeFactory<'a> {
 ///
 /// This line length limit is an
 /// [RFC5322 requirement](https://tools.ietf.org/html/rfc5322#section-2.1.1).
-fn wrapped_base64_encode(buf: &[u8]) -> String {
+pub(crate) fn wrapped_base64_encode(buf: &[u8]) -> String {
     let base64 = base64::engine::general_purpose::STANDARD.encode(buf);
     let mut chars = base64.chars();
     std::iter::repeat_with(|| chars.by_ref().take(78).collect::<String>())
@@ -1391,7 +1390,7 @@ async fn build_body_file(
         .param
         .get_blob(Param::File, context, true)
         .await?
-        .context("msg has no filename")?;
+        .context("msg has no file")?;
     let suffix = blob.suffix().unwrap_or("dat");
 
     // Get file name to use for sending.  For privacy purposes, we do
@@ -1436,7 +1435,11 @@ async fn build_body_file(
                 ),
             &suffix
         ),
-        _ => blob.as_file_name().to_string(),
+        _ => msg
+            .param
+            .get(Param::Filename)
+            .unwrap_or_else(|| blob.as_file_name())
+            .to_string(),
     };
 
     /* check mimetype */
@@ -1955,7 +1958,7 @@ mod tests {
         let incoming_msg = get_chat_msg(&t, new_msg.chat_id, 0, 2).await;
 
         if delete_original_msg {
-            incoming_msg.id.delete_from_db(&t).await.unwrap();
+            incoming_msg.id.trash(&t).await.unwrap();
         }
 
         if message_arrives_inbetween {

@@ -25,6 +25,7 @@ use crate::debug_logging::maybe_set_logging_xdc;
 use crate::ephemeral::Timer as EphemeralTimer;
 use crate::events::EventType;
 use crate::html::new_html_mimepart;
+use crate::location;
 use crate::message::{self, Message, MessageState, MsgId, Viewtype};
 use crate::mimefactory::MimeFactory;
 use crate::mimeparser::SystemMessage;
@@ -33,6 +34,7 @@ use crate::peerstate::{Peerstate, PeerstateVerifiedStatus};
 use crate::receive_imf::ReceivedMsg;
 use crate::scheduler::InterruptInfo;
 use crate::smtp::send_msg_to_smtp;
+use crate::sql;
 use crate::stock_str;
 use crate::tools::{
     buf_compress, create_id, create_outgoing_rfc724_mid, create_smeared_timestamp,
@@ -40,7 +42,6 @@ use crate::tools::{
     strip_rtlo_characters, time, IsNoneOrEmpty,
 };
 use crate::webxdc::WEBXDC_SUFFIX;
-use crate::{location, sql};
 
 /// An chat item, such as a message or a marker.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -376,7 +377,7 @@ impl ChatId {
         let chat = Chat::load_from_db(context, self).await?;
 
         match chat.typ {
-            Chattype::Undefined | Chattype::Broadcast => {
+            Chattype::Broadcast => {
                 bail!("Can't block chat of type {:?}", chat.typ)
             }
             Chattype::Single => {
@@ -417,10 +418,12 @@ impl ChatId {
         let chat = Chat::load_from_db(context, self).await?;
 
         match chat.typ {
-            Chattype::Undefined => bail!("Can't accept chat of undefined chattype"),
-            Chattype::Single if chat.protected == ProtectionStatus::ProtectionBroken => {
-                // The chat was in the 'Request' state because the protection was broken.
-                // The user clicked 'Accept', so, now we want to set the status to Unprotected again:
+            Chattype::Single
+                if chat.blocked == Blocked::Not
+                    && chat.protected == ProtectionStatus::ProtectionBroken =>
+            {
+                // The protection was broken, then the user clicked 'Accept'/'OK',
+                // so, now we want to set the status to Unprotected again:
                 chat.id
                     .inner_set_protection(context, ProtectionStatus::Unprotected)
                     .await?;
@@ -478,7 +481,6 @@ impl ChatId {
                     }
                 }
                 Chattype::Mailinglist => bail!("Cannot protect mailing lists"),
-                Chattype::Undefined => bail!("Undefined group type"),
             },
             ProtectionStatus::Unprotected | ProtectionStatus::ProtectionBroken => {}
         };
@@ -1305,7 +1307,6 @@ impl Chat {
         match self.typ {
             Chattype::Single | Chattype::Broadcast | Chattype::Mailinglist => Ok(true),
             Chattype::Group => is_contact_in_chat(context, self.id, ContactId::SELF).await,
-            Chattype::Undefined => Ok(false),
         }
     }
 
@@ -2110,6 +2111,14 @@ async fn prepare_msg_blob(context: &Context, msg: &mut Message) -> Result<()> {
             }
         }
         msg.param.set(Param::File, blob.as_name());
+        if let (Some(filename), Some(blob_ext)) = (msg.param.get(Param::Filename), blob.suffix()) {
+            let stem = match filename.rsplit_once('.') {
+                Some((stem, _)) => stem,
+                None => filename,
+            };
+            msg.param
+                .set(Param::Filename, stem.to_string() + "." + blob_ext);
+        }
 
         if msg.viewtype == Viewtype::File || msg.viewtype == Viewtype::Image {
             // Correct the type, take care not to correct already very special
@@ -2400,14 +2409,13 @@ async fn create_send_msg_job(context: &Context, msg_id: MsgId) -> Result<Option<
         msg.chat_id.set_gossiped_timestamp(context, time()).await?;
     }
 
-    if 0 != rendered_msg.last_added_location_id {
+    if let Some(last_added_location_id) = rendered_msg.last_added_location_id {
         if let Err(err) = location::set_kml_sent_timestamp(context, msg.chat_id, time()).await {
             error!(context, "Failed to set kml sent_timestamp: {err:#}.");
         }
         if !msg.hidden {
             if let Err(err) =
-                location::set_msg_location_id(context, msg.id, rendered_msg.last_added_location_id)
-                    .await
+                location::set_msg_location_id(context, msg.id, last_added_location_id).await
             {
                 error!(context, "Failed to set msg_location_id: {err:#}.");
             }
@@ -5557,7 +5565,7 @@ mod tests {
         let msg = bob.recv_msg(&sent_msg).await;
         assert_eq!(msg.chat_id, bob_chat.id);
         assert_eq!(msg.get_viewtype(), Viewtype::Sticker);
-        assert_eq!(msg.get_filename(), Some(filename.to_string()));
+        assert_eq!(msg.get_filename().unwrap(), filename);
         assert_eq!(msg.get_width(), w);
         assert_eq!(msg.get_height(), h);
         assert!(msg.get_filebytes(&bob).await?.unwrap() > 250);
