@@ -516,6 +516,10 @@ async fn add_parts(
                     securejoin_seen = true;
                 }
             }
+            // Peerstate could be updated by handling the Securejoin handshake.
+            let contact = Contact::get_by_id(context, from_id).await?;
+            mime_parser.decryption_info.peerstate =
+                Peerstate::from_addr(context, contact.get_addr()).await?;
         } else {
             securejoin_seen = false;
         }
@@ -724,12 +728,17 @@ async fn add_parts(
                     }
                 }
 
-                // The next block checks if the message was sent with verified encryption
-                // and sets the protection of the 1:1 chat accordingly.
-                if is_partial_download.is_none()
+                // Check if the message was sent with verified encryption and set the protection of
+                // the 1:1 chat accordingly.
+                let chat = match is_partial_download.is_none()
                     && mime_parser.get_header(HeaderDef::SecureJoin).is_none()
                     && !is_mdn
                 {
+                    true => Some(Chat::load_from_db(context, chat_id).await?)
+                        .filter(|chat| chat.typ == Chattype::Single),
+                    false => None,
+                };
+                if let Some(chat) = chat {
                     let mut new_protection = match has_verified_encryption(
                         context,
                         mime_parser,
@@ -743,17 +752,15 @@ async fn add_parts(
                         VerifiedEncryption::NotVerified(_) => ProtectionStatus::Unprotected,
                     };
 
-                    let chat = Chat::load_from_db(context, chat_id).await?;
-
+                    if chat.protected != ProtectionStatus::Unprotected
+                        && new_protection == ProtectionStatus::Unprotected
+                        // `chat.protected` must be maintained regardless of the `Config::VerifiedOneOnOneChats`.
+                        // That's why the config is checked here, and not above.
+                        && context.get_config_bool(Config::VerifiedOneOnOneChats).await?
+                    {
+                        new_protection = ProtectionStatus::ProtectionBroken;
+                    }
                     if chat.protected != new_protection {
-                        if new_protection == ProtectionStatus::Unprotected
-                            && context
-                                .get_config_bool(Config::VerifiedOneOnOneChats)
-                                .await?
-                        {
-                            new_protection = ProtectionStatus::ProtectionBroken;
-                        }
-
                         // The message itself will be sorted under the device message since the device
                         // message is `MessageState::InNoticed`, which means that all following
                         // messages are sorted under it.
@@ -1396,17 +1403,19 @@ async fn calc_sort_timestamp(
             )
             .await?
     } else if incoming {
-        // get newest incoming non fresh message for this chat.
+        // get newest non fresh message for this chat.
 
-        // If a user hasn't been online for some time, the Inbox is
-        // fetched first and then the Sentbox. In order for Inbox
-        // and Sent messages to be allowed to mingle,
-        // outgoing messages are purely sorted by their sent timestamp.
+        // If a user hasn't been online for some time, the Inbox is fetched first and then the
+        // Sentbox. In order for Inbox and Sent messages to be allowed to mingle, outgoing messages
+        // are purely sorted by their sent timestamp. NB: The Inbox must be fetched first otherwise
+        // Inbox messages would be always below old Sentbox messages. We could take in the query
+        // below only incoming messages, but then new incoming messages would mingle with just sent
+        // outgoing ones and apear somewhere in the middle of the chat.
         context
             .sql
             .query_get_value(
-                "SELECT MAX(timestamp) FROM msgs WHERE chat_id=? AND state>? AND from_id!=?",
-                (chat_id, MessageState::InFresh, ContactId::SELF),
+                "SELECT MAX(timestamp) FROM msgs WHERE chat_id=? AND state>?",
+                (chat_id, MessageState::InFresh),
             )
             .await?
     } else {
@@ -1724,6 +1733,22 @@ async fn apply_group_changes(
     } else {
         false
     };
+
+    if mime_parser.get_header(HeaderDef::ChatVerified).is_some() {
+        if let VerifiedEncryption::NotVerified(err) =
+            has_verified_encryption(context, mime_parser, from_id, to_ids, chat.typ).await?
+        {
+            warn!(context, "Verification problem: {err:#}.");
+            let s = format!("{err}. See 'Info' for more details");
+            mime_parser.repl_msg_by_error(&s);
+        }
+
+        if !chat.is_protected() {
+            chat_id
+                .inner_set_protection(context, ProtectionStatus::Protected)
+                .await?;
+        }
+    }
 
     if let Some(removed_addr) = mime_parser.get_header(HeaderDef::ChatGroupMemberRemoved) {
         removed_id = Contact::lookup_id_by_addr(context, removed_addr, Origin::Unknown).await?;
@@ -2189,7 +2214,9 @@ async fn has_verified_encryption(
     // and results in group-splits otherwise.
     if from_id != ContactId::SELF {
         let Some(peerstate) = &mimeparser.decryption_info.peerstate else {
-            return Ok(NotVerified("No peerstate, the contact isn't verified".to_string()));
+            return Ok(NotVerified(
+                "No peerstate, the contact isn't verified".to_string(),
+            ));
         };
 
         if !peerstate.has_verified_key(&mimeparser.signatures) {
