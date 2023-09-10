@@ -123,10 +123,10 @@ pub struct Provider {
     pub overview_page: &'static str,
 
     /// List of provider servers.
-    pub server: Vec<Server>,
+    pub server: &'static [Server],
 
     /// Default configuration values to set when provider is configured.
-    pub config_defaults: Option<Vec<ConfigDefault>>,
+    pub config_defaults: Option<&'static [ConfigDefault]>,
 
     /// Type of OAuth 2 authorization if provider supports it.
     pub oauth2_authorizer: Option<Oauth2Authorizer>,
@@ -149,8 +149,8 @@ pub struct ProviderOptions {
     pub delete_to_trash: bool,
 }
 
-impl Default for ProviderOptions {
-    fn default() -> Self {
+impl ProviderOptions {
+    const fn new() -> Self {
         Self {
             strict_tls: true,
             max_smtp_rcpt_to: None,
@@ -171,7 +171,7 @@ fn get_resolver() -> Result<TokioAsyncResolver> {
     let resolver = AsyncResolver::tokio(
         config::ResolverConfig::default(),
         config::ResolverOpts::default(),
-    )?;
+    );
     Ok(resolver)
 }
 

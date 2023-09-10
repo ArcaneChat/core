@@ -5,7 +5,7 @@ use std::collections::BinaryHeap;
 use std::convert::{TryFrom, TryInto};
 use std::fmt;
 use std::ops::Deref;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, ensure, Context as _, Result};
@@ -1186,7 +1186,7 @@ impl Contact {
             }
         } else if let Some(image_rel) = self.param.get(Param::ProfileImage) {
             if !image_rel.is_empty() {
-                return Ok(Some(get_abs_path(context, image_rel)));
+                return Ok(Some(get_abs_path(context, Path::new(image_rel))));
             }
         }
         Ok(None)
@@ -1716,7 +1716,7 @@ mod tests {
         assert_eq!(may_be_valid_addr("dd.tt"), false);
         assert_eq!(may_be_valid_addr("tt.dd@uu"), true);
         assert_eq!(may_be_valid_addr("u@d"), true);
-        assert_eq!(may_be_valid_addr("u@d."), true);
+        assert_eq!(may_be_valid_addr("u@d."), false);
         assert_eq!(may_be_valid_addr("u@d.t"), true);
         assert_eq!(may_be_valid_addr("u@d.tt"), true);
         assert_eq!(may_be_valid_addr("u@.tt"), true);
@@ -1725,6 +1725,7 @@ mod tests {
         assert_eq!(may_be_valid_addr("sk <@d.tt>"), false);
         assert_eq!(may_be_valid_addr("as@sd.de>"), false);
         assert_eq!(may_be_valid_addr("ask dkl@dd.tt"), false);
+        assert_eq!(may_be_valid_addr("user@domain.tld."), false);
     }
 
     #[test]

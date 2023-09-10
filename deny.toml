@@ -3,11 +3,6 @@ unmaintained = "allow"
 ignore = [
     "RUSTSEC-2020-0071",
     "RUSTSEC-2022-0093",
-
-    # Exponential CPU time usage for TLS certificate processing in webpki.
-    # It is only used for backup transfer, so does not affect IMAP and SMTP connections.
-    # Waiting for `iroh` to update dependencies.
-    "RUSTSEC-2023-0052",
 ]
 
 [bans]
@@ -32,7 +27,6 @@ skip = [
      { name = "fastrand", version = "1.9.0" },
      { name = "getrandom", version = "<0.2" },
      { name = "hashbrown", version = "<0.14.0" },
-     { name = "idna", version = "<0.3" },
      { name = "indexmap", version = "<2.0.0" },
      { name = "pem-rfc7468", version = "0.6.0" },
      { name = "pkcs8", version = "0.9.0" },
@@ -62,7 +56,6 @@ skip = [
      { name = "windows_x86_64_gnullvm", version = "<0.48" },
      { name = "windows_x86_64_gnu", version = "<0.48" },
      { name = "windows_x86_64_msvc", version = "<0.48" },
-     { name = "winreg", version = "0.10.1" },
 ]
 
 
