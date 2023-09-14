@@ -280,7 +280,7 @@ pub enum Config {
     QuotaExceeding,
 
     /// address to webrtc instance to use for videochats
-    #[strum(props(default = "https://meet.jit.si"))]
+    #[strum(props(default = "https://meet.systemli.org"))]
     WebrtcInstance,
 
     /// Timestamp of the last time housekeeping was run
