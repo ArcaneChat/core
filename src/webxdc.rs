@@ -83,6 +83,9 @@ pub struct WebxdcManifest {
 
     /// If the webxdc requests network access.
     pub request_internet_access: Option<bool>,
+
+    /// prefered screen orientation (landscape or portrait).
+    pub orientation: Option<String>,
 }
 
 /// Parsed information from WebxdcManifest and fallbacks.
@@ -111,6 +114,9 @@ pub struct WebxdcInfo {
     /// It should request access, be encrypted
     /// and sent to self for this.
     pub internet_access: bool,
+
+    /// prefered screen orientation (landscape or portrait).
+    pub orientation: String,
 }
 
 /// Status Update ID.
@@ -841,6 +847,11 @@ impl Message {
                 "".to_string()
             },
             internet_access,
+            orientation: if let Some(orientation) = manifest.orientation {
+                orientation
+            } else {
+                "".to_string()
+            },
         })
     }
 }

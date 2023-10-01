@@ -482,21 +482,14 @@ impl<'a> MimeFactory<'a> {
                     None
                 };
 
-            for (name, addr) in &self.recipients {
+            for (_name, addr) in &self.recipients {
                 if let Some(email_to_remove) = email_to_remove {
                     if email_to_remove == addr {
                         continue;
                     }
                 }
 
-                if name.is_empty() {
-                    to.push(Address::new_mailbox(addr.clone()));
-                } else {
-                    to.push(Address::new_mailbox_with_name(
-                        name.to_string(),
-                        addr.clone(),
-                    ));
-                }
+                to.push(Address::new_mailbox(addr.clone()));
             }
 
             if to.is_empty() {
@@ -531,9 +524,11 @@ impl<'a> MimeFactory<'a> {
         } else {
             encode_words(&subject_str)
         };
-        headers
-            .protected
-            .push(Header::new("Subject".into(), encoded_subject));
+        if context.get_config_bool(Config::SubjectEnabled).await? {
+            headers
+                .protected
+                .push(Header::new("Subject".into(), encoded_subject));
+        }
 
         let date = chrono::Utc
             .from_local_datetime(

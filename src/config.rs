@@ -120,6 +120,9 @@ pub enum Config {
     #[strum(props(default = "1"))]
     MdnsEnabled,
 
+    #[strum(props(default = "1"))]
+    SubjectEnabled,
+
     /// True if "Sent" folder should be watched for changes.
     #[strum(props(default = "0"))]
     SentboxWatch,
@@ -277,6 +280,7 @@ pub enum Config {
     QuotaExceeding,
 
     /// address to webrtc instance to use for videochats
+    #[strum(props(default = "https://meet.systemli.org"))]
     WebrtcInstance,
 
     /// Timestamp of the last time housekeeping was run
@@ -288,7 +292,7 @@ pub enum Config {
 
     /// Defines the max. size (in bytes) of messages downloaded automatically.
     /// 0 = no limit.
-    #[strum(props(default = "0"))]
+    #[strum(props(default = "163840"))]
     DownloadLimit,
 
     /// Send sync messages, requires `BccSelf` to be set as well.

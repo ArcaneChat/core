@@ -1347,7 +1347,7 @@ pub(crate) fn guess_msgtype_from_suffix(path: &Path) -> Option<(Viewtype, &str)>
         "rar" => (Viewtype::File, "application/vnd.rar"),
         "rtf" => (Viewtype::File, "application/rtf"),
         "spx" => (Viewtype::File, "audio/ogg"), // Ogg Speex Profile
-        "svg" => (Viewtype::File, "image/svg+xml"),
+        "svg" => (Viewtype::Image, "image/svg+xml"),
         "tgs" => (Viewtype::Sticker, "application/x-tgsticker"),
         "tiff" => (Viewtype::File, "image/tiff"),
         "tif" => (Viewtype::File, "image/tiff"),
@@ -1358,7 +1358,7 @@ pub(crate) fn guess_msgtype_from_suffix(path: &Path) -> Option<(Viewtype, &str)>
         "wav" => (Viewtype::File, "audio/wav"),
         "weba" => (Viewtype::File, "audio/webm"),
         "webm" => (Viewtype::Video, "video/webm"),
-        "webp" => (Viewtype::Image, "image/webp"), // iOS via SDWebImage, Android since 4.0
+        "webp" => (Viewtype::Sticker, "image/webp"), // iOS via SDWebImage, Android since 4.0
         "wmv" => (Viewtype::Video, "video/x-ms-wmv"),
         "xdc" => (Viewtype::Webxdc, "application/webxdc+zip"),
         "xhtml" => (Viewtype::File, "application/xhtml+xml"),
