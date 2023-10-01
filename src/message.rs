@@ -114,24 +114,16 @@ WHERE id=?;
     }
 
     /// Deletes a message, corresponding MDNs and unsent SMTP messages from the database.
-    pub async fn delete_from_db(self, context: &Context) -> Result<()> {
-        // We don't use transactions yet, so remove MDNs first to make
-        // sure they are not left while the message is deleted.
+    pub(crate) async fn delete_from_db(self, context: &Context) -> Result<()> {
         context
             .sql
-            .execute("DELETE FROM smtp WHERE msg_id=?", (self,))
-            .await?;
-        context
-            .sql
-            .execute("DELETE FROM msgs_mdns WHERE msg_id=?;", (self,))
-            .await?;
-        context
-            .sql
-            .execute("DELETE FROM msgs_status_updates WHERE msg_id=?;", (self,))
-            .await?;
-        context
-            .sql
-            .execute("DELETE FROM msgs WHERE id=?;", (self,))
+            .transaction(move |transaction| {
+                transaction.execute("DELETE FROM smtp WHERE msg_id=?", (self,))?;
+                transaction.execute("DELETE FROM msgs_mdns WHERE msg_id=?", (self,))?;
+                transaction.execute("DELETE FROM msgs_status_updates WHERE msg_id=?", (self,))?;
+                transaction.execute("DELETE FROM msgs WHERE id=?", (self,))?;
+                Ok(())
+            })
             .await?;
         Ok(())
     }
@@ -772,7 +764,7 @@ impl Message {
                 Chattype::Group | Chattype::Broadcast | Chattype::Mailinglist => {
                     Some(Contact::get_by_id(context, self.from_id).await?)
                 }
-                Chattype::Single | Chattype::Undefined => None,
+                Chattype::Single => None,
             }
         } else {
             None
