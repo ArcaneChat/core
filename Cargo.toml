@@ -1,6 +1,6 @@
 [package]
 name = "deltachat"
-version = "1.123.0"
+version = "1.124.0"
 edition = "2021"
 license = "MPL-2.0"
 rust-version = "1.67"
@@ -43,7 +43,7 @@ async-smtp = { version = "0.9", default-features = false, features = ["runtime-t
 async_zip = { version = "0.0.12", default-features = false, features = ["deflate", "fs"] }
 backtrace = "0.3"
 base64 = "0.21"
-brotli = { version = "3.3", default-features=false, features = ["std"] }
+brotli = { version = "3.4", default-features=false, features = ["std"] }
 chrono = { version = "0.4", default-features=false, features = ["clock", "std"] }
 email = { git = "https://github.com/deltachat/rust-email", branch = "master" }
 encoded-words = { git = "https://github.com/async-email/encoded-words", branch = "master" }
@@ -91,7 +91,7 @@ tokio = { version = "1", features = ["fs", "rt-multi-thread", "macros"] }
 tokio-io-timeout = "1.2.0"
 tokio-stream = { version = "0.1.14", features = ["fs"] }
 tokio-tar = { version = "0.3" } # TODO: integrate tokio into async-tar
-tokio-util = "0.7.8"
+tokio-util = "0.7.9"
 toml = "0.7"
 trust-dns-resolver = "0.23"
 url = "2"
