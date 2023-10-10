@@ -15,6 +15,7 @@ on:
   push:
     branches:
       - master
+      - stable
 
 env:
   RUSTFLAGS: -Dwarnings
@@ -24,7 +25,7 @@ jobs:
     name: Lint Rust
     runs-on: ubuntu-latest
     env:
-      RUSTUP_TOOLCHAIN: 1.71.0
+      RUSTUP_TOOLCHAIN: 1.73.0
     steps:
       - uses: actions/checkout@v3
       - name: Install rustfmt and clippy
@@ -80,15 +81,15 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            rust: 1.71.0
+            rust: 1.73.0
           - os: windows-latest
-            rust: 1.71.0
+            rust: 1.73.0
           - os: macos-latest
-            rust: 1.71.0
+            rust: 1.73.0
 
-          # Minimum Supported Rust Version = 1.66.0
+          # Minimum Supported Rust Version = 1.67.0
           - os: ubuntu-latest
-            rust: 1.66.0
+            rust: 1.67.0
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v3
@@ -101,6 +102,8 @@ jobs:
         uses: swatinem/rust-cache@v2
 
       - name: Tests
+        env:
+          RUST_BACKTRACE: 1
         run: cargo test --workspace
 
       - name: Test cargo vendor
@@ -177,15 +180,15 @@ jobs:
         include:
           # Currently used Rust version.
           - os: ubuntu-latest
-            python: 3.11
+            python: 3.12
           - os: macos-latest
-            python: 3.11
+            python: 3.12
 
           # PyPy tests
           - os: ubuntu-latest
-            python: pypy3.9
+            python: pypy3.10
           - os: macos-latest
-            python: pypy3.9
+            python: pypy3.10
 
           # Minimum Supported Python Version = 3.7
           # This is the minimum version for which manylinux Python wheels are
@@ -227,22 +230,19 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            python: 3.11
+            python: 3.12
           - os: macos-latest
-            python: 3.11
+            python: 3.12
 
           # PyPy tests
           - os: ubuntu-latest
-            python: pypy3.9
+            python: pypy3.10
           - os: macos-latest
-            python: pypy3.9
+            python: pypy3.10
 
-          # Minimum Supported Python Version = 3.8
-          #
-          # Python 3.7 has at least one known bug related to starting subprocesses
-          # in asyncio programs: <https://bugs.python.org/issue35621>
+          # Minimum Supported Python Version = 3.7
           - os: ubuntu-latest
-            python: 3.8
+            python: 3.7
 
     runs-on: ${{ matrix.os }}
     steps:

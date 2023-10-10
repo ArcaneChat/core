@@ -1,4 +1,18 @@
 //! # Handle webxdc messages.
+//!
+//! Internally status updates are stored in the `msgs_status_updates` SQL table.
+//! `msgs_status_updates` contains the following columns:
+//! - `id` - status update serial number
+//! - `msg_id` - ID of the message in the `msgs` table
+//! - `update_item` - JSON representation of the status update
+//!
+//! Status updates are scheduled for sending by adding a record
+//! to `smtp_status_updates_table` SQL table.
+//! `smtp_status_updates` contains the following columns:
+//! - `msg_id` - ID of the message in the `msgs` table
+//! - `first_serial` - serial number of the first status update to send
+//! - `last_serial` - serial number of the last status update to send
+//! - `descr` - text to send along with the updates
 
 use std::convert::TryFrom;
 use std::path::Path;
@@ -12,19 +26,20 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::AsyncReadExt;
 
-use crate::chat::Chat;
+use crate::chat::{self, Chat};
 use crate::constants::Chattype;
 use crate::contact::ContactId;
 use crate::context::Context;
 use crate::download::DownloadState;
+use crate::events::EventType;
 use crate::message::{Message, MessageState, MsgId, Viewtype};
+use crate::mimefactory::wrapped_base64_encode;
 use crate::mimeparser::SystemMessage;
 use crate::param::Param;
 use crate::param::Params;
 use crate::scheduler::InterruptInfo;
 use crate::tools::strip_rtlo_characters;
 use crate::tools::{create_smeared_timestamp, get_abs_path};
-use crate::{chat, EventType};
 
 /// The current API version.
 /// If `min_api` in manifest.toml is set to a larger value,
@@ -535,13 +550,16 @@ impl Context {
     }
 
     pub(crate) fn build_status_update_part(&self, json: &str) -> PartBuilder {
+        let encoded_body = wrapped_base64_encode(json.as_bytes());
+
         PartBuilder::new()
             .content_type(&"application/json".parse::<mime::Mime>().unwrap())
             .header((
                 "Content-Disposition",
                 "attachment; filename=\"status-update.json\"",
             ))
-            .body(json)
+            .header(("Content-Transfer-Encoding", "base64"))
+            .body(encoded_body)
     }
 
     /// Receives status updates from receive_imf to the database
@@ -561,7 +579,6 @@ impl Context {
         json: &str,
     ) -> Result<()> {
         let msg = Message::load_from_db(self, msg_id).await?;
-        let chat_id = msg.chat_id;
         let (timestamp, mut instance, can_info_msg) = if msg.viewtype == Viewtype::Webxdc {
             (msg.timestamp_sort, msg, false)
         } else if let Some(parent) = msg.parent(self).await? {
@@ -575,17 +592,16 @@ impl Context {
         } else {
             bail!("receive_status_update: status message has no parent.")
         };
+        let chat_id = instance.chat_id;
 
-        if from_id != ContactId::SELF
-            && !chat::is_contact_in_chat(self, instance.chat_id, from_id).await?
-        {
+        if from_id != ContactId::SELF && !chat::is_contact_in_chat(self, chat_id, from_id).await? {
             let chat_type: Chattype = self
                 .sql
                 .query_get_value("SELECT type FROM chats WHERE id=?", (chat_id,))
                 .await?
                 .with_context(|| format!("Chat type for chat {chat_id} not found"))?;
             if chat_type != Chattype::Mailinglist {
-                bail!("receive_status_update: status sender not chat member.")
+                bail!("receive_status_update: status sender {from_id} is not a member of chat {chat_id}")
             }
         }
 
@@ -663,6 +679,10 @@ impl Context {
     ///
     /// Example: `{"updates": [{"payload":"any update data"},
     ///                        {"payload":"another update data"}]}`
+    ///
+    /// `range` is an optional range of status update serials to send.
+    /// If it is `None`, all updates are sent.
+    /// This is used when a message is resent using [`crate::chat::resend_msgs`].
     pub(crate) async fn render_webxdc_status_update_object(
         &self,
         instance_msg_id: MsgId,
@@ -705,7 +725,7 @@ fn parse_webxdc_manifest(bytes: &[u8]) -> Result<WebxdcManifest> {
     Ok(manifest)
 }
 
-async fn get_blob(archive: &mut async_zip::read::fs::ZipFileReader, name: &str) -> Result<Vec<u8>> {
+async fn get_blob(archive: &async_zip::read::fs::ZipFileReader, name: &str) -> Result<Vec<u8>> {
     let (i, _) = find_zip_entry(archive.file(), name)
         .ok_or_else(|| anyhow!("no entry found for {}", name))?;
     let mut reader = archive.entry(i).await?;
@@ -748,10 +768,10 @@ impl Message {
             name
         };
 
-        let mut archive = self.get_webxdc_archive(context).await?;
+        let archive = self.get_webxdc_archive(context).await?;
 
         if name == "index.html" {
-            if let Ok(bytes) = get_blob(&mut archive, "manifest.toml").await {
+            if let Ok(bytes) = get_blob(&archive, "manifest.toml").await {
                 if let Ok(manifest) = parse_webxdc_manifest(&bytes) {
                     if let Some(min_api) = manifest.min_api {
                         if min_api > WEBXDC_API_VERSION {
@@ -764,15 +784,15 @@ impl Message {
             }
         }
 
-        get_blob(&mut archive, name).await
+        get_blob(&archive, name).await
     }
 
     /// Return info from manifest.toml or from fallbacks.
     pub async fn get_webxdc_info(&self, context: &Context) -> Result<WebxdcInfo> {
         ensure!(self.viewtype == Viewtype::Webxdc, "No webxdc instance.");
-        let mut archive = self.get_webxdc_archive(context).await?;
+        let archive = self.get_webxdc_archive(context).await?;
 
-        let mut manifest = get_blob(&mut archive, "manifest.toml")
+        let mut manifest = get_blob(&archive, "manifest.toml")
             .await
             .map(|bytes| parse_webxdc_manifest(&bytes).unwrap_or_default())
             .unwrap_or_default();
@@ -893,10 +913,8 @@ mod tests {
     }
 
     async fn create_webxdc_instance(t: &TestContext, name: &str, bytes: &[u8]) -> Result<Message> {
-        let file = t.get_blobdir().join(name);
-        tokio::fs::write(&file, bytes).await?;
         let mut instance = Message::new(Viewtype::File);
-        instance.set_file(file.to_str().unwrap(), None);
+        instance.set_file_from_bytes(t, name, bytes, None).await?;
         Ok(instance)
     }
 
@@ -924,10 +942,10 @@ mod tests {
         assert_eq!(instance.chat_id, chat_id);
 
         // sending using bad extension is not working, even when setting Viewtype to webxdc
-        let file = t.get_blobdir().join("index.html");
-        tokio::fs::write(&file, b"<html>ola!</html>").await?;
         let mut instance = Message::new(Viewtype::Webxdc);
-        instance.set_file(file.to_str().unwrap(), None);
+        instance
+            .set_file_from_bytes(&t, "index.html", b"<html>ola!</html>", None)
+            .await?;
         assert!(send_msg(&t, chat_id, &mut instance).await.is_err());
 
         Ok(())
@@ -951,14 +969,15 @@ mod tests {
         assert_eq!(test.viewtype, Viewtype::File);
 
         // sending invalid .xdc as Viewtype::Webxdc should fail already on sending
-        let file = t.get_blobdir().join("invalid2.xdc");
-        tokio::fs::write(
-            &file,
-            include_bytes!("../test-data/webxdc/invalid-no-zip-but-7z.xdc"),
-        )
-        .await?;
         let mut instance = Message::new(Viewtype::Webxdc);
-        instance.set_file(file.to_str().unwrap(), None);
+        instance
+            .set_file_from_bytes(
+                &t,
+                "invalid2.xdc",
+                include_bytes!("../test-data/webxdc/invalid-no-zip-but-7z.xdc"),
+                None,
+            )
+            .await?;
         assert!(send_msg(&t, chat_id, &mut instance).await.is_err());
 
         Ok(())
@@ -993,7 +1012,7 @@ mod tests {
         let instance = send_webxdc_instance(&t, chat_id).await?;
         t.send_webxdc_status_update(
             instance.id,
-            r#"{"info": "foo", "summary":"bar", "payload": 42}"#,
+            r#"{"info": "foo", "summary":"bar", "document":"doc", "payload": 42}"#,
             "descr",
         )
         .await?;
@@ -1001,7 +1020,7 @@ mod tests {
         assert_eq!(
             t.get_webxdc_status_updates(instance.id, StatusUpdateSerial(0))
                 .await?,
-            r#"[{"payload":42,"info":"foo","summary":"bar","serial":1,"max_serial":1}]"#
+            r#"[{"payload":42,"info":"foo","document":"doc","summary":"bar","serial":1,"max_serial":1}]"#
         );
         assert_eq!(chat_id.get_msg_cnt(&t).await?, 2); // instance and info
         let info = Message::load_from_db(&t, instance.id)
@@ -1009,6 +1028,7 @@ mod tests {
             .get_webxdc_info(&t)
             .await?;
         assert_eq!(info.summary, "bar".to_string());
+        assert_eq!(info.document, "doc".to_string());
 
         // forwarding an instance creates a fresh instance; updates etc. are not forwarded
         forward_msgs(&t, &[instance.get_id()], chat_id).await?;
@@ -1025,6 +1045,7 @@ mod tests {
             .get_webxdc_info(&t)
             .await?;
         assert_eq!(info.summary, "".to_string());
+        assert_eq!(info.document, "".to_string());
 
         Ok(())
     }
@@ -1086,7 +1107,7 @@ mod tests {
         .await?;
         let instance = t.get_last_msg().await;
         assert_eq!(instance.viewtype, Viewtype::Webxdc);
-        assert_eq!(instance.get_filename(), Some("minimal.xdc".to_string()));
+        assert_eq!(instance.get_filename().unwrap(), "minimal.xdc");
 
         receive_imf(
             &t,
@@ -1096,7 +1117,7 @@ mod tests {
         .await?;
         let instance = t.get_last_msg().await;
         assert_eq!(instance.viewtype, Viewtype::File); // we require the correct extension, only a mime type is not sufficient
-        assert_eq!(instance.get_filename(), Some("index.html".to_string()));
+        assert_eq!(instance.get_filename().unwrap(), "index.html");
 
         Ok(())
     }
@@ -1784,10 +1805,9 @@ mod tests {
         // bob receives the instance together with the initial updates in a single message
         let bob_instance = bob.recv_msg(&sent1).await;
         assert_eq!(bob_instance.viewtype, Viewtype::Webxdc);
-        assert_eq!(bob_instance.get_filename(), Some("minimal.xdc".to_string()));
+        assert_eq!(bob_instance.get_filename().unwrap(), "minimal.xdc");
         assert!(sent1.payload().contains("Content-Type: application/json"));
         assert!(sent1.payload().contains("status-update.json"));
-        assert!(sent1.payload().contains(r#""payload":{"foo":"bar"}"#));
         assert_eq!(
             bob.get_webxdc_status_updates(bob_instance.id, StatusUpdateSerial(0))
                 .await?,
@@ -2565,6 +2585,44 @@ sth_for_the = "future""#
                 .await?
                 > 0
         );
+        Ok(())
+    }
+
+    /// Tests extensibility of WebXDC updates.
+    ///
+    /// If an update sent by WebXDC contains unknown properties,
+    /// such as `aNewUnknownProperty` or a reserved property
+    /// like `serial` or `max_serial`,
+    /// they are silently dropped and are not sent over the wire.
+    ///
+    /// This ensures new WebXDC can try to send new properties
+    /// added in later revisions of the WebXDC API
+    /// and this will not result in a failure to send the whole update.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_send_webxdc_status_update_extensibility() -> Result<()> {
+        let alice = TestContext::new_alice().await;
+        let bob = TestContext::new_bob().await;
+        let alice_chat = alice.create_chat(&bob).await;
+        let alice_instance = send_webxdc_instance(&alice, alice_chat.id).await?;
+
+        let bob_instance = bob.recv_msg(&alice.pop_sent_msg().await).await;
+
+        alice
+            .send_webxdc_status_update(
+                alice_instance.id,
+                r#"{"payload":"p","info":"i","aNewUnknownProperty":"x","max_serial":123}"#,
+                "Some description",
+            )
+            .await?;
+        alice.flush_status_updates().await?;
+        bob.recv_msg(&alice.pop_sent_msg().await).await;
+
+        assert_eq!(
+            bob.get_webxdc_status_updates(bob_instance.id, StatusUpdateSerial(0))
+                .await?,
+            r#"[{"payload":"p","info":"i","serial":1,"max_serial":1}]"#
+        );
+
         Ok(())
     }
 }

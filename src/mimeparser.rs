@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::path::Path;
 use std::pin::Pin;
 use std::str;
 
@@ -11,7 +12,6 @@ use deltachat_derive::{FromSql, ToSql};
 use format_flowed::unformat_flowed;
 use lettre_email::mime::{self, Mime};
 use mailparse::{addrparse_header, DispositionType, MailHeader, MailHeaderMap, SingleInfo};
-use once_cell::sync::Lazy;
 
 use crate::aheader::{Aheader, EncryptPreference};
 use crate::blob::BlobObject;
@@ -27,8 +27,10 @@ use crate::decrypt::{
 use crate::dehtml::dehtml;
 use crate::events::EventType;
 use crate::headerdef::{HeaderDef, HeaderDefMap};
-use crate::key::{DcKey, Fingerprint, SignedPublicKey, SignedSecretKey};
-use crate::message::{self, set_msg_failed, update_msg_state, MessageState, MsgId, Viewtype};
+use crate::key::{load_self_secret_key, DcKey, Fingerprint, SignedPublicKey};
+use crate::message::{
+    self, set_msg_failed, update_msg_state, Message, MessageState, MsgId, Viewtype,
+};
 use crate::param::{Param, Params};
 use crate::peerstate::Peerstate;
 use crate::simplify::{simplify, SimplifiedText};
@@ -275,7 +277,7 @@ impl MimeMessage {
         headers.remove("chat-verified");
 
         let from = from.context("No from in message")?;
-        let private_keyring = vec![SignedSecretKey::load_self(context)
+        let private_keyring = vec![load_self_secret_key(context)
             .await
             .context("Failed to get own key")?];
 
@@ -436,6 +438,8 @@ impl MimeMessage {
                         typ: Viewtype::Text,
                         msg_raw: Some(txt.clone()),
                         msg: txt,
+                        // Don't change the error prefix for now,
+                        // receive_imf.rs:lookup_chat_by_reply() checks it.
                         error: Some(format!("Decrypting failed: {err:#}")),
                         ..Default::default()
                     };
@@ -800,18 +804,6 @@ impl MimeMessage {
 
         // Boxed future to deal with recursion
         async move {
-            if mail.ctype.params.get("protected-headers").is_some() {
-                if mail.ctype.mimetype == "text/rfc822-headers" {
-                    warn!(
-                        context,
-                        "Protected headers found in text/rfc822-headers attachment: Will be ignored.",
-                    );
-                    return Ok(false);
-                }
-
-                warn!(context, "Ignoring nested protected headers");
-            }
-
             enum MimeS {
                 Multiple,
                 Single,
@@ -848,7 +840,10 @@ impl MimeMessage {
 
                     self.parse_mime_recursive(context, &mail, is_related).await
                 }
-                MimeS::Single => self.add_single_part_if_known(context, mail, is_related).await,
+                MimeS::Single => {
+                    self.add_single_part_if_known(context, mail, is_related)
+                        .await
+                }
             }
         }
         .boxed()
@@ -861,7 +856,7 @@ impl MimeMessage {
         is_related: bool,
     ) -> Result<bool> {
         let mut any_part_added = false;
-        let mimetype = get_mime_type(mail)?.0;
+        let mimetype = get_mime_type(mail, &get_attachment_filename(context, mail)?)?.0;
         match (mimetype.type_(), mimetype.subtype().as_str()) {
             /* Most times, multipart/alternative contains true alternatives
             as text/plain and text/html.  If we find a multipart/mixed
@@ -869,9 +864,9 @@ impl MimeMessage {
             apple mail: "plaintext" as an alternative to "html+PDF attachment") */
             (mime::MULTIPART, "alternative") => {
                 for cur_data in &mail.subparts {
-                    if get_mime_type(cur_data)?.0 == "multipart/mixed"
-                        || get_mime_type(cur_data)?.0 == "multipart/related"
-                    {
+                    let mime_type =
+                        get_mime_type(cur_data, &get_attachment_filename(context, cur_data)?)?.0;
+                    if mime_type == "multipart/mixed" || mime_type == "multipart/related" {
                         any_part_added = self
                             .parse_mime_recursive(context, cur_data, is_related)
                             .await?;
@@ -881,7 +876,11 @@ impl MimeMessage {
                 if !any_part_added {
                     /* search for text/plain and add this */
                     for cur_data in &mail.subparts {
-                        if get_mime_type(cur_data)?.0.type_() == mime::TEXT {
+                        if get_mime_type(cur_data, &get_attachment_filename(context, cur_data)?)?
+                            .0
+                            .type_()
+                            == mime::TEXT
+                        {
                             any_part_added = self
                                 .parse_mime_recursive(context, cur_data, is_related)
                                 .await?;
@@ -1007,10 +1006,9 @@ impl MimeMessage {
         is_related: bool,
     ) -> Result<bool> {
         // return true if a part was added
-        let (mime_type, msg_type) = get_mime_type(mail)?;
-        let raw_mime = mail.ctype.mimetype.to_lowercase();
-
         let filename = get_attachment_filename(context, mail)?;
+        let (mime_type, msg_type) = get_mime_type(mail, &filename)?;
+        let raw_mime = mail.ctype.mimetype.to_lowercase();
 
         let old_part_count = self.parts.len();
 
@@ -1268,6 +1266,7 @@ impl MimeMessage {
         part.mimetype = Some(mime_type);
         part.bytes = decoded_data.len();
         part.param.set(Param::File, blob.as_name());
+        part.param.set(Param::Filename, filename);
         part.param.set(Param::MimeType, raw_mime);
         part.is_related = is_related;
 
@@ -1434,33 +1433,36 @@ impl MimeMessage {
         let (report_fields, _) = mailparse::parse_headers(&report_body)?;
 
         // must be present
-        if let Some(_disposition) = report_fields.get_header_value(HeaderDef::Disposition) {
-            let original_message_id = report_fields
-                .get_header_value(HeaderDef::OriginalMessageId)
-                // MS Exchange doesn't add an Original-Message-Id header. Instead, they put
-                // the original message id into the In-Reply-To header:
-                .or_else(|| report.headers.get_header_value(HeaderDef::InReplyTo))
-                .and_then(|v| parse_message_id(&v).ok());
-            let additional_message_ids = report_fields
-                .get_header_value(HeaderDef::AdditionalMessageIds)
-                .map_or_else(Vec::new, |v| {
-                    v.split(' ')
-                        .filter_map(|s| parse_message_id(s).ok())
-                        .collect()
-                });
+        if report_fields
+            .get_header_value(HeaderDef::Disposition)
+            .is_none()
+        {
+            warn!(
+                context,
+                "Ignoring unknown disposition-notification, Message-Id: {:?}.",
+                report_fields.get_header_value(HeaderDef::MessageId)
+            );
+            return Ok(None);
+        };
 
-            return Ok(Some(Report {
-                original_message_id,
-                additional_message_ids,
-            }));
-        }
-        warn!(
-            context,
-            "ignoring unknown disposition-notification, Message-Id: {:?}",
-            report_fields.get_header_value(HeaderDef::MessageId)
-        );
+        let original_message_id = report_fields
+            .get_header_value(HeaderDef::OriginalMessageId)
+            // MS Exchange doesn't add an Original-Message-Id header. Instead, they put
+            // the original message id into the In-Reply-To header:
+            .or_else(|| report.headers.get_header_value(HeaderDef::InReplyTo))
+            .and_then(|v| parse_message_id(&v).ok());
+        let additional_message_ids = report_fields
+            .get_header_value(HeaderDef::AdditionalMessageIds)
+            .map_or_else(Vec::new, |v| {
+                v.split(' ')
+                    .filter_map(|s| parse_message_id(s).ok())
+                    .collect()
+            });
 
-        Ok(None)
+        Ok(Some(Report {
+            original_message_id,
+            additional_message_ids,
+        }))
     }
 
     fn process_delivery_status(
@@ -1612,25 +1614,21 @@ impl MimeMessage {
             false
         };
         if maybe_ndn && self.delivery_report.is_none() {
-            static RE: Lazy<regex::Regex> =
-                Lazy::new(|| regex::Regex::new(r"Message-ID:(.*)").unwrap());
-            for captures in self
+            for original_message_id in self
                 .parts
                 .iter()
                 .filter_map(|part| part.msg_raw.as_ref())
                 .flat_map(|part| part.lines())
-                .filter_map(|line| RE.captures(line))
+                .filter_map(|line| line.split_once("Message-ID:"))
+                .filter_map(|(_, message_id)| parse_message_id(message_id).ok())
             {
-                if let Ok(original_message_id) = parse_message_id(&captures[1]) {
-                    if let Ok(Some(_)) =
-                        message::rfc724_mid_exists(context, &original_message_id).await
-                    {
-                        self.delivery_report = Some(DeliveryReport {
-                            rfc724_mid: original_message_id,
-                            failed_recipient: None,
-                            failure: true,
-                        })
-                    }
+                if let Ok(Some(_)) = message::rfc724_mid_exists(context, &original_message_id).await
+                {
+                    self.delivery_report = Some(DeliveryReport {
+                        rfc724_mid: original_message_id,
+                        failed_recipient: None,
+                        failure: true,
+                    })
                 }
             }
         }
@@ -1864,7 +1862,10 @@ pub struct Part {
 }
 
 /// return mimetype and viewtype for a parsed mail
-fn get_mime_type(mail: &mailparse::ParsedMail<'_>) -> Result<(Mime, Viewtype)> {
+fn get_mime_type(
+    mail: &mailparse::ParsedMail<'_>,
+    filename: &Option<String>,
+) -> Result<(Mime, Viewtype)> {
     let mimetype = mail.ctype.mimetype.parse::<Mime>()?;
 
     let viewtype = match mimetype.type_() {
@@ -1900,7 +1901,16 @@ fn get_mime_type(mail: &mailparse::ParsedMail<'_>) -> Result<(Mime, Viewtype)> {
                 Viewtype::Unknown
             }
         }
-        mime::APPLICATION => Viewtype::File,
+        mime::APPLICATION => match mimetype.subtype() {
+            mime::OCTET_STREAM => match filename {
+                Some(filename) => match message::guess_msgtype_from_suffix(Path::new(&filename)) {
+                    Some((viewtype, _)) => viewtype,
+                    None => Viewtype::File,
+                },
+                None => Viewtype::File,
+            },
+            _ => Viewtype::File,
+        },
         _ => Viewtype::Unknown,
     };
 
@@ -2144,7 +2154,8 @@ async fn handle_ndn(
     let mut first = true;
     for msg in msgs {
         let (msg_id, chat_id, chat_type) = msg?;
-        set_msg_failed(context, msg_id, &error).await;
+        let mut message = Message::load_from_db(context, msg_id).await?;
+        set_msg_failed(context, &mut message, &error).await?;
         if first {
             // Add only one info msg for all failed messages
             ndn_maybe_add_info_msg(context, failed, chat_id, chat_type).await?;
@@ -2181,7 +2192,7 @@ async fn ndn_maybe_add_info_msg(
             // If we get an NDN for the mailing list, just issue a warning.
             warn!(context, "ignoring NDN for mailing list.");
         }
-        Chattype::Single | Chattype::Undefined => {}
+        Chattype::Single => {}
     }
     Ok(())
 }
@@ -3752,6 +3763,24 @@ Content-Disposition: reaction\n\
                 .unwrap(),
             "12345@example.org"
         );
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_jpeg_as_application_octet_stream() -> Result<()> {
+        let context = TestContext::new_alice().await;
+        let raw = include_bytes!("../test-data/message/jpeg-as-application-octet-stream.eml");
+
+        let msg = MimeMessage::from_bytes(&context.ctx, &raw[..], None)
+            .await
+            .unwrap();
+        assert_eq!(msg.parts.len(), 1);
+        assert_eq!(msg.parts[0].typ, Viewtype::Image);
+
+        receive_imf(&context, &raw[..], false).await?;
+        let msg = context.get_last_msg().await;
+        assert_eq!(msg.get_viewtype(), Viewtype::Image);
 
         Ok(())
     }

@@ -9,7 +9,7 @@ import pytest
 from imap_tools import AND, U
 
 import deltachat as dc
-from deltachat import account_hookimpl, Message
+from deltachat import account_hookimpl, Message, Chat
 from deltachat.tracker import ImexTracker
 
 
@@ -162,8 +162,9 @@ def test_send_file_twice_unicode_filename_mangling(tmp_path, acfactory, lp):
     ac1, ac2 = acfactory.get_online_accounts(2)
     chat = acfactory.get_accepted_chat(ac1, ac2)
 
-    basename = "somedäüta.html.zip"
-    p = tmp_path / basename
+    basename = "somedäüta"
+    ext = ".html.zip"
+    p = tmp_path / (basename + ext)
     p.write_text("some data")
 
     def send_and_receive_message():
@@ -181,12 +182,14 @@ def test_send_file_twice_unicode_filename_mangling(tmp_path, acfactory, lp):
     msg = send_and_receive_message()
     assert msg.text == "withfile"
     assert open(msg.filename).read() == "some data"
-    assert msg.filename.endswith(basename)
+    msg.filename.index(basename)
+    assert msg.filename.endswith(ext)
 
     msg2 = send_and_receive_message()
     assert msg2.text == "withfile"
     assert open(msg2.filename).read() == "some data"
-    assert msg2.filename.endswith("html.zip")
+    msg2.filename.index(basename)
+    assert msg2.filename.endswith(ext)
     assert msg.filename != msg2.filename
 
 
@@ -194,10 +197,11 @@ def test_send_file_html_attachment(tmp_path, acfactory, lp):
     ac1, ac2 = acfactory.get_online_accounts(2)
     chat = acfactory.get_accepted_chat(ac1, ac2)
 
-    basename = "test.html"
+    basename = "test"
+    ext = ".html"
     content = "<html><body>text</body>data"
 
-    p = tmp_path / basename
+    p = tmp_path / (basename + ext)
     # write wrong html to see if core tries to parse it
     # (it shouldn't as it's a file attachment)
     p.write_text(content)
@@ -211,7 +215,8 @@ def test_send_file_html_attachment(tmp_path, acfactory, lp):
     msg = ac2.get_message_by_id(ev.data2)
 
     assert open(msg.filename).read() == content
-    assert msg.filename.endswith(basename)
+    msg.filename.index(basename)
+    assert msg.filename.endswith(ext)
 
 
 def test_html_message(acfactory, lp):
@@ -324,6 +329,27 @@ def test_webxdc_message(acfactory, data, lp):
     assert len(list(ac2.direct_imap.conn.fetch(AND(seen=True)))) == 1
 
 
+def test_webxdc_huge_update(acfactory, data, lp):
+    ac1, ac2 = acfactory.get_online_accounts(2)
+    chat = ac1.create_chat(ac2)
+
+    msg1 = Message.new_empty(ac1, "webxdc")
+    msg1.set_text("message1")
+    msg1.set_file(data.get_path("webxdc/minimal.xdc"))
+    msg1 = chat.send_msg(msg1)
+    assert msg1.is_webxdc()
+    assert msg1.filename
+
+    msg2 = ac2._evtracker.wait_next_incoming_message()
+    assert msg2.is_webxdc()
+
+    payload = "A" * 1000
+    assert msg1.send_status_update({"payload": payload}, "some test data")
+    ac2._evtracker.get_matching("DC_EVENT_WEBXDC_STATUS_UPDATE")
+    update = msg2.get_status_updates()[0]
+    assert update["payload"] == payload
+
+
 def test_webxdc_download_on_demand(acfactory, data, lp):
     ac1, ac2 = acfactory.get_online_accounts(2)
     acfactory.introduce_each_other([ac1, ac2])
@@ -349,6 +375,11 @@ def test_webxdc_download_on_demand(acfactory, data, lp):
     ac2_update.download_full()
     ac2._evtracker.get_matching("DC_EVENT_WEBXDC_STATUS_UPDATE")
     assert msg2.get_status_updates()
+
+    # Get a event notifying that the message disappeared from the chat.
+    msgs_changed_event = ac2._evtracker.get_matching("DC_EVENT_MSGS_CHANGED")
+    assert msgs_changed_event.data1 == msg2.chat.id
+    assert msgs_changed_event.data2 == 0
 
 
 def test_mvbox_sentbox_threads(acfactory, lp):
@@ -1436,13 +1467,18 @@ def test_reaction_to_partially_fetched_msg(acfactory, lp, tmp_path):
     path = tmp_path / "large"
     path.write_bytes(os.urandom(download_limit + 1))
     msgs.append(chat.send_file(str(path)))
-
-    lp.sec("sending a reaction to the large message from ac1 to ac2")
-    react_str = "\N{THUMBS UP SIGN}"
-    msgs.append(msgs[-1].send_reaction(react_str))
-
     for m in msgs:
         ac1._evtracker.wait_msg_delivered(m)
+
+    lp.sec("sending a reaction to the large message from ac1 to ac2")
+    # TODO: Find the reason of an occasional message reordering on the server (so that the reaction
+    # has a lower UID than the previous message). W/a is to sleep for some time to let the reaction
+    # have a later INTERNALDATE.
+    time.sleep(1.1)
+    react_str = "\N{THUMBS UP SIGN}"
+    msgs.append(msgs[-1].send_reaction(react_str))
+    ac1._evtracker.wait_msg_delivered(msgs[-1])
+
     ac2.start_io()
 
     lp.sec("wait for ac2 to receive a reaction")
@@ -1474,7 +1510,7 @@ def test_reactions_for_a_reordering_move(acfactory, lp):
     ac1._evtracker.wait_msg_delivered(msg1)
     # It's is sad, but messages must differ in their INTERNALDATEs to be processed in the correct
     # order by DC, and most (if not all) mail servers provide only seconds precision.
-    time.sleep(2)
+    time.sleep(1.1)
     react_str = "\N{THUMBS UP SIGN}"
     ac1._evtracker.wait_msg_delivered(msg1.send_reaction(react_str))
 
@@ -1633,8 +1669,12 @@ def test_qr_setup_contact(acfactory, lp):
     ac1._evtracker.wait_securejoin_inviter_progress(1000)
 
 
-def test_qr_join_chat(acfactory, lp):
+@pytest.mark.parametrize("verified_one_on_one_chats", [0, 1])
+def test_qr_join_chat(acfactory, lp, verified_one_on_one_chats):
     ac1, ac2 = acfactory.get_online_accounts(2)
+    ac1.set_config("verified_one_on_one_chats", verified_one_on_one_chats)
+    ac2.set_config("verified_one_on_one_chats", verified_one_on_one_chats)
+
     lp.sec("ac1: create QR code and let ac2 scan it, starting the securejoin")
     chat = ac1.create_group_chat("hello")
     qr = chat.get_join_qr()
@@ -1646,6 +1686,47 @@ def test_qr_join_chat(acfactory, lp):
     ac1._evtracker.get_matching("DC_EVENT_IMAP_MESSAGE_DELETED")
     ac2._evtracker.get_matching("DC_EVENT_IMAP_MESSAGE_DELETED")
     ac1._evtracker.wait_securejoin_inviter_progress(1000)
+
+    msg = ac2._evtracker.wait_next_incoming_message()
+    assert msg.text == "Member Me ({}) added by {}.".format(ac2.get_config("addr"), ac1.get_config("addr"))
+
+    # ac1 reloads the chat.
+    chat = Chat(chat.account, chat.id)
+    assert not chat.is_protected()
+
+    # ac2 reloads the chat.
+    ch = Chat(ch.account, ch.id)
+    assert not ch.is_protected()
+
+
+def test_qr_new_group_unblocked(acfactory, lp):
+    """Regression test for a bug intoduced in core v1.113.0.
+    ac2 scans a verified group QR code created by ac1.
+    This results in creation of a blocked 1:1 chat with ac1 on ac2,
+    but ac1 contact is not blocked on ac2.
+    Then ac1 creates a group, adds ac2 there and promotes it by sending a message.
+    ac2 should receive a message and create a contact request for the group.
+    Due to a bug previously ac2 created a blocked group.
+    """
+
+    ac1, ac2 = acfactory.get_online_accounts(2)
+    ac1_chat = ac1.create_group_chat("Group for joining", verified=True)
+    qr = ac1_chat.get_join_qr()
+    ac2.qr_join_chat(qr)
+
+    ac1._evtracker.wait_securejoin_inviter_progress(1000)
+
+    ac1_new_chat = ac1.create_group_chat("Another group")
+    ac1_new_chat.add_contact(ac2)
+    ac1_new_chat.send_text("Hello!")
+
+    # Receive "Member added" message.
+    ac2._evtracker.wait_next_incoming_message()
+
+    # Receive "Hello!" message.
+    ac2_msg = ac2._evtracker.wait_next_incoming_message()
+    assert ac2_msg.text == "Hello!"
+    assert ac2_msg.chat.is_contact_request()
 
 
 def test_qr_email_capitalization(acfactory, lp):

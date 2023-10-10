@@ -19,7 +19,7 @@ use super::reactions::JSONRPCReactions;
 use super::webxdc::WebxdcMessageInfo;
 
 #[derive(Serialize, TypeDef, schemars::JsonSchema)]
-#[serde(rename_all = "camelCase", tag = "variant")]
+#[serde(rename_all = "camelCase", tag = "kind")]
 pub enum MessageLoadResult {
     Message(MessageObject),
     LoadingError { error: String },
@@ -318,6 +318,7 @@ pub enum DownloadState {
     Done,
     Available,
     Failure,
+    Undecipherable,
     InProgress,
 }
 
@@ -327,6 +328,7 @@ impl From<download::DownloadState> for DownloadState {
             download::DownloadState::Done => DownloadState::Done,
             download::DownloadState::Available => DownloadState::Available,
             download::DownloadState::Failure => DownloadState::Failure,
+            download::DownloadState::Undecipherable => DownloadState::Undecipherable,
             download::DownloadState::InProgress => DownloadState::InProgress,
         }
     }

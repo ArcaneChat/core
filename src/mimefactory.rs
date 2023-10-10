@@ -66,7 +66,7 @@ pub struct MimeFactory<'a> {
     in_reply_to: String,
     references: String,
     req_mdn: bool,
-    last_added_location_id: u32,
+    last_added_location_id: Option<u32>,
 
     /// If the created mime-structure contains sync-items,
     /// the IDs of these items are listed here.
@@ -85,7 +85,7 @@ pub struct RenderedEmail {
     // pub envelope: Envelope,
     pub is_encrypted: bool,
     pub is_gossiped: bool,
-    pub last_added_location_id: u32,
+    pub last_added_location_id: Option<u32>,
 
     /// A comma-separated string of sync-IDs that are used by the rendered email
     /// and must be deleted once the message is actually queued for sending
@@ -223,7 +223,7 @@ impl<'a> MimeFactory<'a> {
             in_reply_to,
             references,
             req_mdn,
-            last_added_location_id: 0,
+            last_added_location_id: None,
             sync_ids_to_delete: None,
             attach_selfavatar,
         };
@@ -264,7 +264,7 @@ impl<'a> MimeFactory<'a> {
             in_reply_to: String::default(),
             references: String::default(),
             req_mdn: false,
-            last_added_location_id: 0,
+            last_added_location_id: None,
             sync_ids_to_delete: None,
             attach_selfavatar: false,
         };
@@ -672,6 +672,12 @@ impl<'a> MimeFactory<'a> {
                 })
         };
 
+        let get_content_type_directives_header = || {
+            (
+                "Content-Type-Deltachat-Directives".to_string(),
+                "protected-headers=\"v1\"".to_string(),
+            )
+        };
         let outer_message = if is_encrypted {
             headers.protected.push(from_header);
 
@@ -708,10 +714,7 @@ impl<'a> MimeFactory<'a> {
             if !existing_ct.ends_with(';') {
                 existing_ct += ";";
             }
-            let message = message.replace_header(Header::new(
-                "Content-Type".to_string(),
-                format!("{existing_ct} protected-headers=\"v1\";"),
-            ));
+            let message = message.header(get_content_type_directives_header());
 
             // Set the appropriate Content-Type for the outer message
             let outer_message = PartBuilder::new().header((
@@ -780,11 +783,12 @@ impl<'a> MimeFactory<'a> {
             {
                 message
             } else {
+                let message = message.header(get_content_type_directives_header());
                 let (payload, signature) = encrypt_helper.sign(context, message).await?;
                 PartBuilder::new()
                     .header((
-                        "Content-Type".to_string(),
-                        "multipart/signed; protocol=\"application/pgp-signature\"".to_string(),
+                        "Content-Type",
+                        "multipart/signed; protocol=\"application/pgp-signature\"",
                     ))
                     .child(payload)
                     .child(
@@ -854,9 +858,13 @@ impl<'a> MimeFactory<'a> {
     }
 
     /// Returns MIME part with a `location.kml` attachment.
-    async fn get_location_kml_part(&mut self, context: &Context) -> Result<PartBuilder> {
-        let (kml_content, last_added_location_id) =
-            location::get_kml(context, self.msg.chat_id).await?;
+    async fn get_location_kml_part(&mut self, context: &Context) -> Result<Option<PartBuilder>> {
+        let Some((kml_content, last_added_location_id)) =
+            location::get_kml(context, self.msg.chat_id).await?
+        else {
+            return Ok(None);
+        };
+
         let part = PartBuilder::new()
             .content_type(
                 &"application/vnd.google-earth.kml+xml"
@@ -870,9 +878,9 @@ impl<'a> MimeFactory<'a> {
             .body(kml_content);
         if !self.msg.param.exists(Param::SetLatitude) {
             // otherwise, the independent location is already filed
-            self.last_added_location_id = last_added_location_id;
+            self.last_added_location_id = Some(last_added_location_id);
         }
-        Ok(part)
+        Ok(Some(part))
     }
 
     #[allow(clippy::cognitive_complexity)]
@@ -891,7 +899,6 @@ impl<'a> MimeFactory<'a> {
         let mut meta_part = None;
 
         let send_verified_headers = match chat.typ {
-            Chattype::Undefined => bail!("Undefined chat type"),
             // In single chats, the protection status isn't necessarily the same for both sides,
             // so we don't send the Chat-Verified header:
             Chattype::Single => false,
@@ -1172,7 +1179,10 @@ impl<'a> MimeFactory<'a> {
         }
         let flowed_text = format_flowed(final_text);
 
-        let footer = &self.selfstatus;
+        let is_reaction = self.msg.param.get_int(Param::Reaction).unwrap_or_default() != 0;
+
+        let footer = if is_reaction { "" } else { &self.selfstatus };
+
         let message_text = format!(
             "{}{}{}{}{}{}",
             fwdhint.unwrap_or_default(),
@@ -1195,7 +1205,7 @@ impl<'a> MimeFactory<'a> {
             ))
             .body(message_text);
 
-        if self.msg.param.get_int(Param::Reaction).unwrap_or_default() != 0 {
+        if is_reaction {
             main_part = main_part.header(("Content-Disposition", "reaction"));
         }
 
@@ -1234,11 +1244,8 @@ impl<'a> MimeFactory<'a> {
         }
 
         if location::is_sending_locations_to_chat(context, Some(self.msg.chat_id)).await? {
-            match self.get_location_kml_part(context).await {
-                Ok(part) => parts.push(part),
-                Err(err) => {
-                    warn!(context, "mimefactory: could not send location: {}", err);
-                }
+            if let Some(part) = self.get_location_kml_part(context).await? {
+                parts.push(part);
             }
         }
 
@@ -1367,15 +1374,16 @@ impl<'a> MimeFactory<'a> {
     }
 }
 
-/// Returns base64-encoded buffer `buf` split into 78-bytes long
+/// Returns base64-encoded buffer `buf` split into 76-bytes long
 /// chunks separated by CRLF.
 ///
-/// This line length limit is an
-/// [RFC5322 requirement](https://tools.ietf.org/html/rfc5322#section-2.1.1).
-fn wrapped_base64_encode(buf: &[u8]) -> String {
+/// [RFC2045 specification of base64 Content-Transfer-Encoding](https://datatracker.ietf.org/doc/html/rfc2045#section-6.8)
+/// says that "The encoded output stream must be represented in lines of no more than 76 characters each."
+/// Longer lines trigger `BASE64_LENGTH_78_79` rule of SpamAssassin.
+pub(crate) fn wrapped_base64_encode(buf: &[u8]) -> String {
     let base64 = base64::engine::general_purpose::STANDARD.encode(buf);
     let mut chars = base64.chars();
-    std::iter::repeat_with(|| chars.by_ref().take(78).collect::<String>())
+    std::iter::repeat_with(|| chars.by_ref().take(76).collect::<String>())
         .take_while(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join("\r\n")
@@ -1390,7 +1398,7 @@ async fn build_body_file(
         .param
         .get_blob(Param::File, context, true)
         .await?
-        .context("msg has no filename")?;
+        .context("msg has no file")?;
     let suffix = blob.suffix().unwrap_or("dat");
 
     // Get file name to use for sending.  For privacy purposes, we do
@@ -1435,7 +1443,11 @@ async fn build_body_file(
                 ),
             &suffix
         ),
-        _ => blob.as_file_name().to_string(),
+        _ => msg
+            .param
+            .get(Param::Filename)
+            .unwrap_or_else(|| blob.as_file_name())
+            .to_string(),
     };
 
     /* check mimetype */
@@ -1530,6 +1542,7 @@ fn maybe_encode_words(words: &str) -> String {
 #[cfg(test)]
 mod tests {
     use mailparse::{addrparse_header, MailHeaderMap};
+    use std::str;
 
     use super::*;
     use crate::chat::ChatId;
@@ -1538,10 +1551,11 @@ mod tests {
         ProtectionStatus,
     };
     use crate::chatlist::Chatlist;
+    use crate::constants;
     use crate::contact::{ContactAddress, Origin};
     use crate::mimeparser::MimeMessage;
     use crate::receive_imf::receive_imf;
-    use crate::test_utils::{get_chat_msg, TestContext};
+    use crate::test_utils::{get_chat_msg, TestContext, TestContextManager};
     #[test]
     fn test_render_email_address() {
         let display_name = "ä space";
@@ -1611,8 +1625,8 @@ mod tests {
     fn test_wrapped_base64_encode() {
         let input = b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
         let output =
-            "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU\r\n\
-             FBQUFBQUFBQQ==";
+            "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB\r\n\
+             QUFBQUFBQUFBQQ==";
         assert_eq!(wrapped_base64_encode(input), output);
     }
 
@@ -1954,7 +1968,7 @@ mod tests {
         let incoming_msg = get_chat_msg(&t, new_msg.chat_id, 0, 2).await;
 
         if delete_original_msg {
-            incoming_msg.id.delete_from_db(&t).await.unwrap();
+            incoming_msg.id.trash(&t).await.unwrap();
         }
 
         if message_arrives_inbetween {
@@ -2190,7 +2204,11 @@ mod tests {
         assert_eq!(part.match_indices("Chat-User-Avatar:").count(), 0);
 
         let part = payload.next().unwrap();
-        assert_eq!(part.match_indices("multipart/mixed").count(), 1);
+        assert_eq!(
+            part.match_indices("multipart/mixed; protected-headers=\"v1\"")
+                .count(),
+            1
+        );
         assert_eq!(part.match_indices("Subject:").count(), 1);
         assert_eq!(part.match_indices("Autocrypt:").count(), 0);
         assert_eq!(part.match_indices("Chat-User-Avatar:").count(), 0);
@@ -2299,6 +2317,39 @@ mod tests {
         assert_eq!(payload.match_indices("From:").count(), 1);
 
         assert!(payload.match_indices("From:").next() < payload.match_indices("Autocrypt:").next());
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_protected_headers_directive() -> Result<()> {
+        let mut tcm = TestContextManager::new();
+        let alice = tcm.alice().await;
+        let bob = tcm.bob().await;
+        let chat = tcm
+            .send_recv_accept(&alice, &bob, "alice->bob")
+            .await
+            .chat_id;
+
+        // Now Bob can send an encrypted message to Alice.
+        let mut msg = Message::new(Viewtype::File);
+        // Long messages are truncated and MimeMessage::decoded_data is set for them. We need
+        // decoded_data to check presense of the necessary headers.
+        msg.set_text("a".repeat(constants::DC_DESIRED_TEXT_LEN + 1));
+        msg.set_file_from_bytes(&bob, "foo.bar", "content".as_bytes(), None)
+            .await?;
+        let sent = bob.send_msg(chat, &mut msg).await;
+        assert!(msg.get_showpadlock());
+
+        let mime = MimeMessage::from_bytes(&alice, sent.payload.as_bytes(), None).await?;
+        let mut payload = str::from_utf8(&mime.decoded_data)?.splitn(2, "\r\n\r\n");
+        let part = payload.next().unwrap();
+        assert_eq!(
+            part.match_indices("multipart/mixed; protected-headers=\"v1\"")
+                .count(),
+            1
+        );
+        assert_eq!(part.match_indices("Subject:").count(), 1);
 
         Ok(())
     }

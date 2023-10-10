@@ -304,6 +304,25 @@ impl Sql {
         }
     }
 
+    /// Changes the passphrase of encrypted database.
+    ///
+    /// The database must already be encrypted and the passphrase cannot be empty.
+    /// It is impossible to turn encrypted database into unencrypted
+    /// and vice versa this way, use import/export for this.
+    pub async fn change_passphrase(&self, passphrase: String) -> Result<()> {
+        let mut lock = self.pool.write().await;
+
+        let pool = lock.take().context("SQL connection pool is not open")?;
+        let conn = pool.get().await?;
+        conn.pragma_update(None, "rekey", passphrase.clone())
+            .context("failed to set PRAGMA rekey")?;
+        drop(pool);
+
+        *lock = Some(Self::new_pool(&self.dbfile, passphrase.to_string())?);
+
+        Ok(())
+    }
+
     /// Locks the write transactions mutex in order to make sure that there never are
     /// multiple write transactions at once.
     ///
@@ -1246,6 +1265,66 @@ mod tests {
         sql.open(&t, "foo".to_string())
             .await
             .context("failed to open the database second time")?;
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_sql_change_passphrase() -> Result<()> {
+        use tempfile::tempdir;
+
+        // The context is used only for logging.
+        let t = TestContext::new().await;
+
+        // Create a separate empty database for testing.
+        let dir = tempdir()?;
+        let dbfile = dir.path().join("testdb.sqlite");
+        let sql = Sql::new(dbfile.clone());
+
+        sql.open(&t, "foo".to_string())
+            .await
+            .context("failed to open the database first time")?;
+        sql.close().await;
+
+        // Change the passphrase from "foo" to "bar".
+        let sql = Sql::new(dbfile.clone());
+        sql.open(&t, "foo".to_string())
+            .await
+            .context("failed to open the database second time")?;
+        sql.change_passphrase("bar".to_string())
+            .await
+            .context("failed to change passphrase")?;
+
+        // Test that at least two connections are still working.
+        // This ensures that not only the connection which changed the password is working,
+        // but other connections as well.
+        {
+            let lock = sql.pool.read().await;
+            let pool = lock.as_ref().unwrap();
+            let conn1 = pool.get().await?;
+            let conn2 = pool.get().await?;
+            conn1
+                .query_row("SELECT count(*) FROM sqlite_master", [], |_row| Ok(()))
+                .unwrap();
+            conn2
+                .query_row("SELECT count(*) FROM sqlite_master", [], |_row| Ok(()))
+                .unwrap();
+        }
+
+        sql.close().await;
+
+        let sql = Sql::new(dbfile);
+
+        // Test that old passphrase is not working.
+        assert!(sql.open(&t, "foo".to_string()).await.is_err());
+
+        // Open the database with the new passphrase.
+        sql.check_passphrase("bar".to_string()).await?;
+        sql.open(&t, "bar".to_string())
+            .await
+            .context("failed to open the database third time")?;
+        sql.close().await;
+
         Ok(())
     }
 }

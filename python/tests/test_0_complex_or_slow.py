@@ -1,6 +1,7 @@
 import sys
 
 import pytest
+import deltachat as dc
 
 
 class TestGroupStressTests:
@@ -136,6 +137,7 @@ def test_qr_verified_group_and_chatting(acfactory, lp):
     lp.sec("ac2: read member added message")
     msg = ac2._evtracker.wait_next_incoming_message()
     assert msg.is_encrypted()
+    assert msg.is_system_message()
     assert "added" in msg.text.lower()
 
     lp.sec("ac1: send message")
@@ -149,9 +151,8 @@ def test_qr_verified_group_and_chatting(acfactory, lp):
     assert msg.is_encrypted()
 
     lp.sec("ac2: Check that ac2 verified ac1")
-    # If we verified the contact ourselves then verifier addr == contact addr
     ac2_ac1_contact = ac2.get_contacts()[0]
-    assert ac2.get_self_contact().get_verifier(ac2_ac1_contact) == ac1_addr
+    assert ac2.get_self_contact().get_verifier(ac2_ac1_contact).id == dc.const.DC_CONTACT_ID_SELF
 
     lp.sec("ac2: send message and let ac1 read it")
     chat2.send_text("world")
@@ -176,14 +177,15 @@ def test_qr_verified_group_and_chatting(acfactory, lp):
 
     lp.sec("ac2: Check that ac1 verified ac3 for ac2")
     ac2_ac1_contact = ac2.get_contacts()[0]
-    assert ac2.get_self_contact().get_verifier(ac2_ac1_contact) == ac1_addr
+    assert ac2.get_self_contact().get_verifier(ac2_ac1_contact).id == dc.const.DC_CONTACT_ID_SELF
     ac2_ac3_contact = ac2.get_contacts()[1]
-    assert ac2.get_self_contact().get_verifier(ac2_ac3_contact) == ac1_addr
+    assert ac2.get_self_contact().get_verifier(ac2_ac3_contact).addr == ac1_addr
 
     lp.sec("ac2: send message and let ac3 read it")
     chat2.send_text("hi")
-    # Skip system message about added member
-    ac3._evtracker.wait_next_incoming_message()
+    # System message about the added member.
+    msg = ac3._evtracker.wait_next_incoming_message()
+    assert msg.is_system_message()
     msg = ac3._evtracker.wait_next_incoming_message()
     assert msg.text == "hi"
     assert msg.is_encrypted()
@@ -524,7 +526,8 @@ def test_see_new_verified_member_after_going_online(acfactory, tmp_path, lp):
     lp.sec("ac2: sending message")
     # Message can be sent only after a receipt of "vg-member-added" message. Just wait for
     # "Member Me (<addr>) added by <addr>." message.
-    ac2._evtracker.wait_next_incoming_message()
+    msg_in = ac2._evtracker.wait_next_incoming_message()
+    assert msg_in.is_system_message()
     msg_out = chat2.send_text("hello")
 
     lp.sec("ac1: receiving message")

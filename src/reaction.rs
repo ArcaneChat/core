@@ -431,6 +431,32 @@ Content-Disposition: reaction\n\
         assert_eq!(bob_reaction.emojis(), vec!["👍"]);
         assert_eq!(bob_reaction.as_str(), "👍");
 
+        // Alice receives reaction to her message from Bob with a footer.
+        receive_imf(
+            &alice,
+            "To: alice@example.org\n\
+From: bob@example.net\n\
+Date: Today, 29 February 2021 00:00:10 -800\n\
+Message-ID: 56790@example.net\n\
+In-Reply-To: 12345@example.org\n\
+Subject: Meeting\n\
+Mime-Version: 1.0 (1.0)\n\
+Content-Type: text/plain; charset=utf-8\n\
+Content-Disposition: reaction\n\
+\n\
+😀\n\
+\n\
+--\n\
+_______________________________________________\n\
+Here's my footer -- bob@example.net"
+                .as_bytes(),
+            false,
+        )
+        .await?;
+
+        let reactions = get_msg_reactions(&alice, msg.id).await?;
+        assert_eq!(reactions.to_string(), "😀1");
+
         Ok(())
     }
 
@@ -463,6 +489,16 @@ Content-Disposition: reaction\n\
     async fn test_send_reaction() -> Result<()> {
         let alice = TestContext::new_alice().await;
         let bob = TestContext::new_bob().await;
+
+        // Test that the status does not get mixed up into reactions.
+        alice
+            .set_config(
+                Config::Selfstatus,
+                Some("Buy Delta Chat today and make this banner go away!"),
+            )
+            .await?;
+        bob.set_config(Config::Selfstatus, Some("Sent from my Delta Chat Pro. 👍"))
+            .await?;
 
         let chat_alice = alice.create_chat(&bob).await;
         let alice_msg = alice.send_text(chat_alice.id, "Hi!").await;

@@ -19,7 +19,7 @@ use crate::constants::DC_VERSION_STR;
 use crate::contact::Contact;
 use crate::debug_logging::DebugLogging;
 use crate::events::{Event, EventEmitter, EventType, Events};
-use crate::key::{DcKey, SignedPublicKey};
+use crate::key::{load_self_public_key, DcKey as _};
 use crate::login_param::LoginParam;
 use crate::message::{self, MessageState, MsgId};
 use crate::quota::QuotaInfo;
@@ -332,6 +332,12 @@ impl Context {
         }
     }
 
+    /// Changes encrypted database passphrase.
+    pub async fn change_passphrase(&self, passphrase: String) -> Result<()> {
+        self.sql.change_passphrase(passphrase).await?;
+        Ok(())
+    }
+
     /// Returns true if database is open.
     pub async fn is_open(&self) -> bool {
         self.sql.is_open().await
@@ -376,7 +382,7 @@ impl Context {
             translated_stockstrings: stockstrings,
             events,
             scheduler: SchedulerState::new(),
-            ratelimit: RwLock::new(Ratelimit::new(Duration::new(60, 0), 6.0)), // Allow to send 6 messages immediately, no more than once every 10 seconds.
+            ratelimit: RwLock::new(Ratelimit::new(Duration::new(60, 0), 6.0)), // Allow at least 1 message every 10 seconds + a burst of 6.
             quota: RwLock::new(None),
             quota_update_request: AtomicBool::new(false),
             resync_request: AtomicBool::new(false),
@@ -580,7 +586,7 @@ impl Context {
             .sql
             .count("SELECT COUNT(*) FROM acpeerstates;", ())
             .await?;
-        let fingerprint_str = match SignedPublicKey::load_self(self).await {
+        let fingerprint_str = match load_self_public_key(self).await {
             Ok(key) => key.fingerprint().hex(),
             Err(err) => format!("<key failure: {err}>"),
         };
@@ -814,7 +820,22 @@ impl Context {
     pub async fn get_next_msgs(&self) -> Result<Vec<MsgId>> {
         let last_msg_id = match self.get_config(Config::LastMsgId).await? {
             Some(s) => MsgId::new(s.parse()?),
-            None => MsgId::new_unset(),
+            None => {
+                // If `last_msg_id` is not set yet,
+                // subtract 1 from the last id,
+                // so a single message is returned and can
+                // be marked as seen.
+                self.sql
+                    .query_row(
+                        "SELECT IFNULL((SELECT MAX(id) - 1 FROM msgs), 0)",
+                        (),
+                        |row| {
+                            let msg_id: MsgId = row.get(0)?;
+                            Ok(msg_id)
+                        },
+                    )
+                    .await?
+            }
         };
 
         let list = self
@@ -1455,6 +1476,35 @@ mod tests {
         assert_eq!(context.check_passphrase("bar".to_string()).await?, false);
         assert_eq!(context.open("false".to_string()).await?, false);
         assert_eq!(context.open("foo".to_string()).await?, true);
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_context_change_passphrase() -> Result<()> {
+        let dir = tempdir()?;
+        let dbfile = dir.path().join("db.sqlite");
+
+        let id = 1;
+        let context = Context::new_closed(&dbfile, id, Events::new(), StockStrings::new())
+            .await
+            .context("failed to create context")?;
+        assert_eq!(context.open("foo".to_string()).await?, true);
+        assert_eq!(context.is_open().await, true);
+
+        context
+            .set_config(Config::Addr, Some("alice@example.org"))
+            .await?;
+
+        context
+            .change_passphrase("bar".to_string())
+            .await
+            .context("Failed to change passphrase")?;
+
+        assert_eq!(
+            context.get_config(Config::Addr).await?.unwrap(),
+            "alice@example.org"
+        );
 
         Ok(())
     }

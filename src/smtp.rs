@@ -12,6 +12,7 @@ use tokio::task;
 
 use crate::config::Config;
 use crate::contact::{Contact, ContactId};
+use crate::context::Context;
 use crate::events::EventType;
 use crate::login_param::{CertificateChecks, LoginParam, ServerLoginParam};
 use crate::message::Message;
@@ -22,9 +23,9 @@ use crate::net::session::SessionBufStream;
 use crate::net::tls::wrap_tls;
 use crate::oauth2::get_oauth2_access_token;
 use crate::provider::Socket;
+use crate::scheduler::connectivity::ConnectivityStore;
 use crate::socks::Socks5Config;
 use crate::sql;
-use crate::{context::Context, scheduler::connectivity::ConnectivityStore};
 
 /// SMTP write and read timeout.
 const SMTP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -492,7 +493,20 @@ pub(crate) async fn smtp_send(
 
     if let SendResult::Failure(err) = &status {
         // We couldn't send the message, so mark it as failed
-        message::set_msg_failed(context, msg_id, &err.to_string()).await;
+        match Message::load_from_db(context, msg_id).await {
+            Ok(mut msg) => {
+                if let Err(err) = message::set_msg_failed(context, &mut msg, &err.to_string()).await
+                {
+                    error!(context, "Failed to mark {msg_id} as failed: {err:#}.");
+                }
+            }
+            Err(err) => {
+                error!(
+                    context,
+                    "Failed to load {msg_id} to mark it as failed: {err:#}."
+                );
+            }
+        }
     }
     status
 }
@@ -539,7 +553,8 @@ pub(crate) async fn send_msg_to_smtp(
         )
         .await?;
     if retries > 6 {
-        message::set_msg_failed(context, msg_id, "Number of retries exceeded the limit.").await;
+        let mut msg = Message::load_from_db(context, msg_id).await?;
+        message::set_msg_failed(context, &mut msg, "Number of retries exceeded the limit.").await?;
         context
             .sql
             .execute("DELETE FROM smtp WHERE id=?", (rowid,))
@@ -564,24 +579,6 @@ pub(crate) async fn send_msg_to_smtp(
             },
         )
         .collect::<Vec<_>>();
-
-    // If there is a msg-id and it does not exist in the db, cancel sending. this happens if
-    // delete_msgs() was called before the generated mime was sent out.
-    if !message::exists(context, msg_id)
-        .await
-        .with_context(|| format!("failed to check message {msg_id} existence"))?
-    {
-        info!(
-            context,
-            "Sending of message {msg_id} (entry {rowid}) was cancelled by the user."
-        );
-        context
-            .sql
-            .execute("DELETE FROM smtp WHERE id=?", (rowid,))
-            .await
-            .context("failed to remove cancelled message from smtp table")?;
-        return Ok(());
-    }
 
     let status = smtp_send(context, &recipients_list, body.as_str(), smtp, msg_id).await;
 

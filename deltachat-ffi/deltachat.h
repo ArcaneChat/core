@@ -302,6 +302,19 @@ int             dc_context_open              (dc_context_t *context, const char*
 
 
 /**
+ * Changes the passphrase on the open database.
+ * Existing database must already be encrypted and the passphrase cannot be NULL or empty.
+ * It is impossible to encrypt unencrypted database with this method and vice versa.
+ *
+ * @memberof dc_context_t
+ * @param context The context object.
+ * @param passphrase The new passphrase.
+ * @return 1 on success, 0 on error.
+ */
+int             dc_context_change_passphrase (dc_context_t* context, const char* passphrase);
+
+
+/**
  * Returns 1 if database is open.
  *
  * @memberof dc_context_t
@@ -430,7 +443,9 @@ char*           dc_get_blobdir               (const dc_context_t* context);
  *                    DC_KEY_GEN_RSA2048 (1)=
  *                    generate RSA 2048 keypair
  *                    DC_KEY_GEN_ED25519 (2)=
- *                    generate Ed25519 keypair
+ *                    generate Curve25519 keypair
+ *                    DC_KEY_GEN_RSA4096 (3)=
+ *                    generate RSA 4096 keypair
  * - `save_mime_headers` = 1=save mime headers
  *                    and make dc_get_mime_headers() work for subsequent calls,
  *                    0=do not save mime headers (default)
@@ -816,7 +831,7 @@ void            dc_maybe_network             (dc_context_t* context);
  * @param context The context as created by dc_context_new().
  * @param addr The e-mail address of the user. This must match the
  *    configured_addr setting of the context as well as the UID of the key.
- * @param public_data ASCII armored public key.
+ * @param public_data Ignored, actual public key is extracted from secret_data.
  * @param secret_data ASCII armored secret key.
  * @return 1 on success, 0 on failure.
  */
@@ -1110,7 +1125,7 @@ dc_reactions_t* dc_get_msg_reactions (dc_context_t *context, int msg_id);
  *
  * In JS land, that would be mapped to something as:
  * ```
- * success = window.webxdc.sendUpdate('{"action":"move","src":"A3","dest":"B4"}', 'move A3 B4');
+ * success = window.webxdc.sendUpdate('{payload: {"action":"move","src":"A3","dest":"B4"}}', 'move A3 B4');
  * ```
  * `context` and `msg_id` are not needed in JS as those are unique within a webxdc instance.
  * See dc_get_webxdc_status_updates() for the receiving counterpart.
@@ -1328,6 +1343,20 @@ int             dc_get_msg_cnt               (dc_context_t* context, uint32_t ch
 int             dc_get_fresh_msg_cnt         (dc_context_t* context, uint32_t chat_id);
 
 
+/**
+ * Returns a list of similar chats.
+ *
+ * @warning This is an experimental API which may change or be removed in the future.
+ *
+ * @memberof dc_context_t
+ * @param context The context object as returned from dc_context_new().
+ * @param chat_id The ID of the chat for which to find similar chats.
+ * @return The list of similar chats.
+ *     On errors, NULL is returned.
+ *     Must be freed using dc_chatlist_unref() when no longer used.
+ */
+dc_chatlist_t*     dc_get_similar_chatlist   (dc_context_t* context, uint32_t chat_id);
+
 
 /**
  * Estimate the number of messages that will be deleted
@@ -1459,6 +1488,7 @@ dc_array_t*     dc_get_chat_media            (dc_context_t* context, uint32_t ch
  * Typically used to implement the "next" and "previous" buttons
  * in a gallery or in a media player.
  *
+ * @deprecated Deprecated 2023-10-03, use dc_get_chat_media() and navigate the returned array instead.
  * @memberof dc_context_t
  * @param context The context object as returned from dc_context_new().
  * @param msg_id The ID of the current message from which the next or previous message should be searched.
@@ -2244,6 +2274,7 @@ dc_contact_t*   dc_get_contact               (dc_context_t* context, uint32_t co
  *
  * - **DC_IMEX_IMPORT_SELF_KEYS** (2) - Import private keys found in the directory given as `param1`.
  *   The last imported key is made the default keys unless its name contains the string `legacy`. Public keys are not imported.
+ *   If `param1` is a filename, import the private key from the file and make it the default.
  *
  * While dc_imex() returns immediately, the started job may take a while,
  * you can stop it using dc_stop_ongoing_process(). During execution of the job,
@@ -2915,12 +2946,15 @@ int dc_receive_backup (dc_context_t* context, const char* qr);
  * @param dir The directory to create the context-databases in.
  *     If the directory does not exist,
  *     dc_accounts_new() will try to create it.
+ * @param writable Whether the returned account manager is writable, i.e. calling these functions on
+ *     it is possible: dc_accounts_add_account(), dc_accounts_add_closed_account(),
+ *     dc_accounts_migrate_account(), dc_accounts_remove_account(), dc_accounts_select_account().
  * @return An account manager object.
  *     The object must be passed to the other account manager functions
  *     and must be freed using dc_accounts_unref() after usage.
  *     On errors, NULL is returned.
  */
-dc_accounts_t* dc_accounts_new                  (const char* os_name, const char* dir);
+dc_accounts_t* dc_accounts_new                  (const char* dir, int writable);
 
 
 /**
@@ -3986,16 +4020,17 @@ char*           dc_msg_get_text               (const dc_msg_t* msg);
  */
 char*           dc_msg_get_subject            (const dc_msg_t* msg);
 
+
 /**
- * Find out full path, file name and extension of the file associated with a
- * message.
+ * Find out full path of the file associated with a message.
  *
  * Typically files are associated with images, videos, audios, documents.
  * Plain text messages do not have a file.
+ * File name may be mangled. To obtain the original attachment filename use dc_msg_get_filename().
  *
  * @memberof dc_msg_t
  * @param msg The message object.
- * @return The full path, the file name, and the extension of the file associated with the message.
+ * @return The full path (with file name and extension) of the file associated with the message.
  *     If there is no file associated with the message, an empty string is returned.
  *     NULL is never returned and the returned value must be released using dc_str_unref().
  */
@@ -4003,14 +4038,13 @@ char*           dc_msg_get_file               (const dc_msg_t* msg);
 
 
 /**
- * Get a base file name without the path. The base file name includes the extension; the path
- * is not returned. To get the full path, use dc_msg_get_file().
+ * Get an original attachment filename, with extension but without the path. To get the full path,
+ * use dc_msg_get_file().
  *
  * @memberof dc_msg_t
  * @param msg The message object.
- * @return The base file name plus the extension without part. If there is no file
- *     associated with the message, an empty string is returned. The returned
- *     value must be released using dc_str_unref().
+ * @return The attachment filename. If there is no file associated with the message, an empty string
+ *     is returned. The returned value must be released using dc_str_unref().
  */
 char*           dc_msg_get_filename           (const dc_msg_t* msg);
 
@@ -5030,6 +5064,7 @@ int             dc_contact_is_verified       (dc_contact_t* contact);
  *    A string containing the verifiers address. If it is the same address as the contact itself,
  *    we verified the contact ourself. If it is an empty string, we don't have verifier 
  *    information or the contact is not verified.
+ * @deprecated 2023-09-28, use dc_contact_get_verifier_id instead
  */
 char*           dc_contact_get_verifier_addr       (dc_contact_t* contact);
 
@@ -5042,7 +5077,7 @@ char*           dc_contact_get_verifier_addr       (dc_contact_t* contact);
  * @memberof dc_contact_t
  * @param contact The contact object.
  * @return 
- *    The `ContactId` of the verifiers address. If it is the same address as the contact itself,
+ *    The contact ID of the verifier. If it is DC_CONTACT_ID_SELF,
  *    we verified the contact ourself. If it is 0, we don't have verifier information or 
  *    the contact is not verified.
  */
@@ -5738,12 +5773,11 @@ char* dc_jsonrpc_next_response(dc_jsonrpc_instance_t* jsonrpc_instance);
  *
  * @memberof dc_jsonrpc_instance_t
  * @param jsonrpc_instance jsonrpc instance as returned from dc_jsonrpc_init().
- * @param method JSON-RPC method name, e.g. `check_email_validity`.
- * @param params JSON-RPC method parameters, e.g. `["alice@example.org"]`.
+ * @param input JSON-RPC request.
  * @return JSON-RPC response as string, must be freed using dc_str_unref() after usage.
- *     On error, NULL is returned.
+ *     If there is no response, NULL is returned.
  */
-char* dc_jsonrpc_blocking_call(dc_jsonrpc_instance_t* jsonrpc_instance, const char *method, const char *params);
+char* dc_jsonrpc_blocking_call(dc_jsonrpc_instance_t* jsonrpc_instance, const char *input);
 
 /**
  * @class dc_event_emitter_t
@@ -6279,6 +6313,7 @@ void dc_event_unref(dc_event_t* event);
 #define DC_KEY_GEN_DEFAULT 0
 #define DC_KEY_GEN_RSA2048 1
 #define DC_KEY_GEN_ED25519 2
+#define DC_KEY_GEN_RSA4096 3
 
 
 /**

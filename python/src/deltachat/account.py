@@ -195,7 +195,7 @@ class Account:
         assert res != ffi.NULL, f"config value not found for: {name!r}"
         return from_dc_charpointer(res)
 
-    def _preconfigure_keypair(self, addr: str, public: str, secret: str) -> None:
+    def _preconfigure_keypair(self, addr: str, secret: str) -> None:
         """See dc_preconfigure_keypair() in deltachat.h.
 
         In other words, you don't need this.
@@ -203,7 +203,7 @@ class Account:
         res = lib.dc_preconfigure_keypair(
             self._dc_context,
             as_dc_charpointer(addr),
-            as_dc_charpointer(public),
+            ffi.NULL,
             as_dc_charpointer(secret),
         )
         if res == 0:
@@ -427,7 +427,7 @@ class Account:
 
         assert dc_chatlist != ffi.NULL
         chatlist = []
-        for i in range(0, lib.dc_chatlist_get_cnt(dc_chatlist)):
+        for i in range(lib.dc_chatlist_get_cnt(dc_chatlist)):
             chat_id = lib.dc_chatlist_get_chat_id(dc_chatlist, i)
             chatlist.append(Chat(self, chat_id))
         return chatlist

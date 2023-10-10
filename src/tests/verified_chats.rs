@@ -2,7 +2,9 @@ use anyhow::Result;
 use pretty_assertions::assert_eq;
 
 use crate::chat::{Chat, ProtectionStatus};
+use crate::chatlist::Chatlist;
 use crate::config::Config;
+use crate::constants::DC_GCL_FOR_FORWARDING;
 use crate::contact::VerifiedStatus;
 use crate::contact::{Contact, Origin};
 use crate::message::{Message, Viewtype};
@@ -159,7 +161,7 @@ async fn test_create_verified_oneonone_chat() -> Result<()> {
 
     // The chat should be and stay unprotected
     {
-        let chat = alice.get_chat(&fiona_new).await.unwrap();
+        let chat = alice.get_chat(&fiona_new).await;
         assert!(!chat.is_protected());
         assert!(chat.is_protection_broken());
 
@@ -287,21 +289,21 @@ async fn test_verified_oneonone_chat_enable_disable() -> Result<()> {
         )
         .await?;
 
-        let chat = alice.get_chat(&bob).await.unwrap();
+        let chat = alice.get_chat(&bob).await;
         assert!(!chat.is_protected());
         assert!(chat.is_protection_broken());
 
         if alice_accepts_breakage {
             tcm.section("Alice clicks 'Accept' on the input-bar-dialog");
             chat.id.accept(&alice).await?;
-            let chat = alice.get_chat(&bob).await.unwrap();
+            let chat = alice.get_chat(&bob).await;
             assert!(!chat.is_protected());
             assert!(!chat.is_protection_broken());
         }
 
         // Bob sends a message from DC again
         tcm.send_recv(&bob, &alice, "Hello from DC").await;
-        let chat = alice.get_chat(&bob).await.unwrap();
+        let chat = alice.get_chat(&bob).await;
         assert!(chat.is_protected());
         assert!(!chat.is_protection_broken());
     }
@@ -436,7 +438,7 @@ async fn test_old_message_3() -> Result<()> {
     .await?;
 
     alice
-        .golden_test_chat(alice.get_chat(&bob).await.unwrap().id, "test_old_message_3")
+        .golden_test_chat(alice.get_chat(&bob).await.id, "test_old_message_3")
         .await;
 
     Ok(())
@@ -476,6 +478,46 @@ async fn test_old_message_4() -> Result<()> {
 
     // The "Happy birthday" message should be shown first, and then the "Thanks" message
     assert!(msg_sent.sort_timestamp < msg_incoming.sort_timestamp);
+
+    Ok(())
+}
+
+/// Alice is offline for some time.
+/// When they come online, first their sentbox is synced and then their inbox.
+/// This test tests that the messages are still in the right order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_old_message_5() -> Result<()> {
+    let alice = TestContext::new_alice().await;
+    let msg_sent = receive_imf(
+        &alice,
+        b"From: alice@example.org\n\
+          To: Bob <bob@example.net>\n\
+          Message-ID: <1234-2-4@example.org>\n\
+          Date: Sat, 07 Dec 2019 19:00:27 +0000\n\
+          \n\
+          Happy birthday, Bob!\n",
+        true,
+    )
+    .await?
+    .unwrap();
+
+    let msg_incoming = receive_imf(
+        &alice,
+        b"From: Bob <bob@example.net>\n\
+          To: alice@example.org\n\
+          Message-ID: <1234-2-3@example.org>\n\
+          Date: Sun, 07 Dec 2019 19:00:26 +0000\n\
+          \n\
+          Happy birthday to me, Alice!\n",
+        false,
+    )
+    .await?
+    .unwrap();
+
+    assert!(msg_sent.sort_timestamp == msg_incoming.sort_timestamp);
+    alice
+        .golden_test_chat(msg_sent.chat_id, "test_old_message_5")
+        .await;
 
     Ok(())
 }
@@ -528,8 +570,7 @@ async fn test_outgoing_mua_msg() -> Result<()> {
     )
     .await?
     .unwrap();
-    tcm.send_recv_accept(&alice, &bob, "Sending with DC again")
-        .await;
+    tcm.send_recv(&alice, &bob, "Sending with DC again").await;
 
     alice
         .golden_test_chat(sent.chat_id, "test_outgoing_mua_msg")
@@ -560,7 +601,7 @@ async fn test_reply() -> Result<()> {
         }
 
         tcm.send_recv_accept(&bob, &alice, "Heyho from DC").await;
-        let encrypted_msg = tcm.send_recv_accept(&alice, &bob, "Heyho back").await;
+        let encrypted_msg = tcm.send_recv(&alice, &bob, "Heyho back").await;
 
         let unencrypted_msg = receive_imf(
             &alice,
@@ -618,6 +659,8 @@ async fn test_break_protection_then_verify_again() -> Result<()> {
 
     alice.create_chat(&bob).await;
     assert_verified(&alice, &bob, ProtectionStatus::Protected).await;
+    let chats = Chatlist::try_load(&alice, DC_GCL_FOR_FORWARDING, None, None).await?;
+    assert!(chats.len() == 1);
 
     tcm.section("Bob reinstalls DC");
     drop(bob);
@@ -627,10 +670,23 @@ async fn test_break_protection_then_verify_again() -> Result<()> {
     e2ee::ensure_secret_key_exists(&bob_new).await?;
 
     tcm.send_recv(&bob_new, &alice, "I have a new device").await;
-    assert_verified(&alice, &bob_new, ProtectionStatus::ProtectionBroken).await;
+
+    let contact = alice.add_or_lookup_contact(&bob_new).await;
+    assert_eq!(
+        contact.is_verified(&alice).await.unwrap(),
+        // Bob sent a message with a new key, so he most likely doesn't have
+        // the old key anymore. This means that Alice's device should show
+        // him as unverified:
+        VerifiedStatus::Unverified
+    );
+    let chat = alice.get_chat(&bob_new).await;
+    assert_eq!(chat.is_protected(), false);
+    assert_eq!(chat.is_protection_broken(), true);
+    let chats = Chatlist::try_load(&alice, DC_GCL_FOR_FORWARDING, None, None).await?;
+    assert!(chats.len() == 1);
 
     {
-        let alice_bob_chat = alice.get_chat(&bob_new).await.unwrap();
+        let alice_bob_chat = alice.get_chat(&bob_new).await;
         assert!(!alice_bob_chat.can_send(&alice).await?);
 
         // Alice's UI should still be able to save a draft, which Alice started to type right when she got Bob's message:
@@ -695,7 +751,7 @@ async fn assert_verified(this: &TestContext, other: &TestContext, protected: Pro
         VerifiedStatus::BidirectVerified
     );
 
-    let chat = this.get_chat(other).await.unwrap();
+    let chat = this.get_chat(other).await;
     let (expect_protected, expect_broken) = match protected {
         ProtectionStatus::Unprotected => (false, false),
         ProtectionStatus::Protected => (true, false),

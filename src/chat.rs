@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::aheader::EncryptPreference;
 use crate::blob::BlobObject;
+use crate::chatlist::Chatlist;
 use crate::color::str_to_color;
 use crate::config::Config;
 use crate::constants::{
@@ -22,9 +23,11 @@ use crate::constants::{
 use crate::contact::{Contact, ContactId, Origin, VerifiedStatus};
 use crate::context::Context;
 use crate::debug_logging::maybe_set_logging_xdc;
+use crate::download::DownloadState;
 use crate::ephemeral::Timer as EphemeralTimer;
 use crate::events::EventType;
 use crate::html::new_html_mimepart;
+use crate::location;
 use crate::message::{self, Message, MessageState, MsgId, Viewtype};
 use crate::mimefactory::MimeFactory;
 use crate::mimeparser::SystemMessage;
@@ -33,6 +36,7 @@ use crate::peerstate::{Peerstate, PeerstateVerifiedStatus};
 use crate::receive_imf::ReceivedMsg;
 use crate::scheduler::InterruptInfo;
 use crate::smtp::send_msg_to_smtp;
+use crate::sql;
 use crate::stock_str;
 use crate::tools::{
     buf_compress, create_id, create_outgoing_rfc724_mid, create_smeared_timestamp,
@@ -40,7 +44,6 @@ use crate::tools::{
     strip_rtlo_characters, time, IsNoneOrEmpty,
 };
 use crate::webxdc::WEBXDC_SUFFIX;
-use crate::{location, sql};
 
 /// An chat item, such as a message or a marker.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -356,7 +359,7 @@ impl ChatId {
         let chat = Chat::load_from_db(context, self).await?;
 
         match chat.typ {
-            Chattype::Undefined | Chattype::Broadcast => {
+            Chattype::Broadcast => {
                 bail!("Can't block chat of type {:?}", chat.typ)
             }
             Chattype::Single => {
@@ -397,10 +400,12 @@ impl ChatId {
         let chat = Chat::load_from_db(context, self).await?;
 
         match chat.typ {
-            Chattype::Undefined => bail!("Can't accept chat of undefined chattype"),
-            Chattype::Single if chat.protected == ProtectionStatus::ProtectionBroken => {
-                // The chat was in the 'Request' state because the protection was broken.
-                // The user clicked 'Accept', so, now we want to set the status to Unprotected again:
+            Chattype::Single
+                if chat.blocked == Blocked::Not
+                    && chat.protected == ProtectionStatus::ProtectionBroken =>
+            {
+                // The protection was broken, then the user clicked 'Accept'/'OK',
+                // so, now we want to set the status to Unprotected again:
                 chat.id
                     .inner_set_protection(context, ProtectionStatus::Unprotected)
                     .await?;
@@ -458,7 +463,6 @@ impl ChatId {
                     }
                 }
                 Chattype::Mailinglist => bail!("Cannot protect mailing lists"),
-                Chattype::Undefined => bail!("Undefined group type"),
             },
             ProtectionStatus::Unprotected | ProtectionStatus::ProtectionBroken => {}
         };
@@ -883,6 +887,134 @@ impl ChatId {
         Ok(count)
     }
 
+    /// Returns timestamp of the latest message in the chat.
+    pub(crate) async fn get_timestamp(self, context: &Context) -> Result<Option<i64>> {
+        let timestamp = context
+            .sql
+            .query_get_value("SELECT MAX(timestamp) FROM msgs WHERE chat_id=?", (self,))
+            .await?;
+        Ok(timestamp)
+    }
+
+    /// Returns a list of active similar chat IDs sorted by similarity metric.
+    ///
+    /// Jaccard similarity coefficient is used to estimate similarity of chat member sets.
+    ///
+    /// Chat is considered active if something was posted there within the last 42 days.
+    pub async fn get_similar_chat_ids(self, context: &Context) -> Result<Vec<(ChatId, f64)>> {
+        // Count number of common members in this and other chats.
+        let intersection: Vec<(ChatId, f64)> = context
+            .sql
+            .query_map(
+                "SELECT y.chat_id, SUM(x.contact_id = y.contact_id)
+                 FROM chats_contacts as x
+                 JOIN chats_contacts as y
+                 WHERE x.contact_id > 9
+                   AND y.contact_id > 9
+                   AND x.chat_id=?
+                   AND y.chat_id<>x.chat_id
+                 GROUP BY y.chat_id",
+                (self,),
+                |row| {
+                    let chat_id: ChatId = row.get(0)?;
+                    let intersection: f64 = row.get(1)?;
+                    Ok((chat_id, intersection))
+                },
+                |rows| {
+                    rows.collect::<std::result::Result<Vec<_>, _>>()
+                        .map_err(Into::into)
+                },
+            )
+            .await
+            .context("failed to calculate member set intersections")?;
+
+        let chat_size: HashMap<ChatId, f64> = context
+            .sql
+            .query_map(
+                "SELECT chat_id, count(*) AS n
+                 FROM chats_contacts
+                 WHERE contact_id > ? AND chat_id > ?
+                 GROUP BY chat_id",
+                (ContactId::LAST_SPECIAL, DC_CHAT_ID_LAST_SPECIAL),
+                |row| {
+                    let chat_id: ChatId = row.get(0)?;
+                    let size: f64 = row.get(1)?;
+                    Ok((chat_id, size))
+                },
+                |rows| {
+                    rows.collect::<std::result::Result<HashMap<ChatId, f64>, _>>()
+                        .map_err(Into::into)
+                },
+            )
+            .await
+            .context("failed to count chat member sizes")?;
+
+        let our_chat_size = chat_size.get(&self).copied().unwrap_or_default();
+        let mut chats_with_metrics = Vec::new();
+        for (chat_id, intersection_size) in intersection {
+            if intersection_size > 0.0 {
+                let other_chat_size = chat_size.get(&chat_id).copied().unwrap_or_default();
+                let union_size = our_chat_size + other_chat_size - intersection_size;
+                let metric = intersection_size / union_size;
+                chats_with_metrics.push((chat_id, metric))
+            }
+        }
+        chats_with_metrics.sort_unstable_by(|(chat_id1, metric1), (chat_id2, metric2)| {
+            metric2
+                .partial_cmp(metric1)
+                .unwrap_or(chat_id2.cmp(chat_id1))
+        });
+
+        // Select up to five similar active chats.
+        let mut res = Vec::new();
+        let now = time();
+        for (chat_id, metric) in chats_with_metrics {
+            if let Some(chat_timestamp) = chat_id.get_timestamp(context).await? {
+                if now > chat_timestamp + 42 * 24 * 3600 {
+                    // Chat was inactive for 42 days, skip.
+                    continue;
+                }
+            }
+
+            if metric < 0.1 {
+                // Chat is unrelated.
+                break;
+            }
+
+            let chat = Chat::load_from_db(context, chat_id).await?;
+            if chat.typ != Chattype::Group {
+                continue;
+            }
+
+            match chat.visibility {
+                ChatVisibility::Normal | ChatVisibility::Pinned => {}
+                ChatVisibility::Archived => continue,
+            }
+
+            res.push((chat_id, metric));
+            if res.len() >= 5 {
+                break;
+            }
+        }
+
+        Ok(res)
+    }
+
+    /// Returns similar chats as a [`Chatlist`].
+    ///
+    /// [`Chatlist`]: crate::chatlist::Chatlist
+    pub async fn get_similar_chatlist(self, context: &Context) -> Result<Chatlist> {
+        let chat_ids: Vec<ChatId> = self
+            .get_similar_chat_ids(context)
+            .await
+            .context("failed to get similar chat IDs")?
+            .into_iter()
+            .map(|(chat_id, _metric)| chat_id)
+            .collect();
+        let chatlist = Chatlist::from_chat_ids(context, &chat_ids).await?;
+        Ok(chatlist)
+    }
+
     pub(crate) async fn get_param(self, context: &Context) -> Result<Params> {
         let res: Option<String> = context
             .sql
@@ -922,11 +1054,14 @@ impl ChatId {
         T: Send + 'static,
     {
         let sql = &context.sql;
+        // Do not reply to not fully downloaded messages. Such a message could be a group chat
+        // message that we assigned to 1:1 chat.
         let query = format!(
             "SELECT {fields} \
-             FROM msgs WHERE chat_id=? AND state NOT IN (?, ?, ?, ?) AND NOT hidden \
+             FROM msgs WHERE chat_id=? AND state NOT IN (?, ?) AND NOT hidden AND download_state={} \
              ORDER BY timestamp DESC, id DESC \
-             LIMIT 1;"
+             LIMIT 1;",
+             DownloadState::Done as u32,
         );
         let row = sql
             .query_row_optional(
@@ -935,8 +1070,11 @@ impl ChatId {
                     self,
                     MessageState::OutPreparing,
                     MessageState::OutDraft,
-                    MessageState::OutPending,
-                    MessageState::OutFailed,
+                    // We don't filter `OutPending` and `OutFailed` messages because the new message
+                    // for which `parent_query()` is done may assume that it will be received in a
+                    // context affected by those messages, e.g. they could add new members to a
+                    // group and the new message will contain them in "To:". Anyway recipients must
+                    // be prepared to orphaned references.
                 ),
                 f,
             )
@@ -948,34 +1086,17 @@ impl ChatId {
         self,
         context: &Context,
     ) -> Result<Option<(String, String, String)>> {
-        if let Some((rfc724_mid, mime_in_reply_to, mime_references, error)) = self
-            .parent_query(
-                context,
-                "rfc724_mid, mime_in_reply_to, mime_references, error",
-                |row: &rusqlite::Row| {
-                    let rfc724_mid: String = row.get(0)?;
-                    let mime_in_reply_to: String = row.get(1)?;
-                    let mime_references: String = row.get(2)?;
-                    let error: String = row.get(3)?;
-                    Ok((rfc724_mid, mime_in_reply_to, mime_references, error))
-                },
-            )
-            .await?
-        {
-            if !error.is_empty() {
-                // Do not reply to error messages.
-                //
-                // An error message could be a group chat message that we failed to decrypt and
-                // assigned to 1:1 chat. A reply to it will show up as a reply to group message
-                // on the other side. To avoid such situations, it is better not to reply to
-                // error messages at all.
-                Ok(None)
-            } else {
-                Ok(Some((rfc724_mid, mime_in_reply_to, mime_references)))
-            }
-        } else {
-            Ok(None)
-        }
+        self.parent_query(
+            context,
+            "rfc724_mid, mime_in_reply_to, mime_references",
+            |row: &rusqlite::Row| {
+                let rfc724_mid: String = row.get(0)?;
+                let mime_in_reply_to: String = row.get(1)?;
+                let mime_references: String = row.get(2)?;
+                Ok((rfc724_mid, mime_in_reply_to, mime_references))
+            },
+        )
+        .await
     }
 
     /// Returns multi-line text summary of encryption preferences of all chat contacts.
@@ -1253,6 +1374,7 @@ impl Chat {
     pub(crate) async fn why_cant_send(&self, context: &Context) -> Result<Option<CantSendReason>> {
         use CantSendReason::*;
 
+        // NB: Don't forget to update Chatlist::try_load() when changing this function!
         let reason = if self.id.is_special() {
             Some(SpecialChat)
         } else if self.is_device_talk() {
@@ -1261,7 +1383,7 @@ impl Chat {
             Some(ContactRequest)
         } else if self.is_protection_broken() {
             Some(ProtectionBroken)
-        } else if self.is_mailing_list() && self.param.get(Param::ListPost).is_none_or_empty() {
+        } else if self.is_mailing_list() && self.get_mailinglist_addr().is_none_or_empty() {
             Some(ReadOnlyMailingList)
         } else if !self.is_self_in_chat(context).await? {
             Some(NotAMember)
@@ -1285,7 +1407,6 @@ impl Chat {
         match self.typ {
             Chattype::Single | Chattype::Broadcast | Chattype::Mailinglist => Ok(true),
             Chattype::Group => is_contact_in_chat(context, self.id, ContactId::SELF).await,
-            Chattype::Undefined => Ok(false),
         }
     }
 
@@ -1324,11 +1445,11 @@ impl Chat {
     pub async fn get_profile_image(&self, context: &Context) -> Result<Option<PathBuf>> {
         if let Some(image_rel) = self.param.get(Param::ProfileImage) {
             if !image_rel.is_empty() {
-                return Ok(Some(get_abs_path(context, image_rel)));
+                return Ok(Some(get_abs_path(context, Path::new(&image_rel))));
             }
         } else if self.id.is_archived_link() {
             if let Ok(image_rel) = get_archive_icon(context).await {
-                return Ok(Some(get_abs_path(context, image_rel)));
+                return Ok(Some(get_abs_path(context, Path::new(&image_rel))));
             }
         } else if self.typ == Chattype::Single {
             let contacts = get_chat_contacts(context, self.id).await?;
@@ -1339,7 +1460,7 @@ impl Chat {
             }
         } else if self.typ == Chattype::Broadcast {
             if let Ok(image_rel) = get_broadcast_icon(context).await {
-                return Ok(Some(get_abs_path(context, image_rel)));
+                return Ok(Some(get_abs_path(context, Path::new(&image_rel))));
             }
         }
         Ok(None)
@@ -1610,6 +1731,11 @@ impl Chat {
             None
         };
 
+        msg.chat_id = self.id;
+        msg.from_id = ContactId::SELF;
+        msg.rfc724_mid = new_rfc724_mid;
+        msg.timestamp_sort = timestamp;
+
         // add message to the database
         if let Some(update_msg_id) = update_msg_id {
             context
@@ -1623,11 +1749,11 @@ impl Chat {
                          ephemeral_timestamp=?
                      WHERE id=?;",
                     params_slice![
-                        new_rfc724_mid,
-                        self.id,
-                        ContactId::SELF,
+                        msg.rfc724_mid,
+                        msg.chat_id,
+                        msg.from_id,
                         to_id,
-                        timestamp,
+                        msg.timestamp_sort,
                         msg.viewtype,
                         msg.state,
                         msg.text,
@@ -1672,11 +1798,11 @@ impl Chat {
                         ephemeral_timestamp)
                         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?);",
                     params_slice![
-                        new_rfc724_mid,
-                        self.id,
-                        ContactId::SELF,
+                        msg.rfc724_mid,
+                        msg.chat_id,
+                        msg.from_id,
                         to_id,
-                        timestamp,
+                        msg.timestamp_sort,
                         msg.viewtype,
                         msg.state,
                         msg.text,
@@ -2081,15 +2207,23 @@ async fn prepare_msg_blob(context: &Context, msg: &mut Message) -> Result<()> {
             .await?
             .with_context(|| format!("attachment missing for message of type #{}", msg.viewtype))?;
 
-        if msg.viewtype == Viewtype::Image {
-            if let Err(err) = blob.recode_to_image_size(context).await {
-                warn!(
-                    context,
-                    "Cannot recode image, using original data: {err:#}."
-                );
+        let mut maybe_sticker = msg.viewtype == Viewtype::Sticker;
+        if msg.viewtype == Viewtype::Image || maybe_sticker {
+            blob.recode_to_image_size(context, &mut maybe_sticker)
+                .await?;
+            if !maybe_sticker {
+                msg.viewtype = Viewtype::Image;
             }
         }
         msg.param.set(Param::File, blob.as_name());
+        if let (Some(filename), Some(blob_ext)) = (msg.param.get(Param::Filename), blob.suffix()) {
+            let stem = match filename.rsplit_once('.') {
+                Some((stem, _)) => stem,
+                None => filename,
+            };
+            msg.param
+                .set(Param::Filename, stem.to_string() + "." + blob_ext);
+        }
 
         if msg.viewtype == Viewtype::File || msg.viewtype == Viewtype::Image {
             // Correct the type, take care not to correct already very special
@@ -2124,6 +2258,8 @@ async fn prepare_msg_blob(context: &Context, msg: &mut Message) -> Result<()> {
                 msg.param.set(Param::MimeType, mime);
             }
         }
+
+        msg.try_calc_and_set_dimensions(context).await?;
 
         info!(
             context,
@@ -2298,7 +2434,7 @@ async fn prepare_send_msg(
         );
         message::update_msg_state(context, msg.id, MessageState::OutPending).await?;
     }
-    let row_id = create_send_msg_job(context, msg.id).await?;
+    let row_id = create_send_msg_job(context, msg).await?;
     Ok(row_id)
 }
 
@@ -2308,13 +2444,10 @@ async fn prepare_send_msg(
 /// group with only self and no BCC-to-self configured.
 ///
 /// The caller has to interrupt SMTP loop or otherwise process a new row.
-async fn create_send_msg_job(context: &Context, msg_id: MsgId) -> Result<Option<i64>> {
-    let mut msg = Message::load_from_db(context, msg_id).await?;
-    msg.try_calc_and_set_dimensions(context)
-        .await
-        .context("failed to calculate media dimensions")?;
-
-    /* create message */
+pub(crate) async fn create_send_msg_job(
+    context: &Context,
+    msg: &mut Message,
+) -> Result<Option<i64>> {
     let needs_encryption = msg.param.get_bool(Param::GuaranteeE2ee).unwrap_or_default();
 
     let attach_selfavatar = match shall_attach_selfavatar(context, msg.chat_id).await {
@@ -2325,7 +2458,7 @@ async fn create_send_msg_job(context: &Context, msg_id: MsgId) -> Result<Option<
         }
     };
 
-    let mimefactory = MimeFactory::from_msg(context, &msg, attach_selfavatar).await?;
+    let mimefactory = MimeFactory::from_msg(context, msg, attach_selfavatar).await?;
 
     let mut recipients = mimefactory.recipients();
 
@@ -2347,16 +2480,17 @@ async fn create_send_msg_job(context: &Context, msg_id: MsgId) -> Result<Option<
         // may happen eg. for groups with only SELF and bcc_self disabled
         info!(
             context,
-            "Message {msg_id} has no recipient, skipping smtp-send."
+            "Message {} has no recipient, skipping smtp-send.", msg.id
         );
-        msg_id.set_delivered(context).await?;
+        msg.id.set_delivered(context).await?;
+        msg.state = MessageState::OutDelivered;
         return Ok(None);
     }
 
     let rendered_msg = match mimefactory.render(context).await {
         Ok(res) => Ok(res),
         Err(err) => {
-            message::set_msg_failed(context, msg_id, &err.to_string()).await;
+            message::set_msg_failed(context, msg, &err.to_string()).await?;
             Err(err)
         }
     }?;
@@ -2365,13 +2499,13 @@ async fn create_send_msg_job(context: &Context, msg_id: MsgId) -> Result<Option<
         /* unrecoverable */
         message::set_msg_failed(
             context,
-            msg_id,
+            msg,
             "End-to-end-encryption unavailable unexpectedly.",
         )
-        .await;
+        .await?;
         bail!(
             "e2e encryption unavailable {} - {:?}",
-            msg_id,
+            msg.id,
             needs_encryption
         );
     }
@@ -2380,14 +2514,13 @@ async fn create_send_msg_job(context: &Context, msg_id: MsgId) -> Result<Option<
         msg.chat_id.set_gossiped_timestamp(context, time()).await?;
     }
 
-    if 0 != rendered_msg.last_added_location_id {
+    if let Some(last_added_location_id) = rendered_msg.last_added_location_id {
         if let Err(err) = location::set_kml_sent_timestamp(context, msg.chat_id, time()).await {
             error!(context, "Failed to set kml sent_timestamp: {err:#}.");
         }
         if !msg.hidden {
             if let Err(err) =
-                location::set_msg_location_id(context, msg.id, rendered_msg.last_added_location_id)
-                    .await
+                location::set_msg_location_id(context, msg.id, last_added_location_id).await
             {
                 error!(context, "Failed to set msg_location_id: {err:#}.");
             }
@@ -2427,7 +2560,7 @@ async fn create_send_msg_job(context: &Context, msg_id: MsgId) -> Result<Option<
                 &rendered_msg.rfc724_mid,
                 recipients,
                 &rendered_msg.message,
-                msg_id,
+                msg.id,
             ),
         )
         .await?;
@@ -2620,14 +2753,7 @@ pub(crate) async fn marknoticed_chat_if_older_than(
     chat_id: ChatId,
     timestamp: i64,
 ) -> Result<()> {
-    if let Some(chat_timestamp) = context
-        .sql
-        .query_get_value(
-            "SELECT MAX(timestamp) FROM msgs WHERE chat_id=?",
-            (chat_id,),
-        )
-        .await?
-    {
+    if let Some(chat_timestamp) = chat_id.get_timestamp(context).await? {
         if timestamp > chat_timestamp {
             marknoticed_chat(context, chat_id).await?;
         }
@@ -2826,6 +2952,9 @@ pub enum Direction {
 }
 
 /// Searches next/previous message based on the given message and list of types.
+///
+/// Deprecated since 2023-10-03.
+#[deprecated(note = "use `get_chat_media` instead")]
 pub async fn get_next_media(
     context: &Context,
     curr_msg_id: MsgId,
@@ -3413,89 +3542,88 @@ pub async fn forward_msgs(context: &Context, msg_ids: &[MsgId], chat_id: ChatId)
     chat_id
         .unarchive_if_not_muted(context, MessageState::Undefined)
         .await?;
-    if let Ok(mut chat) = Chat::load_from_db(context, chat_id).await {
-        if let Some(reason) = chat.why_cant_send(context).await? {
-            bail!("cannot send to {}: {}", chat_id, reason);
+    let mut chat = Chat::load_from_db(context, chat_id).await?;
+    if let Some(reason) = chat.why_cant_send(context).await? {
+        bail!("cannot send to {}: {}", chat_id, reason);
+    }
+    curr_timestamp = create_smeared_timestamps(context, msg_ids.len());
+    let ids = context
+        .sql
+        .query_map(
+            &format!(
+                "SELECT id FROM msgs WHERE id IN({}) ORDER BY timestamp,id",
+                sql::repeat_vars(msg_ids.len())
+            ),
+            rusqlite::params_from_iter(msg_ids),
+            |row| row.get::<_, MsgId>(0),
+            |ids| ids.collect::<Result<Vec<_>, _>>().map_err(Into::into),
+        )
+        .await?;
+
+    for id in ids {
+        let src_msg_id: MsgId = id;
+        let mut msg = Message::load_from_db(context, src_msg_id).await?;
+        if msg.state == MessageState::OutDraft {
+            bail!("cannot forward drafts.");
         }
-        curr_timestamp = create_smeared_timestamps(context, msg_ids.len());
-        let ids = context
-            .sql
-            .query_map(
-                &format!(
-                    "SELECT id FROM msgs WHERE id IN({}) ORDER BY timestamp,id",
-                    sql::repeat_vars(msg_ids.len())
-                ),
-                rusqlite::params_from_iter(msg_ids),
-                |row| row.get::<_, MsgId>(0),
-                |ids| ids.collect::<Result<Vec<_>, _>>().map_err(Into::into),
-            )
-            .await?;
 
-        for id in ids {
-            let src_msg_id: MsgId = id;
-            let mut msg = Message::load_from_db(context, src_msg_id).await?;
-            if msg.state == MessageState::OutDraft {
-                bail!("cannot forward drafts.");
-            }
+        let original_param = msg.param.clone();
 
-            let original_param = msg.param.clone();
+        // we tested a sort of broadcast
+        // by not marking own forwarded messages as such,
+        // however, this turned out to be to confusing and unclear.
 
-            // we tested a sort of broadcast
-            // by not marking own forwarded messages as such,
-            // however, this turned out to be to confusing and unclear.
+        if msg.get_viewtype() != Viewtype::Sticker {
+            msg.param
+                .set_int(Param::Forwarded, src_msg_id.to_u32() as i32);
+        }
 
-            if msg.get_viewtype() != Viewtype::Sticker {
-                msg.param
-                    .set_int(Param::Forwarded, src_msg_id.to_u32() as i32);
-            }
+        msg.param.remove(Param::GuaranteeE2ee);
+        msg.param.remove(Param::ForcePlaintext);
+        msg.param.remove(Param::Cmd);
+        msg.param.remove(Param::OverrideSenderDisplayname);
+        msg.param.remove(Param::WebxdcDocument);
+        msg.param.remove(Param::WebxdcDocumentTimestamp);
+        msg.param.remove(Param::WebxdcSummary);
+        msg.param.remove(Param::WebxdcSummaryTimestamp);
+        msg.in_reply_to = None;
 
-            msg.param.remove(Param::GuaranteeE2ee);
-            msg.param.remove(Param::ForcePlaintext);
-            msg.param.remove(Param::Cmd);
-            msg.param.remove(Param::OverrideSenderDisplayname);
-            msg.param.remove(Param::WebxdcSummary);
-            msg.param.remove(Param::WebxdcSummaryTimestamp);
-            msg.in_reply_to = None;
+        // do not leak data as group names; a default subject is generated by mimefactory
+        msg.subject = "".to_string();
 
-            // do not leak data as group names; a default subject is generated by mimefactory
-            msg.subject = "".to_string();
+        let new_msg_id: MsgId;
+        if msg.state == MessageState::OutPreparing {
+            new_msg_id = chat
+                .prepare_msg_raw(context, &mut msg, None, curr_timestamp)
+                .await?;
+            curr_timestamp += 1;
+            msg.param = original_param;
+            msg.id = src_msg_id;
 
-            let new_msg_id: MsgId;
-            if msg.state == MessageState::OutPreparing {
-                new_msg_id = chat
-                    .prepare_msg_raw(context, &mut msg, None, curr_timestamp)
-                    .await?;
-                curr_timestamp += 1;
-                let save_param = msg.param.clone();
-                msg.param = original_param;
-                msg.id = src_msg_id;
-
-                if let Some(old_fwd) = msg.param.get(Param::PrepForwards) {
-                    let new_fwd = format!("{} {}", old_fwd, new_msg_id.to_u32());
-                    msg.param.set(Param::PrepForwards, new_fwd);
-                } else {
-                    msg.param
-                        .set(Param::PrepForwards, new_msg_id.to_u32().to_string());
-                }
-
-                msg.update_param(context).await?;
-                msg.param = save_param;
+            if let Some(old_fwd) = msg.param.get(Param::PrepForwards) {
+                let new_fwd = format!("{} {}", old_fwd, new_msg_id.to_u32());
+                msg.param.set(Param::PrepForwards, new_fwd);
             } else {
-                msg.state = MessageState::OutPending;
-                new_msg_id = chat
-                    .prepare_msg_raw(context, &mut msg, None, curr_timestamp)
-                    .await?;
-                curr_timestamp += 1;
-                if create_send_msg_job(context, new_msg_id).await?.is_some() {
-                    context
-                        .scheduler
-                        .interrupt_smtp(InterruptInfo::new(false))
-                        .await;
-                }
+                msg.param
+                    .set(Param::PrepForwards, new_msg_id.to_u32().to_string());
             }
-            created_chats.push(chat_id);
-            created_msgs.push(new_msg_id);
+
+            msg.update_param(context).await?;
+        } else {
+            msg.state = MessageState::OutPending;
+            new_msg_id = chat
+                .prepare_msg_raw(context, &mut msg, None, curr_timestamp)
+                .await?;
+            curr_timestamp += 1;
+            if create_send_msg_job(context, &mut msg).await?.is_some() {
+                context
+                    .scheduler
+                    .interrupt_smtp(InterruptInfo::new(false))
+                    .await;
+            }
         }
+        created_chats.push(chat_id);
+        created_msgs.push(new_msg_id);
     }
     for (chat_id, msg_id) in created_chats.iter().zip(created_msgs.iter()) {
         context.emit_msgs_changed(*chat_id, *msg_id);
@@ -3527,29 +3655,31 @@ pub async fn resend_msgs(context: &Context, msg_ids: &[MsgId]) -> Result<()> {
         msgs.push(msg)
     }
 
-    if let Some(chat_id) = chat_id {
-        let chat = Chat::load_from_db(context, chat_id).await?;
-        for mut msg in msgs {
-            if msg.get_showpadlock() && !chat.is_protected() {
-                msg.param.remove(Param::GuaranteeE2ee);
-                msg.update_param(context).await?;
+    let Some(chat_id) = chat_id else {
+        return Ok(());
+    };
+
+    let chat = Chat::load_from_db(context, chat_id).await?;
+    for mut msg in msgs {
+        if msg.get_showpadlock() && !chat.is_protected() {
+            msg.param.remove(Param::GuaranteeE2ee);
+            msg.update_param(context).await?;
+        }
+        match msg.get_state() {
+            MessageState::OutFailed | MessageState::OutDelivered | MessageState::OutMdnRcvd => {
+                message::update_msg_state(context, msg.id, MessageState::OutPending).await?
             }
-            match msg.get_state() {
-                MessageState::OutFailed | MessageState::OutDelivered | MessageState::OutMdnRcvd => {
-                    message::update_msg_state(context, msg.id, MessageState::OutPending).await?
-                }
-                _ => bail!("unexpected message state"),
-            }
-            context.emit_event(EventType::MsgsChanged {
-                chat_id: msg.chat_id,
-                msg_id: msg.id,
-            });
-            if create_send_msg_job(context, msg.id).await?.is_some() {
-                context
-                    .scheduler
-                    .interrupt_smtp(InterruptInfo::new(false))
-                    .await;
-            }
+            _ => bail!("unexpected message state"),
+        }
+        context.emit_event(EventType::MsgsChanged {
+            chat_id: msg.chat_id,
+            msg_id: msg.id,
+        });
+        if create_send_msg_job(context, &mut msg).await?.is_some() {
+            context
+                .scheduler
+                .interrupt_smtp(InterruptInfo::new(false))
+                .await;
         }
     }
     Ok(())
@@ -3619,7 +3749,6 @@ pub async fn add_device_msg_with_importance(
         chat_id = ChatId::get_for_contact(context, ContactId::DEVICE).await?;
 
         let rfc724_mid = create_outgoing_rfc724_mid(None, "@device");
-        msg.try_calc_and_set_dimensions(context).await.ok();
         prepare_msg_blob(context, msg).await?;
 
         let timestamp_sent = create_smeared_timestamp(context);
@@ -5486,7 +5615,13 @@ mod tests {
         Ok(())
     }
 
-    async fn test_sticker(filename: &str, bytes: &[u8], w: i32, h: i32) -> Result<()> {
+    async fn test_sticker(
+        filename: &str,
+        bytes: &[u8],
+        res_viewtype: Viewtype,
+        w: i32,
+        h: i32,
+    ) -> Result<()> {
         let alice = TestContext::new_alice().await;
         let bob = TestContext::new_bob().await;
         let alice_chat = alice.create_chat(&bob).await;
@@ -5500,12 +5635,19 @@ mod tests {
 
         let sent_msg = alice.send_msg(alice_chat.id, &mut msg).await;
         let mime = sent_msg.payload();
-        assert_eq!(mime.match_indices("Chat-Content: sticker").count(), 1);
+        if res_viewtype == Viewtype::Sticker {
+            assert_eq!(mime.match_indices("Chat-Content: sticker").count(), 1);
+        }
 
         let msg = bob.recv_msg(&sent_msg).await;
         assert_eq!(msg.chat_id, bob_chat.id);
-        assert_eq!(msg.get_viewtype(), Viewtype::Sticker);
-        assert_eq!(msg.get_filename(), Some(filename.to_string()));
+        assert_eq!(msg.get_viewtype(), res_viewtype);
+        let msg_filename = msg.get_filename().unwrap();
+        match res_viewtype {
+            Viewtype::Sticker => assert_eq!(msg_filename, filename),
+            Viewtype::Image => assert!(msg_filename.starts_with("image_")),
+            _ => panic!("Not implemented"),
+        }
         assert_eq!(msg.get_width(), w);
         assert_eq!(msg.get_height(), h);
         assert!(msg.get_filebytes(&bob).await?.unwrap() > 250);
@@ -5517,9 +5659,10 @@ mod tests {
     async fn test_sticker_png() -> Result<()> {
         test_sticker(
             "sticker.png",
-            include_bytes!("../test-data/image/avatar64x64.png"),
-            64,
-            64,
+            include_bytes!("../test-data/image/logo.png"),
+            Viewtype::Sticker,
+            135,
+            135,
         )
         .await
     }
@@ -5529,6 +5672,7 @@ mod tests {
         test_sticker(
             "sticker.jpg",
             include_bytes!("../test-data/image/avatar1000x1000.jpg"),
+            Viewtype::Image,
             1000,
             1000,
         )
@@ -5539,9 +5683,10 @@ mod tests {
     async fn test_sticker_gif() -> Result<()> {
         test_sticker(
             "sticker.gif",
-            include_bytes!("../test-data/image/image100x50.gif"),
-            100,
-            50,
+            include_bytes!("../test-data/image/logo.gif"),
+            Viewtype::Sticker,
+            135,
+            135,
         )
         .await
     }
@@ -5555,8 +5700,8 @@ mod tests {
         let bob_chat = bob.create_chat(&alice).await;
 
         // create sticker
-        let file_name = "sticker.jpg";
-        let bytes = include_bytes!("../test-data/image/avatar1000x1000.jpg");
+        let file_name = "sticker.png";
+        let bytes = include_bytes!("../test-data/image/logo.png");
         let file = alice.get_blobdir().join(file_name);
         tokio::fs::write(&file, bytes).await?;
         let mut msg = Message::new(Viewtype::Sticker);
@@ -6093,7 +6238,7 @@ mod tests {
             chat_id1,
             Viewtype::Sticker,
             "b.png",
-            include_bytes!("../test-data/image/avatar64x64.png"),
+            include_bytes!("../test-data/image/logo.png"),
         )
         .await?;
         let second_image_msg_id = send_media(

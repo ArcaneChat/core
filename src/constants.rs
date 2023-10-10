@@ -62,8 +62,15 @@ pub enum MediaQuality {
 pub enum KeyGenType {
     #[default]
     Default = 0,
+
+    /// 2048-bit RSA.
     Rsa2048 = 1,
+
+    /// [Ed25519](https://ed25519.cr.yp.to/) signature and X25519 encryption.
     Ed25519 = 2,
+
+    /// 4096-bit RSA.
+    Rsa4096 = 3,
 }
 
 /// Video chat URL type.
@@ -118,7 +125,6 @@ pub const DC_CHAT_ID_LAST_SPECIAL: ChatId = ChatId::new(9);
 /// Chat type.
 #[derive(
     Debug,
-    Default,
     Display,
     Clone,
     Copy,
@@ -134,10 +140,6 @@ pub const DC_CHAT_ID_LAST_SPECIAL: ChatId = ChatId::new(9);
 )]
 #[repr(u32)]
 pub enum Chattype {
-    /// Undefined chat type.
-    #[default]
-    Undefined = 0,
-
     /// 1:1 chat.
     Single = 100,
 
@@ -216,8 +218,6 @@ mod tests {
     #[test]
     fn test_chattype_values() {
         // values may be written to disk and must not change
-        assert_eq!(Chattype::Undefined, Chattype::default());
-        assert_eq!(Chattype::Undefined, Chattype::from_i32(0).unwrap());
         assert_eq!(Chattype::Single, Chattype::from_i32(100).unwrap());
         assert_eq!(Chattype::Group, Chattype::from_i32(120).unwrap());
         assert_eq!(Chattype::Mailinglist, Chattype::from_i32(140).unwrap());
@@ -231,6 +231,7 @@ mod tests {
         assert_eq!(KeyGenType::Default, KeyGenType::from_i32(0).unwrap());
         assert_eq!(KeyGenType::Rsa2048, KeyGenType::from_i32(1).unwrap());
         assert_eq!(KeyGenType::Ed25519, KeyGenType::from_i32(2).unwrap());
+        assert_eq!(KeyGenType::Rsa4096, KeyGenType::from_i32(3).unwrap());
     }
 
     #[test]

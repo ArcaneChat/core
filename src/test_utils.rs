@@ -27,16 +27,17 @@ use crate::chat::{
 };
 use crate::chatlist::Chatlist;
 use crate::config::Config;
-use crate::constants::Chattype;
+use crate::constants::{Blocked, Chattype};
 use crate::constants::{DC_GCL_NO_SPECIALS, DC_MSG_ID_DAYMARKER};
 use crate::contact::{Contact, ContactAddress, ContactId, Modifier, Origin};
 use crate::context::Context;
 use crate::e2ee::EncryptHelper;
 use crate::events::{Event, EventType, Events};
-use crate::key::{self, DcKey, KeyPair, KeyPairUse};
+use crate::key::{self, DcKey, KeyPairUse};
 use crate::message::{update_msg_state, Message, MessageState, MsgId, Viewtype};
 use crate::mimeparser::{MimeMessage, SystemMessage};
 use crate::peerstate::Peerstate;
+use crate::pgp::KeyPair;
 use crate::receive_imf::receive_imf;
 use crate::securejoin::{get_securejoin_qr, join_securejoin};
 use crate::stock_str::StockStrings;
@@ -118,6 +119,10 @@ impl TestContextManager {
         msg: &str,
     ) -> Message {
         let received_msg = self.send_recv(from, to, msg).await;
+        assert_eq!(
+            received_msg.chat_blocked, Blocked::Request,
+            "`send_recv_accept()` is meant to be used for chat requests. Use `send_recv()` if the chat is already accepted."
+        );
         received_msg.chat_id.accept(to).await.unwrap();
         received_msg
     }
@@ -586,19 +591,21 @@ impl TestContext {
         Contact::get_by_id(&self.ctx, contact_id).await.unwrap()
     }
 
-    /// Returns 1:1 [`Chat`] with another account, if it exists.
+    /// Returns 1:1 [`Chat`] with another account. Panics if it doesn't exist.
     ///
     /// This first creates a contact using the configured details on the other account, then
-    /// creates a 1:1 chat with this contact.
-    pub async fn get_chat(&self, other: &TestContext) -> Option<Chat> {
+    /// gets the 1:1 chat with this contact.
+    pub async fn get_chat(&self, other: &TestContext) -> Chat {
         let contact = self.add_or_lookup_contact(other).await;
-        match ChatId::lookup_by_contact(&self.ctx, contact.id)
+        let chat_id = ChatId::lookup_by_contact(&self.ctx, contact.id)
             .await
             .unwrap()
-        {
-            Some(id) => Some(Chat::load_from_db(&self.ctx, id).await.unwrap()),
-            None => None,
-        }
+            .expect(
+                "There is no chat with this contact. \
+                Hint: Use create_chat() instead of get_chat() if this is expected.",
+            );
+
+        Chat::load_from_db(&self.ctx, chat_id).await.unwrap()
     }
 
     /// Creates or returns an existing 1:1 [`Chat`] with another account.
@@ -657,7 +664,6 @@ impl TestContext {
         res
     }
 
-    #[allow(unused)]
     pub async fn golden_test_chat(&self, chat_id: ChatId, filename: &str) {
         let filename = Path::new("test-data/golden/").join(filename);
 
@@ -684,8 +690,6 @@ impl TestContext {
     /// You can use this to debug your test by printing the entire chat conversation.
     // This code is mainly the same as `log_msglist` in `cmdline.rs`, so one day, we could
     // merge them to a public function in the `deltachat` crate.
-    #[allow(dead_code)]
-    #[allow(clippy::indexing_slicing)]
     async fn display_chat(&self, chat_id: ChatId) -> String {
         let mut res = String::new();
 
@@ -910,7 +914,7 @@ pub fn alice_keypair() -> KeyPair {
     let secret = key::SignedSecretKey::from_asc(include_str!("../test-data/key/alice-secret.asc"))
         .unwrap()
         .0;
-    key::KeyPair {
+    KeyPair {
         addr,
         public,
         secret,
@@ -928,7 +932,7 @@ pub fn bob_keypair() -> KeyPair {
     let secret = key::SignedSecretKey::from_asc(include_str!("../test-data/key/bob-secret.asc"))
         .unwrap()
         .0;
-    key::KeyPair {
+    KeyPair {
         addr,
         public,
         secret,
@@ -938,7 +942,7 @@ pub fn bob_keypair() -> KeyPair {
 /// Load a pre-generated keypair for fiona@example.net from disk.
 ///
 /// Like [alice_keypair] but a different key and identity.
-pub fn fiona_keypair() -> key::KeyPair {
+pub fn fiona_keypair() -> KeyPair {
     let addr = EmailAddress::new("fiona@example.net").unwrap();
     let public = key::SignedPublicKey::from_asc(include_str!("../test-data/key/fiona-public.asc"))
         .unwrap()
@@ -946,7 +950,7 @@ pub fn fiona_keypair() -> key::KeyPair {
     let secret = key::SignedSecretKey::from_asc(include_str!("../test-data/key/fiona-secret.asc"))
         .unwrap()
         .0;
-    key::KeyPair {
+    KeyPair {
         addr,
         public,
         secret,

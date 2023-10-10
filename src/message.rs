@@ -7,6 +7,7 @@ use anyhow::{ensure, format_err, Context as _, Result};
 use deltachat_derive::{FromSql, ToSql};
 use serde::{Deserialize, Serialize};
 
+use crate::blob::BlobObject;
 use crate::chat::{Chat, ChatId};
 use crate::config::Config;
 use crate::constants::{
@@ -113,24 +114,16 @@ WHERE id=?;
     }
 
     /// Deletes a message, corresponding MDNs and unsent SMTP messages from the database.
-    pub async fn delete_from_db(self, context: &Context) -> Result<()> {
-        // We don't use transactions yet, so remove MDNs first to make
-        // sure they are not left while the message is deleted.
+    pub(crate) async fn delete_from_db(self, context: &Context) -> Result<()> {
         context
             .sql
-            .execute("DELETE FROM smtp WHERE msg_id=?", (self,))
-            .await?;
-        context
-            .sql
-            .execute("DELETE FROM msgs_mdns WHERE msg_id=?;", (self,))
-            .await?;
-        context
-            .sql
-            .execute("DELETE FROM msgs_status_updates WHERE msg_id=?;", (self,))
-            .await?;
-        context
-            .sql
-            .execute("DELETE FROM msgs WHERE id=?;", (self,))
+            .transaction(move |transaction| {
+                transaction.execute("DELETE FROM smtp WHERE msg_id=?", (self,))?;
+                transaction.execute("DELETE FROM msgs_mdns WHERE msg_id=?", (self,))?;
+                transaction.execute("DELETE FROM msgs_status_updates WHERE msg_id=?", (self,))?;
+                transaction.execute("DELETE FROM msgs WHERE id=?", (self,))?;
+                Ok(())
+            })
             .await?;
         Ok(())
     }
@@ -582,13 +575,21 @@ impl Message {
                 if (self.viewtype == Viewtype::Image || self.viewtype == Viewtype::Gif)
                     && !self.param.exists(Param::Width)
                 {
-                    self.param.set_int(Param::Width, 0);
-                    self.param.set_int(Param::Height, 0);
+                    let buf = read_file(context, &path_and_filename).await?;
 
-                    if let Ok(buf) = read_file(context, path_and_filename).await {
-                        if let Ok((width, height)) = get_filemeta(&buf) {
+                    match get_filemeta(&buf) {
+                        Ok((width, height)) => {
                             self.param.set_int(Param::Width, width as i32);
                             self.param.set_int(Param::Height, height as i32);
+                        }
+                        Err(err) => {
+                            self.param.set_int(Param::Width, 0);
+                            self.param.set_int(Param::Height, 0);
+                            warn!(
+                                context,
+                                "Failed to get width and height for {}: {err:#}.",
+                                path_and_filename.display()
+                            );
                         }
                     }
 
@@ -688,11 +689,13 @@ impl Message {
         &self.subject
     }
 
-    /// Returns base file name without the path.
-    /// The base file name includes the extension.
+    /// Returns original filename (as shown in chat).
     ///
     /// To get the full path, use [`Self::get_file()`].
     pub fn get_filename(&self) -> Option<String> {
+        if let Some(name) = self.param.get(Param::Filename) {
+            return Some(name.to_string());
+        }
         self.param
             .get(Param::File)
             .and_then(|file| Path::new(file).file_name())
@@ -761,7 +764,7 @@ impl Message {
                 Chattype::Group | Chattype::Broadcast | Chattype::Mailinglist => {
                     Some(Contact::get_by_id(context, self.from_id).await?)
                 }
-                Chattype::Single | Chattype::Undefined => None,
+                Chattype::Single => None,
             }
         } else {
             None
@@ -972,20 +975,34 @@ impl Message {
     /// the file will only be used when the message is prepared
     /// for sending.
     pub fn set_file(&mut self, file: impl ToString, filemime: Option<&str>) {
-        self.param.set(Param::File, file);
-        if let Some(filemime) = filemime {
-            self.param.set(Param::MimeType, filemime);
+        if let Some(name) = Path::new(&file.to_string()).file_name() {
+            if let Some(name) = name.to_str() {
+                self.param.set(Param::Filename, name);
+            }
         }
+        self.param.set(Param::File, file);
+        self.param.set_optional(Param::MimeType, filemime);
+    }
+
+    /// Creates a new blob and sets it as a file associated with a message.
+    pub async fn set_file_from_bytes(
+        &mut self,
+        context: &Context,
+        suggested_name: &str,
+        data: &[u8],
+        filemime: Option<&str>,
+    ) -> Result<()> {
+        let blob = BlobObject::create(context, suggested_name, data).await?;
+        self.param.set(Param::File, blob.as_name());
+        self.param.set_optional(Param::MimeType, filemime);
+        Ok(())
     }
 
     /// Set different sender name for a message.
     /// This overrides the name set by the `set_config()`-option `displayname`.
     pub fn set_override_sender_name(&mut self, name: Option<String>) {
-        if let Some(name) = name {
-            self.param.set(Param::OverrideSenderDisplayname, name);
-        } else {
-            self.param.remove(Param::OverrideSenderDisplayname);
-        }
+        self.param
+            .set_optional(Param::OverrideSenderDisplayname, name);
     }
 
     /// Sets the dimensions of associated image or video file.
@@ -1422,6 +1439,7 @@ pub async fn get_mime_headers(context: &Context, msg_id: MsgId) -> Result<Vec<u8
 /// and scheduling for deletion on IMAP.
 pub async fn delete_msgs(context: &Context, msg_ids: &[MsgId]) -> Result<()> {
     let mut modified_chat_ids = BTreeSet::new();
+    let mut res = Ok(());
 
     for &msg_id in msg_ids {
         let msg = Message::load_from_db(context, msg_id).await?;
@@ -1445,13 +1463,19 @@ pub async fn delete_msgs(context: &Context, msg_ids: &[MsgId]) -> Result<()> {
         modified_chat_ids.insert(msg.chat_id);
 
         let target = context.get_delete_msgs_target().await?;
-        context
-            .sql
-            .execute(
+        let update_db = |conn: &mut rusqlite::Connection| {
+            conn.execute(
                 "UPDATE imap SET target=? WHERE rfc724_mid=?",
                 (target, msg.rfc724_mid),
-            )
-            .await?;
+            )?;
+            conn.execute("DELETE FROM smtp WHERE msg_id=?", (msg_id,))?;
+            Ok(())
+        };
+        if let Err(e) = context.sql.call_write(update_db).await {
+            error!(context, "delete_msgs: failed to update db: {e:#}.");
+            res = Err(e);
+            continue;
+        }
 
         let logging_xdc_id = context
             .debug_logging
@@ -1466,6 +1490,7 @@ pub async fn delete_msgs(context: &Context, msg_ids: &[MsgId]) -> Result<()> {
             }
         }
     }
+    res?;
 
     for modified_chat_id in modified_chat_ids {
         context.emit_msgs_changed(modified_chat_id, MsgId::new(0));
@@ -1637,53 +1662,36 @@ pub(crate) async fn update_msg_state(
 
 // Context functions to work with messages
 
-/// Returns true if given message ID exists in the database and is not trashed.
-pub(crate) async fn exists(context: &Context, msg_id: MsgId) -> Result<bool> {
-    if msg_id.is_special() {
-        return Ok(false);
+pub(crate) async fn set_msg_failed(
+    context: &Context,
+    msg: &mut Message,
+    error: &str,
+) -> Result<()> {
+    if msg.state.can_fail() {
+        msg.state = MessageState::OutFailed;
+        warn!(context, "{} failed: {}", msg.id, error);
+    } else {
+        warn!(
+            context,
+            "{} seems to have failed ({}), but state is {}", msg.id, error, msg.state
+        )
     }
+    msg.error = Some(error.to_string());
 
-    let chat_id: Option<ChatId> = context
+    context
         .sql
-        .query_get_value("SELECT chat_id FROM msgs WHERE id=?;", (msg_id,))
+        .execute(
+            "UPDATE msgs SET state=?, error=? WHERE id=?;",
+            (msg.state, error, msg.id),
+        )
         .await?;
 
-    if let Some(chat_id) = chat_id {
-        Ok(!chat_id.is_trash())
-    } else {
-        Ok(false)
-    }
-}
+    context.emit_event(EventType::MsgFailed {
+        chat_id: msg.chat_id,
+        msg_id: msg.id,
+    });
 
-pub(crate) async fn set_msg_failed(context: &Context, msg_id: MsgId, error: &str) {
-    if let Ok(mut msg) = Message::load_from_db(context, msg_id).await {
-        if msg.state.can_fail() {
-            msg.state = MessageState::OutFailed;
-            warn!(context, "{} failed: {}", msg_id, error);
-        } else {
-            warn!(
-                context,
-                "{} seems to have failed ({}), but state is {}", msg_id, error, msg.state
-            )
-        }
-
-        match context
-            .sql
-            .execute(
-                "UPDATE msgs SET state=?, error=? WHERE id=?;",
-                (msg.state, error, msg_id),
-            )
-            .await
-        {
-            Ok(_) => context.emit_event(EventType::MsgFailed {
-                chat_id: msg.chat_id,
-                msg_id,
-            }),
-            Err(e) => {
-                warn!(context, "{:?}", e);
-            }
-        }
-    }
+    Ok(())
 }
 
 /// The number of messages assigned to unblocked chats
@@ -2290,7 +2298,7 @@ mod tests {
         update_msg_state(&alice, alice_msg.id, MessageState::OutMdnRcvd).await?;
         assert_state(&alice, alice_msg.id, MessageState::OutMdnRcvd).await;
 
-        set_msg_failed(&alice, alice_msg.id, "badly failed").await;
+        set_msg_failed(&alice, &mut alice_msg, "badly failed").await?;
         assert_state(&alice, alice_msg.id, MessageState::OutFailed).await;
 
         // check incoming message states on receiver side
@@ -2423,6 +2431,25 @@ def hello():
         let sent = alice.send_text(chat.id, python_program).await;
         let received = bob.recv_msg(&sent).await;
         assert_eq!(received.text, python_program);
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_delete_msgs_offline() -> Result<()> {
+        let alice = TestContext::new_alice().await;
+        let chat = alice
+            .create_chat_with_contact("Bob", "bob@example.org")
+            .await;
+        let mut msg = Message::new(Viewtype::Text);
+        msg.set_text("hi".to_string());
+        assert!(chat::send_msg_sync(&alice, chat.id, &mut msg)
+            .await
+            .is_err());
+        let stmt = "SELECT COUNT(*) FROM smtp WHERE msg_id=?";
+        assert!(alice.sql.exists(stmt, (msg.id,)).await?);
+        delete_msgs(&alice, &[msg.id]).await?;
+        assert!(!alice.sql.exists(stmt, (msg.id,)).await?);
 
         Ok(())
     }

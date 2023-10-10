@@ -139,11 +139,7 @@ async fn poke_spec(context: &Context, spec: Option<&str>) -> bool {
         /* import a directory */
         let dir_name = std::path::Path::new(&real_spec);
         let dir = fs::read_dir(dir_name).await;
-        if dir.is_err() {
-            error!(context, "Import: Cannot open directory \"{}\".", &real_spec,);
-            return false;
-        } else {
-            let mut dir = dir.unwrap();
+        if let Ok(mut dir) = dir {
             while let Ok(Some(entry)) = dir.next_entry().await {
                 let name_f = entry.file_name();
                 let name = name_f.to_string_lossy();
@@ -155,6 +151,9 @@ async fn poke_spec(context: &Context, spec: Option<&str>) -> bool {
                     }
                 }
             }
+        } else {
+            error!(context, "Import: Cannot open directory \"{}\".", &real_spec);
+            return false;
         }
     }
     println!("Import: {} items read from \"{}\".", read_cnt, &real_spec);
@@ -188,6 +187,7 @@ async fn log_msg(context: &Context, prefix: impl AsRef<str>, msg: &Message) {
         DownloadState::Available => " [⬇ Download available]",
         DownloadState::InProgress => " [⬇ Download in progress...]️",
         DownloadState::Failure => " [⬇ Download failed]",
+        DownloadState::Undecipherable => " [⬇ Decryption failed]",
     };
 
     let temp2 = timestamp_to_str(msg.get_timestamp());
@@ -814,15 +814,30 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
         }
         "chatinfo" => {
             ensure!(sel_chat.is_some(), "No chat selected.");
+            let sel_chat_id = sel_chat.as_ref().unwrap().get_id();
 
-            let contacts =
-                chat::get_chat_contacts(&context, sel_chat.as_ref().unwrap().get_id()).await?;
+            let contacts = chat::get_chat_contacts(&context, sel_chat_id).await?;
             println!("Memberlist:");
 
             log_contactlist(&context, &contacts).await?;
+            println!("{} contacts", contacts.len());
+
+            let similar_chats = sel_chat_id.get_similar_chat_ids(&context).await?;
+            if !similar_chats.is_empty() {
+                println!("Similar chats: ");
+                for (similar_chat_id, metric) in similar_chats {
+                    let similar_chat = Chat::load_from_db(&context, similar_chat_id).await?;
+                    println!(
+                        "{} (#{}) {:.1}",
+                        similar_chat.name,
+                        similar_chat_id,
+                        100.0 * metric
+                    );
+                }
+            }
+
             println!(
-                "{} contacts\nLocation streaming: {}",
-                contacts.len(),
+                "Location streaming: {}",
                 location::is_sending_locations_to_chat(
                     &context,
                     Some(sel_chat.as_ref().unwrap().get_id())
@@ -887,7 +902,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             let latitude = arg1.parse()?;
             let longitude = arg2.parse()?;
 
-            let continue_streaming = location::set(&context, latitude, longitude, 0.).await;
+            let continue_streaming = location::set(&context, latitude, longitude, 0.).await?;
             if continue_streaming {
                 println!("Success, streaming should be continued.");
             } else {

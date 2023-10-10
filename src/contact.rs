@@ -5,7 +5,7 @@ use std::collections::BinaryHeap;
 use std::convert::{TryFrom, TryInto};
 use std::fmt;
 use std::ops::Deref;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, ensure, Context as _, Result};
@@ -25,7 +25,7 @@ use crate::config::Config;
 use crate::constants::{Blocked, Chattype, DC_GCL_ADD_SELF, DC_GCL_VERIFIED_ONLY};
 use crate::context::Context;
 use crate::events::EventType;
-use crate::key::{DcKey, SignedPublicKey};
+use crate::key::{load_self_public_key, DcKey};
 use crate::login_param::LoginParam;
 use crate::message::MessageState;
 use crate::mimeparser::AvatarAction;
@@ -109,7 +109,7 @@ impl ContactId {
 
     /// ID of the contact for device messages.
     pub const DEVICE: ContactId = ContactId::new(5);
-    const LAST_SPECIAL: ContactId = ContactId::new(9);
+    pub(crate) const LAST_SPECIAL: ContactId = ContactId::new(9);
 
     /// Address to go with [`ContactId::DEVICE`].
     ///
@@ -1009,7 +1009,7 @@ impl Contact {
                 let finger_prints = stock_str::finger_prints(context).await;
                 ret += &format!("{stock_message}.\n{finger_prints}:");
 
-                let fingerprint_self = SignedPublicKey::load_self(context)
+                let fingerprint_self = load_self_public_key(context)
                     .await?
                     .fingerprint()
                     .to_string();
@@ -1186,7 +1186,7 @@ impl Contact {
             }
         } else if let Some(image_rel) = self.param.get(Param::ProfileImage) {
             if !image_rel.is_empty() {
-                return Ok(Some(get_abs_path(context, image_rel)));
+                return Ok(Some(get_abs_path(context, Path::new(image_rel))));
             }
         }
         Ok(None)
@@ -1211,7 +1211,6 @@ impl Contact {
     /// and if the key has not changed since this verification.
     ///
     /// The UI may draw a checkbox or something like that beside verified contacts.
-    ///
     pub async fn is_verified(&self, context: &Context) -> Result<VerifiedStatus> {
         // We're always sort of secured-verified as we could verify the key on this device any time with the key
         // on this device
@@ -1220,7 +1219,7 @@ impl Contact {
         }
 
         if let Some(peerstate) = Peerstate::from_addr(context, &self.addr).await? {
-            if peerstate.verified_key.is_some() {
+            if peerstate.is_using_verified_key() {
                 return Ok(VerifiedStatus::BidirectVerified);
             }
         }
@@ -1237,11 +1236,22 @@ impl Contact {
 
     /// Returns the ContactId that verified the contact.
     pub async fn get_verifier_id(&self, context: &Context) -> Result<Option<ContactId>> {
-        let verifier_addr = self.get_verifier_addr(context).await?;
-        if let Some(addr) = verifier_addr {
-            Ok(Contact::lookup_id_by_addr(context, &addr, Origin::AddressBook).await?)
-        } else {
-            Ok(None)
+        let Some(verifier_addr) = self.get_verifier_addr(context).await? else {
+            return Ok(None);
+        };
+
+        if verifier_addr == self.addr {
+            // Contact is directly verified via QR code.
+            return Ok(Some(ContactId::SELF));
+        }
+
+        match Contact::lookup_id_by_addr(context, &verifier_addr, Origin::AddressBook).await? {
+            Some(contact_id) => Ok(Some(contact_id)),
+            None => {
+                let addr = &self.addr;
+                warn!(context, "Could not lookup contact with address {verifier_addr} which introduced {addr}.");
+                Ok(None)
+            }
         }
     }
 
@@ -1717,7 +1727,7 @@ mod tests {
         assert_eq!(may_be_valid_addr("dd.tt"), false);
         assert_eq!(may_be_valid_addr("tt.dd@uu"), true);
         assert_eq!(may_be_valid_addr("u@d"), true);
-        assert_eq!(may_be_valid_addr("u@d."), true);
+        assert_eq!(may_be_valid_addr("u@d."), false);
         assert_eq!(may_be_valid_addr("u@d.t"), true);
         assert_eq!(may_be_valid_addr("u@d.tt"), true);
         assert_eq!(may_be_valid_addr("u@.tt"), true);
@@ -1726,6 +1736,7 @@ mod tests {
         assert_eq!(may_be_valid_addr("sk <@d.tt>"), false);
         assert_eq!(may_be_valid_addr("as@sd.de>"), false);
         assert_eq!(may_be_valid_addr("ask dkl@dd.tt"), false);
+        assert_eq!(may_be_valid_addr("user@domain.tld."), false);
     }
 
     #[test]

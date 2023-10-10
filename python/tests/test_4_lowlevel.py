@@ -1,3 +1,4 @@
+import json
 from queue import Queue
 
 import deltachat as dc
@@ -221,15 +222,32 @@ def test_logged_ac_process_ffi_failure(acfactory):
 
 def test_jsonrpc_blocking_call(tmp_path):
     accounts_fname = tmp_path / "accounts"
+    writable = True
     accounts = ffi.gc(
-        lib.dc_accounts_new(ffi.NULL, str(accounts_fname).encode("ascii")),
+        lib.dc_accounts_new(str(accounts_fname).encode("ascii"), writable),
         lib.dc_accounts_unref,
     )
     jsonrpc = ffi.gc(lib.dc_jsonrpc_init(accounts), lib.dc_jsonrpc_unref)
-    res = from_optional_dc_charpointer(
-        lib.dc_jsonrpc_blocking_call(jsonrpc, b"check_email_validity", b'["alice@example.org"]'),
+    res = json.loads(
+        from_optional_dc_charpointer(
+            lib.dc_jsonrpc_blocking_call(
+                jsonrpc,
+                json.dumps(
+                    {"jsonrpc": "2.0", "method": "check_email_validity", "params": ["alice@example.org"], "id": "123"},
+                ).encode("utf-8"),
+            ),
+        ),
     )
-    assert res == "true"
+    assert res == {"jsonrpc": "2.0", "id": "123", "result": True}
 
-    res = from_optional_dc_charpointer(lib.dc_jsonrpc_blocking_call(jsonrpc, b"check_email_validity", b'["alice"]'))
-    assert res == "false"
+    res = json.loads(
+        from_optional_dc_charpointer(
+            lib.dc_jsonrpc_blocking_call(
+                jsonrpc,
+                json.dumps(
+                    {"jsonrpc": "2.0", "method": "check_email_validity", "params": ["alice"], "id": "456"},
+                ).encode("utf-8"),
+            ),
+        ),
+    )
+    assert res == {"jsonrpc": "2.0", "id": "456", "result": False}

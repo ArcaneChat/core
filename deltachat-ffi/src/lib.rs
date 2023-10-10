@@ -29,7 +29,7 @@ use deltachat::contact::{Contact, ContactId, Origin};
 use deltachat::context::Context;
 use deltachat::ephemeral::Timer as EphemeralTimer;
 use deltachat::imex::BackupProvider;
-use deltachat::key::DcKey;
+use deltachat::key::preconfigure_keypair;
 use deltachat::message::MsgId;
 use deltachat::net::read_url_blob;
 use deltachat::qr_code_generator::{generate_backup_qr, get_securejoin_qr_svg};
@@ -165,6 +165,24 @@ pub unsafe extern "C" fn dc_context_open(
         .log_err(ctx)
         .map(|b| b as libc::c_int)
         .unwrap_or(0)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_context_change_passphrase(
+    context: *mut dc_context_t,
+    passphrase: *const libc::c_char,
+) -> libc::c_int {
+    if context.is_null() {
+        eprintln!("ignoring careless call to dc_context_change_passphrase()");
+        return 0;
+    }
+
+    let ctx = &*context;
+    let passphrase = to_string_lossy(passphrase);
+    block_on(ctx.change_passphrase(passphrase))
+        .context("dc_context_change_passphrase() failed")
+        .log_err(ctx)
+        .is_ok() as libc::c_int
 }
 
 #[no_mangle]
@@ -787,7 +805,7 @@ pub unsafe extern "C" fn dc_maybe_network(context: *mut dc_context_t) {
 pub unsafe extern "C" fn dc_preconfigure_keypair(
     context: *mut dc_context_t,
     addr: *const libc::c_char,
-    public_data: *const libc::c_char,
+    _public_data: *const libc::c_char,
     secret_data: *const libc::c_char,
 ) -> i32 {
     if context.is_null() {
@@ -795,21 +813,12 @@ pub unsafe extern "C" fn dc_preconfigure_keypair(
         return 0;
     }
     let ctx = &*context;
-    block_on(async move {
-        let addr = tools::EmailAddress::new(&to_string_lossy(addr))?;
-        let public = key::SignedPublicKey::from_asc(&to_string_lossy(public_data))?.0;
-        let secret = key::SignedSecretKey::from_asc(&to_string_lossy(secret_data))?.0;
-        let keypair = key::KeyPair {
-            addr,
-            public,
-            secret,
-        };
-        key::store_self_keypair(ctx, &keypair, key::KeyPairUse::Default).await?;
-        Ok::<_, anyhow::Error>(1)
-    })
-    .context("Failed to save keypair")
-    .log_err(ctx)
-    .unwrap_or(0)
+    let addr = to_string_lossy(addr);
+    let secret_data = to_string_lossy(secret_data);
+    block_on(preconfigure_keypair(ctx, &addr, &secret_data))
+        .context("Failed to save keypair")
+        .log_err(ctx)
+        .is_ok() as libc::c_int
 }
 
 #[no_mangle]
@@ -1243,6 +1252,30 @@ pub unsafe extern "C" fn dc_get_fresh_msg_cnt(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn dc_get_similar_chatlist(
+    context: *mut dc_context_t,
+    chat_id: u32,
+) -> *mut dc_chatlist_t {
+    if context.is_null() {
+        eprintln!("ignoring careless call to dc_get_similar_chatlist()");
+        return ptr::null_mut();
+    }
+    let ctx = &*context;
+
+    let chat_id = ChatId::new(chat_id);
+    match block_on(chat_id.get_similar_chatlist(ctx))
+        .context("failed to get similar chatlist")
+        .log_err(ctx)
+    {
+        Ok(list) => {
+            let ffi_list = ChatlistWrapper { context, list };
+            Box::into_raw(Box::new(ffi_list))
+        }
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn dc_estimate_deletion_cnt(
     context: *mut dc_context_t,
     from_server: libc::c_int,
@@ -1389,6 +1422,7 @@ pub unsafe extern "C" fn dc_get_chat_media(
 }
 
 #[no_mangle]
+#[allow(deprecated)]
 pub unsafe extern "C" fn dc_get_next_media(
     context: *mut dc_context_t,
     msg_id: u32,
@@ -2499,7 +2533,12 @@ pub unsafe extern "C" fn dc_set_location(
     }
     let ctx = &*context;
 
-    block_on(location::set(ctx, latitude, longitude, accuracy)) as _
+    block_on(async move {
+        location::set(ctx, latitude, longitude, accuracy)
+            .await
+            .log_err(ctx)
+            .unwrap_or_default()
+    }) as libc::c_int
 }
 
 #[no_mangle]
@@ -4473,7 +4512,14 @@ pub unsafe extern "C" fn dc_provider_new_from_email(
 
     let ctx = &*context;
 
-    match block_on(provider::get_provider_info(ctx, addr.as_str(), true)) {
+    match block_on(provider::get_provider_info_by_addr(
+        ctx,
+        addr.as_str(),
+        true,
+    ))
+    .log_err(ctx)
+    .unwrap_or_default()
+    {
         Some(provider) => provider,
         None => ptr::null_mut(),
     }
@@ -4500,11 +4546,14 @@ pub unsafe extern "C" fn dc_provider_new_from_email_with_dns(
 
     match socks5_enabled {
         Ok(socks5_enabled) => {
-            match block_on(provider::get_provider_info(
+            match block_on(provider::get_provider_info_by_addr(
                 ctx,
                 addr.as_str(),
                 socks5_enabled,
-            )) {
+            ))
+            .log_err(ctx)
+            .unwrap_or_default()
+            {
                 Some(provider) => provider,
                 None => ptr::null_mut(),
             }
@@ -4676,17 +4725,17 @@ pub type dc_accounts_t = AccountsWrapper;
 
 #[no_mangle]
 pub unsafe extern "C" fn dc_accounts_new(
-    _os_name: *const libc::c_char,
-    dbfile: *const libc::c_char,
+    dir: *const libc::c_char,
+    writable: libc::c_int,
 ) -> *mut dc_accounts_t {
     setup_panic!();
 
-    if dbfile.is_null() {
+    if dir.is_null() {
         eprintln!("ignoring careless call to dc_accounts_new()");
         return ptr::null_mut();
     }
 
-    let accs = block_on(Accounts::new(as_path(dbfile).into()));
+    let accs = block_on(Accounts::new(as_path(dir).into(), writable != 0));
 
     match accs {
         Ok(accs) => Box::into_raw(Box::new(AccountsWrapper::new(accs))),
@@ -4952,7 +5001,7 @@ pub unsafe extern "C" fn dc_accounts_get_event_emitter(
 #[cfg(feature = "jsonrpc")]
 mod jsonrpc {
     use deltachat_jsonrpc::api::CommandApi;
-    use deltachat_jsonrpc::yerpc::{OutReceiver, RpcClient, RpcServer, RpcSession};
+    use deltachat_jsonrpc::yerpc::{OutReceiver, RpcClient, RpcSession};
 
     use super::*;
 
@@ -5028,25 +5077,24 @@ mod jsonrpc {
     #[no_mangle]
     pub unsafe extern "C" fn dc_jsonrpc_blocking_call(
         jsonrpc_instance: *mut dc_jsonrpc_instance_t,
-        method: *const libc::c_char,
-        params: *const libc::c_char,
+        input: *const libc::c_char,
     ) -> *mut libc::c_char {
         if jsonrpc_instance.is_null() {
             eprintln!("ignoring careless call to dc_jsonrpc_blocking_call()");
             return ptr::null_mut();
         }
         let api = &*jsonrpc_instance;
-        let method = to_string_lossy(method);
-        let params = to_string_lossy(params);
-        let params: Option<yerpc::Params> = match serde_json::from_str(&params) {
-            Ok(params) => Some(params),
-            Err(_) => None,
-        };
-        let params = params.map(yerpc::Params::into_value).unwrap_or_default();
-        let res = block_on(api.handle.server().handle_request(method, params));
+        let input = to_string_lossy(input);
+        let res = block_on(api.handle.process_incoming(&input));
         match res {
-            Ok(res) => res.to_string().strdup(),
-            Err(_) => ptr::null_mut(),
+            Some(message) => {
+                if let Ok(message) = serde_json::to_string(&message) {
+                    message.strdup()
+                } else {
+                    ptr::null_mut()
+                }
+            }
+            None => ptr::null_mut(),
         }
     }
 }
