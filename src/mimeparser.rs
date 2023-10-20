@@ -109,11 +109,15 @@ pub(crate) struct MimeMessage {
 
     /// The decrypted, raw mime structure.
     ///
-    /// This is non-empty only if the message was actually encrypted.  It is used
+    /// This is non-empty iff `is_mime_modified` and the message was actually encrypted. It is used
     /// for e.g. late-parsing HTML.
     pub decoded_data: Vec<u8>,
 
+    /// Hop info for debugging.
     pub(crate) hop_info: String,
+
+    /// Whether the contact sending this should be marked as bot.
+    pub(crate) is_bot: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -390,6 +394,9 @@ impl MimeMessage {
             signatures.clear();
         }
 
+        // Auto-submitted is also set by holiday-notices so we also check `chat-version`
+        let is_bot = headers.contains_key("auto-submitted") && headers.contains_key("chat-version");
+
         let mut parser = MimeMessage {
             parts: Vec::new(),
             headers,
@@ -418,6 +425,7 @@ impl MimeMessage {
             is_mime_modified: false,
             decoded_data: Vec::new(),
             hop_info,
+            is_bot,
         };
 
         match partial {

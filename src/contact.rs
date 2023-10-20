@@ -139,6 +139,15 @@ impl ContactId {
     pub const fn to_u32(&self) -> u32 {
         self.0
     }
+
+    /// Mark contact as bot.
+    pub(crate) async fn mark_bot(&self, context: &Context, is_bot: bool) -> Result<()> {
+        context
+            .sql
+            .execute("UPDATE contacts SET is_bot=? WHERE id=?;", (is_bot, self.0))
+            .await?;
+        Ok(())
+    }
 }
 
 impl fmt::Display for ContactId {
@@ -223,6 +232,9 @@ pub struct Contact {
 
     /// Last seen message signature for this contact, to be displayed in the profile.
     status: String,
+
+    /// If the contact is a bot.
+    is_bot: bool,
 }
 
 /// Possible origins of a contact.
@@ -366,7 +378,7 @@ impl Contact {
             .sql
             .query_row_optional(
                 "SELECT c.name, c.addr, c.origin, c.blocked, c.last_seen,
-                c.authname, c.param, c.status
+                c.authname, c.param, c.status, c.is_bot
                FROM contacts c
               WHERE c.id=?;",
                 (contact_id,),
@@ -379,6 +391,7 @@ impl Contact {
                     let authname: String = row.get(5)?;
                     let param: String = row.get(6)?;
                     let status: Option<String> = row.get(7)?;
+                    let is_bot: bool = row.get(8)?;
                     let contact = Self {
                         id: contact_id,
                         name,
@@ -389,6 +402,7 @@ impl Contact {
                         origin,
                         param: param.parse().unwrap_or_default(),
                         status: status.unwrap_or_default(),
+                        is_bot,
                     };
                     Ok(contact)
                 },
@@ -496,6 +510,11 @@ impl Contact {
             )
             .await?;
         Ok(())
+    }
+
+    /// Returns whether contact is a bot.
+    pub fn is_bot(&self) -> bool {
+        self.is_bot
     }
 
     /// Check if an e-mail address belongs to a known and unblocked contact.
@@ -812,7 +831,11 @@ impl Contact {
         let mut ret = Vec::new();
         let flag_verified_only = (listflags & DC_GCL_VERIFIED_ONLY) != 0;
         let flag_add_self = (listflags & DC_GCL_ADD_SELF) != 0;
-
+        let minimal_origin = if context.get_config_bool(Config::Bot).await? {
+            Origin::Unknown
+        } else {
+            Origin::IncomingReplyTo
+        };
         if flag_verified_only || query.is_some() {
             let s3str_like_cmd = format!("%{}%", query.unwrap_or(""));
             context
@@ -832,7 +855,7 @@ impl Contact {
                     ),
                     rusqlite::params_from_iter(params_iter(&self_addrs).chain(params_slice![
                         ContactId::LAST_SPECIAL,
-                        Origin::IncomingReplyTo,
+                        minimal_origin,
                         s3str_like_cmd,
                         s3str_like_cmd,
                         if flag_verified_only { 0i32 } else { 1i32 }
@@ -882,10 +905,10 @@ impl Contact {
                  ORDER BY last_seen DESC, id DESC;",
                         sql::repeat_vars(self_addrs.len())
                     ),
-                    rusqlite::params_from_iter(params_iter(&self_addrs).chain(params_slice![
-                        ContactId::LAST_SPECIAL,
-                        Origin::IncomingReplyTo
-                    ])),
+                    rusqlite::params_from_iter(
+                        params_iter(&self_addrs)
+                            .chain(params_slice![ContactId::LAST_SPECIAL, minimal_origin]),
+                    ),
                     |row| row.get::<_, ContactId>(0),
                     |ids| {
                         for id in ids {
@@ -1245,7 +1268,7 @@ impl Contact {
             return Ok(Some(ContactId::SELF));
         }
 
-        match Contact::lookup_id_by_addr(context, &verifier_addr, Origin::AddressBook).await? {
+        match Contact::lookup_id_by_addr(context, &verifier_addr, Origin::Unknown).await? {
             Some(contact_id) => Ok(Some(contact_id)),
             None => {
                 let addr = &self.addr;
