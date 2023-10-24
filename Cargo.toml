@@ -20,7 +20,6 @@ opt-level = 0
 opt-level = "z"
 
 [profile.release]
-strip = true
 lto = true
 panic = 'abort'
 opt-level = "z"
