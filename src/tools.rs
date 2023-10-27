@@ -20,6 +20,7 @@ use mailparse::headers::Headers;
 use mailparse::MailHeaderMap;
 use rand::{thread_rng, Rng};
 use tokio::{fs, io};
+use url::Url;
 
 use crate::chat::{add_device_msg, add_device_msg_with_importance};
 use crate::constants::{DC_ELLIPSIS, DC_OUTDATED_WARNING_DAYS};
@@ -481,7 +482,43 @@ pub(crate) fn time() -> i64 {
         .as_secs() as i64
 }
 
-/// Very simple email address wrapper.
+/// Struct containing all mailto information
+#[derive(Debug, Default, Eq, PartialEq)]
+pub struct MailTo {
+    pub to: Vec<EmailAddress>,
+    pub subject: Option<String>,
+    pub body: Option<String>,
+}
+
+/// Parse mailto urls
+pub fn parse_mailto(mailto_url: &str) -> Option<MailTo> {
+    if let Ok(url) = Url::parse(mailto_url) {
+        if url.scheme() == "mailto" {
+            let mut mailto: MailTo = Default::default();
+            // Extract the email address
+            url.path().split(',').for_each(|email| {
+                if let Ok(email) = EmailAddress::new(email) {
+                    mailto.to.push(email);
+                }
+            });
+
+            // Extract query parameters
+            for (key, value) in url.query_pairs() {
+                if key == "subject" {
+                    mailto.subject = Some(value.to_string());
+                } else if key == "body" {
+                    mailto.body = Some(value.to_string());
+                }
+            }
+            Some(mailto)
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
 ///
 /// Represents an email address, right now just the `name@domain` portion.
 ///
@@ -724,18 +761,18 @@ mod tests {
 
         let raw = include_bytes!("../test-data/message/wrong-html.eml");
         let expected =
-            "Hop: From: oxbsltgw18.schlund.de; By: mrelayeu.kundenserver.de; Date: Thu, 06 Aug 2020 16:40:31 +0000\n\
-             Hop: From: mout.kundenserver.de; By: dd37930.kasserver.com; Date: Thu, 06 Aug 2020 16:40:32 +0000";
+            "Hop: From: oxbsltgw18.schlund.de; By: mrelayeu.kundenserver.de; Date: Thu, 6 Aug 2020 16:40:31 +0000\n\
+             Hop: From: mout.kundenserver.de; By: dd37930.kasserver.com; Date: Thu, 6 Aug 2020 16:40:32 +0000";
         check_parse_receive_headers(raw, expected);
 
         let raw = include_bytes!("../test-data/message/posteo_ndn.eml");
         let expected =
-            "Hop: By: mout01.posteo.de; Date: Tue, 09 Jun 2020 18:44:22 +0000\n\
-             Hop: From: mout01.posteo.de; By: mx04.posteo.de; Date: Tue, 09 Jun 2020 18:44:22 +0000\n\
-             Hop: From: mx04.posteo.de; By: mailin06.posteo.de; Date: Tue, 09 Jun 2020 18:44:23 +0000\n\
-             Hop: From: mailin06.posteo.de; By: proxy02.posteo.de; Date: Tue, 09 Jun 2020 18:44:23 +0000\n\
-             Hop: From: proxy02.posteo.de; By: proxy02.posteo.name; Date: Tue, 09 Jun 2020 18:44:23 +0000\n\
-             Hop: From: proxy02.posteo.name; By: dovecot03.posteo.local; Date: Tue, 09 Jun 2020 18:44:24 +0000";
+            "Hop: By: mout01.posteo.de; Date: Tue, 9 Jun 2020 18:44:22 +0000\n\
+             Hop: From: mout01.posteo.de; By: mx04.posteo.de; Date: Tue, 9 Jun 2020 18:44:22 +0000\n\
+             Hop: From: mx04.posteo.de; By: mailin06.posteo.de; Date: Tue, 9 Jun 2020 18:44:23 +0000\n\
+             Hop: From: mailin06.posteo.de; By: proxy02.posteo.de; Date: Tue, 9 Jun 2020 18:44:23 +0000\n\
+             Hop: From: proxy02.posteo.de; By: proxy02.posteo.name; Date: Tue, 9 Jun 2020 18:44:23 +0000\n\
+             Hop: From: proxy02.posteo.name; By: dovecot03.posteo.local; Date: Tue, 9 Jun 2020 18:44:24 +0000";
         check_parse_receive_headers(raw, expected);
     }
 
@@ -1282,5 +1319,56 @@ DKIM Results: Passed=true, Works=true, Allow_Keychange=true";
         assert_eq!(remove_subject_prefix("Re: Subject"), "Subject");
         assert_eq!(remove_subject_prefix("Fwd: Subject"), "Subject");
         assert_eq!(remove_subject_prefix("Fw: Subject"), "Subject");
+    }
+
+    #[test]
+    fn test_parse_mailto() {
+        let mailto_url = "mailto:someone@example.com";
+        let reps = parse_mailto(mailto_url);
+        assert_eq!(
+            Some(MailTo {
+                to: vec![EmailAddress {
+                    local: "someone".to_string(),
+                    domain: "example.com".to_string()
+                }],
+                subject: None,
+                body: None
+            }),
+            reps
+        );
+
+        let mailto_url = "mailto:someone@example.com?subject=Hello%20World";
+        let reps = parse_mailto(mailto_url);
+        assert_eq!(
+            Some(MailTo {
+                to: vec![EmailAddress {
+                    local: "someone".to_string(),
+                    domain: "example.com".to_string()
+                }],
+                subject: Some("Hello World".to_string()),
+                body: None
+            }),
+            reps
+        );
+
+        let mailto_url = "mailto:someone@example.com,someoneelse@example.com?subject=Hello%20World&body=This%20is%20a%20test";
+        let reps = parse_mailto(mailto_url);
+        assert_eq!(
+            Some(MailTo {
+                to: vec![
+                    EmailAddress {
+                        local: "someone".to_string(),
+                        domain: "example.com".to_string()
+                    },
+                    EmailAddress {
+                        local: "someoneelse".to_string(),
+                        domain: "example.com".to_string()
+                    }
+                ],
+                subject: Some("Hello World".to_string()),
+                body: Some("This is a test".to_string())
+            }),
+            reps
+        );
     }
 }
