@@ -358,3 +358,34 @@ def test_openrpc_command_line() -> None:
     openrpc = json.loads(out)
     assert "openrpc" in openrpc
     assert "methods" in openrpc
+
+
+def test_provider_info(rpc) -> None:
+    account_id = rpc.add_account()
+
+    provider_info = rpc.get_provider_info(account_id, "example.org")
+    assert provider_info["id"] == "example.com"
+
+    provider_info = rpc.get_provider_info(account_id, "uep7oiw4ahtaizuloith.org")
+    assert provider_info is None
+
+    # Test MX record resolution.
+    provider_info = rpc.get_provider_info(account_id, "github.com")
+    assert provider_info["id"] == "gmail"
+
+    # Disable MX record resolution.
+    rpc.set_config(account_id, "socks5_enabled", "1")
+    provider_info = rpc.get_provider_info(account_id, "github.com")
+    assert provider_info is None
+
+
+def test_qr_setup_contact(acfactory) -> None:
+    alice, bob = acfactory.get_online_accounts(2)
+
+    qr_code, _svg = alice.get_qr_code()
+    bob.secure_join(qr_code)
+
+    while True:
+        event = alice.wait_for_event()
+        if event["kind"] == "SecurejoinInviterProgress" and event["progress"] == 1000:
+            return

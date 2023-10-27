@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -23,7 +23,7 @@ use crate::key::{load_self_public_key, DcKey as _};
 use crate::login_param::LoginParam;
 use crate::message::{self, MessageState, MsgId};
 use crate::quota::QuotaInfo;
-use crate::scheduler::SchedulerState;
+use crate::scheduler::{InterruptInfo, SchedulerState};
 use crate::sql::Sql;
 use crate::stock_str::StockStrings;
 use crate::timesmearing::SmearedTimestamp;
@@ -38,7 +38,7 @@ use crate::tools::{duration_to_str, time};
 ///
 /// # Examples
 ///
-/// Creating a new unecrypted database:
+/// Creating a new unencrypted database:
 ///
 /// ```
 /// # let rt = tokio::runtime::Runtime::new().unwrap();
@@ -211,9 +211,6 @@ pub struct InnerContext {
     /// Set to `None` if quota was never tried to load.
     pub(crate) quota: RwLock<Option<QuotaInfo>>,
 
-    /// Set to true if quota update is requested.
-    pub(crate) quota_update_request: AtomicBool,
-
     /// IMAP UID resync request.
     pub(crate) resync_request: AtomicBool,
 
@@ -384,7 +381,6 @@ impl Context {
             scheduler: SchedulerState::new(),
             ratelimit: RwLock::new(Ratelimit::new(Duration::new(60, 0), 6.0)), // Allow at least 1 message every 10 seconds + a burst of 6.
             quota: RwLock::new(None),
-            quota_update_request: AtomicBool::new(false),
             resync_request: AtomicBool::new(false),
             new_msgs_notify,
             server_id: RwLock::new(None),
@@ -424,6 +420,16 @@ impl Context {
     /// Indicate that the network likely has come back.
     pub async fn maybe_network(&self) {
         self.scheduler.maybe_network().await;
+    }
+
+    pub(crate) async fn schedule_resync(&self) -> Result<()> {
+        self.resync_request.store(true, Ordering::Relaxed);
+        self.scheduler
+            .interrupt_inbox(InterruptInfo {
+                probe_network: false,
+            })
+            .await;
+        Ok(())
     }
 
     /// Returns a reference to the underlying SQL instance.
@@ -578,7 +584,7 @@ impl Context {
         let e2ee_enabled = self.get_config_int(Config::E2eeEnabled).await?;
         let mdns_enabled = self.get_config_int(Config::MdnsEnabled).await?;
         let bcc_self = self.get_config_int(Config::BccSelf).await?;
-        let send_sync_msgs = self.get_config_int(Config::SendSyncMsgs).await?;
+        let sync_msgs = self.get_config_int(Config::SyncMsgs).await?;
         let disable_idle = self.get_config_bool(Config::DisableIdle).await?;
 
         let prv_key_cnt = self.sql.count("SELECT COUNT(*) FROM keypairs;", ()).await?;
@@ -691,7 +697,7 @@ impl Context {
             self.get_config_int(Config::KeyGenType).await?.to_string(),
         );
         res.insert("bcc_self", bcc_self.to_string());
-        res.insert("send_sync_msgs", send_sync_msgs.to_string());
+        res.insert("sync_msgs", sync_msgs.to_string());
         res.insert("disable_idle", disable_idle.to_string());
         res.insert("private_key_count", prv_key_cnt.to_string());
         res.insert("public_key_count", pub_key_cnt.to_string());
@@ -754,7 +760,6 @@ impl Context {
                 .await?
                 .to_string(),
         );
-
         res.insert(
             "debug_logging",
             self.get_config_int(Config::DebugLogging).await?.to_string(),
@@ -762,6 +767,10 @@ impl Context {
         res.insert(
             "last_msg_id",
             self.get_config_int(Config::LastMsgId).await?.to_string(),
+        );
+        res.insert(
+            "gossip_period",
+            self.get_config_int(Config::GossipPeriod).await?.to_string(),
         );
         res.insert(
             "verified_one_on_one_chats",

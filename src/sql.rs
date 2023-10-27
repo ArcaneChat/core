@@ -686,6 +686,7 @@ fn new_connection(path: &Path, passphrase: &str) -> Result<Connection> {
          PRAGMA secure_delete=on;
          PRAGMA busy_timeout = 0; -- fail immediately
          PRAGMA temp_store=memory; -- Avoid SQLITE_IOERR_GETTEMPPATH errors on Android
+         PRAGMA soft_heap_limit = 8388608; -- 8 MiB limit, same as set in Android SQLiteDatabase.
          PRAGMA foreign_keys=on;
          ",
     )?;
@@ -740,8 +741,6 @@ pub async fn housekeeping(context: &Context) -> Result<()> {
     if let Err(err) = deduplicate_peerstates(&context.sql).await {
         warn!(context, "Failed to deduplicate peerstates: {:#}.", err)
     }
-
-    context.schedule_quota_update().await?;
 
     // Try to clear the freelist to free some space on the disk. This
     // only works if auto_vacuum is enabled.

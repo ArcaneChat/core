@@ -1,5 +1,155 @@
 # Changelog
 
+## [1.127.1] - 2023-10-27
+
+### API-Changes
+
+- jsonrpc: add `.is_protection_broken` to `FullChat` and `BasicChat`.
+- jsonrpc: Add `id` to `ProviderInfo`.
+
+## [1.127.0] - 2023-10-26
+
+### API-Changes
+
+- [**breaking**] `dc_accounts_new` API is changed. Unused `os_name` argument is removed and `writable` argument is added.
+- jsonrpc: Add `resend_messages`.
+- [**breaking**] Remove unused function `is_verified_ex()` ([#4551](https://github.com/deltachat/deltachat-core-rust/pull/4551))
+- [**breaking**] Make `MsgId.delete_from_db()` private.
+- [**breaking**] deltachat-jsonrpc: use `kind` as a tag for all union types
+- json-rpc: Force stickers to be sent as stickers ([#4819](https://github.com/deltachat/deltachat-core-rust/pull/4819)).
+- Add mailto parse api ([#4829](https://github.com/deltachat/deltachat-core-rust/pull/4829)).
+- [**breaking**] Remove unused `DC_STR_PROTECTION_(EN)ABLED` strings
+- [**breaking**] Remove unused `dc_set_chat_protection()`
+- Hide `DcSecretKey` trait from the API.
+- Verified 1:1 chats ([#4315](https://github.com/deltachat/deltachat-core-rust/pull/4315)). Disabled by default, enable with `verified_one_on_one_chats` config.
+
+### CI
+
+- Run Rust tests with `RUST_BACKTRACE` set.
+- Replace `master` branch with `main`.  Run CI only on `main` branch pushes.
+- Test `deltachat-rpc-client` on Windows.
+
+### Documentation
+
+- Document how logs and error messages should be formatted in `CONTRIBUTING.md`.
+- Clarify transitive behaviour of `dc_contact_is_verfified()`.
+- Document `configured_addr`.
+
+### Features / Changes
+
+- Add lockfile to account manager ([#4314](https://github.com/deltachat/deltachat-core-rust/pull/4314)). 
+- Don't show a contact as verified if their key changed since the verification ([#4574](https://github.com/deltachat/deltachat-core-rust/pull/4574)).
+- deltachat-rpc-server: Add `--openrpc` option to print OpenRPC specification for JSON-RPC API. This specification can be used to generate JSON-RPC API clients.
+- Track whether contact is a bot or not ([#4821](https://github.com/deltachat/deltachat-core-rust/pull/4821)).
+- Replace `Config::SendSyncMsgs` with `SyncMsgs` ([#4817](https://github.com/deltachat/deltachat-core-rust/pull/4817)).
+
+### Fixes
+
+- Don't create 1:1 chat as protected for contact who doesn't prefer to encrypt ([#4538](https://github.com/deltachat/deltachat-core-rust/pull/4538)).
+- Allow to save a draft if the verification is broken ([#4542](https://github.com/deltachat/deltachat-core-rust/pull/4542)).
+- Fix info-message orderings of verified 1:1 chats ([#4545](https://github.com/deltachat/deltachat-core-rust/pull/4545)).
+- Fix example; this was changed some time ago, see https://docs.webxdc.org/spec.html#sendupdate
+- `receive_imf`: Update peerstate from db after handling Securejoin handshake ([#4600](https://github.com/deltachat/deltachat-core-rust/pull/4600)).
+- Sort old incoming messages below all outgoing ones ([#4621](https://github.com/deltachat/deltachat-core-rust/pull/4621)).
+- Do not mark non-verified group chats as verified when using securejoin.
+- `receive_imf`: Set protection only for Chattype::Single ([#4597](https://github.com/deltachat/deltachat-core-rust/pull/4597)).
+- Return from `dc_get_chatlist(DC_GCL_FOR_FORWARDING)` only chats where we can send ([#4616](https://github.com/deltachat/deltachat-core-rust/pull/4616)).
+- Clear VerifiedOneOnOneChats config on backup ([#4615](https://github.com/deltachat/deltachat-core-rust/pull/4615)).
+- Try removal of accounts multiple times with timeouts in case the database file is blocked (restore `try_many_times` workaround).
+
+### Build system
+
+- Remove examples/simple.rs.
+- Increase MSRV to 1.70.0.
+- Update dependencies.
+- Switch to iroh 0.4.x fork with updated dependencies.
+
+## [1.126.1] - 2023-10-24
+
+### Fixes
+
+- Do not hardcode version in deltachat-rpc-server source package.
+- Do not interrupt IMAP loop from `get_connectivity_html()`.
+
+### Features / Changes
+
+- imap: Buffer `STARTTLS` command.
+
+### Build system
+
+- Build `deltachat-rpc-server` binary for aarch64 macOS.
+- Build `deltachat-rpc-server` wheels for macOS and Windows.
+
+### Refactor
+
+- Remove job queue.
+
+### Miscellaneous Tasks
+
+- cargo: Update `ahash` to make `cargo-deny` happy.
+
+## [1.126.0] - 2023-10-22
+
+### API-Changes
+
+- Allow to filter by unread in `chatlist:try_load` ([#4824](https://github.com/deltachat/deltachat-core-rust/pull/4824)).
+- Add `misc_send_draft()` to JSON-RPC API ([#4839](https://github.com/deltachat/deltachat-core-rust/pull/4839)).
+
+### Features / Changes
+
+- [**breaking**] Make broadcast lists create their own chat ([#4644](https://github.com/deltachat/deltachat-core-rust/pull/4644)).
+  - This means that UIs need to ask for the name when creating a broadcast list, similar to <https://github.com/deltachat/deltachat-android/pull/2653>.
+- Add self-address to backup filename ([#4820](https://github.com/deltachat/deltachat-core-rust/pull/4820))
+
+### CI
+
+- Build Python wheels for deltachat-rpc-server.
+
+### Build system
+
+- Strip release binaries.
+- Workaround OpenSSL crate expecting libatomic to be available.
+
+### Fixes
+
+- Set `soft_heap_limit` on SQLite database.
+- imap: Fallback to `STATUS` if `SELECT` did not return UIDNEXT.
+
+## [1.125.0] - 2023-10-14
+
+### API-Changes
+
+- [**breaking**] deltachat-rpc-client: Replace `asyncio` with threads.
+- Validate boolean values passed to `set_config`. Attempts to set values other than `0` and `1` will result in an error.
+
+### CI
+
+- Reduce required Python version for deltachat-rpc-client from 3.8 to 3.7.
+
+### Features / Changes
+
+- Add developer option to disable IDLE.
+
+### Fixes
+
+- `deltachat-rpc-client`: Run `deltachat-rpc-server` in its own process group. This prevents reception of `SIGINT` by the server when the bot is terminated with `^C`.
+- python: Don't automatically set the displayname to "bot" when setting log level.
+- Don't update `timestamp`, `timestamp_rcvd`, `state` when replacing partially downloaded message ([#4700](https://github.com/deltachat/deltachat-core-rust/pull/4700)).
+- Assign encrypted partially downloaded group messages to 1:1 chat ([#4757](https://github.com/deltachat/deltachat-core-rust/pull/4757)).
+- Return all contacts from `Contact::get_all` for bots ([#4811](https://github.com/deltachat/deltachat-core-rust/pull/4811)).
+- Set connectivity status to "connected" during fake idle.
+- Return verifier contacts regardless of their origin.
+- Don't try to send more MDNs if there's a temporary SMTP error ([#4534](https://github.com/deltachat/deltachat-core-rust/pull/4534)).
+
+### Refactor
+
+- deltachat-rpc-client: Close stdin instead of sending `SIGTERM`.
+- deltachat-rpc-client: Remove print() calls. Standard `logging` package is for logging instead.
+
+### Tests
+
+- deltachat-rpc-client: Enable logs in pytest.
+
 ## [1.124.1] - 2023-10-05
 
 ### Fixes
@@ -2879,3 +3029,8 @@ https://github.com/deltachat/deltachat-core-rust/pulls?q=is%3Apr+is%3Aclosed
 [1.123.0]: https://github.com/deltachat/deltachat-core-rust/compare/v1.122.0...v1.123.0
 [1.124.0]: https://github.com/deltachat/deltachat-core-rust/compare/v1.123.0...v1.124.0
 [1.124.1]: https://github.com/deltachat/deltachat-core-rust/compare/v1.124.0...v1.124.1
+[1.125.0]: https://github.com/deltachat/deltachat-core-rust/compare/v1.124.1...v1.125.0
+[1.126.0]: https://github.com/deltachat/deltachat-core-rust/compare/v1.125.0...v1.126.0
+[1.126.1]: https://github.com/deltachat/deltachat-core-rust/compare/v1.126.0...v1.126.1
+[1.127.0]: https://github.com/deltachat/deltachat-core-rust/compare/v1.126.1...v1.127.0
+[1.127.1]: https://github.com/deltachat/deltachat-core-rust/compare/v1.127.0...v1.127.1

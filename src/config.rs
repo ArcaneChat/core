@@ -297,10 +297,9 @@ pub enum Config {
     #[strum(props(default = "163840"))]
     DownloadLimit,
 
-    /// Send sync messages, requires `BccSelf` to be set as well.
-    /// In a future versions, this switch may be removed.
+    /// Enable sending and executing (applying) sync messages. Sending requires `BccSelf` to be set.
     #[strum(props(default = "0"))]
-    SendSyncMsgs,
+    SyncMsgs,
 
     /// Space-separated list of all the authserv-ids which we believe
     /// may be the one of our email server.
@@ -318,6 +317,13 @@ pub enum Config {
 
     /// Last message processed by the bot.
     LastMsgId,
+
+    /// How often to gossip Autocrypt keys in chats with multiple recipients, in seconds. 2 days by
+    /// default.
+    ///
+    /// This is not supposed to be changed by UIs and only used for testing.
+    #[strum(props(default = "172800"))]
+    GossipPeriod,
 
     /// Feature flag for verified 1:1 chats; the UI should set it
     /// to 1 if it supports verified 1:1 chats.
@@ -494,7 +500,7 @@ impl Context {
             | Config::Configured
             | Config::Bot
             | Config::NotifyAboutWrongPw
-            | Config::SendSyncMsgs
+            | Config::SyncMsgs
             | Config::SignUnencrypted
             | Config::DisableIdle => {
                 ensure!(

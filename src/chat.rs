@@ -2208,9 +2208,12 @@ async fn prepare_msg_blob(context: &Context, msg: &mut Message) -> Result<()> {
             .with_context(|| format!("attachment missing for message of type #{}", msg.viewtype))?;
 
         let mut maybe_sticker = msg.viewtype == Viewtype::Sticker;
-        if msg.viewtype == Viewtype::Image || maybe_sticker {
+        if msg.viewtype == Viewtype::Image
+            || maybe_sticker && !msg.param.exists(Param::ForceSticker)
+        {
             blob.recode_to_image_size(context, &mut maybe_sticker)
                 .await?;
+
             if !maybe_sticker {
                 msg.viewtype = Viewtype::Image;
             }
@@ -5680,6 +5683,51 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_sticker_jpeg_force() {
+        let alice = TestContext::new_alice().await;
+        let bob = TestContext::new_bob().await;
+        let alice_chat = alice.create_chat(&bob).await;
+
+        let file = alice.get_blobdir().join("sticker.jpg");
+        tokio::fs::write(
+            &file,
+            include_bytes!("../test-data/image/avatar1000x1000.jpg"),
+        )
+        .await
+        .unwrap();
+
+        // Images without force_sticker should be turned into [Viewtype::Image]
+        let mut msg = Message::new(Viewtype::Sticker);
+        msg.set_file(file.to_str().unwrap(), None);
+        let sent_msg = alice.send_msg(alice_chat.id, &mut msg).await;
+        let msg = bob.recv_msg(&sent_msg).await;
+        assert_eq!(msg.get_viewtype(), Viewtype::Image);
+
+        // Images with `force_sticker = true` should keep [Viewtype::Sticker]
+        let mut msg = Message::new(Viewtype::Sticker);
+        msg.set_file(file.to_str().unwrap(), None);
+        msg.force_sticker();
+        let sent_msg = alice.send_msg(alice_chat.id, &mut msg).await;
+        let msg = bob.recv_msg(&sent_msg).await;
+        assert_eq!(msg.get_viewtype(), Viewtype::Sticker);
+
+        // Images with `force_sticker = true` should keep [Viewtype::Sticker]
+        // even on drafted messages
+        let mut msg = Message::new(Viewtype::Sticker);
+        msg.set_file(file.to_str().unwrap(), None);
+        msg.force_sticker();
+        alice_chat
+            .id
+            .set_draft(&alice, Some(&mut msg))
+            .await
+            .unwrap();
+        let mut msg = alice_chat.id.get_draft(&alice).await.unwrap().unwrap();
+        let sent_msg = alice.send_msg(alice_chat.id, &mut msg).await;
+        let msg = bob.recv_msg(&sent_msg).await;
+        assert_eq!(msg.get_viewtype(), Viewtype::Sticker);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_sticker_gif() -> Result<()> {
         test_sticker(
             "sticker.gif",
@@ -6078,22 +6126,40 @@ mod tests {
             get_chat_contacts(&alice, chat_bob.id).await?.pop().unwrap(),
         )
         .await?;
-        let chat = Chat::load_from_db(&alice, broadcast_id).await?;
-        assert_eq!(chat.typ, Chattype::Broadcast);
-        assert_eq!(chat.name, stock_str::broadcast_list(&alice).await);
-        assert!(!chat.is_self_talk());
+        set_chat_name(&alice, broadcast_id, "Broadcast list").await?;
+        {
+            let chat = Chat::load_from_db(&alice, broadcast_id).await?;
+            assert_eq!(chat.typ, Chattype::Broadcast);
+            assert_eq!(chat.name, "Broadcast list");
+            assert!(!chat.is_self_talk());
 
-        send_text_msg(&alice, broadcast_id, "ola!".to_string()).await?;
-        let msg = alice.get_last_msg().await;
-        assert_eq!(msg.chat_id, chat.id);
+            send_text_msg(&alice, broadcast_id, "ola!".to_string()).await?;
+            let msg = alice.get_last_msg().await;
+            assert_eq!(msg.chat_id, chat.id);
+        }
 
-        let msg = bob.recv_msg(&alice.pop_sent_msg().await).await;
-        assert_eq!(msg.get_text(), "ola!");
-        assert!(!msg.get_showpadlock()); // avoid leaking recipients in encryption data
-        let chat = Chat::load_from_db(&bob, msg.chat_id).await?;
-        assert_eq!(chat.typ, Chattype::Single);
-        assert_eq!(chat.id, chat_bob.id);
-        assert!(!chat.is_self_talk());
+        {
+            let msg = bob.recv_msg(&alice.pop_sent_msg().await).await;
+            assert_eq!(msg.get_text(), "ola!");
+            assert_eq!(msg.subject, "Broadcast list");
+            assert!(!msg.get_showpadlock()); // avoid leaking recipients in encryption data
+            let chat = Chat::load_from_db(&bob, msg.chat_id).await?;
+            assert_eq!(chat.typ, Chattype::Mailinglist);
+            assert_ne!(chat.id, chat_bob.id);
+            assert_eq!(chat.name, "Broadcast list");
+            assert!(!chat.is_self_talk());
+        }
+
+        {
+            // Alice changes the name:
+            set_chat_name(&alice, broadcast_id, "My great broadcast").await?;
+            let sent = alice.send_text(broadcast_id, "I changed the title!").await;
+
+            let msg = bob.recv_msg(&sent).await;
+            assert_eq!(msg.subject, "Re: My great broadcast");
+            let bob_chat = Chat::load_from_db(&bob, msg.chat_id).await?;
+            assert_eq!(bob_chat.name, "My great broadcast");
+        }
 
         Ok(())
     }

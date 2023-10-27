@@ -384,7 +384,12 @@ char*           dc_get_blobdir               (const dc_context_t* context);
 /**
  * Configure the context. The configuration is handled by key=value pairs as:
  *
- * - `addr`         = address to display (always needed)
+ * - `addr`         = Email address to use for configuration.
+ *                    If dc_configure() fails this is not the email address actually in use.
+ *                    Use `configured_addr` to find out the email address actually in use.
+ * - `configured_addr` = Email address actually in use.
+ *                    Unless for testing, do not set this value using dc_set_config().
+ *                    Instead, set `addr` and call dc_configure().
  * - `mail_server`  = IMAP-server, guessed if left out
  * - `mail_user`    = IMAP-username, guessed if left out
  * - `mail_pw`      = IMAP-password (always needed)
@@ -503,6 +508,9 @@ char*           dc_get_blobdir               (const dc_context_t* context);
  *                    to not mess up with non-delivery-reports or read-receipts.
  *                    0=no limit (default).
  *                    Changes affect future messages only.
+ * - `gossip_period` = How often to gossip Autocrypt keys in chats with multiple recipients, in
+ *                    seconds. 2 days by default.
+ *                    This is not supposed to be changed by UIs and only used for testing.
  * - `verified_one_on_one_chats` = Feature flag for verified 1:1 chats; the UI should set it
  *                    to 1 if it supports verified 1:1 chats.
  *                    Regardless of this setting, `dc_chat_is_protected()` returns true while the key is verified,
@@ -888,7 +896,8 @@ int             dc_preconfigure_keypair        (dc_context_t* context, const cha
  *     - if the flag DC_GCL_ADD_ALLDONE_HINT is set, DC_CHAT_ID_ALLDONE_HINT
  *       is added as needed.
  * @param query_str An optional query for filtering the list. Only chats matching this query
- *     are returned. Give NULL for no filtering.
+ *     are returned. Give NULL for no filtering. When `is:unread` is contained in the query,
+ *     the chatlist is filtered such that only chats with unread messages show up.
  * @param query_id An optional contact ID for filtering the list. Only chats including this contact ID
  *     are returned. Give 0 for no filtering.
  * @return A chatlist as an dc_chatlist_t object.
@@ -1703,24 +1712,12 @@ uint32_t        dc_create_group_chat         (dc_context_t* context, int protect
  * Create a new broadcast list.
  *
  * Broadcast lists are similar to groups on the sending device,
- * however, recipients get the messages in normal one-to-one chats
- * and will not be aware of other members.
+ * however, recipients get the messages in a read-only chat
+ * and will see who the other members are.
  *
- * Replies to broadcasts go only to the sender
- * and not to all broadcast recipients.
- * Moreover, replies will not appear in the broadcast list
- * but in the one-to-one chat with the person answering.
- *
- * The name and the image of the broadcast list is set automatically
- * and is visible to the sender only.
- * Not asking for these data allows more focused creation
- * and we bypass the question who will get which data.
- * Also, many users will have at most one broadcast list
- * so, a generic name and image is sufficient at the first place.
- *
- * Later on, however, the name can be changed using dc_set_chat_name().
- * The image cannot be changed to have a unique, recognizable icon in the chat lists.
- * All in all, this is also what other messengers are doing here.
+ * For historical reasons, this function does not take a name directly,
+ * instead you have to set the name using dc_set_chat_name()
+ * after creating the broadcast list.
  *
  * @memberof dc_context_t
  * @param context The context object.
@@ -2263,8 +2260,7 @@ dc_contact_t*   dc_get_contact               (dc_context_t* context, uint32_t co
  *   the backup is not encrypted.
  *   The backup contains all contacts, chats, images and other data and device independent settings.
  *   The backup does not contain device dependent settings as ringtones or LED notification settings.
- *   The name of the backup is typically `delta-chat-<day>.tar`, if more than one backup is create on a day,
- *   the format is `delta-chat-<day>-<number>.tar`
+ *   The name of the backup is `delta-chat-backup-<day>-<number>-<addr>.tar`.
  *
  * - **DC_IMEX_IMPORT_BACKUP** (12) - `param1` is the file (not: directory) to import. `param2` is the passphrase.
  *   The file is normally created by DC_IMEX_EXPORT_BACKUP and detected by dc_imex_has_backup(). Importing a backup
@@ -3970,7 +3966,7 @@ int64_t          dc_msg_get_received_timestamp (const dc_msg_t* msg);
  * Get the message time used for sorting.
  * This function returns the timestamp that is used for sorting the message
  * into lists as returned e.g. by dc_get_chat_msgs().
- * This may be the reveived time, the sending time or another time.
+ * This may be the received time, the sending time or another time.
  *
  * To get the receiving time, use dc_msg_get_received_timestamp().
  * To get the sending time, use dc_msg_get_timestamp().
