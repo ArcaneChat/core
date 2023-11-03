@@ -15,6 +15,7 @@ use crate::contact::Contact;
 use crate::context::Context;
 use crate::events::EventType;
 use crate::mimeparser::MimeMessage;
+use crate::sync::Sync::*;
 use crate::tools::time;
 use crate::{chat, stock_str};
 
@@ -110,7 +111,7 @@ pub(super) async fn handle_auth_required(
 /// Handles `vc-contact-confirm` and `vg-member-added` handshake messages.
 ///
 /// # Bob - the joiner's side
-/// ## Step 4 in the "Setup Contact protocol"
+/// ## Step 7 in the "Setup Contact protocol"
 pub(super) async fn handle_contact_confirm(
     context: &Context,
     mut bobstate: BobState,
@@ -179,7 +180,7 @@ impl BobState {
             } => {
                 let group_chat_id = match chat::get_chat_id_by_grpid(context, grpid).await? {
                     Some((chat_id, _protected, _blocked)) => {
-                        chat_id.unblock(context).await?;
+                        chat_id.unblock_ex(context, Nosync).await?;
                         chat_id
                     }
                     None => {

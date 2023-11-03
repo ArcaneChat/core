@@ -9,7 +9,7 @@ use crate::aheader::EncryptPreference;
 use crate::chat::{self, Chat, ChatId, ChatIdBlocked, ProtectionStatus};
 use crate::config::Config;
 use crate::constants::{Blocked, Chattype};
-use crate::contact::{Contact, ContactId, Origin, VerifiedStatus};
+use crate::contact::{Contact, ContactId, Origin};
 use crate::context::Context;
 use crate::e2ee::ensure_secret_key_exists;
 use crate::events::EventType;
@@ -18,7 +18,7 @@ use crate::key::{load_self_public_key, DcKey, Fingerprint};
 use crate::message::{Message, Viewtype};
 use crate::mimeparser::{MimeMessage, SystemMessage};
 use crate::param::Param;
-use crate::peerstate::{Peerstate, PeerstateKeyType, PeerstateVerifiedStatus};
+use crate::peerstate::{Peerstate, PeerstateKeyType};
 use crate::qr::check_qr;
 use crate::stock_str;
 use crate::token;
@@ -415,10 +415,9 @@ pub(crate) async fn handle_securejoin_handshake(
                 .await?
                 .get_addr()
                 .to_owned();
-            if mark_peer_as_verified(context, fingerprint.clone(), contact_addr)
-                .await
-                .is_err()
-            {
+            let fingerprint_found =
+                mark_peer_as_verified(context, fingerprint.clone(), contact_addr).await?;
+            if !fingerprint_found {
                 could_not_establish_secure_connection(
                     context,
                     contact_id,
@@ -446,12 +445,8 @@ pub(crate) async fn handle_securejoin_handshake(
                 match chat::get_chat_id_by_grpid(context, field_grpid).await? {
                     Some((group_chat_id, _, _)) => {
                         secure_connection_established(context, contact_id, group_chat_id).await?;
-                        if let Err(err) =
-                            chat::add_contact_to_chat_ex(context, group_chat_id, contact_id, true)
-                                .await
-                        {
-                            error!(context, "failed to add contact: {}", err);
-                        }
+                        chat::add_contact_to_chat_ex(context, group_chat_id, contact_id, true)
+                            .await?;
                     }
                     None => bail!("Chat {} not found", &field_grpid),
                 }
@@ -478,49 +473,48 @@ pub(crate) async fn handle_securejoin_handshake(
             }
             Ok(HandshakeMessage::Ignore) // "Done" would delete the message and break multi-device (the key from Autocrypt-header is needed)
         }
-        "vg-member-added" | "vc-contact-confirm" => {
-            /*=======================================================
-            ====             Bob - the joiner's side             ====
-            ====   Step 7 in "Setup verified contact" protocol   ====
-            =======================================================*/
+        /*=======================================================
+        ====             Bob - the joiner's side             ====
+        ====   Step 7 in "Setup verified contact" protocol   ====
+        =======================================================*/
+        "vc-contact-confirm" => match BobState::from_db(&context.sql).await? {
+            Some(bobstate) => bob::handle_contact_confirm(context, bobstate, mime_message).await,
+            None => Ok(HandshakeMessage::Ignore),
+        },
+
+        "vg-member-added" => {
+            let Some(member_added) = mime_message
+                .get_header(HeaderDef::ChatGroupMemberAdded)
+                .map(|s| s.as_str())
+            else {
+                warn!(
+                    context,
+                    "vg-member-added without Chat-Group-Member-Added header"
+                );
+                return Ok(HandshakeMessage::Propagate);
+            };
+            if !context.is_self_addr(member_added).await? {
+                info!(
+                    context,
+                    "Member {member_added} added by unrelated SecureJoin process"
+                );
+                return Ok(HandshakeMessage::Propagate);
+            }
             match BobState::from_db(&context.sql).await? {
                 Some(bobstate) => {
                     bob::handle_contact_confirm(context, bobstate, mime_message).await
                 }
-                None => match join_vg {
-                    true => Ok(HandshakeMessage::Propagate),
-                    false => Ok(HandshakeMessage::Ignore),
-                },
+                None => Ok(HandshakeMessage::Propagate),
             }
         }
+
         "vg-member-added-received" | "vc-contact-confirm-received" => {
             /*==========================================================
             ====              Alice - the inviter side              ====
             ====  Step 8 in "Out-of-band verified groups" protocol  ====
             ==========================================================*/
 
-            if let Ok(contact) = Contact::get_by_id(context, contact_id).await {
-                if contact.is_verified(context).await? == VerifiedStatus::Unverified {
-                    warn!(context, "{} invalid.", step);
-                    return Ok(HandshakeMessage::Ignore);
-                }
-                if join_vg {
-                    let field_grpid = mime_message
-                        .get_header(HeaderDef::SecureJoinGroup)
-                        .map(|s| s.as_str())
-                        .unwrap_or_else(|| "");
-                    if let Err(err) = chat::get_chat_id_by_grpid(context, field_grpid).await {
-                        warn!(context, "Failed to lookup chat_id from grpid: {}", err);
-                        return Err(
-                            err.context(format!("Chat for group {} not found", &field_grpid))
-                        );
-                    }
-                }
-                Ok(HandshakeMessage::Ignore) // "Done" deletes the message and breaks multi-device
-            } else {
-                warn!(context, "{} invalid.", step);
-                Ok(HandshakeMessage::Ignore)
-            }
+            Ok(HandshakeMessage::Done) // "Done" deletes the message
         }
         _ => {
             warn!(context, "invalid step: {}", step);
@@ -614,21 +608,7 @@ pub(crate) async fn observe_securejoin_on_other_device(
                         return Ok(HandshakeMessage::Ignore);
                     }
                 };
-                if let Err(err) = peerstate.set_verified(
-                    PeerstateKeyType::GossipKey,
-                    fingerprint,
-                    PeerstateVerifiedStatus::BidirectVerified,
-                    addr,
-                ) {
-                    could_not_establish_secure_connection(
-                        context,
-                        contact_id,
-                        info_chat_id(context, contact_id).await?,
-                        &format!("Could not mark peer as verified at step {step}: {err}"),
-                    )
-                    .await?;
-                    return Ok(HandshakeMessage::Ignore);
-                }
+                peerstate.set_verified(PeerstateKeyType::GossipKey, fingerprint, addr)?;
                 peerstate.prefer_encrypt = EncryptPreference::Mutual;
                 peerstate.save_to_db(&context.sql).await.unwrap_or_default();
             } else if let Some(fingerprint) =
@@ -637,7 +617,7 @@ pub(crate) async fn observe_securejoin_on_other_device(
                 // FIXME: Old versions of DC send this header instead of gossips. Remove this
                 // eventually.
                 let fingerprint = fingerprint.parse()?;
-                if mark_peer_as_verified(
+                let fingerprint_found = mark_peer_as_verified(
                     context,
                     fingerprint,
                     Contact::get_by_id(context, contact_id)
@@ -645,9 +625,8 @@ pub(crate) async fn observe_securejoin_on_other_device(
                         .get_addr()
                         .to_owned(),
                 )
-                .await
-                .is_err()
-                {
+                .await?;
+                if !fingerprint_found {
                     could_not_establish_secure_connection(
                         context,
                         contact_id,
@@ -737,27 +716,21 @@ async fn could_not_establish_secure_connection(
     Ok(())
 }
 
+/// Tries to mark peer with provided key fingerprint as verified.
+///
+/// Returns true if such key was found, false otherwise.
 async fn mark_peer_as_verified(
     context: &Context,
     fingerprint: Fingerprint,
     verifier: String,
-) -> Result<()> {
-    if let Some(ref mut peerstate) = Peerstate::from_fingerprint(context, &fingerprint).await? {
-        if let Err(err) = peerstate.set_verified(
-            PeerstateKeyType::PublicKey,
-            fingerprint,
-            PeerstateVerifiedStatus::BidirectVerified,
-            verifier,
-        ) {
-            error!(context, "Could not mark peer as verified: {}", err);
-            return Err(err);
-        }
-        peerstate.prefer_encrypt = EncryptPreference::Mutual;
-        peerstate.save_to_db(&context.sql).await.unwrap_or_default();
-        Ok(())
-    } else {
-        bail!("no peerstate in db for fingerprint {}", fingerprint.hex());
-    }
+) -> Result<bool> {
+    let Some(ref mut peerstate) = Peerstate::from_fingerprint(context, &fingerprint).await? else {
+        return Ok(false);
+    };
+    peerstate.set_verified(PeerstateKeyType::PublicKey, fingerprint, verifier)?;
+    peerstate.prefer_encrypt = EncryptPreference::Mutual;
+    peerstate.save_to_db(&context.sql).await.unwrap_or_default();
+    Ok(true)
 }
 
 /* ******************************************************************************

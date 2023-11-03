@@ -30,12 +30,13 @@ use crate::message::{
 };
 use crate::mimeparser::{parse_message_ids, AvatarAction, MimeMessage, SystemMessage};
 use crate::param::{Param, Params};
-use crate::peerstate::{Peerstate, PeerstateKeyType, PeerstateVerifiedStatus};
+use crate::peerstate::{Peerstate, PeerstateKeyType};
 use crate::reaction::{set_msg_reaction, Reaction};
 use crate::securejoin::{self, handle_securejoin_handshake, observe_securejoin_on_other_device};
 use crate::simplify;
 use crate::sql;
 use crate::stock_str;
+use crate::sync::Sync::*;
 use crate::tools::{
     buf_compress, extract_grpid_from_rfc724_mid, smeared_time, strip_rtlo_characters,
 };
@@ -514,24 +515,22 @@ async fn add_parts(
 
         // handshake may mark contacts as verified and must be processed before chats are created
         if mime_parser.get_header(HeaderDef::SecureJoin).is_some() {
-            match handle_securejoin_handshake(context, mime_parser, from_id).await {
-                Ok(securejoin::HandshakeMessage::Done) => {
+            match handle_securejoin_handshake(context, mime_parser, from_id)
+                .await
+                .context("error in Secure-Join message handling")?
+            {
+                securejoin::HandshakeMessage::Done => {
                     chat_id = Some(DC_CHAT_ID_TRASH);
                     needs_delete_job = true;
                     securejoin_seen = true;
                 }
-                Ok(securejoin::HandshakeMessage::Ignore) => {
+                securejoin::HandshakeMessage::Ignore => {
                     chat_id = Some(DC_CHAT_ID_TRASH);
                     securejoin_seen = true;
                 }
-                Ok(securejoin::HandshakeMessage::Propagate) => {
+                securejoin::HandshakeMessage::Propagate => {
                     // process messages as "member added" normally
                     securejoin_seen = false;
-                }
-                Err(err) => {
-                    warn!(context, "Error in Secure-Join message handling: {err:#}.");
-                    chat_id = Some(DC_CHAT_ID_TRASH);
-                    securejoin_seen = true;
                 }
             }
             // Peerstate could be updated by handling the Securejoin handshake.
@@ -637,7 +636,7 @@ async fn add_parts(
                         chat_id = None;
                     } else {
                         let s = stock_str::unknown_sender_for_chat(context).await;
-                        mime_parser.repl_msg_by_error(&s);
+                        mime_parser.replace_msg_by_error(&s);
                     }
                 } else {
                     // In non-protected chats, just mark the sender as overridden. Therefore, the UI will prepend `~`
@@ -808,18 +807,16 @@ async fn add_parts(
 
         // handshake may mark contacts as verified and must be processed before chats are created
         if mime_parser.get_header(HeaderDef::SecureJoin).is_some() {
-            match observe_securejoin_on_other_device(context, mime_parser, to_id).await {
-                Ok(securejoin::HandshakeMessage::Done)
-                | Ok(securejoin::HandshakeMessage::Ignore) => {
+            match observe_securejoin_on_other_device(context, mime_parser, to_id)
+                .await
+                .context("error in Secure-Join watching")?
+            {
+                securejoin::HandshakeMessage::Done | securejoin::HandshakeMessage::Ignore => {
                     chat_id = Some(DC_CHAT_ID_TRASH);
                 }
-                Ok(securejoin::HandshakeMessage::Propagate) => {
+                securejoin::HandshakeMessage::Propagate => {
                     // process messages as "member added" normally
                     chat_id = None;
-                }
-                Err(err) => {
-                    warn!(context, "Error in Secure-Join watching: {err:#}.");
-                    chat_id = Some(DC_CHAT_ID_TRASH);
                 }
             }
         } else if mime_parser.sync_items.is_some() && self_sent {
@@ -887,7 +884,7 @@ async fn add_parts(
             // automatically unblock chat when the user sends a message
             if chat_id_blocked != Blocked::Not {
                 if let Some(chat_id) = chat_id {
-                    chat_id.unblock(context).await?;
+                    chat_id.unblock_ex(context, Nosync).await?;
                     chat_id_blocked = Blocked::Not;
                 }
             }
@@ -919,7 +916,7 @@ async fn add_parts(
 
             if let Some(chat_id) = chat_id {
                 if Blocked::Not != chat_id_blocked {
-                    chat_id.unblock(context).await?;
+                    chat_id.unblock_ex(context, Nosync).await?;
                     // Not assigning `chat_id_blocked = Blocked::Not` to avoid unused_assignments warning.
                 }
             }
@@ -1055,7 +1052,7 @@ async fn add_parts(
             {
                 warn!(context, "Verification problem: {err:#}.");
                 let s = format!("{err}. See 'Info' for more details");
-                mime_parser.repl_msg_by_error(&s);
+                mime_parser.replace_msg_by_error(&s);
             }
         }
     }
@@ -1596,7 +1593,7 @@ async fn create_or_lookup_group(
         {
             warn!(context, "Verification problem: {err:#}.");
             let s = format!("{err}. See 'Info' for more details");
-            mime_parser.repl_msg_by_error(&s);
+            mime_parser.replace_msg_by_error(&s);
         }
         ProtectionStatus::Protected
     } else {
@@ -1657,6 +1654,7 @@ async fn create_or_lookup_group(
             members.push(from_id);
         }
         members.extend(to_ids);
+        members.sort_unstable();
         members.dedup();
         chat::add_to_chat_contacts_table(context, new_chat_id, &members).await?;
 
@@ -1758,7 +1756,7 @@ async fn apply_group_changes(
         {
             warn!(context, "Verification problem: {err:#}.");
             let s = format!("{err}. See 'Info' for more details");
-            mime_parser.repl_msg_by_error(&s);
+            mime_parser.replace_msg_by_error(&s);
         }
 
         if !chat.is_protected() {
@@ -2311,7 +2309,7 @@ async fn has_verified_encryption(
              LEFT JOIN acpeerstates ps ON c.addr=ps.addr  WHERE c.id IN({}) ",
                 sql::repeat_vars(to_ids.len())
             ),
-            rusqlite::params_from_iter(to_ids),
+            rusqlite::params_from_iter(&to_ids),
             |row| {
                 let to_addr: String = row.get(0)?;
                 let is_verified: i32 = row.get(1).unwrap_or(0);
@@ -2326,47 +2324,25 @@ async fn has_verified_encryption(
 
     let contact = Contact::get_by_id(context, from_id).await?;
 
-    for (to_addr, mut is_verified) in rows {
-        info!(
-            context,
-            "has_verified_encryption: {:?} self={:?}.",
-            to_addr,
-            context.is_self_addr(&to_addr).await
-        );
-        let peerstate = Peerstate::from_addr(context, &to_addr).await?;
-
+    for (to_addr, is_verified) in rows {
         // mark gossiped keys (if any) as verified
         if mimeparser.gossiped_addr.contains(&to_addr.to_lowercase()) {
-            if let Some(mut peerstate) = peerstate {
-                // if we're here, we know the gossip key is verified:
-                // - use the gossip-key as verified-key if there is no verified-key
-                // - OR if the verified-key does not match public-key or gossip-key
-                //   (otherwise a verified key can _only_ be updated through QR scan which might be annoying,
-                //   see <https://github.com/nextleap-project/countermitm/issues/46> for a discussion about this point)
-                if !is_verified
-                    || peerstate.verified_key_fingerprint != peerstate.public_key_fingerprint
-                        && peerstate.verified_key_fingerprint != peerstate.gossip_key_fingerprint
-                {
+            if let Some(mut peerstate) = Peerstate::from_addr(context, &to_addr).await? {
+                // If we're here, we know the gossip key is verified.
+                // Use the gossip-key as verified-key if there is no verified-key.
+                if !is_verified {
                     info!(context, "{} has verified {}.", contact.get_addr(), to_addr);
                     let fp = peerstate.gossip_key_fingerprint.clone();
                     if let Some(fp) = fp {
                         peerstate.set_verified(
                             PeerstateKeyType::GossipKey,
                             fp,
-                            PeerstateVerifiedStatus::BidirectVerified,
                             contact.get_addr().to_owned(),
                         )?;
                         peerstate.save_to_db(&context.sql).await?;
-                        is_verified = true;
                     }
                 }
             }
-        }
-        if !is_verified {
-            return Ok(NotVerified(format!(
-                "{} is not a member of this protected chat",
-                to_addr
-            )));
         }
     }
     Ok(Verified)

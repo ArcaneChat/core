@@ -32,6 +32,7 @@ use crate::mimeparser::AvatarAction;
 use crate::param::{Param, Params};
 use crate::peerstate::{Peerstate, PeerstateVerifiedStatus};
 use crate::sql::{self, params_iter};
+use crate::sync::{self, Sync::*, SyncData};
 use crate::tools::{
     duration_to_str, get_abs_path, improve_single_line_input, strip_rtlo_characters, time,
     EmailAddress,
@@ -459,12 +460,12 @@ impl Contact {
 
     /// Block the given contact.
     pub async fn block(context: &Context, id: ContactId) -> Result<()> {
-        set_block_contact(context, id, true).await
+        set_blocked(context, Sync, id, true).await
     }
 
     /// Unblock the given contact.
     pub async fn unblock(context: &Context, id: ContactId) -> Result<()> {
-        set_block_contact(context, id, false).await
+        set_blocked(context, Sync, id, false).await
     }
 
     /// Add a single contact as a result of an _explicit_ user action.
@@ -494,7 +495,7 @@ impl Contact {
             }
         }
         if blocked {
-            Contact::unblock(context, contact_id).await?;
+            set_blocked(context, Nosync, contact_id, false).await?;
         }
 
         Ok(contact_id)
@@ -523,10 +524,24 @@ impl Contact {
     ///
     /// To validate an e-mail address independently of the contact database
     /// use `may_be_valid_addr()`.
+    ///
+    /// Returns the contact ID of the contact belonging to the e-mail address or 0 if there is no
+    /// contact that is or was introduced by an accepted contact.
     pub async fn lookup_id_by_addr(
         context: &Context,
         addr: &str,
         min_origin: Origin,
+    ) -> Result<Option<ContactId>> {
+        Self::lookup_id_by_addr_ex(context, addr, min_origin, Some(Blocked::Not)).await
+    }
+
+    /// The same as `lookup_id_by_addr()`, but internal function. Currently also allows looking up
+    /// not unblocked contacts.
+    pub(crate) async fn lookup_id_by_addr_ex(
+        context: &Context,
+        addr: &str,
+        min_origin: Origin,
+        blocked: Option<Blocked>,
     ) -> Result<Option<ContactId>> {
         if addr.is_empty() {
             bail!("lookup_id_by_addr: empty address");
@@ -543,8 +558,14 @@ impl Contact {
             .query_get_value(
                 "SELECT id FROM contacts \
             WHERE addr=?1 COLLATE NOCASE \
-            AND id>?2 AND origin>=?3 AND blocked=0;",
-                (&addr_normalized, ContactId::LAST_SPECIAL, min_origin as u32),
+            AND id>?2 AND origin>=?3 AND (? OR blocked=?)",
+                (
+                    &addr_normalized,
+                    ContactId::LAST_SPECIAL,
+                    min_origin as u32,
+                    blocked.is_none(),
+                    blocked.unwrap_or_default(),
+                ),
             )
             .await?;
         Ok(id)
@@ -1363,8 +1384,9 @@ fn sanitize_name_and_addr(name: &str, addr: &str) -> (String, String) {
     }
 }
 
-async fn set_block_contact(
+pub(crate) async fn set_blocked(
     context: &Context,
+    sync: sync::Sync,
     contact_id: ContactId,
     new_blocking: bool,
 ) -> Result<()> {
@@ -1373,7 +1395,6 @@ async fn set_block_contact(
         "Can't block special contact {}",
         contact_id
     );
-
     let contact = Contact::get_by_id(context, contact_id).await?;
 
     if contact.blocked != new_blocking {
@@ -1415,8 +1436,21 @@ WHERE type=? AND id IN (
             if let Some((chat_id, _, _)) =
                 chat::get_chat_id_by_grpid(context, &contact.addr).await?
             {
-                chat_id.unblock(context).await?;
+                chat_id.unblock_ex(context, Nosync).await?;
             }
+        }
+
+        if sync.into() {
+            let action = match new_blocking {
+                true => sync::ChatAction::Block,
+                false => sync::ChatAction::Unblock,
+            };
+            context
+                .add_sync_item(SyncData::AlterChat {
+                    id: sync::ChatId::ContactAddr(contact.addr.clone()),
+                    action,
+                })
+                .await?;
         }
     }
 

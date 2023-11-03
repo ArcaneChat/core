@@ -1,5 +1,35 @@
 # Changelog
 
+## [1.128.0] - 2023-11-02
+
+### Build system
+- [**breaking**] Upgrade nodejs version to 18 ([#4903](https://github.com/deltachat/deltachat-core-rust/pull/4903)).
+
+### Features / Changes
+
+- deltachat-rpc-client: Add `Account.wait_for_incoming_msg_event()`.
+- Decrease ratelimit for .testrun.org subdomains.
+
+### Fixes
+
+- Do not fail securejoin due to unrelated pending bobstate  ([#4896](https://github.com/deltachat/deltachat-core-rust/pull/4896)).
+- Allow other verified group recipients to be unverified, only check the sender verification.
+- Remove not working attempt to recover from verified key changes.
+
+## [1.127.2] - 2023-10-29
+
+### API-Changes
+
+- [**breaking**] Jsonrpc `misc_set_draft` now requires setting the viewtype.
+- jsonrpc: Add `get_message_info_object`.
+
+### Tests
+
+- deltachat-rpc-client: Move pytest option from pyproject.toml to tox.ini and set log level.
+- deltachat-rpc-client: Test securejoin.
+- Increase pytest timeout to 10 minutes.
+- Compile deltachat-rpc-server in debug mode for tests.
+
 ## [1.127.1] - 2023-10-27
 
 ### API-Changes
@@ -1078,7 +1108,7 @@ Bugfix release attempting to fix the [iOS build error](https://github.com/deltac
 
 ### Changes
 - Look at Authentication-Results. Don't accept Autocrypt key changes
-  if they come with negative authentiation results while this contact
+  if they come with negative authentication results while this contact
   sent emails with positive authentication results in the past. #3583
 - jsonrpc in cffi also sends events now #3662
 - jsonrpc: new format for events and better typescript autocompletion
@@ -2664,7 +2694,7 @@ Bugfix release attempting to fix the [iOS build error](https://github.com/deltac
 
 - delete all consumed secure-join handshake messagess #1209 #1212
 
-- rust-level cleanups #1218 #1217 #1210 #1205
+- Rust-level cleanups #1218 #1217 #1210 #1205
 
 - python-level cleanups #1204 #1202 #1201
 
@@ -3034,3 +3064,5 @@ https://github.com/deltachat/deltachat-core-rust/pulls?q=is%3Apr+is%3Aclosed
 [1.126.1]: https://github.com/deltachat/deltachat-core-rust/compare/v1.126.0...v1.126.1
 [1.127.0]: https://github.com/deltachat/deltachat-core-rust/compare/v1.126.1...v1.127.0
 [1.127.1]: https://github.com/deltachat/deltachat-core-rust/compare/v1.127.0...v1.127.1
+[1.127.2]: https://github.com/deltachat/deltachat-core-rust/compare/v1.127.1...v1.127.2
+[1.128.0]: https://github.com/deltachat/deltachat-core-rust/compare/v1.127.2...v1.128.0

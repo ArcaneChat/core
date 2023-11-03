@@ -5,7 +5,7 @@ use lettre_email::mime::{self};
 use lettre_email::PartBuilder;
 use serde::{Deserialize, Serialize};
 
-use crate::chat::{Chat, ChatId};
+use crate::chat::{self, Chat, ChatVisibility};
 use crate::config::Config;
 use crate::constants::Blocked;
 use crate::contact::ContactId;
@@ -13,10 +13,26 @@ use crate::context::Context;
 use crate::message::{Message, MsgId, Viewtype};
 use crate::mimeparser::SystemMessage;
 use crate::param::Param;
-use crate::sync::SyncData::{AddQrToken, DeleteQrToken};
+use crate::sync::SyncData::{AddQrToken, AlterChat, DeleteQrToken};
 use crate::token::Namespace;
 use crate::tools::time;
-use crate::{chat, stock_str, token};
+use crate::{stock_str, token};
+
+/// Whether to send device sync messages. Aimed for usage in the internal API.
+#[derive(Debug)]
+pub(crate) enum Sync {
+    Nosync,
+    Sync,
+}
+
+impl From<Sync> for bool {
+    fn from(sync: Sync) -> bool {
+        match sync {
+            Sync::Nosync => false,
+            Sync::Sync => true,
+        }
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct QrTokenData {
@@ -25,10 +41,28 @@ pub(crate) struct QrTokenData {
     pub(crate) grpid: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub(crate) enum ChatId {
+    ContactAddr(String),
+    Grpid(String),
+    // NOTE: Ad-hoc groups lack an identifier that can be used across devices so
+    // block/mute/etc. actions on them are not synchronized to other devices.
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub(crate) enum ChatAction {
+    Block,
+    Unblock,
+    Accept,
+    SetVisibility(ChatVisibility),
+    SetMuted(chat::MuteDuration),
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) enum SyncData {
     AddQrToken(QrTokenData),
     DeleteQrToken(QrTokenData),
+    AlterChat { id: ChatId, action: ChatAction },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -67,7 +101,7 @@ impl Context {
     /// Adds most recent qr-code tokens for a given chat to the list of items to be synced.
     /// If device synchronization is disabled,
     /// no tokens exist or the chat is unpromoted, the function does nothing.
-    pub(crate) async fn sync_qr_code_tokens(&self, chat_id: Option<ChatId>) -> Result<()> {
+    pub(crate) async fn sync_qr_code_tokens(&self, chat_id: Option<chat::ChatId>) -> Result<()> {
         if !self.get_config_bool(Config::SyncMsgs).await? {
             return Ok(());
         }
@@ -118,7 +152,7 @@ impl Context {
     pub async fn send_sync_msg(&self) -> Result<Option<MsgId>> {
         if let Some((json, ids)) = self.build_sync_json().await? {
             let chat_id =
-                ChatId::create_for_contact_with_blocked(self, ContactId::SELF, Blocked::Yes)
+                chat::ChatId::create_for_contact_with_blocked(self, ContactId::SELF, Blocked::Yes)
                     .await?;
             let mut msg = Message {
                 chat_id,
@@ -204,7 +238,7 @@ impl Context {
         Ok(sync_items)
     }
 
-    /// Execute sync items.
+    /// Executes sync items sent by other device.
     ///
     /// CAVE: When changing the code to handle other sync items,
     /// take care that does not result in calls to `add_sync_item()`
@@ -243,6 +277,7 @@ impl Context {
                     token::delete(self, Namespace::InviteNumber, &token.invitenumber).await?;
                     token::delete(self, Namespace::Auth, &token.auth).await?;
                 }
+                AlterChat { id, action } => self.sync_alter_chat(id, action).await?,
             }
         }
         Ok(())
@@ -251,11 +286,15 @@ impl Context {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, SystemTime};
+
     use anyhow::bail;
+    use strum::IntoEnumIterator;
 
     use super::*;
     use crate::chat::Chat;
     use crate::chatlist::Chatlist;
+    use crate::contact::{Contact, Origin};
     use crate::test_utils::TestContext;
     use crate::token::Namespace;
 
@@ -276,6 +315,20 @@ mod tests {
         t.set_config_bool(Config::SyncMsgs, true).await?;
 
         assert!(t.build_sync_json().await?.is_none());
+
+        // Having one test on `SyncData::AlterChat` is sufficient here as `ChatAction::SetMuted`
+        // introduces enums inside items and `SystemTime`. Let's avoid in-depth testing of the
+        // serialiser here which is an external crate.
+        t.add_sync_item_with_timestamp(
+            SyncData::AlterChat {
+                id: ChatId::ContactAddr("bob@example.net".to_string()),
+                action: ChatAction::SetMuted(chat::MuteDuration::Until(
+                    SystemTime::UNIX_EPOCH + Duration::from_millis(42999),
+                )),
+            },
+            1631781315,
+        )
+        .await?;
 
         t.add_sync_item_with_timestamp(
             SyncData::AddQrToken(QrTokenData {
@@ -300,6 +353,7 @@ mod tests {
         assert_eq!(
             serialized,
             r#"{"items":[
+{"timestamp":1631781315,"data":{"AlterChat":{"id":{"ContactAddr":"bob@example.net"},"action":{"SetMuted":{"Until":{"secs_since_epoch":42,"nanos_since_epoch":999000000}}}}}},
 {"timestamp":1631781316,"data":{"AddQrToken":{"invitenumber":"testinvite","auth":"testauth","grpid":"group123"}}},
 {"timestamp":1631781317,"data":{"DeleteQrToken":{"invitenumber":"123!?\":.;{}","auth":"456","grpid":null}}}
 ]}"#
@@ -310,7 +364,7 @@ mod tests {
         assert!(t.build_sync_json().await?.is_none());
 
         let sync_items = t.parse_sync_items(serialized)?;
-        assert_eq!(sync_items.items.len(), 2);
+        assert_eq!(sync_items.items.len(), 3);
 
         Ok(())
     }
@@ -368,6 +422,27 @@ mod tests {
             )
             .is_err()); // missing field
 
+        assert!(t.parse_sync_items(
+                r#"{"items":[{"timestamp":1631781318,"data":{"AlterChat":{"id":{"ContactAddr":"bob@example.net"},"action":"Burn"}}}]}"#.to_string(),
+            )
+            .is_err()); // Unknown enum value
+
+        // Test enums inside items and SystemTime
+        let sync_items = t.parse_sync_items(
+            r#"{"items":[{"timestamp":1631781318,"data":{"AlterChat":{"id":{"ContactAddr":"bob@example.net"},"action":{"SetMuted":{"Until":{"secs_since_epoch":42,"nanos_since_epoch":999000000}}}}}}]}"#.to_string(),
+        )?;
+        assert_eq!(sync_items.items.len(), 1);
+        let AlterChat { id, action } = &sync_items.items.get(0).unwrap().data else {
+            bail!("bad item");
+        };
+        assert_eq!(*id, ChatId::ContactAddr("bob@example.net".to_string()));
+        assert_eq!(
+            *action,
+            ChatAction::SetMuted(chat::MuteDuration::Until(
+                SystemTime::UNIX_EPOCH + Duration::from_millis(42999)
+            ))
+        );
+
         // empty item list is okay
         assert_eq!(
             t.parse_sync_items(r#"{"items":[]}"#.to_string())?
@@ -423,6 +498,7 @@ mod tests {
         let sync_items = t
             .parse_sync_items(
                 r#"{"items":[
+{"timestamp":1631781315,"data":{"AlterChat":{"id":{"ContactAddr":"bob@example.net"},"action":"Block"}}},
 {"timestamp":1631781316,"data":{"AddQrToken":{"invitenumber":"yip-in","auth":"a"}}},
 {"timestamp":1631781316,"data":{"DeleteQrToken":{"invitenumber":"in","auth":"delete unexistent, shall continue"}}},
 {"timestamp":1631781316,"data":{"AddQrToken":{"invitenumber":"in","auth":"yip-auth"}}},
@@ -435,6 +511,11 @@ mod tests {
             ?;
         t.execute_sync_items(&sync_items).await?;
 
+        assert!(
+            Contact::lookup_id_by_addr(&t, "bob@example.net", Origin::Unknown)
+                .await?
+                .is_none()
+        );
         assert!(token::exists(&t, Namespace::InviteNumber, "yip-in").await);
         assert!(token::exists(&t, Namespace::Auth, "yip-auth").await);
         assert!(!token::exists(&t, Namespace::Auth, "non-existent").await);
@@ -462,7 +543,7 @@ mod tests {
         // check that the used self-talk is not visible to the user
         // but that creation will still work (in this case, the chat is empty)
         assert_eq!(Chatlist::try_load(&alice, 0, None, None).await?.len(), 0);
-        let chat_id = ChatId::create_for_contact(&alice, ContactId::SELF).await?;
+        let chat_id = chat::ChatId::create_for_contact(&alice, ContactId::SELF).await?;
         let chat = Chat::load_from_db(&alice, chat_id).await?;
         assert!(chat.is_self_talk());
         assert_eq!(Chatlist::try_load(&alice, 0, None, None).await?.len(), 1);
@@ -482,6 +563,93 @@ mod tests {
         let bob = TestContext::new_bob().await;
         bob.recv_msg(&sent_msg).await;
         assert!(!token::exists(&bob, token::Namespace::Auth, "testtoken").await);
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_alter_chat() -> Result<()> {
+        let alices = [
+            TestContext::new_alice().await,
+            TestContext::new_alice().await,
+        ];
+        for a in &alices {
+            a.set_config_bool(Config::SyncMsgs, true).await?;
+        }
+        let bob = TestContext::new_bob().await;
+
+        let ba_chat = bob.create_chat(&alices[0]).await;
+        let sent_msg = bob.send_text(ba_chat.id, "hi").await;
+        let a0b_chat_id = alices[0].recv_msg(&sent_msg).await.chat_id;
+        alices[1].recv_msg(&sent_msg).await;
+
+        async fn sync(alices: &[TestContext]) -> Result<()> {
+            alices.get(0).unwrap().send_sync_msg().await?.unwrap();
+            let sent_msg = alices.get(0).unwrap().pop_sent_msg().await;
+            alices.get(1).unwrap().recv_msg(&sent_msg).await;
+            Ok(())
+        }
+
+        assert_eq!(alices[1].get_chat(&bob).await.blocked, Blocked::Request);
+        a0b_chat_id.accept(&alices[0]).await?;
+        sync(&alices).await?;
+        assert_eq!(alices[1].get_chat(&bob).await.blocked, Blocked::Not);
+        a0b_chat_id.block(&alices[0]).await?;
+        sync(&alices).await?;
+        assert_eq!(alices[1].get_chat(&bob).await.blocked, Blocked::Yes);
+        a0b_chat_id.unblock(&alices[0]).await?;
+        sync(&alices).await?;
+        assert_eq!(alices[1].get_chat(&bob).await.blocked, Blocked::Not);
+
+        // Unblocking a 1:1 chat doesn't unblock the contact currently.
+        let a0b_contact_id = alices[0].add_or_lookup_contact(&bob).await.id;
+        Contact::unblock(&alices[0], a0b_contact_id).await?;
+
+        assert!(!alices[1].add_or_lookup_contact(&bob).await.is_blocked());
+        Contact::block(&alices[0], a0b_contact_id).await?;
+        sync(&alices).await?;
+        assert!(alices[1].add_or_lookup_contact(&bob).await.is_blocked());
+        Contact::unblock(&alices[0], a0b_contact_id).await?;
+        sync(&alices).await?;
+        assert!(!alices[1].add_or_lookup_contact(&bob).await.is_blocked());
+
+        assert_eq!(
+            alices[1].get_chat(&bob).await.get_visibility(),
+            ChatVisibility::Normal
+        );
+        let mut visibilities =
+            ChatVisibility::iter().chain(std::iter::once(ChatVisibility::Normal));
+        visibilities.next();
+        for v in visibilities {
+            a0b_chat_id.set_visibility(&alices[0], v).await?;
+            sync(&alices).await?;
+            assert_eq!(alices[1].get_chat(&bob).await.get_visibility(), v);
+        }
+
+        use chat::MuteDuration;
+        assert_eq!(
+            alices[1].get_chat(&bob).await.mute_duration,
+            MuteDuration::NotMuted
+        );
+        let mute_durations = [
+            MuteDuration::Forever,
+            MuteDuration::Until(SystemTime::now() + Duration::from_secs(42)),
+            MuteDuration::NotMuted,
+        ];
+        for m in mute_durations {
+            chat::set_muted(&alices[0], a0b_chat_id, m).await?;
+            sync(&alices).await?;
+            let m = match m {
+                MuteDuration::Until(time) => MuteDuration::Until(
+                    SystemTime::UNIX_EPOCH
+                        + Duration::from_secs(
+                            time.duration_since(SystemTime::UNIX_EPOCH)?.as_secs(),
+                        ),
+                ),
+                _ => m,
+            };
+            assert_eq!(alices[1].get_chat(&bob).await.mute_duration, m);
+        }
 
         Ok(())
     }
