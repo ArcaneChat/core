@@ -8,7 +8,7 @@ use futures_lite::FutureExt;
 use super::session::Session;
 use super::Imap;
 use crate::config::Config;
-use crate::imap::{client::IMAP_TIMEOUT, FolderMeaning};
+use crate::imap::{client::IMAP_TIMEOUT, get_uid_next, FolderMeaning};
 use crate::log::LogExt;
 use crate::{context::Context, scheduler::InterruptInfo};
 
@@ -19,7 +19,7 @@ impl Session {
         mut self,
         context: &Context,
         idle_interrupt_receiver: Receiver<InterruptInfo>,
-        watch_folder: Option<String>,
+        folder: &str,
     ) -> Result<(Self, InterruptInfo)> {
         use futures::future::FutureExt;
 
@@ -33,10 +33,33 @@ impl Session {
 
         let mut info = Default::default();
 
-        self.select_folder(context, watch_folder.as_deref()).await?;
+        self.select_folder(context, Some(folder)).await?;
 
         if self.server_sent_unsolicited_exists(context)? {
             return Ok((self, info));
+        }
+
+        // Despite checking for unsolicited EXISTS above,
+        // we may have missed EXISTS if the message was
+        // received when the folder was not selected.
+        let status = self
+            .status(folder, "(UIDNEXT)")
+            .await
+            .context("STATUS (UIDNEXT) error for {folder:?}")?;
+        if let Some(uid_next) = status.uid_next {
+            let expected_uid_next = get_uid_next(context, folder)
+                .await
+                .with_context(|| format!("failed to get old UID NEXT for folder {folder}"))?;
+            if uid_next > expected_uid_next {
+                info!(
+                    context,
+                    "Skipping IDLE because UIDNEXT indicates there are new messages."
+                );
+                return Ok((self, info));
+            }
+        } else {
+            warn!(context, "STATUS {folder} (UIDNEXT) did not return UIDNEXT");
+            // Go to IDLE anyway if STATUS is broken.
         }
 
         if let Ok(info) = idle_interrupt_receiver.try_recv() {
@@ -61,11 +84,7 @@ impl Session {
             Interrupt(InterruptInfo),
         }
 
-        let folder_name = watch_folder.as_deref().unwrap_or("None");
-        info!(
-            context,
-            "{}: Idle entering wait-on-remote state", folder_name
-        );
+        info!(context, "{folder}: Idle entering wait-on-remote state");
         let fut = idle_wait.map(|ev| ev.map(Event::IdleResponse)).race(async {
             let info = idle_interrupt_receiver.recv().await;
 
@@ -77,36 +96,27 @@ impl Session {
 
         match fut.await {
             Ok(Event::IdleResponse(IdleResponse::NewData(x))) => {
-                info!(context, "{}: Idle has NewData {:?}", folder_name, x);
+                info!(context, "{folder}: Idle has NewData {:?}", x);
             }
             Ok(Event::IdleResponse(IdleResponse::Timeout)) => {
-                info!(
-                    context,
-                    "{}: Idle-wait timeout or interruption", folder_name
-                );
+                info!(context, "{folder}: Idle-wait timeout or interruption");
             }
             Ok(Event::IdleResponse(IdleResponse::ManualInterrupt)) => {
-                info!(
-                    context,
-                    "{}: Idle wait was interrupted manually", folder_name
-                );
+                info!(context, "{folder}: Idle wait was interrupted manually");
             }
             Ok(Event::Interrupt(i)) => {
-                info!(
-                    context,
-                    "{}: Idle wait was interrupted: {:?}", folder_name, &i
-                );
+                info!(context, "{folder}: Idle wait was interrupted: {:?}", &i);
                 info = i;
             }
             Err(err) => {
-                warn!(context, "{}: Idle wait errored: {:?}", folder_name, err);
+                warn!(context, "{folder}: Idle wait errored: {err:?}");
             }
         }
 
         let mut session = tokio::time::timeout(Duration::from_secs(15), handle.done())
             .await
-            .with_context(|| format!("{folder_name}: IMAP IDLE protocol timed out"))?
-            .with_context(|| format!("{folder_name}: IMAP IDLE failed"))?;
+            .with_context(|| format!("{folder}: IMAP IDLE protocol timed out"))?
+            .with_context(|| format!("{folder}: IMAP IDLE failed"))?;
         session.as_mut().set_read_timeout(Some(IMAP_TIMEOUT));
         self.inner = session;
 

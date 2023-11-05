@@ -2941,7 +2941,6 @@ int dc_receive_backup (dc_context_t* context, const char* qr);
  * use dc_accounts_remove_account().
  *
  * @memberof dc_accounts_t
- * @param os_name
  * @param dir The directory to create the context-databases in.
  *     If the directory does not exist,
  *     dc_accounts_new() will try to create it.
@@ -3732,8 +3731,25 @@ int             dc_chat_can_send              (const dc_chat_t* chat);
 
 /**
  * Check if a chat is protected.
- * Protected chats contain only verified members and encryption is always enabled.
- * Protected chats are created using dc_create_group_chat() by setting the 'protect' parameter to 1.
+ *
+ * End-to-end encryption is guaranteed in protected chats
+ * and only verified contacts
+ * as determined by dc_contact_is_verified()
+ * can be added to protected chats.
+ *
+ * Protected chats are created using dc_create_group_chat()
+ * by setting the 'protect' parameter to 1.
+ * 1:1 chats become protected or unprotected automatically
+ * if `verified_one_on_one_chats` setting is enabled.
+ *
+ * UI should display a green checkmark
+ * in the chat title,
+ * in the chat profile title and
+ * in the chatlist item
+ * if chat protection is enabled.
+ * UI should also display a green checkmark
+ * in the contact profile
+ * if 1:1 chat with this contact exists and is protected.
  *
  * @memberof dc_chat_t
  * @param chat The chat object.
@@ -5040,11 +5056,14 @@ int             dc_contact_is_blocked        (const dc_contact_t* contact);
  *
  * If contact is verified
  * UI should display green checkmark after the contact name
- * in the title of the contact profile,
- * in contact list items and in chat member list items.
+ * in contact list items and
+ * in chat member list items.
  *
- * Do not use this function when displaying profile view contents.
- * Use dc_contact_get_verifier_id instead.
+ * Do not use this function when displaying the contact profile view.
+ * Display green checkmark in the title of the contact profile
+ * if 1:1 chat with the contact exists and is protected.
+ * Use dc_contact_get_verified_id to display the verifier contact
+ * in the info section of the contact profile.
  *
  * @memberof dc_contact_t
  * @param contact The contact object.
@@ -7255,6 +7274,11 @@ void dc_event_unref(dc_event_t* event);
 ///
 /// Used in info messages.
 #define DC_STR_CHAT_PROTECTION_DISABLED 171
+
+/// "Others will only see this group after you sent a first message."
+///
+/// Used as the first info messages in newly created groups.
+#define DC_STR_NEW_GROUP_SEND_FIRST_MESSAGE 172
 
 /**
  * @}

@@ -78,6 +78,9 @@ pub(crate) struct SyncItems {
 
 impl Context {
     /// Adds an item to the list of items that should be synchronized to other devices.
+    ///
+    /// NB: Private and `pub(crate)` functions shouldn't call this unless `Sync::Sync` is explicitly
+    /// passed to them. This way it's always clear whether the code performs synchronisation.
     pub(crate) async fn add_sync_item(&self, data: SyncData) -> Result<()> {
         self.add_sync_item_with_timestamp(data, time()).await
     }
@@ -584,9 +587,8 @@ mod tests {
         alices[1].recv_msg(&sent_msg).await;
 
         async fn sync(alices: &[TestContext]) -> Result<()> {
-            alices.get(0).unwrap().send_sync_msg().await?.unwrap();
-            let sent_msg = alices.get(0).unwrap().pop_sent_msg().await;
-            alices.get(1).unwrap().recv_msg(&sent_msg).await;
+            let sync_msg = alices.get(0).unwrap().pop_sent_msg().await;
+            alices.get(1).unwrap().recv_msg(&sync_msg).await;
             Ok(())
         }
 
@@ -613,17 +615,23 @@ mod tests {
         sync(&alices).await?;
         assert!(!alices[1].add_or_lookup_contact(&bob).await.is_blocked());
 
+        // Test syncing of chat visibility on a self-chat. This way we test:
+        // - Self-chat synchronisation.
+        // - That sync messages don't unarchive the self-chat.
+        let a0self_chat_id = alices[0].get_self_chat().await.id;
         assert_eq!(
-            alices[1].get_chat(&bob).await.get_visibility(),
+            alices[1].get_self_chat().await.get_visibility(),
             ChatVisibility::Normal
         );
         let mut visibilities =
             ChatVisibility::iter().chain(std::iter::once(ChatVisibility::Normal));
         visibilities.next();
         for v in visibilities {
-            a0b_chat_id.set_visibility(&alices[0], v).await?;
+            a0self_chat_id.set_visibility(&alices[0], v).await?;
             sync(&alices).await?;
-            assert_eq!(alices[1].get_chat(&bob).await.get_visibility(), v);
+            for a in &alices {
+                assert_eq!(a.get_self_chat().await.get_visibility(), v);
+            }
         }
 
         use chat::MuteDuration;

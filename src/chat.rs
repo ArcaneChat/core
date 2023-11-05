@@ -252,7 +252,7 @@ impl ChatId {
         let chat_id = match ChatIdBlocked::lookup_by_contact(context, contact_id).await? {
             Some(chat) => {
                 if create_blocked == Blocked::Not && chat.blocked != Blocked::Not {
-                    chat.id.unblock_ex(context, Nosync).await?;
+                    chat.id.set_blocked(context, Blocked::Not).await?;
                 }
                 chat.id
             }
@@ -1604,6 +1604,15 @@ impl Chat {
     }
 
     /// Returns true if chat protection is enabled.
+    ///
+    /// UI should display a green checkmark
+    /// in the chat title,
+    /// in the chat profile title and
+    /// in the chatlist item
+    /// if chat protection is enabled.
+    /// UI should also display a green checkmark
+    /// in the contact profile
+    /// if 1:1 chat with this contact exists and is protected.
     pub fn is_protected(&self) -> bool {
         self.protected == ProtectionStatus::Protected
     }
@@ -1897,7 +1906,7 @@ impl Chat {
             Chattype::Single => {
                 let mut r = None;
                 for contact_id in get_chat_contacts(context, self.id).await? {
-                    if contact_id == ContactId::SELF {
+                    if contact_id == ContactId::SELF && !self.is_self_talk() {
                         continue;
                     }
                     if r.is_some() {
@@ -1923,6 +1932,7 @@ impl Chat {
             context
                 .add_sync_item(SyncData::AlterChat { id, action })
                 .await?;
+            context.send_sync_msg().await?;
         }
         Ok(())
     }
@@ -3153,6 +3163,13 @@ pub async fn create_group_chat(
         chat_id
             .set_protection(context, protect, timestamp, None)
             .await?;
+    }
+
+    if !context.get_config_bool(Config::Bot).await?
+        && !context.get_config_bool(Config::SkipStartMessages).await?
+    {
+        let text = stock_str::new_group_send_first_message(context).await;
+        add_info_msg(context, chat_id, &text, create_smeared_timestamp(context)).await?;
     }
 
     Ok(chat_id)
