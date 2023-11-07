@@ -26,7 +26,8 @@ use crate::imap::{markseen_on_imap_table, GENERATED_PREFIX};
 use crate::location;
 use crate::log::LogExt;
 use crate::message::{
-    self, rfc724_mid_exists, Message, MessageState, MessengerMessage, MsgId, Viewtype,
+    self, rfc724_mid_exists, rfc724_mid_exists_and, Message, MessageState, MessengerMessage, MsgId,
+    Viewtype,
 };
 use crate::mimeparser::{parse_message_ids, AvatarAction, MimeMessage, SystemMessage};
 use crate::param::{Param, Params};
@@ -503,7 +504,6 @@ async fn add_parts(
     // - incoming messages introduce a chat only for known contacts if they are sent by a messenger
     // (of course, the user can add other chats manually later)
     let to_id: ContactId;
-
     let state: MessageState;
     let mut needs_delete_job = false;
     if incoming {
@@ -656,6 +656,7 @@ async fn add_parts(
                 group_chat_id,
                 from_id,
                 to_ids,
+                is_partial_download.is_some(),
             )
             .await?);
         }
@@ -898,6 +899,7 @@ async fn add_parts(
                 chat_id,
                 from_id,
                 to_ids,
+                is_partial_download.is_some(),
             )
             .await?);
         }
@@ -1693,6 +1695,7 @@ async fn create_or_lookup_group(
 /// Apply group member list, name, avatar and protection status changes from the MIME message.
 ///
 /// Optionally returns better message to replace the original system message.
+/// is_partial_download: whether the message is not fully downloaded.
 async fn apply_group_changes(
     context: &Context,
     mime_parser: &mut MimeMessage,
@@ -1700,6 +1703,7 @@ async fn apply_group_changes(
     chat_id: ChatId,
     from_id: ContactId,
     to_ids: &[ContactId],
+    is_partial_download: bool,
 ) -> Result<Option<String>> {
     let mut chat = Chat::load_from_db(context, chat_id).await?;
     if chat.typ != Chattype::Group {
@@ -1718,12 +1722,14 @@ async fn apply_group_changes(
             false
         };
 
-    let mut chat_contacts = HashSet::from_iter(chat::get_chat_contacts(context, chat_id).await?);
+    let mut chat_contacts =
+        HashSet::<ContactId>::from_iter(chat::get_chat_contacts(context, chat_id).await?);
     let is_from_in_chat =
         !chat_contacts.contains(&ContactId::SELF) || chat_contacts.contains(&from_id);
 
     // Reject group membership changes from non-members and old changes.
-    let allow_member_list_changes = is_from_in_chat
+    let allow_member_list_changes = !is_partial_download
+        && is_from_in_chat
         && chat_id
             .update_timestamp(context, Param::MemberListTimestamp, sent_timestamp)
             .await?;
@@ -1737,7 +1743,9 @@ async fn apply_group_changes(
             || match mime_parser.get_header(HeaderDef::InReplyTo) {
                 // If we don't know the referenced message, we missed some messages.
                 // Maybe they added/removed members, so we need to recreate our member list.
-                Some(reply_to) => rfc724_mid_exists(context, reply_to).await?.is_none(),
+                Some(reply_to) => rfc724_mid_exists_and(context, reply_to, "download_state=0")
+                    .await?
+                    .is_none(),
                 None => false,
             }
     } && {
@@ -1854,32 +1862,30 @@ async fn apply_group_changes(
         }
 
         if !recreate_member_list {
-            let diff: HashSet<ContactId> =
-                chat_contacts.difference(&new_members).copied().collect();
-            // Only delete old contacts if the sender is not a classical MUA user:
-            // Classical MUA users usually don't intend to remove users from an email
-            // thread, so if they removed a recipient then it was probably by accident.
-            if mime_parser.has_chat_version() {
-                // This is what provides group membership consistency: we remove group members
-                // locally if we see a discrepancy with the "To" list in the received message as it
-                // is better for privacy than adding absent members locally. But it shouldn't be a
-                // big problem if somebody missed a member addition, because they will likely
-                // recreate the member list from the next received message. The problem occurs only
-                // if that "somebody" managed to reply earlier. Really, it's a problem for big
-                // groups with high message rate, but let it be for now.
-                if !diff.is_empty() {
-                    warn!(context, "Implicit removal of {diff:?} from chat {chat_id}.");
-                }
-                new_members = chat_contacts.difference(&diff).copied().collect();
-            } else {
-                new_members.extend(diff);
+            // Don't delete any members locally, but instead add absent ones to provide group
+            // membership consistency for all members:
+            // - Classical MUA users usually don't intend to remove users from an email thread, so
+            //   if they removed a recipient then it was probably by accident.
+            // - DC users could miss new member additions and then better to handle this in the same
+            //   way as for classical MUA messages. Moreover, if we remove a member implicitly, they
+            //   will never know that and continue to think they're still here.
+            // But it shouldn't be a big problem if somebody missed a member removal, because they
+            // will likely recreate the member list from the next received message. The problem
+            // occurs only if that "somebody" managed to reply earlier. Really, it's a problem for
+            // big groups with high message rate, but let it be for now.
+            let mut diff: HashSet<ContactId> =
+                new_members.difference(&chat_contacts).copied().collect();
+            new_members = chat_contacts.clone();
+            new_members.extend(diff.clone());
+            if let Some(added_id) = added_id {
+                diff.remove(&added_id);
+            }
+            if !diff.is_empty() {
+                warn!(context, "Implicit addition of {diff:?} to chat {chat_id}.");
             }
         }
         if let Some(removed_id) = removed_id {
             new_members.remove(&removed_id);
-        }
-        if let Some(added_id) = added_id {
-            new_members.insert(added_id);
         }
         if recreate_member_list {
             info!(
