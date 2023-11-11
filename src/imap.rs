@@ -35,7 +35,6 @@ use crate::receive_imf::{
     from_field_to_contact_id, get_prefetch_parent_message, receive_imf_inner, ReceivedMsg,
 };
 use crate::scheduler::connectivity::ConnectivityStore;
-use crate::scheduler::InterruptInfo;
 use crate::socks::Socks5Config;
 use crate::sql;
 use crate::stock_str;
@@ -86,7 +85,7 @@ const BODY_PARTIAL: &str = "(FLAGS RFC822.SIZE BODY.PEEK[HEADER])";
 
 #[derive(Debug)]
 pub struct Imap {
-    pub(crate) idle_interrupt_receiver: Receiver<InterruptInfo>,
+    pub(crate) idle_interrupt_receiver: Receiver<()>,
     config: ImapConfig,
     pub(crate) session: Option<Session>,
     login_failed_once: bool,
@@ -195,7 +194,7 @@ impl<T: Iterator<Item = (i64, u32, String)>> Iterator for UidGrouper<T> {
 
                 while let Some((next_rowid, next_uid, _)) =
                     self.inner.next_if(|(_, next_uid, next_folder)| {
-                        next_folder == &folder && *next_uid == end_uid + 1
+                        next_folder == &folder && (*next_uid == end_uid + 1 || *next_uid == end_uid)
                     })
                 {
                     end_uid = next_uid;
@@ -228,7 +227,7 @@ impl Imap {
         socks5_config: Option<Socks5Config>,
         addr: &str,
         provider_strict_tls: bool,
-        idle_interrupt_receiver: Receiver<InterruptInfo>,
+        idle_interrupt_receiver: Receiver<()>,
     ) -> Result<Self> {
         if lp.server.is_empty() || lp.user.is_empty() || lp.password.is_empty() {
             bail!("Incomplete IMAP connection parameters");
@@ -261,7 +260,7 @@ impl Imap {
     /// Creates new disconnected IMAP client using configured parameters.
     pub async fn new_configured(
         context: &Context,
-        idle_interrupt_receiver: Receiver<InterruptInfo>,
+        idle_interrupt_receiver: Receiver<()>,
     ) -> Result<Self> {
         if !context.is_configured().await? {
             bail!("IMAP Connect without configured params");
@@ -2290,10 +2289,7 @@ pub(crate) async fn markseen_on_imap_table(context: &Context, message_id: &str) 
             (message_id,),
         )
         .await?;
-    context
-        .scheduler
-        .interrupt_inbox(InterruptInfo::new(false))
-        .await;
+    context.scheduler.interrupt_inbox().await;
 
     Ok(())
 }
@@ -2840,5 +2836,32 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn test_uid_grouper() {
+        // Input: sequence of (rowid: i64, uid: u32, target: String)
+        // Output: sequence of (target: String, rowid_set: Vec<i64>, uid_set: String)
+        let grouper = UidGrouper::from([(1, 2, "INBOX".to_string())]);
+        let res: Vec<(String, Vec<i64>, String)> = grouper.into_iter().collect();
+        assert_eq!(res, vec![("INBOX".to_string(), vec![1], "2".to_string())]);
+
+        let grouper = UidGrouper::from([(1, 2, "INBOX".to_string()), (2, 3, "INBOX".to_string())]);
+        let res: Vec<(String, Vec<i64>, String)> = grouper.into_iter().collect();
+        assert_eq!(
+            res,
+            vec![("INBOX".to_string(), vec![1, 2], "2:3".to_string())]
+        );
+
+        let grouper = UidGrouper::from([
+            (1, 2, "INBOX".to_string()),
+            (2, 2, "INBOX".to_string()),
+            (3, 3, "INBOX".to_string()),
+        ]);
+        let res: Vec<(String, Vec<i64>, String)> = grouper.into_iter().collect();
+        assert_eq!(
+            res,
+            vec![("INBOX".to_string(), vec![1, 2, 3], "2:3".to_string())]
+        );
     }
 }

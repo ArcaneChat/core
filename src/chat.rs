@@ -35,7 +35,6 @@ use crate::mimeparser::SystemMessage;
 use crate::param::{Param, Params};
 use crate::peerstate::{Peerstate, PeerstateVerifiedStatus};
 use crate::receive_imf::ReceivedMsg;
-use crate::scheduler::InterruptInfo;
 use crate::smtp::send_msg_to_smtp;
 use crate::sql;
 use crate::stock_str;
@@ -216,9 +215,16 @@ impl ChatId {
         context: &Context,
         contact_id: ContactId,
     ) -> Result<Option<Self>> {
-        ChatIdBlocked::lookup_by_contact(context, contact_id)
-            .await
-            .map(|lookup| lookup.map(|chat| chat.id))
+        let Some(chat_id_blocked) = ChatIdBlocked::lookup_by_contact(context, contact_id).await?
+        else {
+            return Ok(None);
+        };
+
+        let chat_id = match chat_id_blocked.blocked {
+            Blocked::Not | Blocked::Request => Some(chat_id_blocked.id),
+            Blocked::Yes => None,
+        };
+        Ok(chat_id)
     }
 
     /// Returns the [`ChatId`] for the 1:1 chat with `contact_id`.
@@ -722,10 +728,7 @@ impl ChatId {
         context.emit_msgs_changed_without_ids();
 
         context.set_config(Config::LastHousekeeping, None).await?;
-        context
-            .scheduler
-            .interrupt_inbox(InterruptInfo::new(false))
-            .await;
+        context.scheduler.interrupt_inbox().await;
 
         if chat.is_self_talk() {
             let mut msg = Message::new(Viewtype::Text);
@@ -2523,10 +2526,7 @@ async fn send_msg_inner(context: &Context, chat_id: ChatId, msg: &mut Message) -
             context.emit_event(EventType::LocationChanged(Some(ContactId::SELF)));
         }
 
-        context
-            .scheduler
-            .interrupt_smtp(InterruptInfo::new(false))
-            .await;
+        context.scheduler.interrupt_smtp().await;
     }
 
     Ok(msg.id)
@@ -3788,10 +3788,7 @@ pub async fn forward_msgs(context: &Context, msg_ids: &[MsgId], chat_id: ChatId)
                 .await?;
             curr_timestamp += 1;
             if create_send_msg_job(context, &mut msg).await?.is_some() {
-                context
-                    .scheduler
-                    .interrupt_smtp(InterruptInfo::new(false))
-                    .await;
+                context.scheduler.interrupt_smtp().await;
             }
         }
         created_chats.push(chat_id);
@@ -3848,10 +3845,7 @@ pub async fn resend_msgs(context: &Context, msg_ids: &[MsgId]) -> Result<()> {
             msg_id: msg.id,
         });
         if create_send_msg_job(context, &mut msg).await?.is_some() {
-            context
-                .scheduler
-                .interrupt_smtp(InterruptInfo::new(false))
-                .await;
+            context.scheduler.interrupt_smtp().await;
         }
     }
     Ok(())

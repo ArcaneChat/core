@@ -22,8 +22,8 @@ use tokio::sync::RwLock;
 use tokio::{fs, task};
 
 use crate::chat::{
-    self, add_to_chat_contacts_table, create_group_chat, Chat, ChatId, MessageListOptions,
-    ProtectionStatus,
+    self, add_to_chat_contacts_table, create_group_chat, Chat, ChatId, ChatIdBlocked,
+    MessageListOptions, ProtectionStatus,
 };
 use crate::chatlist::Chatlist;
 use crate::config::Config;
@@ -592,14 +592,17 @@ impl TestContext {
     }
 
     /// Returns 1:1 [`Chat`] with another account. Panics if it doesn't exist.
+    /// May return a blocked chat.
     ///
     /// This first creates a contact using the configured details on the other account, then
     /// gets the 1:1 chat with this contact.
     pub async fn get_chat(&self, other: &TestContext) -> Chat {
         let contact = self.add_or_lookup_contact(other).await;
-        let chat_id = ChatId::lookup_by_contact(&self.ctx, contact.id)
+
+        let chat_id = ChatIdBlocked::lookup_by_contact(&self.ctx, contact.id)
             .await
             .unwrap()
+            .map(|chat_id_blocked| chat_id_blocked.id)
             .expect(
                 "There is no chat with this contact. \
                 Hint: Use create_chat() instead of get_chat() if this is expected.",
@@ -711,7 +714,9 @@ impl TestContext {
             })
             .collect();
 
-        let sel_chat = Chat::load_from_db(self, chat_id).await.unwrap();
+        let Ok(sel_chat) = Chat::load_from_db(self, chat_id).await else {
+            return String::from("Can't load chat\n");
+        };
         let members = chat::get_chat_contacts(self, sel_chat.id).await.unwrap();
         let subtitle = if sel_chat.is_device_talk() {
             "device-talk".to_string()
