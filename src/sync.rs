@@ -5,11 +5,12 @@ use lettre_email::mime::{self};
 use lettre_email::PartBuilder;
 use serde::{Deserialize, Serialize};
 
-use crate::chat::{self, Chat, ChatVisibility};
+use crate::chat::{self, Chat, ChatId};
 use crate::config::Config;
 use crate::constants::Blocked;
 use crate::contact::ContactId;
 use crate::context::Context;
+use crate::log::LogExt;
 use crate::message::{Message, MsgId, Viewtype};
 use crate::mimeparser::SystemMessage;
 use crate::param::Param;
@@ -41,28 +42,14 @@ pub(crate) struct QrTokenData {
     pub(crate) grpid: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
-pub(crate) enum ChatId {
-    ContactAddr(String),
-    Grpid(String),
-    // NOTE: Ad-hoc groups lack an identifier that can be used across devices so
-    // block/mute/etc. actions on them are not synchronized to other devices.
-}
-
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
-pub(crate) enum ChatAction {
-    Block,
-    Unblock,
-    Accept,
-    SetVisibility(ChatVisibility),
-    SetMuted(chat::MuteDuration),
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) enum SyncData {
     AddQrToken(QrTokenData),
     DeleteQrToken(QrTokenData),
-    AlterChat { id: ChatId, action: ChatAction },
+    AlterChat {
+        id: chat::SyncId,
+        action: chat::SyncAction,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -104,7 +91,7 @@ impl Context {
     /// Adds most recent qr-code tokens for a given chat to the list of items to be synced.
     /// If device synchronization is disabled,
     /// no tokens exist or the chat is unpromoted, the function does nothing.
-    pub(crate) async fn sync_qr_code_tokens(&self, chat_id: Option<chat::ChatId>) -> Result<()> {
+    pub(crate) async fn sync_qr_code_tokens(&self, chat_id: Option<ChatId>) -> Result<()> {
         if !self.get_config_bool(Config::SyncMsgs).await? {
             return Ok(());
         }
@@ -155,7 +142,7 @@ impl Context {
     pub async fn send_sync_msg(&self) -> Result<Option<MsgId>> {
         if let Some((json, ids)) = self.build_sync_json().await? {
             let chat_id =
-                chat::ChatId::create_for_contact_with_blocked(self, ContactId::SELF, Blocked::Yes)
+                ChatId::create_for_contact_with_blocked(self, ContactId::SELF, Blocked::Yes)
                     .await?;
             let mut msg = Message {
                 chat_id,
@@ -248,41 +235,44 @@ impl Context {
     /// as otherwise we would add in a dead-loop between two devices
     /// sending message back and forth.
     ///
-    /// If an error is returned, the caller shall not try over.
-    /// Therefore, errors should only be returned on database errors or so.
-    /// If eg. just an item cannot be deleted,
-    /// that should not hold off the other items to be executed.
-    pub(crate) async fn execute_sync_items(&self, items: &SyncItems) -> Result<()> {
+    /// If an error is returned, the caller shall not try over because some sync items could be
+    /// already executed. Sync items are considered independent and executed in the given order but
+    /// regardless of whether executing of the previous items succeeded.
+    pub(crate) async fn execute_sync_items(&self, items: &SyncItems) {
         info!(self, "executing {} sync item(s)", items.items.len());
         for item in &items.items {
             match &item.data {
-                AddQrToken(token) => {
-                    let chat_id = if let Some(grpid) = &token.grpid {
-                        if let Some((chat_id, _, _)) =
-                            chat::get_chat_id_by_grpid(self, grpid).await?
-                        {
-                            Some(chat_id)
-                        } else {
-                            warn!(
-                                self,
-                                "Ignoring token for nonexistent/deleted group '{}'.", grpid
-                            );
-                            continue;
-                        }
-                    } else {
-                        None
-                    };
-                    token::save(self, Namespace::InviteNumber, chat_id, &token.invitenumber)
-                        .await?;
-                    token::save(self, Namespace::Auth, chat_id, &token.auth).await?;
-                }
-                DeleteQrToken(token) => {
-                    token::delete(self, Namespace::InviteNumber, &token.invitenumber).await?;
-                    token::delete(self, Namespace::Auth, &token.auth).await?;
-                }
-                AlterChat { id, action } => self.sync_alter_chat(id, action).await?,
+                AddQrToken(token) => self.add_qr_token(token).await,
+                DeleteQrToken(token) => self.delete_qr_token(token).await,
+                AlterChat { id, action } => self.sync_alter_chat(id, action).await,
             }
+            .log_err(self)
+            .ok();
         }
+    }
+
+    async fn add_qr_token(&self, token: &QrTokenData) -> Result<()> {
+        let chat_id = if let Some(grpid) = &token.grpid {
+            if let Some((chat_id, _, _)) = chat::get_chat_id_by_grpid(self, grpid).await? {
+                Some(chat_id)
+            } else {
+                warn!(
+                    self,
+                    "Ignoring token for nonexistent/deleted group '{}'.", grpid
+                );
+                return Ok(());
+            }
+        } else {
+            None
+        };
+        token::save(self, Namespace::InviteNumber, chat_id, &token.invitenumber).await?;
+        token::save(self, Namespace::Auth, chat_id, &token.auth).await?;
+        Ok(())
+    }
+
+    async fn delete_qr_token(&self, token: &QrTokenData) -> Result<()> {
+        token::delete(self, Namespace::InviteNumber, &token.invitenumber).await?;
+        token::delete(self, Namespace::Auth, &token.auth).await?;
         Ok(())
     }
 }
@@ -292,10 +282,9 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     use anyhow::bail;
-    use strum::IntoEnumIterator;
 
     use super::*;
-    use crate::chat::{Chat, ProtectionStatus};
+    use crate::chat::Chat;
     use crate::chatlist::Chatlist;
     use crate::contact::{Contact, Origin};
     use crate::test_utils::TestContext;
@@ -319,13 +308,13 @@ mod tests {
 
         assert!(t.build_sync_json().await?.is_none());
 
-        // Having one test on `SyncData::AlterChat` is sufficient here as `ChatAction::SetMuted`
-        // introduces enums inside items and `SystemTime`. Let's avoid in-depth testing of the
-        // serialiser here which is an external crate.
+        // Having one test on `SyncData::AlterChat` is sufficient here as
+        // `chat::SyncAction::SetMuted` introduces enums inside items and `SystemTime`. Let's avoid
+        // in-depth testing of the serialiser here which is an external crate.
         t.add_sync_item_with_timestamp(
             SyncData::AlterChat {
-                id: ChatId::ContactAddr("bob@example.net".to_string()),
-                action: ChatAction::SetMuted(chat::MuteDuration::Until(
+                id: chat::SyncId::ContactAddr("bob@example.net".to_string()),
+                action: chat::SyncAction::SetMuted(chat::MuteDuration::Until(
                     SystemTime::UNIX_EPOCH + Duration::from_millis(42999),
                 )),
             },
@@ -438,10 +427,13 @@ mod tests {
         let AlterChat { id, action } = &sync_items.items.get(0).unwrap().data else {
             bail!("bad item");
         };
-        assert_eq!(*id, ChatId::ContactAddr("bob@example.net".to_string()));
+        assert_eq!(
+            *id,
+            chat::SyncId::ContactAddr("bob@example.net".to_string())
+        );
         assert_eq!(
             *action,
-            ChatAction::SetMuted(chat::MuteDuration::Until(
+            chat::SyncAction::SetMuted(chat::MuteDuration::Until(
                 SystemTime::UNIX_EPOCH + Duration::from_millis(42999)
             ))
         );
@@ -512,7 +504,7 @@ mod tests {
                 .to_string(),
             )
             ?;
-        t.execute_sync_items(&sync_items).await?;
+        t.execute_sync_items(&sync_items).await;
 
         assert!(
             Contact::lookup_id_by_addr(&t, "bob@example.net", Origin::Unknown)
@@ -546,7 +538,7 @@ mod tests {
         // check that the used self-talk is not visible to the user
         // but that creation will still work (in this case, the chat is empty)
         assert_eq!(Chatlist::try_load(&alice, 0, None, None).await?.len(), 0);
-        let chat_id = chat::ChatId::create_for_contact(&alice, ContactId::SELF).await?;
+        let chat_id = ChatId::create_for_contact(&alice, ContactId::SELF).await?;
         let chat = Chat::load_from_db(&alice, chat_id).await?;
         assert!(chat.is_self_talk());
         assert_eq!(Chatlist::try_load(&alice, 0, None, None).await?.len(), 1);
@@ -566,126 +558,6 @@ mod tests {
         let bob = TestContext::new_bob().await;
         bob.recv_msg(&sent_msg).await;
         assert!(!token::exists(&bob, token::Namespace::Auth, "testtoken").await);
-
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_alter_chat() -> Result<()> {
-        let alices = [
-            TestContext::new_alice().await,
-            TestContext::new_alice().await,
-        ];
-        for a in &alices {
-            a.set_config_bool(Config::SyncMsgs, true).await?;
-        }
-        let bob = TestContext::new_bob().await;
-
-        let ba_chat = bob.create_chat(&alices[0]).await;
-        let sent_msg = bob.send_text(ba_chat.id, "hi").await;
-        let a0b_chat_id = alices[0].recv_msg(&sent_msg).await.chat_id;
-        alices[1].recv_msg(&sent_msg).await;
-
-        async fn sync(alices: &[TestContext]) -> Result<()> {
-            let sync_msg = alices.get(0).unwrap().pop_sent_msg().await;
-            alices.get(1).unwrap().recv_msg(&sync_msg).await;
-            Ok(())
-        }
-
-        assert_eq!(alices[1].get_chat(&bob).await.blocked, Blocked::Request);
-        a0b_chat_id.accept(&alices[0]).await?;
-        sync(&alices).await?;
-        assert_eq!(alices[1].get_chat(&bob).await.blocked, Blocked::Not);
-        a0b_chat_id.block(&alices[0]).await?;
-        sync(&alices).await?;
-        assert_eq!(alices[1].get_chat(&bob).await.blocked, Blocked::Yes);
-        a0b_chat_id.unblock(&alices[0]).await?;
-        sync(&alices).await?;
-        assert_eq!(alices[1].get_chat(&bob).await.blocked, Blocked::Not);
-
-        // Unblocking a 1:1 chat doesn't unblock the contact currently.
-        let a0b_contact_id = alices[0].add_or_lookup_contact(&bob).await.id;
-        Contact::unblock(&alices[0], a0b_contact_id).await?;
-
-        assert!(!alices[1].add_or_lookup_contact(&bob).await.is_blocked());
-        Contact::block(&alices[0], a0b_contact_id).await?;
-        sync(&alices).await?;
-        assert!(alices[1].add_or_lookup_contact(&bob).await.is_blocked());
-        Contact::unblock(&alices[0], a0b_contact_id).await?;
-        sync(&alices).await?;
-        assert!(!alices[1].add_or_lookup_contact(&bob).await.is_blocked());
-
-        // Test accepting and blocking groups. This way we test:
-        // - Group chats synchronisation.
-        // - That blocking a group deletes it on other devices.
-        let fiona = TestContext::new_fiona().await;
-        let fiona_grp_chat_id = fiona
-            .create_group_with_members(ProtectionStatus::Unprotected, "grp", &[&alices[0]])
-            .await;
-        let sent_msg = fiona.send_text(fiona_grp_chat_id, "hi").await;
-        let a0_grp_chat_id = alices[0].recv_msg(&sent_msg).await.chat_id;
-        let a1_grp_chat_id = alices[1].recv_msg(&sent_msg).await.chat_id;
-        let a1_grp_chat = Chat::load_from_db(&alices[1], a1_grp_chat_id).await?;
-        assert_eq!(a1_grp_chat.blocked, Blocked::Request);
-        a0_grp_chat_id.accept(&alices[0]).await?;
-        sync(&alices).await?;
-        let a1_grp_chat = Chat::load_from_db(&alices[1], a1_grp_chat_id).await?;
-        assert_eq!(a1_grp_chat.blocked, Blocked::Not);
-        a0_grp_chat_id.block(&alices[0]).await?;
-        sync(&alices).await?;
-        assert!(Chat::load_from_db(&alices[1], a1_grp_chat_id)
-            .await
-            .is_err());
-        assert!(
-            !alices[1]
-                .sql
-                .exists("SELECT COUNT(*) FROM chats WHERE id=?", (a1_grp_chat_id,))
-                .await?
-        );
-
-        // Test syncing of chat visibility on a self-chat. This way we test:
-        // - Self-chat synchronisation.
-        // - That sync messages don't unarchive the self-chat.
-        let a0self_chat_id = alices[0].get_self_chat().await.id;
-        assert_eq!(
-            alices[1].get_self_chat().await.get_visibility(),
-            ChatVisibility::Normal
-        );
-        let mut visibilities =
-            ChatVisibility::iter().chain(std::iter::once(ChatVisibility::Normal));
-        visibilities.next();
-        for v in visibilities {
-            a0self_chat_id.set_visibility(&alices[0], v).await?;
-            sync(&alices).await?;
-            for a in &alices {
-                assert_eq!(a.get_self_chat().await.get_visibility(), v);
-            }
-        }
-
-        use chat::MuteDuration;
-        assert_eq!(
-            alices[1].get_chat(&bob).await.mute_duration,
-            MuteDuration::NotMuted
-        );
-        let mute_durations = [
-            MuteDuration::Forever,
-            MuteDuration::Until(SystemTime::now() + Duration::from_secs(42)),
-            MuteDuration::NotMuted,
-        ];
-        for m in mute_durations {
-            chat::set_muted(&alices[0], a0b_chat_id, m).await?;
-            sync(&alices).await?;
-            let m = match m {
-                MuteDuration::Until(time) => MuteDuration::Until(
-                    SystemTime::UNIX_EPOCH
-                        + Duration::from_secs(
-                            time.duration_since(SystemTime::UNIX_EPOCH)?.as_secs(),
-                        ),
-                ),
-                _ => m,
-            };
-            assert_eq!(alices[1].get_chat(&bob).await.mute_duration, m);
-        }
 
         Ok(())
     }

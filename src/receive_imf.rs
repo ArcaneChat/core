@@ -291,9 +291,7 @@ pub(crate) async fn receive_imf_inner(
     if let Some(ref sync_items) = mime_parser.sync_items {
         if from_id == ContactId::SELF {
             if mime_parser.was_encrypted() {
-                if let Err(err) = context.execute_sync_items(sync_items).await {
-                    warn!(context, "receive_imf cannot execute sync items: {err:#}.");
-                }
+                context.execute_sync_items(sync_items).await;
             } else {
                 warn!(context, "Sync items are not encrypted.");
             }
@@ -930,6 +928,22 @@ async fn add_parts(
                     chat_id.unblock_ex(context, Nosync).await?;
                     // Not assigning `chat_id_blocked = Blocked::Not` to avoid unused_assignments warning.
                 }
+            }
+        }
+
+        if chat_id.is_none() {
+            // Check if the message belongs to a broadcast list.
+            if let Some(mailinglist_header) = mime_parser.get_mailinglist_header() {
+                let listid = mailinglist_header_listid(mailinglist_header)?;
+                chat_id = Some(
+                    if let Some((id, ..)) = chat::get_chat_id_by_grpid(context, &listid).await? {
+                        id
+                    } else {
+                        let name =
+                            compute_mailinglist_name(mailinglist_header, &listid, mime_parser);
+                        chat::create_broadcast_list_ex(context, Nosync, listid, name).await?
+                    },
+                );
             }
         }
     }
@@ -1678,17 +1692,6 @@ async fn create_or_lookup_group(
         members.dedup();
         chat::add_to_chat_contacts_table(context, new_chat_id, &members).await?;
 
-        // once, we have protected-chats explained in UI, we can uncomment the following lines.
-        // ("verified groups" did not add a message anyway)
-        //
-        //if create_protected == ProtectionStatus::Protected {
-        // set from_id=0 as it is not clear that the sender of this random group message
-        // actually really has enabled chat-protection at some point.
-        //new_chat_id
-        //    .add_protection_msg(context, ProtectionStatus::Protected, false, 0)
-        //    .await?;
-        //}
-
         context.emit_event(EventType::ChatModified(new_chat_id));
     }
 
@@ -1791,7 +1794,12 @@ async fn apply_group_changes(
 
         if !chat.is_protected() {
             chat_id
-                .inner_set_protection(context, ProtectionStatus::Protected)
+                .set_protection(
+                    context,
+                    ProtectionStatus::Protected,
+                    smeared_time(context),
+                    Some(from_id),
+                )
                 .await?;
         }
     }
@@ -1929,21 +1937,7 @@ async fn apply_group_changes(
         }
 
         if new_members != chat_contacts {
-            let new_members_ref = &new_members;
-            context
-                .sql
-                .transaction(move |transaction| {
-                    transaction
-                        .execute("DELETE FROM chats_contacts WHERE chat_id=?", (chat_id,))?;
-                    for contact_id in new_members_ref {
-                        transaction.execute(
-                            "INSERT INTO chats_contacts (chat_id, contact_id) VALUES(?, ?)",
-                            (chat_id, contact_id),
-                        )?;
-                    }
-                    Ok(())
-                })
-                .await?;
+            chat::update_chat_contacts_table(context, chat_id, &new_members).await?;
             chat_contacts = new_members;
             send_event_chat_modified = true;
         }
@@ -1988,6 +1982,17 @@ async fn apply_group_changes(
 
 static LIST_ID_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"^(.+)<(.+)>$").unwrap());
 
+fn mailinglist_header_listid(list_id_header: &str) -> Result<String> {
+    Ok(match LIST_ID_REGEX.captures(list_id_header) {
+        Some(cap) => cap.get(2).context("no match??")?.as_str().trim(),
+        None => list_id_header
+            .trim()
+            .trim_start_matches('<')
+            .trim_end_matches('>'),
+    }
+    .to_string())
+}
+
 /// Create or lookup a mailing list chat.
 ///
 /// `list_id_header` contains the Id that must be used for the mailing list
@@ -1997,21 +2002,13 @@ static LIST_ID_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"^(.+)<(.+)>$").unw
 ///
 /// `mime_parser` is the corresponding message
 /// and is used to figure out the mailing list name from different header fields.
-#[allow(clippy::indexing_slicing)]
 async fn create_or_lookup_mailinglist(
     context: &Context,
     allow_creation: bool,
     list_id_header: &str,
     mime_parser: &MimeMessage,
 ) -> Result<Option<(ChatId, Blocked)>> {
-    let listid = match LIST_ID_REGEX.captures(list_id_header) {
-        Some(cap) => cap[2].trim().to_string(),
-        None => list_id_header
-            .trim()
-            .trim_start_matches('<')
-            .trim_end_matches('>')
-            .to_string(),
-    };
+    let listid = mailinglist_header_listid(list_id_header)?;
 
     if let Some((chat_id, _, blocked)) = chat::get_chat_id_by_grpid(context, &listid).await? {
         return Ok(Some((chat_id, blocked)));
@@ -2411,6 +2408,16 @@ async fn has_verified_encryption(
         return Ok(Verified);
     }
 
+    mark_recipients_as_verified(context, from_id, to_ids, mimeparser).await?;
+    Ok(Verified)
+}
+
+async fn mark_recipients_as_verified(
+    context: &Context,
+    from_id: ContactId,
+    to_ids: Vec<ContactId>,
+    mimeparser: &MimeMessage,
+) -> Result<(), anyhow::Error> {
     let rows = context
         .sql
         .query_map(
@@ -2453,6 +2460,17 @@ async fn has_verified_encryption(
                     if let Some(fp) = peerstate.gossip_key_fingerprint.clone() {
                         peerstate.set_verified(PeerstateKeyType::GossipKey, fp, verifier_addr)?;
                         peerstate.save_to_db(&context.sql).await?;
+
+                        if !is_verified {
+                            let (to_contact_id, _) = Contact::add_or_lookup(
+                                context,
+                                "",
+                                ContactAddress::new(&to_addr)?,
+                                Origin::Hidden,
+                            )
+                            .await?;
+                            ChatId::set_protection_for_contact(context, to_contact_id).await?;
+                        }
                     }
                 } else {
                     // The contact already has a verified key.
@@ -2463,7 +2481,8 @@ async fn has_verified_encryption(
             }
         }
     }
-    Ok(Verified)
+
+    Ok(())
 }
 
 /// Returns the last message referenced from `References` header if it is in the database.

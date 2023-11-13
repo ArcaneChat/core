@@ -1,7 +1,7 @@
 use anyhow::Result;
 use pretty_assertions::assert_eq;
 
-use crate::chat::{Chat, ProtectionStatus};
+use crate::chat::ProtectionStatus;
 use crate::chatlist::Chatlist;
 use crate::config::Config;
 use crate::constants::DC_GCL_FOR_FORWARDING;
@@ -126,24 +126,22 @@ async fn test_create_verified_oneonone_chat() -> Result<()> {
         VerifiedStatus::BidirectVerified
     );
 
-    // As soon as Alice creates a chat with Fiona, it should directly be protected
+    // Alice should have a hidden protected chat with Fiona
     {
-        let chat = alice.create_chat(&fiona).await;
+        let chat = alice.get_chat(&fiona).await;
         assert!(chat.is_protected());
 
-        let msg = alice.get_last_msg().await;
+        let msg = get_chat_msg(&alice, chat.id, 0, 1).await;
         let expected_text = stock_str::chat_protection_enabled(&alice).await;
         assert_eq!(msg.text, expected_text);
     }
 
-    // Fiona should also see the chat as protected
+    // Fiona should have a hidden protected chat with Alice
     {
-        let rcvd = tcm.send_recv(&alice, &fiona, "Hi Fiona").await;
-        let alice_fiona_id = rcvd.chat_id;
-        let chat = Chat::load_from_db(&fiona, alice_fiona_id).await?;
+        let chat = fiona.get_chat(&alice).await;
         assert!(chat.is_protected());
 
-        let msg0 = get_chat_msg(&fiona, chat.id, 0, 2).await;
+        let msg0 = get_chat_msg(&fiona, chat.id, 0, 1).await;
         let expected_text = stock_str::chat_protection_enabled(&fiona).await;
         assert_eq!(msg0.text, expected_text);
     }
@@ -164,6 +162,15 @@ async fn test_create_verified_oneonone_chat() -> Result<()> {
         let chat = alice.get_chat(&fiona_new).await;
         assert!(!chat.is_protected());
         assert!(chat.is_protection_broken());
+
+        let msg1 = get_chat_msg(&alice, chat.id, 0, 3).await;
+        assert_eq!(msg1.get_info_type(), SystemMessage::ChatProtectionEnabled);
+
+        let msg2 = get_chat_msg(&alice, chat.id, 1, 3).await;
+        assert_eq!(msg2.get_info_type(), SystemMessage::ChatProtectionDisabled);
+
+        let msg2 = get_chat_msg(&alice, chat.id, 2, 3).await;
+        assert_eq!(msg2.text, "I have a new device");
 
         // After recreating the chat, it should still be unprotected
         chat.id.delete(&alice).await?;
@@ -700,6 +707,39 @@ async fn test_break_protection_then_verify_again() -> Result<()> {
     }
 
     tcm.execute_securejoin(&alice, &bob_new).await;
+    assert_verified(&alice, &bob_new, ProtectionStatus::Protected).await;
+
+    Ok(())
+}
+
+/// Regression test for the following bug:
+///
+/// - Scan your chat partner's QR Code
+/// - They change devices
+/// - Scan their QR code again
+///
+/// -> The re-verification fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_verify_then_verify_again() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = tcm.alice().await;
+    let bob = tcm.bob().await;
+    enable_verified_oneonone_chats(&[&alice, &bob]).await;
+
+    mark_as_verified(&alice, &bob).await;
+    mark_as_verified(&bob, &alice).await;
+
+    alice.create_chat(&bob).await;
+    assert_verified(&alice, &bob, ProtectionStatus::Protected).await;
+
+    tcm.section("Bob reinstalls DC");
+    drop(bob);
+    let bob_new = tcm.unconfigured().await;
+    enable_verified_oneonone_chats(&[&bob_new]).await;
+    bob_new.configure_addr("bob@example.net").await;
+    e2ee::ensure_secret_key_exists(&bob_new).await?;
+
+    tcm.execute_securejoin(&bob_new, &alice).await;
     assert_verified(&alice, &bob_new, ProtectionStatus::Protected).await;
 
     Ok(())

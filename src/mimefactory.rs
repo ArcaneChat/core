@@ -316,7 +316,15 @@ impl<'a> MimeFactory<'a> {
         match &self.loaded {
             Loaded::Message { chat } => {
                 if chat.is_protected() {
-                    PeerstateVerifiedStatus::BidirectVerified
+                    if self.msg.get_info_type() == SystemMessage::SecurejoinMessage {
+                        // Securejoin messages are supposed to verify a key.
+                        // In order to do this, it is necessary that they can be sent
+                        // to a key that is not yet verified.
+                        // This has to work independently of whether the chat is protected right now.
+                        PeerstateVerifiedStatus::Unverified
+                    } else {
+                        PeerstateVerifiedStatus::BidirectVerified
+                    }
                 } else {
                     PeerstateVerifiedStatus::Unverified
                 }
@@ -591,9 +599,10 @@ impl<'a> MimeFactory<'a> {
 
         if let Loaded::Message { chat } = &self.loaded {
             if chat.typ == Chattype::Broadcast {
+                let encoded_chat_name = encode_words(&chat.name);
                 headers.protected.push(Header::new(
                     "List-ID".into(),
-                    format!("{} <{}>", chat.name, chat.grpid),
+                    format!("{encoded_chat_name} <{}>", chat.grpid),
                 ));
             }
         }

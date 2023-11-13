@@ -21,6 +21,7 @@ use crate::param::Param;
 use crate::peerstate::{Peerstate, PeerstateKeyType};
 use crate::qr::check_qr;
 use crate::stock_str;
+use crate::sync::Sync::*;
 use crate::token;
 use crate::tools::time;
 
@@ -443,8 +444,14 @@ pub(crate) async fn handle_securejoin_handshake(
                 match chat::get_chat_id_by_grpid(context, field_grpid).await? {
                     Some((group_chat_id, _, _)) => {
                         secure_connection_established(context, contact_id, group_chat_id).await?;
-                        chat::add_contact_to_chat_ex(context, group_chat_id, contact_id, true)
-                            .await?;
+                        chat::add_contact_to_chat_ex(
+                            context,
+                            Nosync,
+                            group_chat_id,
+                            contact_id,
+                            true,
+                        )
+                        .await?;
                     }
                     None => bail!("Chat {} not found", &field_grpid),
                 }
@@ -609,6 +616,8 @@ pub(crate) async fn observe_securejoin_on_other_device(
                 peerstate.set_verified(PeerstateKeyType::GossipKey, fingerprint, addr)?;
                 peerstate.prefer_encrypt = EncryptPreference::Mutual;
                 peerstate.save_to_db(&context.sql).await.unwrap_or_default();
+
+                ChatId::set_protection_for_contact(context, contact_id).await?;
             } else if let Some(fingerprint) =
                 mime_message.get_header(HeaderDef::SecureJoinFingerprint)
             {
