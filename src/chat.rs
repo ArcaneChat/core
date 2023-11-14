@@ -1013,8 +1013,9 @@ impl ChatId {
                    AND y.contact_id > 9
                    AND x.chat_id=?
                    AND y.chat_id<>x.chat_id
+                   AND y.chat_id>?
                  GROUP BY y.chat_id",
-                (self,),
+                (self, DC_CHAT_ID_LAST_SPECIAL),
                 |row| {
                     let chat_id: ChatId = row.get(0)?;
                     let intersection: f64 = row.get(1)?;
@@ -4728,6 +4729,37 @@ mod tests {
             "Member Me (bob@example.net) removed by alice@example.org."
         );
 
+        Ok(())
+    }
+
+    /// Test that if a message implicitly adds a member, both messages appear.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_msg_with_implicit_member_add() -> Result<()> {
+        let mut tcm = TestContextManager::new();
+        let alice = tcm.alice().await;
+        let bob = tcm.bob().await;
+        let alice_bob_contact_id =
+            Contact::create(&alice, "Bob", &bob.get_config(Config::Addr).await?.unwrap()).await?;
+        let fiona_addr = "fiona@example.net";
+        let alice_fiona_contact_id = Contact::create(&alice, "Fiona", fiona_addr).await?;
+        let bob_fiona_contact_id = Contact::create(&bob, "Fiona", fiona_addr).await?;
+        let alice_chat_id =
+            create_group_chat(&alice, ProtectionStatus::Unprotected, "Group chat").await?;
+        add_contact_to_chat(&alice, alice_chat_id, alice_bob_contact_id).await?;
+        let sent_msg = alice.send_text(alice_chat_id, "I created a group").await;
+        let bob_received_msg = bob.recv_msg(&sent_msg).await;
+        let bob_chat_id = bob_received_msg.get_chat_id();
+        bob_chat_id.accept(&bob).await?;
+
+        add_contact_to_chat(&alice, alice_chat_id, alice_fiona_contact_id).await?;
+        let sent_msg = alice.pop_sent_msg().await;
+        bob.recv_msg(&sent_msg).await;
+        remove_contact_from_chat(&bob, bob_chat_id, bob_fiona_contact_id).await?;
+
+        let sent_msg = alice.send_text(alice_chat_id, "Welcome, Fiona!").await;
+        bob.recv_msg(&sent_msg).await;
+        bob.golden_test_chat(bob_chat_id, "chat_test_msg_with_implicit_member_add")
+            .await;
         Ok(())
     }
 

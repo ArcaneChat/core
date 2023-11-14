@@ -227,8 +227,7 @@ pub(crate) async fn receive_imf_inner(
         .and_then(|value| mailparse::dateparse(value).ok())
         .map_or(rcvd_timestamp, |value| min(value, rcvd_timestamp + 60));
 
-    let updated_verified_key_addr =
-        update_verified_keys(context, &mut mime_parser, from_id).await?;
+    update_verified_keys(context, &mut mime_parser, from_id).await?;
 
     // Add parts
     let received_msg = add_parts(
@@ -280,11 +279,6 @@ pub(crate) async fn receive_imf_inner(
     } else {
         MsgId::new_unset()
     };
-
-    if let Some(addr) = updated_verified_key_addr {
-        let msg = stock_str::contact_setup_changed(context, &addr).await;
-        chat::add_info_msg(context, chat_id, &msg, received_msg.sort_timestamp).await?;
-    }
 
     save_locations(context, &mime_parser, chat_id, from_id, insert_msg_id).await?;
 
@@ -463,7 +457,7 @@ async fn add_parts(
     let mut chat_id_blocked = Blocked::Not;
 
     let mut better_msg = None;
-    let mut group_changes_msgs = Vec::new();
+    let mut group_changes_msgs = (Vec::new(), None);
     if mime_parser.is_system_message == SystemMessage::LocationStreamingEnabled {
         better_msg = Some(stock_str::msg_location_enabled_by(context, from_id).await);
     }
@@ -558,6 +552,11 @@ async fn add_parts(
             chat_id = Some(DC_CHAT_ID_TRASH);
             info!(context, "Message is a DSN (TRASH).",);
             markseen_on_imap_table(context, rfc724_mid).await.ok();
+        }
+
+        if chat_id.is_none() && is_mdn {
+            chat_id = Some(DC_CHAT_ID_TRASH);
+            info!(context, "Message is an MDN (TRASH).",);
         }
 
         if chat_id.is_none() {
@@ -656,8 +655,7 @@ async fn add_parts(
                 }
             }
 
-            let new_better_msg;
-            (group_changes_msgs, new_better_msg) = apply_group_changes(
+            group_changes_msgs = apply_group_changes(
                 context,
                 mime_parser,
                 sent_timestamp,
@@ -667,7 +665,6 @@ async fn add_parts(
                 is_partial_download.is_some(),
             )
             .await?;
-            better_msg = better_msg.or(new_better_msg)
         }
 
         if chat_id.is_none() {
@@ -901,8 +898,7 @@ async fn add_parts(
         }
 
         if let Some(chat_id) = chat_id {
-            let new_better_msg;
-            (group_changes_msgs, new_better_msg) = apply_group_changes(
+            group_changes_msgs = apply_group_changes(
                 context,
                 mime_parser,
                 sent_timestamp,
@@ -912,7 +908,6 @@ async fn add_parts(
                 is_partial_download.is_some(),
             )
             .await?;
-            better_msg = better_msg.or(new_better_msg)
         }
 
         if chat_id.is_none() && self_sent {
@@ -1142,7 +1137,13 @@ async fn add_parts(
 
     let mut created_db_entries = Vec::with_capacity(mime_parser.parts.len());
 
-    group_changes_msgs = group_changes_msgs.into_iter().rev().collect();
+    if let Some(msg) = group_changes_msgs.1 {
+        match &better_msg {
+            None => better_msg = Some(msg),
+            Some(_) => group_changes_msgs.0.push(msg),
+        }
+    }
+    let mut group_changes_msgs: Vec<_> = group_changes_msgs.0.into_iter().rev().collect();
     let mut parts = mime_parser.parts.iter_mut().peekable();
     while let Some(part) = parts.peek() {
         if part.is_reaction {
@@ -1309,7 +1310,7 @@ RETURNING id
         debug_assert!(!row_id.is_special());
         created_db_entries.push(row_id);
 
-        if group_changes_msg.is_none() && group_changes_msgs.is_empty() {
+        if group_changes_msg.is_none() {
             parts.next();
         }
     }
@@ -2288,9 +2289,6 @@ enum VerifiedEncryption {
 /// Moves secondary verified key to primary verified key
 /// if the message is signed with a secondary verified key.
 /// Removes secondary verified key if the message is signed with primary key.
-///
-/// Returns address of the peerstate if the primary verified key was updated,
-/// the caller then needs to add "Setup changed" notification somewhere.
 async fn update_verified_keys(
     context: &Context,
     mimeparser: &mut MimeMessage,
@@ -2338,10 +2336,11 @@ async fn update_verified_keys(
         peerstate.verified_key = peerstate.secondary_verified_key.take();
         peerstate.verified_key_fingerprint = peerstate.secondary_verified_key_fingerprint.take();
         peerstate.verifier = peerstate.secondary_verifier.take();
+        peerstate.fingerprint_changed = true;
         peerstate.save_to_db(&context.sql).await?;
 
         // Primary verified key changed.
-        Ok(Some(peerstate.addr.clone()))
+        Ok(None)
     } else {
         Ok(None)
     }
