@@ -1955,11 +1955,18 @@ impl Chat {
 
     /// Sends a `SyncAction` synchronising chat contacts to other devices.
     pub(crate) async fn sync_contacts(&self, context: &Context) -> Result<()> {
-        let mut addrs = Vec::new();
-        for contact_id in get_chat_contacts(context, self.id).await? {
-            let contact = Contact::get_by_id(context, contact_id).await?;
-            addrs.push(contact.get_addr().to_string());
-        }
+        let addrs = context
+            .sql
+            .query_map(
+                "SELECT c.addr \
+                FROM contacts c INNER JOIN chats_contacts cc \
+                ON c.id=cc.contact_id \
+                WHERE cc.chat_id=?",
+                (self.id,),
+                |row| row.get::<_, String>(0),
+                |addrs| addrs.collect::<Result<Vec<_>, _>>().map_err(Into::into),
+            )
+            .await?;
         self.sync(context, SyncAction::SetContacts(addrs)).await
     }
 
@@ -3737,7 +3744,6 @@ async fn rename_ex(
     chat_id: ChatId,
     new_name: &str,
 ) -> Result<()> {
-    let sync_name = new_name;
     let new_name = improve_single_line_input(new_name);
     /* the function only sets the names of group chats; normal chats get their names from the contacts */
     let mut success = false;
@@ -3790,7 +3796,7 @@ async fn rename_ex(
         bail!("Failed to set name");
     }
     if sync.into() && chat.name != new_name {
-        let sync_name = sync_name.to_string();
+        let sync_name = new_name.to_string();
         chat.sync(context, SyncAction::Rename(sync_name))
             .await
             .log_err(context)
