@@ -1,3 +1,4 @@
+import itertools
 import json
 import logging
 import os
@@ -5,7 +6,7 @@ import subprocess
 import sys
 from queue import Queue
 from threading import Event, Thread
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterator, Optional
 
 
 class JsonRpcError(Exception):
@@ -23,7 +24,7 @@ class Rpc:
 
         self._kwargs = kwargs
         self.process: subprocess.Popen
-        self.id: int
+        self.id_iterator: Iterator[int]
         self.event_queues: Dict[int, Queue]
         # Map from request ID to `threading.Event`.
         self.request_events: Dict[int, Event]
@@ -54,7 +55,7 @@ class Rpc:
                 preexec_fn=os.setpgrp,  # noqa: PLW1509
                 **self._kwargs,
             )
-        self.id = 0
+        self.id_iterator = itertools.count(start=1)
         self.event_queues = {}
         self.request_events = {}
         self.request_results = {}
@@ -131,7 +132,9 @@ class Rpc:
                 event = self.get_next_event()
                 account_id = event["contextId"]
                 queue = self.get_queue(account_id)
-                queue.put(event["event"])
+                event = event["event"]
+                logging.debug("account_id=%d got an event %s", account_id, event)
+                queue.put(event)
         except Exception:
             # Log an exception if the event loop dies.
             logging.exception("Exception in the event loop")
@@ -143,14 +146,12 @@ class Rpc:
 
     def __getattr__(self, attr: str):
         def method(*args) -> Any:
-            self.id += 1
-            request_id = self.id
-
+            request_id = next(self.id_iterator)
             request = {
                 "jsonrpc": "2.0",
                 "method": attr,
                 "params": args,
-                "id": self.id,
+                "id": request_id,
             }
             event = Event()
             self.request_events[request_id] = event

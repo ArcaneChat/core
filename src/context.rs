@@ -23,7 +23,7 @@ use crate::key::{load_self_public_key, DcKey as _};
 use crate::login_param::LoginParam;
 use crate::message::{self, MessageState, MsgId};
 use crate::quota::QuotaInfo;
-use crate::scheduler::{InterruptInfo, SchedulerState};
+use crate::scheduler::SchedulerState;
 use crate::sql::Sql;
 use crate::stock_str::StockStrings;
 use crate::timesmearing::SmearedTimestamp;
@@ -398,10 +398,24 @@ impl Context {
     }
 
     /// Starts the IO scheduler.
-    pub async fn start_io(&self) {
-        if let Ok(false) = self.is_configured().await {
+    pub async fn start_io(&mut self) {
+        if !self.is_configured().await.unwrap_or_default() {
             warn!(self, "can not start io on a context that is not configured");
             return;
+        }
+
+        {
+            if self
+                .get_config(Config::ConfiguredAddr)
+                .await
+                .unwrap_or_default()
+                .filter(|s| s.ends_with(".testrun.org"))
+                .is_some()
+            {
+                let mut lock = self.ratelimit.write().await;
+                // Allow at least 1 message every second + a burst of 3.
+                *lock = Ratelimit::new(Duration::new(3, 0), 3.0);
+            }
         }
         self.scheduler.start(self.clone()).await;
     }
@@ -424,11 +438,7 @@ impl Context {
 
     pub(crate) async fn schedule_resync(&self) -> Result<()> {
         self.resync_request.store(true, Ordering::Relaxed);
-        self.scheduler
-            .interrupt_inbox(InterruptInfo {
-                probe_network: false,
-            })
-            .await;
+        self.scheduler.interrupt_inbox().await;
         Ok(())
     }
 
@@ -1302,6 +1312,7 @@ mod tests {
             "send_port",
             "send_security",
             "server_flags",
+            "skip_start_messages",
             "smtp_certificate_checks",
             "socks5_host",
             "socks5_port",

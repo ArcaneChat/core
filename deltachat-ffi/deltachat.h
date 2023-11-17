@@ -2941,7 +2941,6 @@ int dc_receive_backup (dc_context_t* context, const char* qr);
  * use dc_accounts_remove_account().
  *
  * @memberof dc_accounts_t
- * @param os_name
  * @param dir The directory to create the context-databases in.
  *     If the directory does not exist,
  *     dc_accounts_new() will try to create it.
@@ -3732,8 +3731,22 @@ int             dc_chat_can_send              (const dc_chat_t* chat);
 
 /**
  * Check if a chat is protected.
- * Protected chats contain only verified members and encryption is always enabled.
- * Protected chats are created using dc_create_group_chat() by setting the 'protect' parameter to 1.
+ *
+ * End-to-end encryption is guaranteed in protected chats
+ * and only verified contacts
+ * as determined by dc_contact_is_verified()
+ * can be added to protected chats.
+ *
+ * Protected chats are created using dc_create_group_chat()
+ * by setting the 'protect' parameter to 1.
+ * 1:1 chats become protected or unprotected automatically
+ * if `verified_one_on_one_chats` setting is enabled.
+ *
+ * UI should display a green checkmark
+ * in the chat title,
+ * in the chatlist item
+ * and in the chat profile
+ * if chat protection is enabled.
  *
  * @memberof dc_chat_t
  * @param chat The chat object.
@@ -4567,15 +4580,18 @@ int dc_msg_has_html (dc_msg_t* msg);
   * if they are larger than the limit set by the dc_set_config()-option `download_limit`.
   *
   * The function returns one of:
-  * - @ref DC_DOWNLOAD_DONE        - The message does not need any further download action
-  *                                  and should be rendered as usual.
-  * - @ref DC_DOWNLOAD_AVAILABLE   - There is additional content to download.
-  *                                  In addition to the usual message rendering,
-  *                                  the UI shall show a download button that calls dc_download_full_msg()
-  * - @ref DC_DOWNLOAD_IN_PROGRESS - Download was started with dc_download_full_msg() and is still in progress.
-  *                                  If the download fails or succeeds,
-  *                                  the event @ref DC_EVENT_MSGS_CHANGED is emitted.
-  * - @ref DC_DOWNLOAD_FAILURE     - Download error, the user may start over calling dc_download_full_msg() again.
+  * - @ref DC_DOWNLOAD_DONE           - The message does not need any further download action
+  *                                     and should be rendered as usual.
+  * - @ref DC_DOWNLOAD_AVAILABLE      - There is additional content to download.
+  *                                     In addition to the usual message rendering,
+  *                                     the UI shall show a download button that calls dc_download_full_msg()
+  * - @ref DC_DOWNLOAD_IN_PROGRESS    - Download was started with dc_download_full_msg() and is still in progress.
+  *                                     If the download fails or succeeds,
+  *                                     the event @ref DC_EVENT_MSGS_CHANGED is emitted.
+  *
+  * - @ref DC_DOWNLOAD_UNDECIPHERABLE - The message does not need any futher download action.
+  *                                     It was fully downloaded, but we failed to decrypt it.
+  * - @ref DC_DOWNLOAD_FAILURE        - Download error, the user may start over calling dc_download_full_msg() again.
   *
   * @memberof dc_msg_t
   * @param msg The message object.
@@ -5033,10 +5049,16 @@ int             dc_contact_is_blocked        (const dc_contact_t* contact);
 
 
 /**
- * Check if a contact was verified. E.g. by a secure-join QR code scan
- * and if the key has not changed since this verification.
+ * Check if the contact
+ * can be added to verified chats,
+ * i.e. has a verified key
+ * and Autocrypt key matches the verified key.
  *
- * The UI may draw a checkbox or something like that beside verified contacts.
+ * If contact is verified
+ * UI should display green checkmark after the contact name
+ * in contact list items,
+ * in chat member list items
+ * and in profiles if no chat with the contact exist (otherwise, use dc_chat_is_protected()).
  *
  * @memberof dc_contact_t
  * @param contact The contact object.
@@ -5046,32 +5068,19 @@ int             dc_contact_is_blocked        (const dc_contact_t* contact);
 int             dc_contact_is_verified       (dc_contact_t* contact);
 
 
-
 /**
- * Return the address that verified a contact
+ * Return the contact ID that verified a contact.
  *
- * The UI may use this in addition to a checkmark showing the verification status.
- * In case of verification chains,
- * the last contact in the chain is shown.
- * This is because of privacy reasons, but also as it would not help the user
- * to see a unknown name here - where one can mostly always ask the shown name
- * as it is directly known.
+ * If the function returns non-zero result,
+ * display green checkmark in the profile and "Introduced by ..." line
+ * with the name and address of the contact
+ * formatted by dc_contact_get_name_n_addr.
  *
- * @memberof dc_contact_t
- * @param contact The contact object.
- * @return 
- *    A string containing the verifiers address. If it is the same address as the contact itself,
- *    we verified the contact ourself. If it is an empty string, we don't have verifier 
- *    information or the contact is not verified.
- * @deprecated 2023-09-28, use dc_contact_get_verifier_id instead
- */
-char*           dc_contact_get_verifier_addr       (dc_contact_t* contact);
-
-
-/**
- * Return the `ContactId` that verified a contact
- *
- * The UI may use this in addition to a checkmark showing the verification status
+ * If this function returns a verifier,
+ * this does not necessarily mean
+ * you can add the contact to verified chats.
+ * Use dc_contact_is_verified() to check
+ * if a contact can be added to a verified chat instead.
  *
  * @memberof dc_contact_t
  * @param contact The contact object.
@@ -6234,6 +6243,7 @@ void dc_event_unref(dc_event_t* event);
  * @param data2 (int) The progress as:
  *     400=vg-/vc-request-with-auth sent, typically shown as "alice@addr verified, introducing myself."
  *     (Bob has verified alice and waits until Alice does the same for him)
+ *     1000=vg-member-added/vc-contact-confirm received
  */
 #define DC_EVENT_SECUREJOIN_JOINER_PROGRESS       2061
 
@@ -6426,22 +6436,27 @@ void dc_event_unref(dc_event_t* event);
 /**
  * Download not needed, see dc_msg_get_download_state() for details.
  */
-#define DC_DOWNLOAD_DONE          0
+#define DC_DOWNLOAD_DONE           0
 
 /**
  * Download available, see dc_msg_get_download_state() for details.
  */
-#define DC_DOWNLOAD_AVAILABLE    10
+#define DC_DOWNLOAD_AVAILABLE      10
 
 /**
  * Download failed, see dc_msg_get_download_state() for details.
  */
-#define DC_DOWNLOAD_FAILURE      20
+#define DC_DOWNLOAD_FAILURE        20
+
+/**
+ * Download not needed, see dc_msg_get_download_state() for details.
+ */
+#define DC_DOWNLOAD_UNDECIPHERABLE 30
 
 /**
  * Download in progress, see dc_msg_get_download_state() for details.
  */
-#define DC_DOWNLOAD_IN_PROGRESS  1000
+#define DC_DOWNLOAD_IN_PROGRESS    1000
 
 
 
@@ -7259,6 +7274,11 @@ void dc_event_unref(dc_event_t* event);
 ///
 /// Used in info messages.
 #define DC_STR_CHAT_PROTECTION_DISABLED 171
+
+/// "Others will only see this group after you sent a first message."
+///
+/// Used as the first info messages in newly created groups.
+#define DC_STR_NEW_GROUP_SEND_FIRST_MESSAGE 172
 
 /**
  * @}

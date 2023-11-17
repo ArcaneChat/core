@@ -367,7 +367,7 @@ def test_webxdc_download_on_demand(acfactory, data, lp):
 
     lp.sec("ac2 sets download limit")
     ac2.set_config("download_limit", "100")
-    assert msg1.send_status_update({"payload": base64.b64encode(os.urandom(50000))}, "some test data")
+    assert msg1.send_status_update({"payload": base64.b64encode(os.urandom(300000))}, "some test data")
     ac2_update = ac2._evtracker.wait_next_incoming_message()
     assert ac2_update.download_state == dc.const.DC_DOWNLOAD_AVAILABLE
     assert not msg2.get_status_updates()
@@ -489,7 +489,7 @@ def test_forward_messages(acfactory, lp):
     lp.sec("ac2: check new chat has a forwarded message")
     assert chat3.is_promoted()
     messages = chat3.get_messages()
-    assert len(messages) == 1
+    assert len(messages) == 2
     msg = messages[-1]
     assert msg.is_forwarded()
     ac2.delete_messages(messages)
@@ -1445,7 +1445,7 @@ def test_reaction_to_partially_fetched_msg(acfactory, lp, tmp_path):
       message, then processes a partially downloaded message.
     - As a result, Bob does not see a reaction
     """
-    download_limit = 32768
+    download_limit = 300000
     ac1, ac2 = acfactory.get_online_accounts(2)
     ac1_addr = ac1.get_config("addr")
     chat = ac1.create_chat(ac2)
@@ -1699,6 +1699,59 @@ def test_qr_join_chat(acfactory, lp, verified_one_on_one_chats):
     assert not ch.is_protected()
 
 
+def test_qr_join_chat_with_pending_bobstate_issue4894(acfactory, lp):
+    ac1, ac2, ac3, ac4 = acfactory.get_online_accounts(4)
+
+    lp.sec("ac3: verify with ac2")
+    ac3.qr_setup_contact(ac2.get_setup_contact_qr())
+    ac2._evtracker.wait_securejoin_inviter_progress(1000)
+
+    # in order for ac2 to have pending bobstate with a verified group
+    # we first create a fully joined verified group, and then start
+    # joining a second time but interrupt it, to create pending bob state
+
+    lp.sec("ac1: create verified group that ac2 fully joins")
+    ch1 = ac1.create_group_chat("ac1-shutoff group", verified=True)
+    ac2.qr_join_chat(ch1.get_join_qr())
+    ac1._evtracker.wait_securejoin_inviter_progress(1000)
+
+    # ensure ac1 can write and ac2 receives messages in verified chat
+    ch1.send_text("ac1 says hello")
+    while 1:
+        msg = ac2.wait_next_incoming_message()
+        if msg.text == "ac1 says hello":
+            assert msg.chat.is_protected()
+            break
+
+    lp.sec("ac1: let ac2 join again but shutoff ac1 in the middle of securejoin")
+    ac2.qr_join_chat(ch1.get_join_qr())
+    ac1.shutdown()
+    lp.sec("ac2 now has pending bobstate but ac1 is shutoff")
+
+    # we meanwhile expect ac3/ac2 verification started in the beginning to have completed
+    assert ac3.get_contact(ac2).is_verified()
+    assert ac2.get_contact(ac3).is_verified()
+
+    lp.sec("ac3: create a verified group VG with ac2")
+    vg = ac3.create_group_chat("ac3-created", [ac2], verified=True)
+
+    # ensure ac2 receives message in VG
+    vg.send_text("hello")
+    while 1:
+        msg = ac2.wait_next_incoming_message()
+        if msg.text == "hello":
+            assert msg.chat.is_protected()
+            break
+
+    lp.sec("ac3: create a join-code for group VG and let ac4 join, check that ac2 got it")
+    ac4.qr_join_chat(vg.get_join_qr())
+    ac3._evtracker.wait_securejoin_inviter_progress(1000)
+    while 1:
+        ev = ac2._evtracker.get()
+        if "added by unrelated SecureJoin" in str(ev):
+            return
+
+
 def test_qr_new_group_unblocked(acfactory, lp):
     """Regression test for a bug intoduced in core v1.113.0.
     ac2 scans a verified group QR code created by ac1.
@@ -1904,7 +1957,7 @@ def test_system_group_msg_from_blocked_user(acfactory, lp):
     chat_on_ac2.send_text("This will arrive")
     msg = ac1._evtracker.wait_next_incoming_message()
     assert msg.text == "This will arrive"
-    message_texts = [m.text for m in chat_on_ac1.get_messages()]
+    message_texts = [m.text for m in chat_on_ac1.get_messages() if not m.is_system_message()]
     assert len(message_texts) == 2
     assert "First group message" in message_texts
     assert "This will arrive" in message_texts
@@ -2208,7 +2261,17 @@ def test_delete_multiple_messages(acfactory, lp):
 
 def test_trash_multiple_messages(acfactory, lp):
     ac1, ac2 = acfactory.get_online_accounts(2)
+
+    # Create the Trash folder on IMAP server
+    # and recreate the account so Trash folder is configured.
+    lp.sec("Creating trash folder")
+    ac2.direct_imap.create_folder("Trash")
+    lp.sec("Creating new accounts")
+    ac2 = acfactory.new_online_configuring_account(cloned_from=ac2)
+    acfactory.bring_accounts_online()
+
     ac2.set_config("delete_to_trash", "1")
+    assert ac2.get_config("configured_trash_folder")
     chat12 = acfactory.get_accepted_chat(ac1, ac2)
 
     lp.sec("ac1: sending 3 messages")
@@ -2239,13 +2302,15 @@ def test_trash_multiple_messages(acfactory, lp):
 
 
 def test_configure_error_msgs_wrong_pw(acfactory):
-    configdict = acfactory.get_next_liveconfig()
-    ac1 = acfactory.get_unconfigured_account()
-    ac1.update_config(configdict)
-    ac1.set_config("mail_pw", "abc")  # Wrong mail pw
-    ac1.configure()
+    (ac1,) = acfactory.get_online_accounts(1)
+
+    ac2 = acfactory.get_unconfigured_account()
+    ac2.set_config("addr", ac1.get_config("addr"))
+    ac2.set_config("mail_pw", "abc")  # Wrong mail pw
+    ac2.configure()
     while True:
-        ev = ac1._evtracker.get_matching("DC_EVENT_CONFIGURE_PROGRESS")
+        ev = ac2._evtracker.get_matching("DC_EVENT_CONFIGURE_PROGRESS")
+        print(f"Configuration progress: {ev.data1}")
         if ev.data1 == 0:
             break
     # Password is wrong so it definitely has to say something about "password"
@@ -2548,7 +2613,7 @@ class TestOnlineConfigureFails:
     def test_invalid_user(self, acfactory):
         configdict = acfactory.get_next_liveconfig()
         ac1 = acfactory.get_unconfigured_account()
-        configdict["addr"] = "x" + configdict["addr"]
+        configdict["addr"] = "$" + configdict["addr"]
         ac1.update_config(configdict)
         configtracker = ac1.configure()
         configtracker.wait_progress(500)
@@ -2557,7 +2622,7 @@ class TestOnlineConfigureFails:
     def test_invalid_domain(self, acfactory):
         configdict = acfactory.get_next_liveconfig()
         ac1 = acfactory.get_unconfigured_account()
-        configdict["addr"] += "x"
+        configdict["addr"] += "$"
         ac1.update_config(configdict)
         configtracker = ac1.configure()
         configtracker.wait_progress(500)

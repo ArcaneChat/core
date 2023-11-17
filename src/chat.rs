@@ -1,15 +1,16 @@
 //! # Chat module.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::{TryFrom, TryInto};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, SystemTime};
 
-use anyhow::{bail, ensure, Context as _, Result};
+use anyhow::{anyhow, bail, ensure, Context as _, Result};
 use deltachat_derive::{FromSql, ToSql};
 use serde::{Deserialize, Serialize};
+use strum_macros::EnumIter;
 
 use crate::aheader::EncryptPreference;
 use crate::blob::BlobObject;
@@ -20,7 +21,7 @@ use crate::constants::{
     Blocked, Chattype, DC_CHAT_ID_ALLDONE_HINT, DC_CHAT_ID_ARCHIVED_LINK, DC_CHAT_ID_LAST_SPECIAL,
     DC_CHAT_ID_TRASH, DC_RESEND_USER_AVATAR_DAYS,
 };
-use crate::contact::{Contact, ContactId, Origin, VerifiedStatus};
+use crate::contact::{self, Contact, ContactAddress, ContactId, Origin, VerifiedStatus};
 use crate::context::Context;
 use crate::debug_logging::maybe_set_logging_xdc;
 use crate::download::DownloadState;
@@ -28,20 +29,21 @@ use crate::ephemeral::Timer as EphemeralTimer;
 use crate::events::EventType;
 use crate::html::new_html_mimepart;
 use crate::location;
+use crate::log::LogExt;
 use crate::message::{self, Message, MessageState, MsgId, Viewtype};
 use crate::mimefactory::MimeFactory;
 use crate::mimeparser::SystemMessage;
 use crate::param::{Param, Params};
 use crate::peerstate::{Peerstate, PeerstateVerifiedStatus};
 use crate::receive_imf::ReceivedMsg;
-use crate::scheduler::InterruptInfo;
 use crate::smtp::send_msg_to_smtp;
 use crate::sql;
 use crate::stock_str;
+use crate::sync::{self, Sync::*, SyncData};
 use crate::tools::{
     buf_compress, create_id, create_outgoing_rfc724_mid, create_smeared_timestamp,
     create_smeared_timestamps, get_abs_path, gm2local_offset, improve_single_line_input,
-    strip_rtlo_characters, time, IsNoneOrEmpty,
+    smeared_time, strip_rtlo_characters, time, IsNoneOrEmpty,
 };
 use crate::webxdc::WEBXDC_SUFFIX;
 
@@ -206,16 +208,24 @@ impl ChatId {
         self == DC_CHAT_ID_ALLDONE_HINT
     }
 
-    /// Returns the [`ChatId`] for the 1:1 chat with `contact_id` if it exists.
+    /// Returns the [`ChatId`] for the 1:1 chat with `contact_id`
+    /// if it exists and is not blocked.
     ///
-    /// If it does not exist, `None` is returned.
+    /// If the chat does not exist or is blocked, `None` is returned.
     pub async fn lookup_by_contact(
         context: &Context,
         contact_id: ContactId,
     ) -> Result<Option<Self>> {
-        ChatIdBlocked::lookup_by_contact(context, contact_id)
-            .await
-            .map(|lookup| lookup.map(|chat| chat.id))
+        let Some(chat_id_blocked) = ChatIdBlocked::lookup_by_contact(context, contact_id).await?
+        else {
+            return Ok(None);
+        };
+
+        let chat_id = match chat_id_blocked.blocked {
+            Blocked::Not | Blocked::Request => Some(chat_id_blocked.id),
+            Blocked::Yes => None,
+        };
+        Ok(chat_id)
     }
 
     /// Returns the [`ChatId`] for the 1:1 chat with `contact_id`.
@@ -225,7 +235,7 @@ impl ChatId {
     /// This is an internal API, if **a user action** needs to get a chat
     /// [`ChatId::create_for_contact`] should be used as this also scales up the
     /// [`Contact`]'s origin.
-    pub async fn get_for_contact(context: &Context, contact_id: ContactId) -> Result<Self> {
+    pub(crate) async fn get_for_contact(context: &Context, contact_id: ContactId) -> Result<Self> {
         ChatIdBlocked::get_for_contact(context, contact_id, Blocked::Not)
             .await
             .map(|chat| chat.id)
@@ -250,7 +260,7 @@ impl ChatId {
         let chat_id = match ChatIdBlocked::lookup_by_contact(context, contact_id).await? {
             Some(chat) => {
                 if create_blocked == Blocked::Not && chat.blocked != Blocked::Not {
-                    chat.id.unblock(context).await?;
+                    chat.id.set_blocked(context, Blocked::Not).await?;
                 }
                 chat.id
             }
@@ -356,6 +366,10 @@ impl ChatId {
 
     /// Blocks the chat as a result of explicit user action.
     pub async fn block(self, context: &Context) -> Result<()> {
+        self.block_ex(context, Sync).await
+    }
+
+    pub(crate) async fn block_ex(self, context: &Context, sync: sync::Sync) -> Result<()> {
         let chat = Chat::load_from_db(context, self).await?;
 
         match chat.typ {
@@ -369,7 +383,7 @@ impl ChatId {
                             context,
                             "Blocking the contact {contact_id} to block 1:1 chat."
                         );
-                        Contact::block(context, contact_id).await?;
+                        contact::set_blocked(context, Nosync, contact_id, true).await?;
                     }
                 }
             }
@@ -384,12 +398,34 @@ impl ChatId {
             }
         }
 
+        if sync.into() {
+            // NB: For a 1:1 chat this currently triggers `Contact::block()` on other devices.
+            chat.sync(context, SyncAction::Block)
+                .await
+                .log_err(context)
+                .ok();
+        }
         Ok(())
     }
 
     /// Unblocks the chat.
     pub async fn unblock(self, context: &Context) -> Result<()> {
+        self.unblock_ex(context, Sync).await
+    }
+
+    pub(crate) async fn unblock_ex(self, context: &Context, sync: sync::Sync) -> Result<()> {
         self.set_blocked(context, Blocked::Not).await?;
+
+        if sync.into() {
+            let chat = Chat::load_from_db(context, self).await?;
+            // TODO: For a 1:1 chat this currently triggers `Contact::unblock()` on other devices.
+            // Maybe we should unblock the contact locally too, this would also resolve discrepancy
+            // with `block()` which also blocks the contact.
+            chat.sync(context, SyncAction::Unblock)
+                .await
+                .log_err(context)
+                .ok();
+        }
         Ok(())
     }
 
@@ -397,6 +433,10 @@ impl ChatId {
     ///
     /// Unblocks the chat and scales up origin of contacts.
     pub async fn accept(self, context: &Context) -> Result<()> {
+        self.accept_ex(context, Sync).await
+    }
+
+    pub(crate) async fn accept_ex(self, context: &Context, sync: sync::Sync) -> Result<()> {
         let chat = Chat::load_from_db(context, self).await?;
 
         match chat.typ {
@@ -431,6 +471,12 @@ impl ChatId {
             context.emit_event(EventType::ChatModified(self));
         }
 
+        if sync.into() {
+            chat.sync(context, SyncAction::Accept)
+                .await
+                .log_err(context)
+                .ok();
+        }
         Ok(())
     }
 
@@ -531,8 +577,39 @@ impl ChatId {
         }
     }
 
+    /// Sets the 1:1 chat with the given address to ProtectionStatus::Protected,
+    /// and posts a `SystemMessage::ChatProtectionEnabled` into it.
+    ///
+    /// If necessary, creates a hidden chat for this.
+    pub(crate) async fn set_protection_for_contact(
+        context: &Context,
+        contact_id: ContactId,
+    ) -> Result<()> {
+        let chat_id = ChatId::create_for_contact_with_blocked(context, contact_id, Blocked::Yes)
+            .await
+            .with_context(|| format!("can't create chat for {}", contact_id))?;
+        chat_id
+            .set_protection(
+                context,
+                ProtectionStatus::Protected,
+                smeared_time(context),
+                Some(contact_id),
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Archives or unarchives a chat.
     pub async fn set_visibility(self, context: &Context, visibility: ChatVisibility) -> Result<()> {
+        self.set_visibility_ex(context, Sync, visibility).await
+    }
+
+    pub(crate) async fn set_visibility_ex(
+        self,
+        context: &Context,
+        sync: sync::Sync,
+        visibility: ChatVisibility,
+    ) -> Result<()> {
         ensure!(
             !self.is_special(),
             "bad chat_id, can not be special chat: {}",
@@ -558,6 +635,13 @@ impl ChatId {
 
         context.emit_msgs_changed_without_ids();
 
+        if sync.into() {
+            let chat = Chat::load_from_db(context, self).await?;
+            chat.sync(context, SyncAction::SetVisibility(visibility))
+                .await
+                .log_err(context)
+                .ok();
+        }
         Ok(())
     }
 
@@ -630,7 +714,6 @@ impl ChatId {
             "bad chat_id, can not be a special chat: {}",
             self
         );
-        /* Up to 2017-11-02 deleting a group also implied leaving it, see above why we have changed this. */
 
         let chat = Chat::load_from_db(context, self).await?;
         context
@@ -659,10 +742,7 @@ impl ChatId {
         context.emit_msgs_changed_without_ids();
 
         context.set_config(Config::LastHousekeeping, None).await?;
-        context
-            .scheduler
-            .interrupt_inbox(InterruptInfo::new(false))
-            .await;
+        context.scheduler.interrupt_inbox().await;
 
         if chat.is_self_talk() {
             let mut msg = Message::new(Viewtype::Text);
@@ -913,8 +993,9 @@ impl ChatId {
                    AND y.contact_id > 9
                    AND x.chat_id=?
                    AND y.chat_id<>x.chat_id
+                   AND y.chat_id>?
                  GROUP BY y.chat_id",
-                (self,),
+                (self, DC_CHAT_ID_LAST_SPECIAL),
                 |row| {
                     let chat_id: ChatId = row.get(0)?;
                     let intersection: f64 = row.get(1)?;
@@ -1209,6 +1290,16 @@ impl ChatId {
 
         Ok(())
     }
+
+    /// Returns true if the chat is protected.
+    pub async fn is_protected(self, context: &Context) -> Result<ProtectionStatus> {
+        let protection_status = context
+            .sql
+            .query_get_value("SELECT protected FROM chats WHERE id=?", (self,))
+            .await?
+            .unwrap_or_default();
+        Ok(protection_status)
+    }
 }
 
 impl std::fmt::Display for ChatId {
@@ -1270,7 +1361,8 @@ pub struct Chat {
     /// Whether the chat is archived or pinned.
     pub visibility: ChatVisibility,
 
-    /// Group ID.
+    /// Group ID. For [`Chattype::Mailinglist`] -- mailing list address. Empty for 1:1 chats and
+    /// ad-hoc groups.
     pub grpid: String,
 
     /// Whether the chat is blocked, unblocked or a contact request.
@@ -1541,6 +1633,15 @@ impl Chat {
     }
 
     /// Returns true if chat protection is enabled.
+    ///
+    /// UI should display a green checkmark
+    /// in the chat title,
+    /// in the chat profile title and
+    /// in the chatlist item
+    /// if chat protection is enabled.
+    /// UI should also display a green checkmark
+    /// in the contact profile
+    /// if 1:1 chat with this contact exists and is protected.
     pub fn is_protected(&self) -> bool {
         self.protected == ProtectionStatus::Protected
     }
@@ -1631,7 +1732,11 @@ impl Chat {
             // send_sync_msg() is called (usually) a moment later at send_msg_to_smtp()
             // when the group-creation message is actually sent though SMTP -
             // this makes sure, the other devices are aware of grpid that is used in the sync-message.
-            context.sync_qr_code_tokens(Some(self.id)).await?;
+            context
+                .sync_qr_code_tokens(Some(self.id))
+                .await
+                .log_err(context)
+                .ok();
         }
 
         // reset encrypt error state eg. for forwarding
@@ -1827,29 +1932,84 @@ impl Chat {
         context.scheduler.interrupt_ephemeral_task().await;
         Ok(msg.id)
     }
+
+    /// Sends a `SyncAction` synchronising chat contacts to other devices.
+    pub(crate) async fn sync_contacts(&self, context: &Context) -> Result<()> {
+        let addrs = context
+            .sql
+            .query_map(
+                "SELECT c.addr \
+                FROM contacts c INNER JOIN chats_contacts cc \
+                ON c.id=cc.contact_id \
+                WHERE cc.chat_id=?",
+                (self.id,),
+                |row| row.get::<_, String>(0),
+                |addrs| addrs.collect::<Result<Vec<_>, _>>().map_err(Into::into),
+            )
+            .await?;
+        self.sync(context, SyncAction::SetContacts(addrs)).await
+    }
+
+    /// Returns chat id for the purpose of synchronisation across devices.
+    async fn get_sync_id(&self, context: &Context) -> Result<Option<SyncId>> {
+        match self.typ {
+            Chattype::Single => {
+                let mut r = None;
+                for contact_id in get_chat_contacts(context, self.id).await? {
+                    if contact_id == ContactId::SELF && !self.is_self_talk() {
+                        continue;
+                    }
+                    if r.is_some() {
+                        return Ok(None);
+                    }
+                    let contact = Contact::get_by_id(context, contact_id).await?;
+                    r = Some(SyncId::ContactAddr(contact.get_addr().to_string()));
+                }
+                Ok(r)
+            }
+            Chattype::Broadcast | Chattype::Group | Chattype::Mailinglist => {
+                if self.grpid.is_empty() {
+                    return Ok(None);
+                }
+                Ok(Some(SyncId::Grpid(self.grpid.clone())))
+            }
+        }
+    }
+
+    /// Synchronises a chat action to other devices.
+    pub(crate) async fn sync(&self, context: &Context, action: SyncAction) -> Result<()> {
+        if let Some(id) = self.get_sync_id(context).await? {
+            sync(context, id, action).await?;
+        }
+        Ok(())
+    }
+}
+
+async fn sync(context: &Context, id: SyncId, action: SyncAction) -> Result<()> {
+    context
+        .add_sync_item(SyncData::AlterChat { id, action })
+        .await?;
+    context.send_sync_msg().await?;
+    Ok(())
 }
 
 /// Whether the chat is pinned or archived.
-#[derive(Debug, Copy, Eq, PartialEq, Clone, Serialize, Deserialize)]
+#[derive(Debug, Copy, Eq, PartialEq, Clone, Serialize, Deserialize, EnumIter)]
+#[repr(i8)]
 pub enum ChatVisibility {
     /// Chat is neither archived nor pinned.
-    Normal,
+    Normal = 0,
 
     /// Chat is archived.
-    Archived,
+    Archived = 1,
 
     /// Chat is pinned to the top of the chatlist.
-    Pinned,
+    Pinned = 2,
 }
 
 impl rusqlite::types::ToSql for ChatVisibility {
     fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput> {
-        let visibility = match &self {
-            ChatVisibility::Normal => 0,
-            ChatVisibility::Archived => 1,
-            ChatVisibility::Pinned => 2,
-        };
-        let val = rusqlite::types::Value::Integer(visibility);
+        let val = rusqlite::types::Value::Integer(*self as i64);
         let out = rusqlite::types::ToSqlOutput::Owned(val);
         Ok(out)
     }
@@ -2287,10 +2447,13 @@ async fn prepare_msg_common(
 
     // Check if the chat can be sent to.
     if let Some(reason) = chat.why_cant_send(context).await? {
-        if reason == CantSendReason::ProtectionBroken
-            && msg.param.get_cmd() == SystemMessage::SecurejoinMessage
+        if matches!(
+            reason,
+            CantSendReason::ProtectionBroken | CantSendReason::ContactRequest
+        ) && msg.param.get_cmd() == SystemMessage::SecurejoinMessage
         {
-            // Send out the message, the securejoin message is supposed to repair the verification
+            // Send out the message, the securejoin message is supposed to repair the verification.
+            // If the chat is a contact request, let the user accept it later.
         } else {
             bail!("cannot send to {chat_id}: {reason}");
         }
@@ -2407,10 +2570,7 @@ async fn send_msg_inner(context: &Context, chat_id: ChatId, msg: &mut Message) -
             context.emit_event(EventType::LocationChanged(Some(ContactId::SELF)));
         }
 
-        context
-            .scheduler
-            .interrupt_smtp(InterruptInfo::new(false))
-            .await;
+        context.scheduler.interrupt_smtp().await;
     }
 
     Ok(msg.id)
@@ -3060,6 +3220,13 @@ pub async fn create_group_chat(
             .await?;
     }
 
+    if !context.get_config_bool(Config::Bot).await?
+        && !context.get_config_bool(Config::SkipStartMessages).await?
+    {
+        let text = stock_str::new_group_send_first_message(context).await;
+        add_info_msg(context, chat_id, &text, create_smeared_timestamp(context)).await?;
+    }
+
     Ok(chat_id)
 }
 
@@ -3090,24 +3257,77 @@ async fn find_unused_broadcast_list_name(context: &Context) -> Result<String> {
 pub async fn create_broadcast_list(context: &Context) -> Result<ChatId> {
     let chat_name = find_unused_broadcast_list_name(context).await?;
     let grpid = create_id();
-    let row_id = context
-        .sql
-        .insert(
-            "INSERT INTO chats
-        (type, name, grpid, param, created_timestamp)
-        VALUES(?, ?, ?, \'U=1\', ?);",
-            (
-                Chattype::Broadcast,
-                chat_name,
-                grpid,
-                create_smeared_timestamp(context),
-            ),
-        )
-        .await?;
+    create_broadcast_list_ex(context, Sync, grpid, chat_name).await
+}
+
+pub(crate) async fn create_broadcast_list_ex(
+    context: &Context,
+    sync: sync::Sync,
+    grpid: String,
+    chat_name: String,
+) -> Result<ChatId> {
+    let row_id = {
+        let chat_name = &chat_name;
+        let grpid = &grpid;
+        let trans_fn = |t: &mut rusqlite::Transaction| {
+            let cnt = t.execute("UPDATE chats SET name=? WHERE grpid=?", (chat_name, grpid))?;
+            ensure!(cnt <= 1, "{cnt} chats exist with grpid {grpid}");
+            if cnt == 1 {
+                return Ok(t.query_row(
+                    "SELECT id FROM chats WHERE grpid=? AND type=?",
+                    (grpid, Chattype::Broadcast),
+                    |row| {
+                        let id: isize = row.get(0)?;
+                        Ok(id)
+                    },
+                )?);
+            }
+            t.execute(
+                "INSERT INTO chats \
+                (type, name, grpid, param, created_timestamp) \
+                VALUES(?, ?, ?, \'U=1\', ?);",
+                (
+                    Chattype::Broadcast,
+                    &chat_name,
+                    &grpid,
+                    create_smeared_timestamp(context),
+                ),
+            )?;
+            Ok(t.last_insert_rowid().try_into()?)
+        };
+        context.sql.transaction(trans_fn).await?
+    };
     let chat_id = ChatId::new(u32::try_from(row_id)?);
 
     context.emit_msgs_changed_without_ids();
+    if sync.into() {
+        let id = SyncId::Grpid(grpid);
+        let action = SyncAction::CreateBroadcast(chat_name);
+        self::sync(context, id, action).await.log_err(context).ok();
+    }
     Ok(chat_id)
+}
+
+/// Set chat contacts in the `chats_contacts` table.
+pub(crate) async fn update_chat_contacts_table(
+    context: &Context,
+    id: ChatId,
+    contacts: &HashSet<ContactId>,
+) -> Result<()> {
+    context
+        .sql
+        .transaction(move |transaction| {
+            transaction.execute("DELETE FROM chats_contacts WHERE chat_id=?", (id,))?;
+            for contact_id in contacts {
+                transaction.execute(
+                    "INSERT INTO chats_contacts (chat_id, contact_id) VALUES(?, ?)",
+                    (id, contact_id),
+                )?;
+            }
+            Ok(())
+        })
+        .await?;
+    Ok(())
 }
 
 /// Adds contacts to the `chats_contacts` table.
@@ -3155,12 +3375,13 @@ pub async fn add_contact_to_chat(
     chat_id: ChatId,
     contact_id: ContactId,
 ) -> Result<()> {
-    add_contact_to_chat_ex(context, chat_id, contact_id, false).await?;
+    add_contact_to_chat_ex(context, Sync, chat_id, contact_id, false).await?;
     Ok(())
 }
 
 pub(crate) async fn add_contact_to_chat_ex(
     context: &Context,
+    mut sync: sync::Sync,
     chat_id: ChatId,
     contact_id: ContactId,
     from_handshake: bool,
@@ -3199,8 +3420,12 @@ pub(crate) async fn add_contact_to_chat_ex(
     if from_handshake && chat.param.get_int(Param::Unpromoted).unwrap_or_default() == 1 {
         chat.param.remove(Param::Unpromoted);
         chat.update_param(context).await?;
-        context.sync_qr_code_tokens(Some(chat_id)).await?;
-        context.send_sync_msg().await?;
+        let _ = context
+            .sync_qr_code_tokens(Some(chat_id))
+            .await
+            .log_err(context)
+            .is_ok()
+            && context.send_sync_msg().await.log_err(context).is_ok();
     }
 
     if context.is_self_addr(contact.get_addr()).await? {
@@ -3242,8 +3467,12 @@ pub(crate) async fn add_contact_to_chat_ex(
         msg.param.set(Param::Arg, contact_addr);
         msg.param.set_int(Param::Arg2, from_handshake.into());
         msg.id = send_msg(context, chat_id, &mut msg).await?;
+        sync = Nosync;
     }
     context.emit_event(EventType::ChatModified(chat_id));
+    if sync.into() {
+        chat.sync_contacts(context).await.log_err(context).ok();
+    }
     Ok(true)
 }
 
@@ -3280,7 +3509,7 @@ pub(crate) async fn shall_attach_selfavatar(context: &Context, chat_id: ChatId) 
 }
 
 /// Chat mute duration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MuteDuration {
     /// Chat is not muted.
     NotMuted,
@@ -3329,6 +3558,15 @@ impl rusqlite::types::FromSql for MuteDuration {
 
 /// Mutes the chat for a given duration or unmutes it.
 pub async fn set_muted(context: &Context, chat_id: ChatId, duration: MuteDuration) -> Result<()> {
+    set_muted_ex(context, Sync, chat_id, duration).await
+}
+
+pub(crate) async fn set_muted_ex(
+    context: &Context,
+    sync: sync::Sync,
+    chat_id: ChatId,
+    duration: MuteDuration,
+) -> Result<()> {
     ensure!(!chat_id.is_special(), "Invalid chat ID");
     context
         .sql
@@ -3339,6 +3577,13 @@ pub async fn set_muted(context: &Context, chat_id: ChatId, duration: MuteDuratio
         .await
         .context(format!("Failed to set mute duration for {chat_id}"))?;
     context.emit_event(EventType::ChatModified(chat_id));
+    if sync.into() {
+        let chat = Chat::load_from_db(context, chat_id).await?;
+        chat.sync(context, SyncAction::SetMuted(duration))
+            .await
+            .log_err(context)
+            .ok();
+    }
     Ok(())
 }
 
@@ -3369,6 +3614,7 @@ pub async fn remove_contact_from_chat(
             context.emit_event(EventType::ErrorSelfNotInGroup(err_msg.clone()));
             bail!("{}", err_msg);
         } else {
+            let mut sync = Nosync;
             // We do not return an error if the contact does not exist in the database.
             // This allows to delete dangling references to deleted contacts
             // in case of the database becoming inconsistent due to a bug.
@@ -3389,6 +3635,8 @@ pub async fn remove_contact_from_chat(
                     msg.param.set_cmd(SystemMessage::MemberRemovedFromGroup);
                     msg.param.set(Param::Arg, contact.get_addr());
                     msg.id = send_msg(context, chat_id, &mut msg).await?;
+                } else {
+                    sync = Sync;
                 }
             }
             // we remove the member from the chat after constructing the
@@ -3403,6 +3651,9 @@ pub async fn remove_contact_from_chat(
             // check/encryption logic.
             remove_from_chat_contacts_table(context, chat_id, contact_id).await?;
             context.emit_event(EventType::ChatModified(chat_id));
+            if sync.into() {
+                chat.sync_contacts(context).await.log_err(context).ok();
+            }
         }
     } else {
         bail!("Cannot remove members from non-group chats.");
@@ -3432,6 +3683,15 @@ pub(crate) async fn is_group_explicitly_left(context: &Context, grpid: &str) -> 
 
 /// Sets group or mailing list chat name.
 pub async fn set_chat_name(context: &Context, chat_id: ChatId, new_name: &str) -> Result<()> {
+    rename_ex(context, Sync, chat_id, new_name).await
+}
+
+async fn rename_ex(
+    context: &Context,
+    sync: sync::Sync,
+    chat_id: ChatId,
+    new_name: &str,
+) -> Result<()> {
     let new_name = improve_single_line_input(new_name);
     /* the function only sets the names of group chats; normal chats get their names from the contacts */
     let mut success = false;
@@ -3483,7 +3743,13 @@ pub async fn set_chat_name(context: &Context, chat_id: ChatId, new_name: &str) -
     if !success {
         bail!("Failed to set name");
     }
-
+    if sync.into() && chat.name != new_name {
+        let sync_name = new_name.to_string();
+        chat.sync(context, SyncAction::Rename(sync_name))
+            .await
+            .log_err(context)
+            .ok();
+    }
     Ok(())
 }
 
@@ -3619,10 +3885,7 @@ pub async fn forward_msgs(context: &Context, msg_ids: &[MsgId], chat_id: ChatId)
                 .await?;
             curr_timestamp += 1;
             if create_send_msg_job(context, &mut msg).await?.is_some() {
-                context
-                    .scheduler
-                    .interrupt_smtp(InterruptInfo::new(false))
-                    .await;
+                context.scheduler.interrupt_smtp().await;
             }
         }
         created_chats.push(chat_id);
@@ -3679,10 +3942,7 @@ pub async fn resend_msgs(context: &Context, msg_ids: &[MsgId]) -> Result<()> {
             msg_id: msg.id,
         });
         if create_send_msg_job(context, &mut msg).await?.is_some() {
-            context
-                .scheduler
-                .interrupt_smtp(InterruptInfo::new(false))
-                .await;
+            context.scheduler.interrupt_smtp().await;
         }
     }
     Ok(())
@@ -3963,6 +4223,107 @@ pub(crate) async fn update_msg_text_and_timestamp(
     Ok(())
 }
 
+/// Set chat contacts by their addresses creating the corresponding contacts if necessary.
+async fn set_contacts_by_addrs(context: &Context, id: ChatId, addrs: &[String]) -> Result<()> {
+    let chat = Chat::load_from_db(context, id).await?;
+    ensure!(
+        chat.typ == Chattype::Group || chat.typ == Chattype::Broadcast,
+        "{id} is not a group/broadcast",
+    );
+    let mut contacts = HashSet::new();
+    for addr in addrs {
+        let contact_addr = ContactAddress::new(addr)?;
+        let contact = Contact::add_or_lookup(context, "", contact_addr, Origin::Hidden)
+            .await?
+            .0;
+        contacts.insert(contact);
+    }
+    let contacts_old = HashSet::<ContactId>::from_iter(get_chat_contacts(context, id).await?);
+    if contacts == contacts_old {
+        return Ok(());
+    }
+    update_chat_contacts_table(context, id, &contacts).await?;
+    context.emit_event(EventType::ChatModified(id));
+    Ok(())
+}
+
+/// A cross-device chat id used for synchronisation.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub(crate) enum SyncId {
+    ContactAddr(String),
+    Grpid(String),
+    // NOTE: Ad-hoc groups lack an identifier that can be used across devices so
+    // block/mute/etc. actions on them are not synchronized to other devices.
+}
+
+/// An action synchronised to other devices.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub(crate) enum SyncAction {
+    Block,
+    Unblock,
+    Accept,
+    SetVisibility(ChatVisibility),
+    SetMuted(MuteDuration),
+    /// Create broadcast list with the given name.
+    CreateBroadcast(String),
+    Rename(String),
+    /// Set chat contacts by their addresses.
+    SetContacts(Vec<String>),
+}
+
+impl Context {
+    /// Executes [`SyncData::AlterChat`] item sent by other device.
+    pub(crate) async fn sync_alter_chat(&self, id: &SyncId, action: &SyncAction) -> Result<()> {
+        let chat_id = match id {
+            SyncId::ContactAddr(addr) => {
+                let Some(contact_id) =
+                    Contact::lookup_id_by_addr_ex(self, addr, Origin::Unknown, None).await?
+                else {
+                    warn!(self, "sync_alter_chat: No contact for addr '{addr}'.");
+                    return Ok(());
+                };
+                match action {
+                    SyncAction::Block => {
+                        return contact::set_blocked(self, Nosync, contact_id, true).await
+                    }
+                    SyncAction::Unblock => {
+                        return contact::set_blocked(self, Nosync, contact_id, false).await
+                    }
+                    _ => (),
+                }
+                let Some(chat_id) = ChatId::lookup_by_contact(self, contact_id).await? else {
+                    warn!(self, "sync_alter_chat: No chat for addr '{addr}'.");
+                    return Ok(());
+                };
+                chat_id
+            }
+            SyncId::Grpid(grpid) => {
+                if let SyncAction::CreateBroadcast(name) = action {
+                    create_broadcast_list_ex(self, Nosync, grpid.clone(), name.clone()).await?;
+                    return Ok(());
+                }
+                let Some((chat_id, ..)) = get_chat_id_by_grpid(self, grpid).await? else {
+                    warn!(self, "sync_alter_chat: No chat for grpid '{grpid}'.");
+                    return Ok(());
+                };
+                chat_id
+            }
+        };
+        match action {
+            SyncAction::Block => chat_id.block_ex(self, Nosync).await,
+            SyncAction::Unblock => chat_id.unblock_ex(self, Nosync).await,
+            SyncAction::Accept => chat_id.accept_ex(self, Nosync).await,
+            SyncAction::SetVisibility(v) => chat_id.set_visibility_ex(self, Nosync, *v).await,
+            SyncAction::SetMuted(duration) => set_muted_ex(self, Nosync, chat_id, *duration).await,
+            SyncAction::CreateBroadcast(_) => {
+                Err(anyhow!("sync_alter_chat({id:?}, {action:?}): Bad request."))
+            }
+            SyncAction::Rename(to) => rename_ex(self, Nosync, chat_id, to).await,
+            SyncAction::SetContacts(addrs) => set_contacts_by_addrs(self, chat_id, addrs).await,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3972,6 +4333,7 @@ mod tests {
     use crate::message::delete_msgs;
     use crate::receive_imf::receive_imf;
     use crate::test_utils::{TestContext, TestContextManager};
+    use strum::IntoEnumIterator;
     use tokio::fs;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4182,7 +4544,7 @@ mod tests {
         let chat_id = create_group_chat(&t, ProtectionStatus::Unprotected, "foo")
             .await
             .unwrap();
-        let added = add_contact_to_chat_ex(&t, chat_id, ContactId::SELF, false)
+        let added = add_contact_to_chat_ex(&t, Nosync, chat_id, ContactId::SELF, false)
             .await
             .unwrap();
         assert_eq!(added, false);
@@ -4306,13 +4668,11 @@ mod tests {
         remove_contact_from_chat(&bob, bob_chat_id, ContactId::SELF).await?;
 
         // Bob receives a msg about Alice adding Claire to the group.
-        let bob_received_add_msg = bob.recv_msg(&alice_sent_add_msg).await;
+        bob.recv_msg(&alice_sent_add_msg).await;
 
         // Test that add message is rewritten.
-        assert_eq!(
-            bob_received_add_msg.get_text(),
-            "Member claire@example.net added by alice@example.org."
-        );
+        bob.golden_test_chat(bob_chat_id, "chat_test_simultaneous_member_remove")
+            .await;
 
         // Bob receives a msg about Alice removing him from the group.
         let bob_received_remove_msg = bob.recv_msg(&alice_sent_remove_msg).await;
@@ -4323,6 +4683,37 @@ mod tests {
             "Member Me (bob@example.net) removed by alice@example.org."
         );
 
+        Ok(())
+    }
+
+    /// Test that if a message implicitly adds a member, both messages appear.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_msg_with_implicit_member_add() -> Result<()> {
+        let mut tcm = TestContextManager::new();
+        let alice = tcm.alice().await;
+        let bob = tcm.bob().await;
+        let alice_bob_contact_id =
+            Contact::create(&alice, "Bob", &bob.get_config(Config::Addr).await?.unwrap()).await?;
+        let fiona_addr = "fiona@example.net";
+        let alice_fiona_contact_id = Contact::create(&alice, "Fiona", fiona_addr).await?;
+        let bob_fiona_contact_id = Contact::create(&bob, "Fiona", fiona_addr).await?;
+        let alice_chat_id =
+            create_group_chat(&alice, ProtectionStatus::Unprotected, "Group chat").await?;
+        add_contact_to_chat(&alice, alice_chat_id, alice_bob_contact_id).await?;
+        let sent_msg = alice.send_text(alice_chat_id, "I created a group").await;
+        let bob_received_msg = bob.recv_msg(&sent_msg).await;
+        let bob_chat_id = bob_received_msg.get_chat_id();
+        bob_chat_id.accept(&bob).await?;
+
+        add_contact_to_chat(&alice, alice_chat_id, alice_fiona_contact_id).await?;
+        let sent_msg = alice.pop_sent_msg().await;
+        bob.recv_msg(&sent_msg).await;
+        remove_contact_from_chat(&bob, bob_chat_id, bob_fiona_contact_id).await?;
+
+        let sent_msg = alice.send_text(alice_chat_id, "Welcome, Fiona!").await;
+        bob.recv_msg(&sent_msg).await;
+        bob.golden_test_chat(bob_chat_id, "chat_test_msg_with_implicit_member_add")
+            .await;
         Ok(())
     }
 
@@ -4534,7 +4925,7 @@ mod tests {
 
         // adding or removing contacts from one-to-one-chats result in an error
         let claire = Contact::create(&ctx, "", "claire@foo.de").await.unwrap();
-        let added = add_contact_to_chat_ex(&ctx, chat.id, claire, false).await;
+        let added = add_contact_to_chat_ex(&ctx, Nosync, chat.id, claire, false).await;
         assert!(added.is_err());
         assert_eq!(get_chat_contacts(&ctx, chat.id).await.unwrap().len(), 1);
 
@@ -6165,6 +6556,47 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_broadcast_multidev() -> Result<()> {
+        let alices = [
+            TestContext::new_alice().await,
+            TestContext::new_alice().await,
+        ];
+        let bob = TestContext::new_bob().await;
+        let a1b_contact_id = alices[1].add_or_lookup_contact(&bob).await.id;
+
+        let a0_broadcast_id = create_broadcast_list(&alices[0]).await?;
+        let a0_broadcast_chat = Chat::load_from_db(&alices[0], a0_broadcast_id).await?;
+        set_chat_name(&alices[0], a0_broadcast_id, "Broadcast list 42").await?;
+        let sent_msg = alices[0].send_text(a0_broadcast_id, "hi").await;
+        let msg = alices[1].recv_msg(&sent_msg).await;
+        let a1_broadcast_id = get_chat_id_by_grpid(&alices[1], &a0_broadcast_chat.grpid)
+            .await?
+            .unwrap()
+            .0;
+        assert_eq!(msg.chat_id, a1_broadcast_id);
+        let a1_broadcast_chat = Chat::load_from_db(&alices[1], a1_broadcast_id).await?;
+        assert_eq!(a1_broadcast_chat.get_type(), Chattype::Broadcast);
+        assert_eq!(a1_broadcast_chat.get_name(), "Broadcast list 42");
+        assert!(get_chat_contacts(&alices[1], a1_broadcast_id)
+            .await?
+            .is_empty());
+
+        add_contact_to_chat(&alices[1], a1_broadcast_id, a1b_contact_id).await?;
+        set_chat_name(&alices[1], a1_broadcast_id, "Broadcast list 43").await?;
+        let sent_msg = alices[1].send_text(a1_broadcast_id, "hi").await;
+        let msg = alices[0].recv_msg(&sent_msg).await;
+        assert_eq!(msg.chat_id, a0_broadcast_id);
+        let a0_broadcast_chat = Chat::load_from_db(&alices[0], a0_broadcast_id).await?;
+        assert_eq!(a0_broadcast_chat.get_type(), Chattype::Broadcast);
+        assert_eq!(a0_broadcast_chat.get_name(), "Broadcast list 42");
+        assert!(get_chat_contacts(&alices[0], a0_broadcast_id)
+            .await?
+            .is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_create_for_contact_with_blocked() -> Result<()> {
         let t = TestContext::new().await;
         let (contact_id, _) = Contact::add_or_lookup(
@@ -6450,6 +6882,161 @@ mod tests {
             Some("$BLOBDIR/harmless_file.txt.exe"),
             msg.param.get(Param::File),
         );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_sync_alter_chat() -> Result<()> {
+        let alices = [
+            TestContext::new_alice().await,
+            TestContext::new_alice().await,
+        ];
+        for a in &alices {
+            a.set_config_bool(Config::SyncMsgs, true).await?;
+        }
+        let bob = TestContext::new_bob().await;
+
+        let ba_chat = bob.create_chat(&alices[0]).await;
+        let sent_msg = bob.send_text(ba_chat.id, "hi").await;
+        let a0b_chat_id = alices[0].recv_msg(&sent_msg).await.chat_id;
+        alices[1].recv_msg(&sent_msg).await;
+        let ab_contact_ids = [
+            alices[0].add_or_lookup_contact(&bob).await.id,
+            alices[1].add_or_lookup_contact(&bob).await.id,
+        ];
+
+        async fn sync(alices: &[TestContext]) -> Result<()> {
+            let sync_msg = alices.get(0).unwrap().pop_sent_msg().await;
+            alices.get(1).unwrap().recv_msg(&sync_msg).await;
+            Ok(())
+        }
+
+        assert_eq!(alices[1].get_chat(&bob).await.blocked, Blocked::Request);
+        a0b_chat_id.accept(&alices[0]).await?;
+        sync(&alices).await?;
+        assert_eq!(alices[1].get_chat(&bob).await.blocked, Blocked::Not);
+        a0b_chat_id.block(&alices[0]).await?;
+        sync(&alices).await?;
+        assert_eq!(alices[1].get_chat(&bob).await.blocked, Blocked::Yes);
+        a0b_chat_id.unblock(&alices[0]).await?;
+        sync(&alices).await?;
+        assert_eq!(alices[1].get_chat(&bob).await.blocked, Blocked::Not);
+
+        // Unblocking a 1:1 chat doesn't unblock the contact currently.
+        Contact::unblock(&alices[0], ab_contact_ids[0]).await?;
+
+        assert!(!alices[1].add_or_lookup_contact(&bob).await.is_blocked());
+        Contact::block(&alices[0], ab_contact_ids[0]).await?;
+        sync(&alices).await?;
+        assert!(alices[1].add_or_lookup_contact(&bob).await.is_blocked());
+        Contact::unblock(&alices[0], ab_contact_ids[0]).await?;
+        sync(&alices).await?;
+        assert!(!alices[1].add_or_lookup_contact(&bob).await.is_blocked());
+
+        // Test accepting and blocking groups. This way we test:
+        // - Group chats synchronisation.
+        // - That blocking a group deletes it on other devices.
+        let fiona = TestContext::new_fiona().await;
+        let fiona_grp_chat_id = fiona
+            .create_group_with_members(ProtectionStatus::Unprotected, "grp", &[&alices[0]])
+            .await;
+        let sent_msg = fiona.send_text(fiona_grp_chat_id, "hi").await;
+        let a0_grp_chat_id = alices[0].recv_msg(&sent_msg).await.chat_id;
+        let a1_grp_chat_id = alices[1].recv_msg(&sent_msg).await.chat_id;
+        let a1_grp_chat = Chat::load_from_db(&alices[1], a1_grp_chat_id).await?;
+        assert_eq!(a1_grp_chat.blocked, Blocked::Request);
+        a0_grp_chat_id.accept(&alices[0]).await?;
+        sync(&alices).await?;
+        let a1_grp_chat = Chat::load_from_db(&alices[1], a1_grp_chat_id).await?;
+        assert_eq!(a1_grp_chat.blocked, Blocked::Not);
+        a0_grp_chat_id.block(&alices[0]).await?;
+        sync(&alices).await?;
+        assert!(Chat::load_from_db(&alices[1], a1_grp_chat_id)
+            .await
+            .is_err());
+        assert!(
+            !alices[1]
+                .sql
+                .exists("SELECT COUNT(*) FROM chats WHERE id=?", (a1_grp_chat_id,))
+                .await?
+        );
+
+        // Test syncing of chat visibility on a self-chat. This way we test:
+        // - Self-chat synchronisation.
+        // - That sync messages don't unarchive the self-chat.
+        let a0self_chat_id = alices[0].get_self_chat().await.id;
+        assert_eq!(
+            alices[1].get_self_chat().await.get_visibility(),
+            ChatVisibility::Normal
+        );
+        let mut visibilities =
+            ChatVisibility::iter().chain(std::iter::once(ChatVisibility::Normal));
+        visibilities.next();
+        for v in visibilities {
+            a0self_chat_id.set_visibility(&alices[0], v).await?;
+            sync(&alices).await?;
+            for a in &alices {
+                assert_eq!(a.get_self_chat().await.get_visibility(), v);
+            }
+        }
+
+        assert_eq!(
+            alices[1].get_chat(&bob).await.mute_duration,
+            MuteDuration::NotMuted
+        );
+        let mute_durations = [
+            MuteDuration::Forever,
+            MuteDuration::Until(SystemTime::now() + Duration::from_secs(42)),
+            MuteDuration::NotMuted,
+        ];
+        for m in mute_durations {
+            set_muted(&alices[0], a0b_chat_id, m).await?;
+            sync(&alices).await?;
+            let m = match m {
+                MuteDuration::Until(time) => MuteDuration::Until(
+                    SystemTime::UNIX_EPOCH
+                        + Duration::from_secs(
+                            time.duration_since(SystemTime::UNIX_EPOCH)?.as_secs(),
+                        ),
+                ),
+                _ => m,
+            };
+            assert_eq!(alices[1].get_chat(&bob).await.mute_duration, m);
+        }
+
+        let a0_broadcast_id = create_broadcast_list(&alices[0]).await?;
+        sync(&alices).await?;
+        let a0_broadcast_chat = Chat::load_from_db(&alices[0], a0_broadcast_id).await?;
+        set_chat_name(&alices[0], a0_broadcast_id, "Broadcast list 42").await?;
+        sync(&alices).await?;
+        let a1_broadcast_id = get_chat_id_by_grpid(&alices[1], &a0_broadcast_chat.grpid)
+            .await?
+            .unwrap()
+            .0;
+        let a1_broadcast_chat = Chat::load_from_db(&alices[1], a1_broadcast_id).await?;
+        assert_eq!(a1_broadcast_chat.get_type(), Chattype::Broadcast);
+        assert_eq!(a1_broadcast_chat.get_name(), "Broadcast list 42");
+        assert!(get_chat_contacts(&alices[1], a1_broadcast_id)
+            .await?
+            .is_empty());
+        add_contact_to_chat(&alices[0], a0_broadcast_id, ab_contact_ids[0]).await?;
+        sync(&alices).await?;
+        assert_eq!(
+            get_chat_contacts(&alices[1], a1_broadcast_id).await?,
+            vec![ab_contact_ids[1]]
+        );
+        let sent_msg = alices[1].send_text(a1_broadcast_id, "hi").await;
+        let msg = bob.recv_msg(&sent_msg).await;
+        let chat = Chat::load_from_db(&bob, msg.chat_id).await?;
+        assert_eq!(chat.get_type(), Chattype::Mailinglist);
+        let msg = alices[0].recv_msg(&sent_msg).await;
+        assert_eq!(msg.chat_id, a0_broadcast_id);
+        remove_contact_from_chat(&alices[0], a0_broadcast_id, ab_contact_ids[0]).await?;
+        sync(&alices).await?;
+        assert!(get_chat_contacts(&alices[1], a1_broadcast_id)
+            .await?
+            .is_empty());
+
         Ok(())
     }
 }

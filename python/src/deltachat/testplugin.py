@@ -8,11 +8,11 @@ import sys
 import threading
 import time
 import weakref
+import random
 from queue import Queue
 from typing import Callable, Dict, List, Optional, Set
 
 import pytest
-import requests
 from _pytest._code import Source
 
 import deltachat
@@ -24,10 +24,10 @@ from .events import FFIEventLogger, FFIEventTracker
 def pytest_addoption(parser):
     group = parser.getgroup("deltachat testplugin options")
     group.addoption(
-        "--liveconfig",
+        "--chatmail",
         action="store",
         default=None,
-        help="a file with >=2 lines where each line contains NAME=VALUE config settings for one account",
+        help="chatmail server domain name",
     )
     group.addoption(
         "--ignored",
@@ -52,11 +52,11 @@ def pytest_addoption(parser):
 
 
 def pytest_configure(config):
-    cfg = config.getoption("--liveconfig")
+    cfg = config.getoption("--chatmail")
     if not cfg:
-        cfg = os.getenv("DCC_NEW_TMP_EMAIL")
+        cfg = os.getenv("CHATMAIL_DOMAIN")
         if cfg:
-            config.option.liveconfig = cfg
+            config.option.chatmail = cfg
 
     # Make sure we don't get garbled output because threads keep running
     # collect all ever created accounts in a weakref-set (so we don't
@@ -125,13 +125,10 @@ def pytest_report_header(config, startdir):
         ),
     ]
 
-    cfg = config.option.liveconfig
-    if cfg:
-        if "?" in cfg:
-            url, token = cfg.split("?", 1)
-            summary.append(f"Liveconfig provider: {url}?<token omitted>")
-        else:
-            summary.append(f"Liveconfig file: {cfg}")
+    chatmail_opt = config.getoption("--chatmail")
+    if chatmail_opt:
+        summary.append(f"Chatmail account provider: {chatmail_opt}")
+
     return summary
 
 
@@ -156,38 +153,29 @@ class TestProcess:
     def get_liveconfig_producer(self):
         """provide live account configs, cached on a per-test-process scope
         so that test functions can re-use already known live configs.
-        Depending on the --liveconfig option this comes from
-        a HTTP provider or a file with a line specifying each accounts config.
         """
-        liveconfig_opt = self.pytestconfig.getoption("--liveconfig")
-        if not liveconfig_opt:
-            pytest.skip("specify DCC_NEW_TMP_EMAIL or --liveconfig to provide live accounts")
-
-        if not liveconfig_opt.startswith("http"):
-            for line in open(liveconfig_opt):
-                if line.strip() and not line.strip().startswith("#"):
-                    d = {}
-                    for part in line.split():
-                        name, value = part.split("=")
-                        d[name] = value
-                    self._configlist.append(d)
-
-            yield from iter(self._configlist)
-        else:
+        chatmail_opt = self.pytestconfig.getoption("--chatmail")
+        if chatmail_opt:
+            # Use a chatmail instance.
+            domain = chatmail_opt
             MAX_LIVE_CREATED_ACCOUNTS = 10
             for index in range(MAX_LIVE_CREATED_ACCOUNTS):
                 try:
                     yield self._configlist[index]
                 except IndexError:
-                    res = requests.post(liveconfig_opt, timeout=60)
-                    if res.status_code != 200:
-                        pytest.fail(f"newtmpuser count={index} code={res.status_code}: '{res.text}'")
-                    d = res.json()
-                    config = {"addr": d["email"], "mail_pw": d["password"]}
+                    part = "".join(random.choices("2345789acdefghjkmnpqrstuvwxyz", k=6))
+                    username = f"ci-{part}"
+                    password = f"{username}${username}"
+                    addr = f"{username}@{domain}"
+                    config = {"addr": addr, "mail_pw": password}
                     print("newtmpuser {}: addr={}".format(index, config["addr"]))
                     self._configlist.append(config)
                     yield config
             pytest.fail(f"more than {MAX_LIVE_CREATED_ACCOUNTS} live accounts requested.")
+        else:
+            pytest.skip(
+                "specify CHATMAIL_DOMAIN or --chatmail to provide live accounts",
+            )
 
     def cache_maybe_retrieve_configured_db_files(self, cache_addr, db_target_path):
         db_target_path = pathlib.Path(db_target_path)
@@ -533,6 +521,7 @@ class ACFactory:
         configdict.setdefault("bcc_self", False)
         configdict.setdefault("mvbox_move", False)
         configdict.setdefault("sentbox_watch", False)
+        configdict.setdefault("sync_msgs", False)
         ac.update_config(configdict)
         self._preconfigure_key(ac, configdict["addr"])
         return ac

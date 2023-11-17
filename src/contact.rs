@@ -19,7 +19,7 @@ use tokio::task;
 use tokio::time::{timeout, Duration};
 
 use crate::aheader::EncryptPreference;
-use crate::chat::ChatId;
+use crate::chat::{ChatId, ProtectionStatus};
 use crate::color::str_to_color;
 use crate::config::Config;
 use crate::constants::{Blocked, Chattype, DC_GCL_ADD_SELF, DC_GCL_VERIFIED_ONLY};
@@ -32,6 +32,7 @@ use crate::mimeparser::AvatarAction;
 use crate::param::{Param, Params};
 use crate::peerstate::{Peerstate, PeerstateVerifiedStatus};
 use crate::sql::{self, params_iter};
+use crate::sync::{self, Sync::*, SyncData};
 use crate::tools::{
     duration_to_str, get_abs_path, improve_single_line_input, strip_rtlo_characters, time,
     EmailAddress,
@@ -145,6 +146,22 @@ impl ContactId {
         context
             .sql
             .execute("UPDATE contacts SET is_bot=? WHERE id=?;", (is_bot, self.0))
+            .await?;
+        Ok(())
+    }
+
+    /// Reset gossip timestamp in all chats with this contact.
+    pub(crate) async fn regossip_keys(&self, context: &Context) -> Result<()> {
+        context
+            .sql
+            .execute(
+                "UPDATE chats
+                 SET gossiped_timestamp=0
+                 WHERE EXISTS (SELECT 1 FROM chats_contacts
+                               WHERE chats_contacts.chat_id=chats.id
+                               AND chats_contacts.contact_id=?)",
+                (self,),
+            )
             .await?;
         Ok(())
     }
@@ -459,12 +476,12 @@ impl Contact {
 
     /// Block the given contact.
     pub async fn block(context: &Context, id: ContactId) -> Result<()> {
-        set_block_contact(context, id, true).await
+        set_blocked(context, Sync, id, true).await
     }
 
     /// Unblock the given contact.
     pub async fn unblock(context: &Context, id: ContactId) -> Result<()> {
-        set_block_contact(context, id, false).await
+        set_blocked(context, Sync, id, false).await
     }
 
     /// Add a single contact as a result of an _explicit_ user action.
@@ -494,7 +511,7 @@ impl Contact {
             }
         }
         if blocked {
-            Contact::unblock(context, contact_id).await?;
+            set_blocked(context, Nosync, contact_id, false).await?;
         }
 
         Ok(contact_id)
@@ -523,10 +540,24 @@ impl Contact {
     ///
     /// To validate an e-mail address independently of the contact database
     /// use `may_be_valid_addr()`.
+    ///
+    /// Returns the contact ID of the contact belonging to the e-mail address or 0 if there is no
+    /// contact that is or was introduced by an accepted contact.
     pub async fn lookup_id_by_addr(
         context: &Context,
         addr: &str,
         min_origin: Origin,
+    ) -> Result<Option<ContactId>> {
+        Self::lookup_id_by_addr_ex(context, addr, min_origin, Some(Blocked::Not)).await
+    }
+
+    /// The same as `lookup_id_by_addr()`, but internal function. Currently also allows looking up
+    /// not unblocked contacts.
+    pub(crate) async fn lookup_id_by_addr_ex(
+        context: &Context,
+        addr: &str,
+        min_origin: Origin,
+        blocked: Option<Blocked>,
     ) -> Result<Option<ContactId>> {
         if addr.is_empty() {
             bail!("lookup_id_by_addr: empty address");
@@ -543,8 +574,14 @@ impl Contact {
             .query_get_value(
                 "SELECT id FROM contacts \
             WHERE addr=?1 COLLATE NOCASE \
-            AND id>?2 AND origin>=?3 AND blocked=0;",
-                (&addr_normalized, ContactId::LAST_SPECIAL, min_origin as u32),
+            AND id>?2 AND origin>=?3 AND (? OR blocked=?)",
+                (
+                    &addr_normalized,
+                    ContactId::LAST_SPECIAL,
+                    min_origin as u32,
+                    blocked.is_none(),
+                    blocked.unwrap_or_default(),
+                ),
             )
             .await?;
         Ok(id)
@@ -1230,10 +1267,20 @@ impl Contact {
         self.status.as_str()
     }
 
-    /// Check if a contact was verified. E.g. by a secure-join QR code scan
-    /// and if the key has not changed since this verification.
+    /// Returns true if the contact
+    /// can be added to verified chats,
+    /// i.e. has a verified key
+    /// and Autocrypt key matches the verified key.
     ///
-    /// The UI may draw a checkbox or something like that beside verified contacts.
+    /// If contact is verified
+    /// UI should display green checkmark after the contact name
+    /// in contact list items and
+    /// in chat member list items.
+    ///
+    /// In contact profile view, us this function only if there is no chat with the contact,
+    /// otherwise use is_chat_protected().
+    /// Use [Self::get_verifier_id] to display the verifier contact
+    /// in the info section of the contact profile.
     pub async fn is_verified(&self, context: &Context) -> Result<VerifiedStatus> {
         // We're always sort of secured-verified as we could verify the key on this device any time with the key
         // on this device
@@ -1250,16 +1297,23 @@ impl Contact {
         Ok(VerifiedStatus::Unverified)
     }
 
-    /// Returns the address that verified the contact.
-    pub async fn get_verifier_addr(&self, context: &Context) -> Result<Option<String>> {
-        Ok(Peerstate::from_addr(context, self.get_addr())
-            .await?
-            .and_then(|peerstate| peerstate.get_verifier().map(|addr| addr.to_owned())))
-    }
-
-    /// Returns the ContactId that verified the contact.
+    /// Returns the `ContactId` that verified the contact.
+    ///
+    /// If the function returns non-zero result,
+    /// display green checkmark in the profile and "Introduced by ..." line
+    /// with the name and address of the contact
+    /// formatted by [Self::get_name_n_addr].
+    ///
+    /// If this function returns a verifier,
+    /// this does not necessarily mean
+    /// you can add the contact to verified chats.
+    /// Use [Self::is_verified] to check
+    /// if a contact can be added to a verified chat instead.
     pub async fn get_verifier_id(&self, context: &Context) -> Result<Option<ContactId>> {
-        let Some(verifier_addr) = self.get_verifier_addr(context).await? else {
+        let Some(verifier_addr) = Peerstate::from_addr(context, self.get_addr())
+            .await?
+            .and_then(|peerstate| peerstate.get_verifier().map(|addr| addr.to_owned()))
+        else {
             return Ok(None);
         };
 
@@ -1275,6 +1329,27 @@ impl Contact {
                 warn!(context, "Could not lookup contact with address {verifier_addr} which introduced {addr}.");
                 Ok(None)
             }
+        }
+    }
+
+    /// Returns if the contact profile title should display a green checkmark.
+    ///
+    /// This generally should be consistent with the 1:1 chat with the contact
+    /// so 1:1 chat with the contact and the contact profile
+    /// either both display the green checkmark or both don't display a green checkmark.
+    ///
+    /// UI often knows beforehand if a chat exists and can also call
+    /// `chat.is_protected()` (if there is a chat)
+    /// or `contact.is_verified()` (if there is no chat) directly.
+    /// This is often easier and also skips some database calls.
+    pub async fn is_profile_verified(&self, context: &Context) -> Result<bool> {
+        let contact_id = self.id;
+
+        if let Some(chat_id) = ChatId::lookup_by_contact(context, contact_id).await? {
+            Ok(chat_id.is_protected(context).await? == ProtectionStatus::Protected)
+        } else {
+            // 1:1 chat does not exist.
+            Ok(self.is_verified(context).await? == VerifiedStatus::BidirectVerified)
         }
     }
 
@@ -1363,8 +1438,9 @@ fn sanitize_name_and_addr(name: &str, addr: &str) -> (String, String) {
     }
 }
 
-async fn set_block_contact(
+pub(crate) async fn set_blocked(
     context: &Context,
+    sync: sync::Sync,
     contact_id: ContactId,
     new_blocking: bool,
 ) -> Result<()> {
@@ -1373,7 +1449,6 @@ async fn set_block_contact(
         "Can't block special contact {}",
         contact_id
     );
-
     let contact = Contact::get_by_id(context, contact_id).await?;
 
     if contact.blocked != new_blocking {
@@ -1415,8 +1490,22 @@ WHERE type=? AND id IN (
             if let Some((chat_id, _, _)) =
                 chat::get_chat_id_by_grpid(context, &contact.addr).await?
             {
-                chat_id.unblock(context).await?;
+                chat_id.unblock_ex(context, Nosync).await?;
             }
+        }
+
+        if sync.into() {
+            let action = match new_blocking {
+                true => chat::SyncAction::Block,
+                false => chat::SyncAction::Unblock,
+            };
+            context
+                .add_sync_item(SyncData::AlterChat {
+                    id: chat::SyncId::ContactAddr(contact.addr.clone()),
+                    action,
+                })
+                .await?;
+            context.send_sync_msg().await?;
         }
     }
 
@@ -2710,7 +2799,6 @@ Hi."#;
 
         let contact_id = Contact::create(&alice, "Bob", "bob@example.net").await?;
         let contact = Contact::get_by_id(&alice, contact_id).await?;
-        assert!(contact.get_verifier_addr(&alice).await?.is_none());
         assert!(contact.get_verifier_id(&alice).await?.is_none());
 
         // Receive a message from Bob to create a peerstate.
@@ -2719,7 +2807,6 @@ Hi."#;
         alice.recv_msg(&sent_msg).await;
 
         let contact = Contact::get_by_id(&alice, contact_id).await?;
-        assert!(contact.get_verifier_addr(&alice).await?.is_none());
         assert!(contact.get_verifier_id(&alice).await?.is_none());
 
         Ok(())

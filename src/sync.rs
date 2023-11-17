@@ -5,18 +5,35 @@ use lettre_email::mime::{self};
 use lettre_email::PartBuilder;
 use serde::{Deserialize, Serialize};
 
-use crate::chat::{Chat, ChatId};
+use crate::chat::{self, Chat, ChatId};
 use crate::config::Config;
 use crate::constants::Blocked;
 use crate::contact::ContactId;
 use crate::context::Context;
+use crate::log::LogExt;
 use crate::message::{Message, MsgId, Viewtype};
 use crate::mimeparser::SystemMessage;
 use crate::param::Param;
-use crate::sync::SyncData::{AddQrToken, DeleteQrToken};
+use crate::sync::SyncData::{AddQrToken, AlterChat, DeleteQrToken};
 use crate::token::Namespace;
 use crate::tools::time;
-use crate::{chat, stock_str, token};
+use crate::{stock_str, token};
+
+/// Whether to send device sync messages. Aimed for usage in the internal API.
+#[derive(Debug)]
+pub(crate) enum Sync {
+    Nosync,
+    Sync,
+}
+
+impl From<Sync> for bool {
+    fn from(sync: Sync) -> bool {
+        match sync {
+            Sync::Nosync => false,
+            Sync::Sync => true,
+        }
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct QrTokenData {
@@ -29,12 +46,24 @@ pub(crate) struct QrTokenData {
 pub(crate) enum SyncData {
     AddQrToken(QrTokenData),
     DeleteQrToken(QrTokenData),
+    AlterChat {
+        id: chat::SyncId,
+        action: chat::SyncAction,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum SyncDataOrUnknown {
+    SyncData(SyncData),
+    Unknown(serde_json::Value),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct SyncItem {
     timestamp: i64,
-    data: SyncData,
+
+    data: SyncDataOrUnknown,
 }
 
 #[derive(Debug, Deserialize)]
@@ -42,8 +71,17 @@ pub(crate) struct SyncItems {
     items: Vec<SyncItem>,
 }
 
+impl From<SyncData> for SyncDataOrUnknown {
+    fn from(sync_data: SyncData) -> Self {
+        Self::SyncData(sync_data)
+    }
+}
+
 impl Context {
     /// Adds an item to the list of items that should be synchronized to other devices.
+    ///
+    /// NB: Private and `pub(crate)` functions shouldn't call this unless `Sync::Sync` is explicitly
+    /// passed to them. This way it's always clear whether the code performs synchronisation.
     pub(crate) async fn add_sync_item(&self, data: SyncData) -> Result<()> {
         self.add_sync_item_with_timestamp(data, time()).await
     }
@@ -55,7 +93,10 @@ impl Context {
             return Ok(());
         }
 
-        let item = SyncItem { timestamp, data };
+        let item = SyncItem {
+            timestamp,
+            data: data.into(),
+        };
         let item = serde_json::to_string(&item)?;
         self.sql
             .execute("INSERT INTO multi_device_sync (item) VALUES(?);", (item,))
@@ -204,58 +245,71 @@ impl Context {
         Ok(sync_items)
     }
 
-    /// Execute sync items.
+    /// Executes sync items sent by other device.
     ///
     /// CAVE: When changing the code to handle other sync items,
     /// take care that does not result in calls to `add_sync_item()`
     /// as otherwise we would add in a dead-loop between two devices
     /// sending message back and forth.
     ///
-    /// If an error is returned, the caller shall not try over.
-    /// Therefore, errors should only be returned on database errors or so.
-    /// If eg. just an item cannot be deleted,
-    /// that should not hold off the other items to be executed.
-    pub(crate) async fn execute_sync_items(&self, items: &SyncItems) -> Result<()> {
+    /// If an error is returned, the caller shall not try over because some sync items could be
+    /// already executed. Sync items are considered independent and executed in the given order but
+    /// regardless of whether executing of the previous items succeeded.
+    pub(crate) async fn execute_sync_items(&self, items: &SyncItems) {
         info!(self, "executing {} sync item(s)", items.items.len());
         for item in &items.items {
             match &item.data {
-                AddQrToken(token) => {
-                    let chat_id = if let Some(grpid) = &token.grpid {
-                        if let Some((chat_id, _, _)) =
-                            chat::get_chat_id_by_grpid(self, grpid).await?
-                        {
-                            Some(chat_id)
-                        } else {
-                            warn!(
-                                self,
-                                "Ignoring token for nonexistent/deleted group '{}'.", grpid
-                            );
-                            continue;
-                        }
-                    } else {
-                        None
-                    };
-                    token::save(self, Namespace::InviteNumber, chat_id, &token.invitenumber)
-                        .await?;
-                    token::save(self, Namespace::Auth, chat_id, &token.auth).await?;
-                }
-                DeleteQrToken(token) => {
-                    token::delete(self, Namespace::InviteNumber, &token.invitenumber).await?;
-                    token::delete(self, Namespace::Auth, &token.auth).await?;
+                SyncDataOrUnknown::SyncData(data) => match data {
+                    AddQrToken(token) => self.add_qr_token(token).await,
+                    DeleteQrToken(token) => self.delete_qr_token(token).await,
+                    AlterChat { id, action } => self.sync_alter_chat(id, action).await,
+                },
+                SyncDataOrUnknown::Unknown(data) => {
+                    warn!(self, "Ignored unknown sync item: {data}.");
+                    Ok(())
                 }
             }
+            .log_err(self)
+            .ok();
         }
+    }
+
+    async fn add_qr_token(&self, token: &QrTokenData) -> Result<()> {
+        let chat_id = if let Some(grpid) = &token.grpid {
+            if let Some((chat_id, _, _)) = chat::get_chat_id_by_grpid(self, grpid).await? {
+                Some(chat_id)
+            } else {
+                warn!(
+                    self,
+                    "Ignoring token for nonexistent/deleted group '{}'.", grpid
+                );
+                return Ok(());
+            }
+        } else {
+            None
+        };
+        token::save(self, Namespace::InviteNumber, chat_id, &token.invitenumber).await?;
+        token::save(self, Namespace::Auth, chat_id, &token.auth).await?;
+        Ok(())
+    }
+
+    async fn delete_qr_token(&self, token: &QrTokenData) -> Result<()> {
+        token::delete(self, Namespace::InviteNumber, &token.invitenumber).await?;
+        token::delete(self, Namespace::Auth, &token.auth).await?;
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, SystemTime};
+
     use anyhow::bail;
 
     use super::*;
     use crate::chat::Chat;
     use crate::chatlist::Chatlist;
+    use crate::contact::{Contact, Origin};
     use crate::test_utils::TestContext;
     use crate::token::Namespace;
 
@@ -276,6 +330,20 @@ mod tests {
         t.set_config_bool(Config::SyncMsgs, true).await?;
 
         assert!(t.build_sync_json().await?.is_none());
+
+        // Having one test on `SyncData::AlterChat` is sufficient here as
+        // `chat::SyncAction::SetMuted` introduces enums inside items and `SystemTime`. Let's avoid
+        // in-depth testing of the serialiser here which is an external crate.
+        t.add_sync_item_with_timestamp(
+            SyncData::AlterChat {
+                id: chat::SyncId::ContactAddr("bob@example.net".to_string()),
+                action: chat::SyncAction::SetMuted(chat::MuteDuration::Until(
+                    SystemTime::UNIX_EPOCH + Duration::from_millis(42999),
+                )),
+            },
+            1631781315,
+        )
+        .await?;
 
         t.add_sync_item_with_timestamp(
             SyncData::AddQrToken(QrTokenData {
@@ -300,6 +368,7 @@ mod tests {
         assert_eq!(
             serialized,
             r#"{"items":[
+{"timestamp":1631781315,"data":{"AlterChat":{"id":{"ContactAddr":"bob@example.net"},"action":{"SetMuted":{"Until":{"secs_since_epoch":42,"nanos_since_epoch":999000000}}}}}},
 {"timestamp":1631781316,"data":{"AddQrToken":{"invitenumber":"testinvite","auth":"testauth","grpid":"group123"}}},
 {"timestamp":1631781317,"data":{"DeleteQrToken":{"invitenumber":"123!?\":.;{}","auth":"456","grpid":null}}}
 ]}"#
@@ -310,7 +379,7 @@ mod tests {
         assert!(t.build_sync_json().await?.is_none());
 
         let sync_items = t.parse_sync_items(serialized)?;
-        assert_eq!(sync_items.items.len(), 2);
+        assert_eq!(sync_items.items.len(), 3);
 
         Ok(())
     }
@@ -337,36 +406,44 @@ mod tests {
 
         assert!(t.parse_sync_items(r#"{"badname":[]}"#.to_string()).is_err());
 
-        assert!(t.parse_sync_items(
-                r#"{"items":[{"timestamp":1631781316,"data":{"BadItem":{"invitenumber":"in","auth":"a","grpid":null}}}]}"#
-                    .to_string(),
-            )
-            .is_err());
+        for bad_item_example in [
+            r#"{"items":[{"timestamp":1631781316,"data":{"BadItem":{"invitenumber":"in","auth":"a","grpid":null}}}]}"#,
+            r#"{"items":[{"timestamp":1631781316,"data":{"AddQrToken":{"invitenumber":"in","auth":123}}}]}"#, // `123` is invalid for `String`
+            r#"{"items":[{"timestamp":1631781316,"data":{"AddQrToken":{"invitenumber":"in","auth":true}}}]}"#, // `true` is invalid for `String`
+            r#"{"items":[{"timestamp":1631781316,"data":{"AddQrToken":{"invitenumber":"in","auth":[]}}}]}"#, // `[]` is invalid for `String`
+            r#"{"items":[{"timestamp":1631781316,"data":{"AddQrToken":{"invitenumber":"in","auth":{}}}}]}"#, // `{}` is invalid for `String`
+            r#"{"items":[{"timestamp":1631781316,"data":{"AddQrToken":{"invitenumber":"in","grpid":null}}}]}"#, // missing field
+            r#"{"items":[{"timestamp":1631781316,"data":{"AlterChat":{"id":{"ContactAddr":"bob@example.net"},"action":"Burn"}}}]}"#, // Unknown enum value
+        ] {
+            let sync_items = t.parse_sync_items(bad_item_example.to_string()).unwrap();
+            assert_eq!(sync_items.items.len(), 1);
+            assert!(matches!(sync_items.items[0].timestamp, 1631781316));
+            assert!(matches!(
+                sync_items.items[0].data,
+                SyncDataOrUnknown::Unknown(_)
+            ));
+        }
 
-        assert!(t.parse_sync_items(
-                r#"{"items":[{"timestamp":1631781316,"data":{"AddQrToken":{"invitenumber":"in","auth":123}}}]}"#.to_string(),
-            )
-            .is_err()); // `123` is invalid for `String`
-
-        assert!(t.parse_sync_items(
-                r#"{"items":[{"timestamp":1631781316,"data":{"AddQrToken":{"invitenumber":"in","auth":true}}}]}"#.to_string(),
-            )
-            .is_err()); // `true` is invalid for `String`
-
-        assert!(t.parse_sync_items(
-                r#"{"items":[{"timestamp":1631781316,"data":{"AddQrToken":{"invitenumber":"in","auth":[]}}}]}"#.to_string(),
-            )
-            .is_err()); // `[]` is invalid for `String`
-
-        assert!(t.parse_sync_items(
-                r#"{"items":[{"timestamp":1631781316,"data":{"AddQrToken":{"invitenumber":"in","auth":{}}}}]}"#.to_string(),
-            )
-            .is_err()); // `{}` is invalid for `String`
-
-        assert!(t.parse_sync_items(
-                r#"{"items":[{"timestamp":1631781316,"data":{"AddQrToken":{"invitenumber":"in","grpid":null}}}]}"#.to_string(),
-            )
-            .is_err()); // missing field
+        // Test enums inside items and SystemTime
+        let sync_items = t.parse_sync_items(
+            r#"{"items":[{"timestamp":1631781318,"data":{"AlterChat":{"id":{"ContactAddr":"bob@example.net"},"action":{"SetMuted":{"Until":{"secs_since_epoch":42,"nanos_since_epoch":999000000}}}}}}]}"#.to_string(),
+        )?;
+        assert_eq!(sync_items.items.len(), 1);
+        let SyncDataOrUnknown::SyncData(AlterChat { id, action }) =
+            &sync_items.items.get(0).unwrap().data
+        else {
+            bail!("bad item");
+        };
+        assert_eq!(
+            *id,
+            chat::SyncId::ContactAddr("bob@example.net".to_string())
+        );
+        assert_eq!(
+            *action,
+            chat::SyncAction::SetMuted(chat::MuteDuration::Until(
+                SystemTime::UNIX_EPOCH + Duration::from_millis(42999)
+            ))
+        );
 
         // empty item list is okay
         assert_eq!(
@@ -396,7 +473,9 @@ mod tests {
         )?;
 
         assert_eq!(sync_items.items.len(), 1);
-        if let AddQrToken(token) = &sync_items.items.get(0).unwrap().data {
+        if let SyncDataOrUnknown::SyncData(AddQrToken(token)) =
+            &sync_items.items.get(0).unwrap().data
+        {
             assert_eq!(token.invitenumber, "in");
             assert_eq!(token.auth, "yip");
             assert_eq!(token.grpid, None);
@@ -423,6 +502,7 @@ mod tests {
         let sync_items = t
             .parse_sync_items(
                 r#"{"items":[
+{"timestamp":1631781315,"data":{"AlterChat":{"id":{"ContactAddr":"bob@example.net"},"action":"Block"}}},
 {"timestamp":1631781316,"data":{"AddQrToken":{"invitenumber":"yip-in","auth":"a"}}},
 {"timestamp":1631781316,"data":{"DeleteQrToken":{"invitenumber":"in","auth":"delete unexistent, shall continue"}}},
 {"timestamp":1631781316,"data":{"AddQrToken":{"invitenumber":"in","auth":"yip-auth"}}},
@@ -433,8 +513,13 @@ mod tests {
                 .to_string(),
             )
             ?;
-        t.execute_sync_items(&sync_items).await?;
+        t.execute_sync_items(&sync_items).await;
 
+        assert!(
+            Contact::lookup_id_by_addr(&t, "bob@example.net", Origin::Unknown)
+                .await?
+                .is_none()
+        );
         assert!(token::exists(&t, Namespace::InviteNumber, "yip-in").await);
         assert!(token::exists(&t, Namespace::Auth, "yip-auth").await);
         assert!(!token::exists(&t, Namespace::Auth, "non-existent").await);

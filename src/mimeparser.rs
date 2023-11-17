@@ -59,7 +59,7 @@ pub(crate) struct MimeMessage {
     /// Message headers.
     headers: HashMap<String, String>,
 
-    /// Addresses are normalized and lowercased:
+    /// Addresses are normalized and lowercase
     pub recipients: Vec<SingleInfo>,
 
     /// `From:` address.
@@ -163,10 +163,10 @@ pub enum SystemMessage {
     /// Chat ephemeral message timer is changed.
     EphemeralTimerChanged = 10,
 
-    /// Chat protection is enabled.
+    /// "Messages are guaranteed to be end-to-end encrypted from now on."
     ChatProtectionEnabled = 11,
 
-    /// Chat protection is disabled.
+    /// "%1$s sent a message from another device."
     ChatProtectionDisabled = 12,
 
     /// Self-sent-message that contains only json used for multi-device-sync;
@@ -375,6 +375,12 @@ impl MimeMessage {
         }
         if !encrypted {
             signatures.clear();
+        }
+        if let Some(peerstate) = &mut decryption_info.peerstate {
+            if peerstate.prefer_encrypt != EncryptPreference::Mutual && !signatures.is_empty() {
+                peerstate.prefer_encrypt = EncryptPreference::Mutual;
+                peerstate.save_to_db(&context.sql).await?;
+            }
         }
 
         // Auto-submitted is also set by holiday-notices so we also check `chat-version`
@@ -1358,7 +1364,7 @@ impl MimeMessage {
         self.get_mailinglist_header().is_some()
     }
 
-    pub fn repl_msg_by_error(&mut self, error_msg: &str) {
+    pub fn replace_msg_by_error(&mut self, error_msg: &str) {
         self.is_system_message = SystemMessage::Unknown;
         if let Some(part) = self.parts.first_mut() {
             part.typ = Viewtype::Text;

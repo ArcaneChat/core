@@ -26,7 +26,7 @@ def wait_msgs_changed(account, msgs_list):
                     break
         else:
             account.log(f"waiting mismatch data1={data1} data2={data2}")
-    return ev.data1, ev.data2
+    return ev.data2
 
 
 class TestOnlineInCreation:
@@ -68,14 +68,17 @@ class TestOnlineInCreation:
         assert prepared_original.is_out_preparing()
         wait_msgs_changed(ac1, [(chat.id, prepared_original.id)])
 
-        lp.sec("forward the message while still in creation")
+        lp.sec("create a new group")
         chat2 = ac1.create_group_chat("newgroup")
+        wait_msgs_changed(ac1, [(0, 0)])
+
+        lp.sec("add a contact to new group")
         chat2.add_contact(ac2)
-        wait_msgs_changed(ac1, [(0, 0)])  # why not chat id?
+        wait_msgs_changed(ac1, [(chat2.id, None)])
+
+        lp.sec("forward the message while still in creation")
         ac1.forward_messages([prepared_original], chat2)
-        # XXX there might be two EVENT_MSGS_CHANGED and only one of them
-        # is the one caused by forwarding
-        _, forwarded_id = wait_msgs_changed(ac1, [(chat2.id, None)])
+        forwarded_id = wait_msgs_changed(ac1, [(chat2.id, None)])
         forwarded_msg = ac1.get_message_by_id(forwarded_id)
         assert forwarded_msg.is_out_preparing()
 

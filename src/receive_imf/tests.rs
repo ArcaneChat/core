@@ -3118,6 +3118,46 @@ async fn test_thunderbird_autocrypt() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_prefer_encrypt_mutual_if_encrypted() -> Result<()> {
+    let t = TestContext::new_bob().await;
+
+    let raw =
+        include_bytes!("../../test-data/message/thunderbird_encrypted_signed_with_pubkey.eml");
+    receive_imf(&t, raw, false).await?;
+    let peerstate = Peerstate::from_addr(&t, "alice@example.org")
+        .await?
+        .unwrap();
+    assert_eq!(peerstate.prefer_encrypt, EncryptPreference::Mutual);
+
+    receive_imf(
+        &t,
+        b"From: alice@example.org\n\
+          To: bob@example.net\n\
+          Subject: foo\n\
+          Message-ID: <message@example.org>\n\
+          Date: Thu, 2 Nov 2023 02:20:28 -0300\n\
+          \n\
+          unencrypted\n",
+        false,
+    )
+    .await?;
+    let peerstate = Peerstate::from_addr(&t, "alice@example.org")
+        .await?
+        .unwrap();
+    assert_eq!(peerstate.prefer_encrypt, EncryptPreference::Reset);
+
+    let raw = include_bytes!("../../test-data/message/thunderbird_encrypted_signed.eml");
+    receive_imf(&t, raw, false).await?;
+    let peerstate = Peerstate::from_addr(&t, "alice@example.org")
+        .await?
+        .unwrap();
+    assert!(peerstate.public_key.is_some());
+    assert_eq!(peerstate.prefer_encrypt, EncryptPreference::Mutual);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_thunderbird_autocrypt_unencrypted() -> Result<()> {
     let t = TestContext::new_bob().await;
 
@@ -3371,14 +3411,24 @@ async fn test_dont_recreate_contacts_on_add_remove() -> Result<()> {
 
     alice.recv_msg(&bob.pop_sent_msg().await).await;
 
-    // Bob didn't receive the addition of Fiona, so Alice must remove Fiona from the members list
-    // back to make their group members view consistent.
-    assert_eq!(get_chat_contacts(&alice, alice_chat_id).await?.len(), 3);
+    // Bob didn't receive the addition of Fiona, but Alice mustn't remove Fiona from the members
+    // list back. Instead, Bob must add Fiona from the next Alice's message to make their group
+    // members view consistent.
+    assert_eq!(get_chat_contacts(&alice, alice_chat_id).await?.len(), 4);
 
     // Just a dumb check for remove_contact_from_chat(). Let's have it in this only place.
     remove_contact_from_chat(&bob, bob_chat_id, bob_blue).await?;
     alice.recv_msg(&bob.pop_sent_msg().await).await;
-    assert_eq!(get_chat_contacts(&alice, alice_chat_id).await?.len(), 2);
+    assert_eq!(get_chat_contacts(&alice, alice_chat_id).await?.len(), 3);
+
+    send_text_msg(
+        &alice,
+        alice_chat_id,
+        "Finally add Fiona please".to_string(),
+    )
+    .await?;
+    bob.recv_msg(&alice.pop_sent_msg().await).await;
+    assert_eq!(get_chat_contacts(&bob, bob_chat_id).await?.len(), 3);
 
     Ok(())
 }
@@ -3462,8 +3512,11 @@ async fn test_dont_readd_with_normal_msg() -> Result<()> {
 
     bob.recv_msg(&alice.pop_sent_msg().await).await;
 
-    // Alice didn't receive Bobs leave message, but bob shouldn't readded himself just because of that.
-    assert!(!is_contact_in_chat(&bob, bob_chat_id, ContactId::SELF).await?);
+    // Alice didn't receive Bob's leave message, so Bob must readd themselves otherwise other
+    // members would think Bob is still here while they aren't, and then retry to leave if they
+    // think that Alice didn't re-add them on purpose (which is possible if Alice uses a classical
+    // MUA).
+    assert!(is_contact_in_chat(&bob, bob_chat_id, ContactId::SELF).await?);
     Ok(())
 }
 
@@ -3634,6 +3687,34 @@ async fn test_mua_can_readd() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_member_left_does_not_create_chat() -> Result<()> {
+    let alice = TestContext::new_alice().await;
+    let bob = TestContext::new_bob().await;
+    let alice_chat_id = create_group_chat(&alice, ProtectionStatus::Unprotected, "Group").await?;
+    add_contact_to_chat(
+        &alice,
+        alice_chat_id,
+        Contact::create(&alice, "bob", &bob.get_config(Config::Addr).await?.unwrap()).await?,
+    )
+    .await?;
+    send_text_msg(&alice, alice_chat_id, "populate".to_string()).await?;
+    alice.pop_sent_msg().await;
+
+    // Bob only received a message of Alice leaving the group.
+    // This should not create the group.
+    //
+    // The reason is to avoid recreating deleted chats,
+    // especially the chats that were created due to "split group" bugs
+    // which some members simply deleted and some members left,
+    // recreating the chat for others.
+    remove_contact_from_chat(&alice, alice_chat_id, ContactId::SELF).await?;
+    let bob_chat_id = bob.recv_msg(&alice.pop_sent_msg().await).await.chat_id;
+    assert!(bob_chat_id.is_trash());
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_recreate_member_list_on_missing_add_of_self() -> Result<()> {
     let alice = TestContext::new_alice().await;
     let bob = TestContext::new_bob().await;
@@ -3646,11 +3727,14 @@ async fn test_recreate_member_list_on_missing_add_of_self() -> Result<()> {
     .await?;
     send_text_msg(&alice, alice_chat_id, "populate".to_string()).await?;
     alice.pop_sent_msg().await;
-    remove_contact_from_chat(&alice, alice_chat_id, ContactId::SELF).await?;
+
+    send_text_msg(&alice, alice_chat_id, "second message".to_string()).await?;
+
     let bob_chat_id = bob.recv_msg(&alice.pop_sent_msg().await).await.chat_id;
+    assert!(!bob_chat_id.is_special());
 
     // Bob missed the message adding them, but must recreate the member list.
-    assert_eq!(get_chat_contacts(&bob, bob_chat_id).await?.len(), 1);
+    assert_eq!(get_chat_contacts(&bob, bob_chat_id).await?.len(), 2);
     assert!(is_contact_in_chat(&bob, bob_chat_id, ContactId::SELF).await?);
     Ok(())
 }
@@ -3807,6 +3891,116 @@ async fn test_create_group_with_big_msg() -> Result<()> {
 
     // The big message must go away from the 1:1 chat.
     assert_eq!(alice.get_last_msg_in(ab_chat_id).await.text, "hi");
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_partial_group_consistency() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = tcm.alice().await;
+    let bob_id = Contact::create(&alice, "", "bob@example.net").await?;
+    let alice_chat_id = create_group_chat(&alice, ProtectionStatus::Unprotected, "foos").await?;
+    add_contact_to_chat(&alice, alice_chat_id, bob_id).await?;
+
+    send_text_msg(&alice, alice_chat_id, "populate".to_string()).await?;
+    let add = alice.pop_sent_msg().await;
+    let bob = tcm.bob().await;
+    bob.recv_msg(&add).await;
+    let bob_chat_id = bob.get_last_msg().await.chat_id;
+    let contacts = get_chat_contacts(&bob, bob_chat_id).await?;
+    assert_eq!(contacts.len(), 2);
+
+    // Get initial timestamp.
+    let timestamp = bob_chat_id
+        .get_param(&bob)
+        .await?
+        .get_i64(Param::MemberListTimestamp)
+        .unwrap();
+
+    // Bob receives partial message.
+    let msg_id = receive_imf_inner(
+        &bob,
+        "first@example.org",
+        b"From: Alice <alice@example.org>\n\
+To: <bob@example.net>, <charlie@example.com>\n\
+Chat-Version: 1.0\n\
+Subject: subject\n\
+Message-ID: <first@example.org>\n\
+Date: Sun, 14 Nov 2021 00:10:00 +0000\
+Content-Type: text/plain
+Chat-Group-Member-Added: charlie@example.com",
+        false,
+        Some(100000),
+        false,
+    )
+    .await?
+    .context("no received message")?;
+
+    let msg = Message::load_from_db(&bob, msg_id.msg_ids[0]).await?;
+    let timestamp2 = bob_chat_id
+        .get_param(&bob)
+        .await?
+        .get_i64(Param::MemberListTimestamp)
+        .unwrap();
+
+    // Partial download does not change the member list.
+    assert_eq!(msg.download_state, DownloadState::Available);
+    assert_eq!(timestamp, timestamp2);
+    assert_eq!(get_chat_contacts(&bob, bob_chat_id).await?, contacts);
+
+    // Alice sends normal message to bob, adding fiona.
+    add_contact_to_chat(
+        &alice,
+        alice_chat_id,
+        Contact::create(&alice, "fiona", "fiona@example.net").await?,
+    )
+    .await?;
+
+    bob.recv_msg(&alice.pop_sent_msg().await).await;
+
+    let timestamp3 = bob_chat_id
+        .get_param(&bob)
+        .await?
+        .get_i64(Param::MemberListTimestamp)
+        .unwrap();
+
+    // Receiving a message after a partial download recreates the member list because we treat
+    // such messages as if we have not seen them.
+    assert_ne!(timestamp, timestamp3);
+    let contacts = get_chat_contacts(&bob, bob_chat_id).await?;
+    assert_eq!(contacts.len(), 3);
+
+    // Bob fully reives the partial message.
+    let msg_id = receive_imf_inner(
+        &bob,
+        "first@example.org",
+        b"From: Alice <alice@example.org>\n\
+To: Bob <bob@example.net>\n\
+Chat-Version: 1.0\n\
+Subject: subject\n\
+Message-ID: <first@example.org>\n\
+Date: Sun, 14 Nov 2021 00:10:00 +0000\
+Content-Type: text/plain
+Chat-Group-Member-Added: charlie@example.com",
+        false,
+        None,
+        false,
+    )
+    .await?
+    .context("no received message")?;
+
+    let msg = Message::load_from_db(&bob, msg_id.msg_ids[0]).await?;
+    let timestamp4 = bob_chat_id
+        .get_param(&bob)
+        .await?
+        .get_i64(Param::MemberListTimestamp)
+        .unwrap();
+
+    // After full download, the old message should not change group state.
+    assert_eq!(msg.download_state, DownloadState::Done);
+    assert_eq!(timestamp3, timestamp4);
+    assert_eq!(get_chat_contacts(&bob, bob_chat_id).await?, contacts);
 
     Ok(())
 }

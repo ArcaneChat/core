@@ -4,7 +4,7 @@ from warnings import warn
 
 from ._utils import AttrDict
 from .chat import Chat
-from .const import ChatlistFlag, ContactFlag, SpecialContactId
+from .const import ChatlistFlag, ContactFlag, EventType, SpecialContactId
 from .contact import Contact
 from .message import Message
 
@@ -110,6 +110,20 @@ class Account:
         """Return a list with snapshots of all blocked contacts."""
         contacts = self._rpc.get_blocked_contacts(self.id)
         return [AttrDict(contact=Contact(self, contact["id"]), **contact) for contact in contacts]
+
+    def get_chat_by_contact(self, contact: Union[int, Contact]) -> Optional[Chat]:
+        """Return 1:1 chat for a contact if it exists."""
+        if isinstance(contact, Contact):
+            assert contact.account == self
+            contact_id = contact.id
+        elif isinstance(contact, int):
+            contact_id = contact
+        else:
+            raise ValueError(f"{contact!r} is not a contact")
+        chat_id = self._rpc.get_chat_id_by_contact_id(self.id, contact_id)
+        if chat_id:
+            return Chat(self, chat_id)
+        return None
 
     def get_contacts(
         self,
@@ -249,6 +263,25 @@ class Account:
         """Wait for new messages and return a list of them."""
         next_msg_ids = self._rpc.wait_next_msgs(self.id)
         return [Message(self, msg_id) for msg_id in next_msg_ids]
+
+    def wait_for_incoming_msg_event(self):
+        """Wait for incoming message event and return it."""
+        while True:
+            event = self.wait_for_event()
+            if event.kind == EventType.INCOMING_MSG:
+                return event
+
+    def wait_for_securejoin_inviter_success(self):
+        while True:
+            event = self.wait_for_event()
+            if event["kind"] == "SecurejoinInviterProgress" and event["progress"] == 1000:
+                break
+
+    def wait_for_securejoin_joiner_success(self):
+        while True:
+            event = self.wait_for_event()
+            if event["kind"] == "SecurejoinJoinerProgress" and event["progress"] == 1000:
+                break
 
     def get_fresh_messages_in_arrival_order(self) -> List[Message]:
         """Return fresh messages list sorted in the order of their arrival, with ascending IDs."""

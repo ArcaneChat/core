@@ -19,11 +19,30 @@ pub struct ContactObject {
     profile_image: Option<String>, // BLOBS
     name_and_addr: String,
     is_blocked: bool,
+
+    /// True if the contact can be added to verified groups.
+    ///
+    /// If this is true
+    /// UI should display green checkmark after the contact name
+    /// in contact list items,
+    /// in chat member list items
+    /// and in profiles if no chat with the contact exist.
     is_verified: bool,
-    /// the address that verified this contact
-    verifier_addr: Option<String>,
-    /// the id of the contact that verified this contact
+
+    /// True if the contact profile title should have a green checkmark.
+    ///
+    /// This indicates whether 1:1 chat has a green checkmark
+    /// or will have a green checkmark if created.
+    is_profile_verified: bool,
+
+    /// The ID of the contact that verified this contact.
+    ///
+    /// If this is present,
+    /// display a green checkmark and "Introduced by ..."
+    /// string followed by the verifier contact name and address
+    /// in the contact profile.
     verifier_id: Option<u32>,
+
     /// the contact's last seen timestamp
     last_seen: i64,
     was_seen_recently: bool,
@@ -39,18 +58,12 @@ impl ContactObject {
             None => None,
         };
         let is_verified = contact.is_verified(context).await? == VerifiedStatus::BidirectVerified;
+        let is_profile_verified = contact.is_profile_verified(context).await?;
 
-        let (verifier_addr, verifier_id) = if is_verified {
-            (
-                contact.get_verifier_addr(context).await?,
-                contact
-                    .get_verifier_id(context)
-                    .await?
-                    .map(|contact_id| contact_id.to_u32()),
-            )
-        } else {
-            (None, None)
-        };
+        let verifier_id = contact
+            .get_verifier_id(context)
+            .await?
+            .map(|contact_id| contact_id.to_u32());
 
         Ok(ContactObject {
             address: contact.get_addr().to_owned(),
@@ -64,7 +77,7 @@ impl ContactObject {
             name_and_addr: contact.get_name_n_addr(),
             is_blocked: contact.is_blocked(),
             is_verified,
-            verifier_addr,
+            is_profile_verified,
             verifier_id,
             last_seen: contact.last_seen(),
             was_seen_recently: contact.was_seen_recently(),

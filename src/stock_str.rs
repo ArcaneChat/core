@@ -149,7 +149,7 @@ pub enum StockMessage {
                     however, of course, if they like, you may point them to 👉 https://get.delta.chat"))]
     WelcomeMessage = 71,
 
-    #[strum(props(fallback = "Unknown sender for this chat. See 'info' for more details."))]
+    #[strum(props(fallback = "Unknown sender for this chat."))]
     UnknownSenderForChat = 72,
 
     #[strum(props(fallback = "Message from %1$s"))]
@@ -413,6 +413,12 @@ pub enum StockMessage {
 
     #[strum(props(fallback = "%1$s sent a message from another device."))]
     ChatProtectionDisabled = 171,
+
+    #[strum(props(fallback = "Others will only see this group after you sent a first message."))]
+    NewGroupSendFirstMessage = 172,
+
+    #[strum(props(fallback = "Member %1$s added."))]
+    MsgAddMember = 173,
 }
 
 impl StockMessage {
@@ -600,6 +606,7 @@ pub(crate) async fn msg_grp_img_changed(context: &Context, by_contact: ContactId
 }
 
 /// Stock string: `I added member %1$s.`.
+/// This one is for sending in group chats.
 ///
 /// The `added_member_addr` parameter should be an email address and is looked up in the
 /// contacts to combine with the authorized display name.
@@ -634,7 +641,11 @@ pub(crate) async fn msg_add_member_local(
             .unwrap_or_else(|_| addr.to_string()),
         _ => addr.to_string(),
     };
-    if by_contact == ContactId::SELF {
+    if by_contact == ContactId::UNDEFINED {
+        translated(context, StockMessage::MsgAddMember)
+            .await
+            .replace1(whom)
+    } else if by_contact == ContactId::SELF {
         translated(context, StockMessage::MsgYouAddMember)
             .await
             .replace1(whom)
@@ -813,6 +824,7 @@ pub(crate) async fn secure_join_group_qr_description(context: &Context, chat: &C
 }
 
 /// Stock string: `%1$s verified.`.
+#[allow(dead_code)]
 pub(crate) async fn contact_verified(context: &Context, contact: &Contact) -> String {
     let addr = &contact.get_name_n_addr();
     translated(context, StockMessage::ContactVerified)
@@ -918,7 +930,7 @@ pub(crate) async fn welcome_message(context: &Context) -> String {
     translated(context, StockMessage::WelcomeMessage).await
 }
 
-/// Stock string: `Unknown sender for this chat. See 'info' for more details.`.
+/// Stock string: `Unknown sender for this chat.`.
 pub(crate) async fn unknown_sender_for_chat(context: &Context) -> String {
     translated(context, StockMessage::UnknownSenderForChat).await
 }
@@ -1282,6 +1294,11 @@ pub(crate) async fn aeap_explanation_and_link(
         .await
         .replace1(old_addr)
         .replace2(new_addr)
+}
+
+/// Stock string: `Others will only see this group after you sent a first message.`.
+pub(crate) async fn new_group_send_first_message(context: &Context) -> String {
+    translated(context, StockMessage::NewGroupSendFirstMessage).await
 }
 
 /// Text to put in the [`Qr::Backup`] rendered SVG image.

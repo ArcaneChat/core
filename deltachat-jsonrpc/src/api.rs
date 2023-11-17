@@ -47,7 +47,7 @@ use types::provider_info::ProviderInfo;
 use types::reactions::JSONRPCReactions;
 use types::webxdc::WebxdcMessageInfo;
 
-use self::types::message::MessageLoadResult;
+use self::types::message::{MessageInfo, MessageLoadResult};
 use self::types::{
     chat::{BasicChat, JSONRPCChatVisibility, MuteDuration},
     location::JsonrpcLocation,
@@ -221,13 +221,13 @@ impl CommandApi {
 
     /// Starts background tasks for all accounts.
     async fn start_io_for_all_accounts(&self) -> Result<()> {
-        self.accounts.read().await.start_io().await;
+        self.accounts.write().await.start_io().await;
         Ok(())
     }
 
     /// Stops background tasks for all accounts.
     async fn stop_io_for_all_accounts(&self) -> Result<()> {
-        self.accounts.read().await.stop_io().await;
+        self.accounts.write().await.stop_io().await;
         Ok(())
     }
 
@@ -237,7 +237,7 @@ impl CommandApi {
 
     /// Starts background tasks for a single account.
     async fn start_io(&self, account_id: u32) -> Result<()> {
-        let ctx = self.get_context(account_id).await?;
+        let mut ctx = self.get_context(account_id).await?;
         ctx.start_io().await;
         Ok(())
     }
@@ -383,7 +383,7 @@ impl CommandApi {
     /// Configures this account with the currently set parameters.
     /// Setup the credential config before calling this.
     async fn configure(&self, account_id: u32) -> Result<()> {
-        let ctx = self.get_context(account_id).await?;
+        let mut ctx = self.get_context(account_id).await?;
         ctx.stop_io().await;
         let result = ctx.configure().await;
         if result.is_err() {
@@ -1126,6 +1126,16 @@ impl CommandApi {
         MsgId::new(message_id).get_info(&ctx).await
     }
 
+    /// Returns additional information for single message.
+    async fn get_message_info_object(
+        &self,
+        account_id: u32,
+        message_id: u32,
+    ) -> Result<MessageInfo> {
+        let ctx = self.get_context(account_id).await?;
+        MessageInfo::from_msg_id(&ctx, MsgId::new(message_id)).await
+    }
+
     /// Returns contacts that sent read receipts and the time of reading.
     async fn get_message_read_receipts(
         &self,
@@ -1380,6 +1390,19 @@ impl CommandApi {
     // ---------------------------------------------
     //                   chat
     // ---------------------------------------------
+
+    /// Returns the [`ChatId`] for the 1:1 chat with `contact_id` if it exists.
+    ///
+    /// If it does not exist, `None` is returned.
+    async fn get_chat_id_by_contact_id(
+        &self,
+        account_id: u32,
+        contact_id: u32,
+    ) -> Result<Option<u32>> {
+        let ctx = self.get_context(account_id).await?;
+        let chat_id = ChatId::lookup_by_contact(&ctx, ContactId::new(contact_id)).await?;
+        Ok(chat_id.map(|id| id.to_u32()))
+    }
 
     /// Returns all message IDs of the given types in a chat.
     /// Typically used to show a gallery.
@@ -2033,13 +2056,19 @@ impl CommandApi {
         text: Option<String>,
         file: Option<String>,
         quoted_message_id: Option<u32>,
+        view_type: Option<MessageViewtype>,
     ) -> Result<()> {
         let ctx = self.get_context(account_id).await?;
-        let mut draft = Message::new(if file.is_some() {
-            Viewtype::File
-        } else {
-            Viewtype::Text
-        });
+        let mut draft = Message::new(view_type.map_or_else(
+            || {
+                if file.is_some() {
+                    Viewtype::File
+                } else {
+                    Viewtype::Text
+                }
+            },
+            |v| v.into(),
+        ));
         draft.set_text(text.unwrap_or_default());
         if let Some(file) = file {
             draft.set_file(file, None);

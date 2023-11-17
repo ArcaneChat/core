@@ -1,5 +1,180 @@
 # Changelog
 
+## [1.131.4] - 2023-11-16
+
+### Documentation
+
+- Document DC_DOWNLOAD_UNDECIPHERABLE.
+
+### Fixes
+
+- Always add "Member added" as system message.
+
+## [1.131.3] - 2023-11-15
+
+### Fixes
+
+- Update async-imap to 0.9.4 which does not ignore EOF on FETCH.
+- Reset gossiped timestamp on securejoin.
+- sync: Ignore unknown sync items to provide forward compatibility and avoid creating empty message bubbles.
+- sync: Skip sync when chat name is set to the current one.
+- Return connectivity HTML with an error when IO is stopped.
+
+## [1.131.2] - 2023-11-14
+
+### API-Changes
+
+- deltachat-rpc-client: add `Account.get_chat_by_contact()`.
+
+### Features / Changes
+
+- Do not post "... verified" messages on QR scan success.
+- Never drop better message from `apply_group_changes()`.
+
+### Fixes
+
+- Assign MDNs to the trash chat early to prevent received MDNs from creating or unblocking 1:1 chats.
+- Allow to securejoin groups when 1:1 chat with the inviter is a contact request.
+- Add "setup changed" message for verified key before the message.
+- Ignore special chats when calculating similar chats.
+
+## [1.131.1] - 2023-11-13
+
+### Fixes
+
+- Do not skip actual message parts when group change messages are inserted.
+
+## [1.131.0] - 2023-11-13
+
+### Features / Changes
+
+- Sync chat contacts across devices ([#4953](https://github.com/deltachat/deltachat-core-rust/pull/4953)).
+- Sync creating broadcast lists across devices ([#4953](https://github.com/deltachat/deltachat-core-rust/pull/4953)).
+- Sync Chat::name across devices ([#4953](https://github.com/deltachat/deltachat-core-rust/pull/4953)).
+- Multi-device broadcast lists ([#4953](https://github.com/deltachat/deltachat-core-rust/pull/4953)).
+
+### Fixes
+
+- Encode chat name in the `List-ID` header to avoid SMTPUTF8 errors.
+- Ignore errors from generating sync messages.
+- `Context::execute_sync_items`: Ignore all errors ([#4817](https://github.com/deltachat/deltachat-core-rust/pull/4817)).
+- Allow to send unverified securejoin messages to protected chats ([#4982](https://github.com/deltachat/deltachat-core-rust/pull/4982)).
+
+## [1.130.0] - 2023-11-10
+
+### API-Changes
+
+- Emit JoinerProgress(1000) event when Bob verifies Alice.
+- JSON-RPC: add `ContactObject.is_profile_verified` property.
+- Hide `ChatId::get_for_contact()` from public API.
+
+### Features / Changes
+
+- Add secondary verified key.
+- Add info messages about implicitly added members.
+- Treat reset state as encryption not preferred.
+- Grow sleep durations on errors in Imap::fake_idle() ([#4424](https://github.com/deltachat/deltachat-core-rust/pull/4424)).
+
+### Fixes
+
+- Mark 1:1 chat as protected when joining a group.
+- Raise lower auto-download limit to 160k.
+- Remove `Reporting-UA` from read receipts.
+- Do not apply group changes to special chats. Avoid adding members to the trash chat.
+- imap: make `UidGrouper` robust against duplicate UIDs.
+- Do not return hidden chat from `dc_get_chat_id_by_contact_id`.
+- Smtp_loop(): Don't grow timeout if interrupted early ([#4833](https://github.com/deltachat/deltachat-core-rust/pull/4833)).
+
+### Refactor
+
+- imap: Do not FETCH right after `scan_folders()`.
+- deltachat-rpc-client: Use `itertools` instead of `Lock` for thread-safe request ID generation.
+
+### Tests
+
+- Remove unused `--liveconfig` option.
+- Test chatlist can load for corrupted chats ([#4979](https://github.com/deltachat/deltachat-core-rust/pull/4979)).
+
+### Miscellaneous Tasks
+
+- Update provider-db ([#4949](https://github.com/deltachat/deltachat-core-rust/pull/4949)).
+
+## [1.129.1] - 2023-11-06
+
+### Fixes
+
+- Update tokio-imap to fix Outlook STATUS parsing bug.
+- deltachat-rpc-client: Add the Lock around request ID.
+- `apply_group_changes`: Don't implicitly delete members locally, add absent ones instead ([#4934](https://github.com/deltachat/deltachat-core-rust/pull/4934)).
+- Partial messages do not change group state ([#4900](https://github.com/deltachat/deltachat-core-rust/pull/4900)).
+
+### Tests
+
+- Group chats device synchronisation.
+
+## [1.129.0] - 2023-11-06
+
+### API-Changes
+
+- Add JSON-RPC `get_chat_id_by_contact_id` API ([#4918](https://github.com/deltachat/deltachat-core-rust/pull/4918)).
+- [**breaking**] Remove deprecated `get_verifier_addr`.
+
+### Features / Changes
+
+- Sync chat `Blocked` state, chat visibility, chat mute duration and contact blocked status across devices ([#4817](https://github.com/deltachat/deltachat-core-rust/pull/4817)).
+- Add 'group created instructions' as info message ([#4916](https://github.com/deltachat/deltachat-core-rust/pull/4916)).
+- Add hardcoded fallback DNS cache.
+
+### Fixes
+
+- Switch to `EncryptionPreference::Mutual` on a receipt of encrypted+signed message ([#4707](https://github.com/deltachat/deltachat-core-rust/pull/4707)).
+- imap: Check UIDNEXT with a STATUS command before going IDLE.
+- Allow to change verified key via "member added" message.
+- json-rpc: Return verifier even if the contact is not "verified" (Autocrypt key does not equal Secure-Join key).
+
+### Documentation
+
+- Refine `Contact::get_verifier_id` and `Contact::is_verified` documentation ([#4922](https://github.com/deltachat/deltachat-core-rust/pull/4922)).
+- Contact profile view should not use `dc_contact_is_verified()`.
+- Remove documentation for non-existing `dc_accounts_new` `os_name` param.
+
+### Refactor
+
+- Remove unused or useless code paths in Secure-Join ([#4897](https://github.com/deltachat/deltachat-core-rust/pull/4897)).
+- Improve error handling in Secure-Join code.
+- Add hostname to "no DNS resolution results" error message.
+- Accept `&str` instead of `Option<String>` in idle().
+
+## [1.128.0] - 2023-11-02
+
+### Build system
+- [**breaking**] Upgrade nodejs version to 18 ([#4903](https://github.com/deltachat/deltachat-core-rust/pull/4903)).
+
+### Features / Changes
+
+- deltachat-rpc-client: Add `Account.wait_for_incoming_msg_event()`.
+- Decrease ratelimit for .testrun.org subdomains.
+
+### Fixes
+
+- Do not fail securejoin due to unrelated pending bobstate  ([#4896](https://github.com/deltachat/deltachat-core-rust/pull/4896)).
+- Allow other verified group recipients to be unverified, only check the sender verification.
+- Remove not working attempt to recover from verified key changes.
+
+## [1.127.2] - 2023-10-29
+
+### API-Changes
+
+- [**breaking**] Jsonrpc `misc_set_draft` now requires setting the viewtype.
+- jsonrpc: Add `get_message_info_object`.
+
+### Tests
+
+- deltachat-rpc-client: Move pytest option from pyproject.toml to tox.ini and set log level.
+- deltachat-rpc-client: Test securejoin.
+- Increase pytest timeout to 10 minutes.
+- Compile deltachat-rpc-server in debug mode for tests.
+
 ## [1.127.1] - 2023-10-27
 
 ### API-Changes
@@ -22,6 +197,8 @@
 - [**breaking**] Remove unused `dc_set_chat_protection()`
 - Hide `DcSecretKey` trait from the API.
 - Verified 1:1 chats ([#4315](https://github.com/deltachat/deltachat-core-rust/pull/4315)). Disabled by default, enable with `verified_one_on_one_chats` config.
+- Add api `chat::Chat::is_protection_broken`
+- Add `dc_chat_is_protection_broken()` C API.
 
 ### CI
 
@@ -1078,7 +1255,7 @@ Bugfix release attempting to fix the [iOS build error](https://github.com/deltac
 
 ### Changes
 - Look at Authentication-Results. Don't accept Autocrypt key changes
-  if they come with negative authentiation results while this contact
+  if they come with negative authentication results while this contact
   sent emails with positive authentication results in the past. #3583
 - jsonrpc in cffi also sends events now #3662
 - jsonrpc: new format for events and better typescript autocompletion
@@ -2664,7 +2841,7 @@ Bugfix release attempting to fix the [iOS build error](https://github.com/deltac
 
 - delete all consumed secure-join handshake messagess #1209 #1212
 
-- rust-level cleanups #1218 #1217 #1210 #1205
+- Rust-level cleanups #1218 #1217 #1210 #1205
 
 - python-level cleanups #1204 #1202 #1201
 
@@ -3034,3 +3211,13 @@ https://github.com/deltachat/deltachat-core-rust/pulls?q=is%3Apr+is%3Aclosed
 [1.126.1]: https://github.com/deltachat/deltachat-core-rust/compare/v1.126.0...v1.126.1
 [1.127.0]: https://github.com/deltachat/deltachat-core-rust/compare/v1.126.1...v1.127.0
 [1.127.1]: https://github.com/deltachat/deltachat-core-rust/compare/v1.127.0...v1.127.1
+[1.127.2]: https://github.com/deltachat/deltachat-core-rust/compare/v1.127.1...v1.127.2
+[1.128.0]: https://github.com/deltachat/deltachat-core-rust/compare/v1.127.2...v1.128.0
+[1.129.0]: https://github.com/deltachat/deltachat-core-rust/compare/v1.128.0...v1.129.0
+[1.129.1]: https://github.com/deltachat/deltachat-core-rust/compare/v1.129.0...v1.129.1
+[1.130.0]: https://github.com/deltachat/deltachat-core-rust/compare/v1.129.1...v1.130.0
+[1.131.0]: https://github.com/deltachat/deltachat-core-rust/compare/v1.130.0...v1.131.0
+[1.131.1]: https://github.com/deltachat/deltachat-core-rust/compare/v1.131.0...v1.131.1
+[1.131.2]: https://github.com/deltachat/deltachat-core-rust/compare/v1.131.1...v1.131.2
+[1.131.3]: https://github.com/deltachat/deltachat-core-rust/compare/v1.131.2...v1.131.3
+[1.131.4]: https://github.com/deltachat/deltachat-core-rust/compare/v1.131.3...v1.131.4

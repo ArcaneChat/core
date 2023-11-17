@@ -2,7 +2,6 @@ import { tmpdir } from "os";
 import { join, resolve } from "path";
 import { mkdtemp, rm } from "fs/promises";
 import { spawn, exec } from "child_process";
-import fetch from "node-fetch";
 import { Readable, Writable } from "node:stream";
 
 export type RpcServerHandle = {
@@ -57,15 +56,14 @@ export async function startServer(): Promise<RpcServerHandle> {
   };
 }
 
-export async function createTempUser(url: string) {
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "cache-control": "no-cache",
-    },
-  });
-  if (!response.ok) throw new Error("Received invalid response");
-  return response.json();
+export function createTempUser(chatmailDomain: String) {
+  const charset = "2345789acdefghjkmnpqrstuvwxyz";
+  let user = "ci-";
+  for (let i = 0; i < 6; i++) {
+    user += charset[Math.floor(Math.random() * charset.length)];
+  }
+  const email = user + "@" + chatmailDomain;
+  return { email: email, password: user + "$" + user };
 }
 
 function getTargetDir(): Promise<string> {

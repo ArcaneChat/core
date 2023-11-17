@@ -8,8 +8,8 @@ use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use crate::aheader::EncryptPreference;
 use crate::chat::{self, Chat, ChatId, ChatIdBlocked, ProtectionStatus};
 use crate::config::Config;
-use crate::constants::{Blocked, Chattype};
-use crate::contact::{Contact, ContactId, Origin, VerifiedStatus};
+use crate::constants::Blocked;
+use crate::contact::{Contact, ContactId, Origin};
 use crate::context::Context;
 use crate::e2ee::ensure_secret_key_exists;
 use crate::events::EventType;
@@ -18,9 +18,10 @@ use crate::key::{load_self_public_key, DcKey, Fingerprint};
 use crate::message::{Message, Viewtype};
 use crate::mimeparser::{MimeMessage, SystemMessage};
 use crate::param::Param;
-use crate::peerstate::{Peerstate, PeerstateKeyType, PeerstateVerifiedStatus};
+use crate::peerstate::{Peerstate, PeerstateKeyType};
 use crate::qr::check_qr;
 use crate::stock_str;
+use crate::sync::Sync::*;
 use crate::token;
 use crate::tools::time;
 
@@ -36,17 +37,15 @@ use crate::token::Namespace;
 /// Set of characters to percent-encode in email addresses and names.
 pub const NON_ALPHANUMERIC_WITHOUT_DOT: &AsciiSet = &NON_ALPHANUMERIC.remove(b'.');
 
-macro_rules! inviter_progress {
-    ($context:tt, $contact_id:expr, $progress:expr) => {
-        assert!(
-            $progress >= 0 && $progress <= 1000,
-            "value in range 0..1000 expected with: 0=error, 1..999=progress, 1000=success"
-        );
-        $context.emit_event($crate::events::EventType::SecurejoinInviterProgress {
-            contact_id: $contact_id,
-            progress: $progress,
-        });
-    };
+fn inviter_progress(context: &Context, contact_id: ContactId, progress: usize) {
+    debug_assert!(
+        progress <= 1000,
+        "value in range 0..1000 expected with: 0=error, 1..999=progress, 1000=success"
+    );
+    context.emit_event(EventType::SecurejoinInviterProgress {
+        contact_id,
+        progress,
+    });
 }
 
 /// Generates a Secure Join QR code.
@@ -318,7 +317,7 @@ pub(crate) async fn handle_securejoin_handshake(
             }
             info!(context, "Secure-join requested.",);
 
-            inviter_progress!(context, contact_id, 300);
+            inviter_progress(context, contact_id, 300);
 
             // for setup-contact, make Alice's one-to-one chat with Bob visible
             // (secure-join-information are shown in the group chat)
@@ -415,10 +414,9 @@ pub(crate) async fn handle_securejoin_handshake(
                 .await?
                 .get_addr()
                 .to_owned();
-            if mark_peer_as_verified(context, fingerprint.clone(), contact_addr)
-                .await
-                .is_err()
-            {
+            let fingerprint_found =
+                mark_peer_as_verified(context, fingerprint.clone(), contact_addr).await?;
+            if !fingerprint_found {
                 could_not_establish_secure_connection(
                     context,
                     contact_id,
@@ -428,10 +426,11 @@ pub(crate) async fn handle_securejoin_handshake(
                 .await?;
                 return Ok(HandshakeMessage::Ignore);
             }
+            contact_id.regossip_keys(context).await?;
             Contact::scaleup_origin_by_id(context, contact_id, Origin::SecurejoinInvited).await?;
             info!(context, "Auth verified.",);
             context.emit_event(EventType::ContactsChanged(Some(contact_id)));
-            inviter_progress!(context, contact_id, 600);
+            inviter_progress(context, contact_id, 600);
             if join_vg {
                 // the vg-member-added message is special:
                 // this is a normal Chat-Group-Member-Added message
@@ -446,17 +445,19 @@ pub(crate) async fn handle_securejoin_handshake(
                 match chat::get_chat_id_by_grpid(context, field_grpid).await? {
                     Some((group_chat_id, _, _)) => {
                         secure_connection_established(context, contact_id, group_chat_id).await?;
-                        if let Err(err) =
-                            chat::add_contact_to_chat_ex(context, group_chat_id, contact_id, true)
-                                .await
-                        {
-                            error!(context, "failed to add contact: {}", err);
-                        }
+                        chat::add_contact_to_chat_ex(
+                            context,
+                            Nosync,
+                            group_chat_id,
+                            contact_id,
+                            true,
+                        )
+                        .await?;
                     }
                     None => bail!("Chat {} not found", &field_grpid),
                 }
-                inviter_progress!(context, contact_id, 800);
-                inviter_progress!(context, contact_id, 1000);
+                inviter_progress(context, contact_id, 800);
+                inviter_progress(context, contact_id, 1000);
             } else {
                 // Alice -> Bob
                 secure_connection_established(
@@ -474,53 +475,52 @@ pub(crate) async fn handle_securejoin_handshake(
                 .await
                 .context("failed sending vc-contact-confirm message")?;
 
-                inviter_progress!(context, contact_id, 1000);
+                inviter_progress(context, contact_id, 1000);
             }
             Ok(HandshakeMessage::Ignore) // "Done" would delete the message and break multi-device (the key from Autocrypt-header is needed)
         }
-        "vg-member-added" | "vc-contact-confirm" => {
-            /*=======================================================
-            ====             Bob - the joiner's side             ====
-            ====   Step 7 in "Setup verified contact" protocol   ====
-            =======================================================*/
+        /*=======================================================
+        ====             Bob - the joiner's side             ====
+        ====   Step 7 in "Setup verified contact" protocol   ====
+        =======================================================*/
+        "vc-contact-confirm" => match BobState::from_db(&context.sql).await? {
+            Some(bobstate) => bob::handle_contact_confirm(context, bobstate, mime_message).await,
+            None => Ok(HandshakeMessage::Ignore),
+        },
+
+        "vg-member-added" => {
+            let Some(member_added) = mime_message
+                .get_header(HeaderDef::ChatGroupMemberAdded)
+                .map(|s| s.as_str())
+            else {
+                warn!(
+                    context,
+                    "vg-member-added without Chat-Group-Member-Added header"
+                );
+                return Ok(HandshakeMessage::Propagate);
+            };
+            if !context.is_self_addr(member_added).await? {
+                info!(
+                    context,
+                    "Member {member_added} added by unrelated SecureJoin process"
+                );
+                return Ok(HandshakeMessage::Propagate);
+            }
             match BobState::from_db(&context.sql).await? {
                 Some(bobstate) => {
                     bob::handle_contact_confirm(context, bobstate, mime_message).await
                 }
-                None => match join_vg {
-                    true => Ok(HandshakeMessage::Propagate),
-                    false => Ok(HandshakeMessage::Ignore),
-                },
+                None => Ok(HandshakeMessage::Propagate),
             }
         }
+
         "vg-member-added-received" | "vc-contact-confirm-received" => {
             /*==========================================================
             ====              Alice - the inviter side              ====
             ====  Step 8 in "Out-of-band verified groups" protocol  ====
             ==========================================================*/
 
-            if let Ok(contact) = Contact::get_by_id(context, contact_id).await {
-                if contact.is_verified(context).await? == VerifiedStatus::Unverified {
-                    warn!(context, "{} invalid.", step);
-                    return Ok(HandshakeMessage::Ignore);
-                }
-                if join_vg {
-                    let field_grpid = mime_message
-                        .get_header(HeaderDef::SecureJoinGroup)
-                        .map(|s| s.as_str())
-                        .unwrap_or_else(|| "");
-                    if let Err(err) = chat::get_chat_id_by_grpid(context, field_grpid).await {
-                        warn!(context, "Failed to lookup chat_id from grpid: {}", err);
-                        return Err(
-                            err.context(format!("Chat for group {} not found", &field_grpid))
-                        );
-                    }
-                }
-                Ok(HandshakeMessage::Ignore) // "Done" deletes the message and breaks multi-device
-            } else {
-                warn!(context, "{} invalid.", step);
-                Ok(HandshakeMessage::Ignore)
-            }
+            Ok(HandshakeMessage::Done) // "Done" deletes the message
         }
         _ => {
             warn!(context, "invalid step: {}", step);
@@ -614,30 +614,18 @@ pub(crate) async fn observe_securejoin_on_other_device(
                         return Ok(HandshakeMessage::Ignore);
                     }
                 };
-                if let Err(err) = peerstate.set_verified(
-                    PeerstateKeyType::GossipKey,
-                    fingerprint,
-                    PeerstateVerifiedStatus::BidirectVerified,
-                    addr,
-                ) {
-                    could_not_establish_secure_connection(
-                        context,
-                        contact_id,
-                        info_chat_id(context, contact_id).await?,
-                        &format!("Could not mark peer as verified at step {step}: {err}"),
-                    )
-                    .await?;
-                    return Ok(HandshakeMessage::Ignore);
-                }
+                peerstate.set_verified(PeerstateKeyType::GossipKey, fingerprint, addr)?;
                 peerstate.prefer_encrypt = EncryptPreference::Mutual;
                 peerstate.save_to_db(&context.sql).await.unwrap_or_default();
+
+                ChatId::set_protection_for_contact(context, contact_id).await?;
             } else if let Some(fingerprint) =
                 mime_message.get_header(HeaderDef::SecureJoinFingerprint)
             {
                 // FIXME: Old versions of DC send this header instead of gossips. Remove this
                 // eventually.
                 let fingerprint = fingerprint.parse()?;
-                if mark_peer_as_verified(
+                let fingerprint_found = mark_peer_as_verified(
                     context,
                     fingerprint,
                     Contact::get_by_id(context, contact_id)
@@ -645,9 +633,8 @@ pub(crate) async fn observe_securejoin_on_other_device(
                         .get_addr()
                         .to_owned(),
                 )
-                .await
-                .is_err()
-                {
+                .await?;
+                if !fingerprint_found {
                     could_not_establish_secure_connection(
                         context,
                         contact_id,
@@ -672,10 +659,10 @@ pub(crate) async fn observe_securejoin_on_other_device(
                 return Ok(HandshakeMessage::Ignore);
             }
             if step.as_str() == "vg-member-added" {
-                inviter_progress!(context, contact_id, 800);
+                inviter_progress(context, contact_id, 800);
             }
             if step.as_str() == "vg-member-added" || step.as_str() == "vc-contact-confirm" {
-                inviter_progress!(context, contact_id, 1000);
+                inviter_progress(context, contact_id, 1000);
             }
             if step.as_str() == "vg-request-with-auth" || step.as_str() == "vc-request-with-auth" {
                 // This actually reflects what happens on the first device (which does the secure
@@ -698,24 +685,21 @@ async fn secure_connection_established(
     contact_id: ContactId,
     chat_id: ChatId,
 ) -> Result<()> {
-    let contact = Contact::get_by_id(context, contact_id).await?;
-    let msg = stock_str::contact_verified(context, &contact).await;
-    chat::add_info_msg(context, chat_id, &msg, time()).await?;
     if context
         .get_config_bool(Config::VerifiedOneOnOneChats)
         .await?
     {
-        let chat = Chat::load_from_db(context, chat_id).await?;
-        if chat.typ == Chattype::Single {
-            chat_id
-                .set_protection(
-                    context,
-                    ProtectionStatus::Protected,
-                    time(),
-                    Some(contact_id),
-                )
-                .await?;
-        }
+        let private_chat_id = ChatIdBlocked::get_for_contact(context, contact_id, Blocked::Yes)
+            .await?
+            .id;
+        private_chat_id
+            .set_protection(
+                context,
+                ProtectionStatus::Protected,
+                time(),
+                Some(contact_id),
+            )
+            .await?;
     }
     context.emit_event(EventType::ChatModified(chat_id));
     Ok(())
@@ -737,27 +721,21 @@ async fn could_not_establish_secure_connection(
     Ok(())
 }
 
+/// Tries to mark peer with provided key fingerprint as verified.
+///
+/// Returns true if such key was found, false otherwise.
 async fn mark_peer_as_verified(
     context: &Context,
     fingerprint: Fingerprint,
     verifier: String,
-) -> Result<()> {
-    if let Some(ref mut peerstate) = Peerstate::from_fingerprint(context, &fingerprint).await? {
-        if let Err(err) = peerstate.set_verified(
-            PeerstateKeyType::PublicKey,
-            fingerprint,
-            PeerstateVerifiedStatus::BidirectVerified,
-            verifier,
-        ) {
-            error!(context, "Could not mark peer as verified: {}", err);
-            return Err(err);
-        }
-        peerstate.prefer_encrypt = EncryptPreference::Mutual;
-        peerstate.save_to_db(&context.sql).await.unwrap_or_default();
-        Ok(())
-    } else {
-        bail!("no peerstate in db for fingerprint {}", fingerprint.hex());
-    }
+) -> Result<bool> {
+    let Some(ref mut peerstate) = Peerstate::from_fingerprint(context, &fingerprint).await? else {
+        return Ok(false);
+    };
+    peerstate.set_verified(PeerstateKeyType::PublicKey, fingerprint, verifier)?;
+    peerstate.prefer_encrypt = EncryptPreference::Mutual;
+    peerstate.save_to_db(&context.sql).await.unwrap_or_default();
+    Ok(true)
 }
 
 /* ******************************************************************************
@@ -792,8 +770,9 @@ fn encrypted_and_signed(
 mod tests {
     use super::*;
     use crate::chat;
-    use crate::chat::ProtectionStatus;
+    use crate::chat::{remove_contact_from_chat, ProtectionStatus};
     use crate::chatlist::Chatlist;
+    use crate::constants::Chattype;
     use crate::contact::ContactAddress;
     use crate::contact::VerifiedStatus;
     use crate::peerstate::Peerstate;
@@ -943,25 +922,10 @@ mod tests {
         // Check Alice got the verified message in her 1:1 chat.
         {
             let chat = alice.create_chat(&bob).await;
-            let msg_ids: Vec<_> = chat::get_chat_msgs(&alice.ctx, chat.get_id())
-                .await
-                .unwrap()
-                .into_iter()
-                .filter_map(|item| match item {
-                    chat::ChatItem::Message { msg_id } => Some(msg_id),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(msg_ids.len(), 2);
-
-            let msg0 = Message::load_from_db(&alice.ctx, msg_ids[0]).await.unwrap();
-            assert!(msg0.is_info());
-            assert!(msg0.get_text().contains("bob@example.net verified"));
-
-            let msg1 = Message::load_from_db(&alice.ctx, msg_ids[1]).await.unwrap();
-            assert!(msg1.is_info());
+            let msg = get_chat_msg(&alice, chat.get_id(), 0, 1).await;
+            assert!(msg.is_info());
             let expected_text = chat_protection_enabled(&alice).await;
-            assert_eq!(msg1.get_text(), expected_text);
+            assert_eq!(msg.get_text(), expected_text);
         }
 
         // Check Alice sent the right message to Bob.
@@ -997,24 +961,10 @@ mod tests {
         // Check Bob got the verified message in his 1:1 chat.
         {
             let chat = bob.create_chat(&alice).await;
-            let msg_ids: Vec<_> = chat::get_chat_msgs(&bob.ctx, chat.get_id())
-                .await
-                .unwrap()
-                .into_iter()
-                .filter_map(|item| match item {
-                    chat::ChatItem::Message { msg_id } => Some(msg_id),
-                    _ => None,
-                })
-                .collect();
-
-            let msg0 = Message::load_from_db(&bob.ctx, msg_ids[0]).await.unwrap();
-            assert!(msg0.is_info());
-            assert!(msg0.get_text().contains("alice@example.org verified"));
-
-            let msg1 = Message::load_from_db(&bob.ctx, msg_ids[1]).await.unwrap();
-            assert!(msg1.is_info());
+            let msg = get_chat_msg(&bob, chat.get_id(), 0, 1).await;
+            assert!(msg.is_info());
             let expected_text = chat_protection_enabled(&bob).await;
-            assert_eq!(msg1.get_text(), expected_text);
+            assert_eq!(msg.get_text(), expected_text);
         }
 
         // Check Bob sent the final message
@@ -1054,8 +1004,11 @@ mod tests {
             gossip_key_fingerprint: Some(alice_pubkey.fingerprint()),
             verified_key: None,
             verified_key_fingerprint: None,
-            fingerprint_changed: false,
             verifier: None,
+            secondary_verified_key: None,
+            secondary_verified_key_fingerprint: None,
+            secondary_verifier: None,
+            fingerprint_changed: false,
         };
         peerstate.save_to_db(&bob.ctx.sql).await?;
 
@@ -1310,11 +1263,11 @@ mod tests {
             );
             // There should be 3 messages in the chat:
             // - The ChatProtectionEnabled message
-            // - bob@example.net verified
             // - You added member bob@example.net
-            let msg = get_chat_msg(&alice, alice_chatid, 1, 3).await;
+            let msg = get_chat_msg(&alice, alice_chatid, 0, 2).await;
             assert!(msg.is_info());
-            assert!(msg.get_text().contains("bob@example.net verified"));
+            let expected_text = chat_protection_enabled(&alice).await;
+            assert_eq!(msg.get_text(), expected_text);
         }
 
         // Bob should not yet have Alice verified
@@ -1348,27 +1301,6 @@ mod tests {
                     let msg = Message::load_from_db(&bob.ctx, msg_id).await.unwrap();
                     let text = msg.get_text();
                     println!("msg {msg_id} text: {text}");
-                }
-            }
-            let mut msg_iter = chat::get_chat_msgs(&bob.ctx, bob_chatid)
-                .await
-                .unwrap()
-                .into_iter();
-            loop {
-                match msg_iter.next() {
-                    Some(chat::ChatItem::Message { msg_id }) => {
-                        let msg = Message::load_from_db(&bob.ctx, msg_id).await.unwrap();
-                        let text = msg.get_text();
-                        match text.contains("alice@example.org verified") {
-                            true => {
-                                assert!(msg.is_info());
-                                break;
-                            }
-                            false => continue,
-                        }
-                    }
-                    Some(_) => continue,
-                    None => panic!("Verified message not found in Bob's group chat"),
                 }
             }
         }
@@ -1418,6 +1350,34 @@ First thread."#;
         let chat_id = msg.chat_id;
 
         assert!(get_securejoin_qr(&alice, Some(chat_id)).await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_unknown_sender() -> Result<()> {
+        let mut tcm = TestContextManager::new();
+        let alice = tcm.alice().await;
+        let bob = tcm.bob().await;
+
+        tcm.execute_securejoin(&alice, &bob).await;
+
+        let alice_chat_id = alice
+            .create_group_with_members(ProtectionStatus::Protected, "Group with Bob", &[&bob])
+            .await;
+
+        let sent = alice.send_text(alice_chat_id, "Hi!").await;
+        let bob_chat_id = bob.recv_msg(&sent).await.chat_id;
+
+        let sent = bob.send_text(bob_chat_id, "Hi hi!").await;
+
+        let alice_bob_contact_id = Contact::create(&alice, "Bob", "bob@example.net").await?;
+        remove_contact_from_chat(&alice, alice_chat_id, alice_bob_contact_id).await?;
+
+        // The message from Bob is delivered late, Bob is already removed.
+        let msg = alice.recv_msg(&sent).await;
+        assert_eq!(msg.text, "Hi hi!");
+        assert_eq!(msg.error.unwrap(), "Unknown sender for this chat.");
+
         Ok(())
     }
 }

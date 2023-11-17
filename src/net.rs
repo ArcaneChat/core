@@ -1,10 +1,11 @@
 //! # Common network utilities.
+use std::net::Ipv4Addr;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::str::FromStr;
 use std::time::Duration;
 
-use anyhow::{Context as _, Error, Result};
+use anyhow::{format_err, Context as _, Result};
 use tokio::net::{lookup_host, TcpStream};
 use tokio::time::timeout;
 use tokio_io_timeout::TimeoutStream;
@@ -119,6 +120,22 @@ async fn lookup_host_with_cache(
                 }
             }
         }
+
+        if resolved_addrs.is_empty() {
+            // Load hardcoded cache if everything else fails.
+            //
+            // See <https://support.delta.chat/t/no-dns-resolution-result/2778> and
+            // <https://github.com/deltachat/deltachat-core-rust/issues/4920> for reasons.
+            //
+            // In the future we may pre-resolve all provider database addresses
+            // and build them in.
+            if hostname == "mail.sangham.net" {
+                resolved_addrs.push(SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::new(159, 69, 186, 85)),
+                    port,
+                ));
+            }
+        }
     }
 
     Ok(resolved_addrs)
@@ -178,7 +195,9 @@ pub(crate) async fn connect_tcp(
     let tcp_stream = match tcp_stream {
         Some(tcp_stream) => tcp_stream,
         None => {
-            return Err(last_error.unwrap_or_else(|| Error::msg("no DNS resolution results")));
+            return Err(
+                last_error.unwrap_or_else(|| format_err!("no DNS resolution results for {host}"))
+            );
         }
     };
 

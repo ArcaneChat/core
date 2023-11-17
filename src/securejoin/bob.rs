@@ -15,6 +15,7 @@ use crate::contact::Contact;
 use crate::context::Context;
 use crate::events::EventType;
 use crate::mimeparser::MimeMessage;
+use crate::sync::Sync::*;
 use crate::tools::time;
 use crate::{chat, stock_str};
 
@@ -110,7 +111,7 @@ pub(super) async fn handle_auth_required(
 /// Handles `vc-contact-confirm` and `vg-member-added` handshake messages.
 ///
 /// # Bob - the joiner's side
-/// ## Step 4 in the "Setup Contact protocol"
+/// ## Step 7 in the "Setup Contact protocol"
 pub(super) async fn handle_contact_confirm(
     context: &Context,
     mut bobstate: BobState,
@@ -131,6 +132,7 @@ pub(super) async fn handle_contact_confirm(
             // verify both contacts (this could be a bug/security issue, see
             // e.g. https://github.com/deltachat/deltachat-core-rust/issues/1177).
             bobstate.notify_peer_verified(context).await?;
+            bobstate.emit_progress(context, JoinerProgress::Succeeded);
             Ok(retval)
         }
         Some(_) => {
@@ -179,7 +181,7 @@ impl BobState {
             } => {
                 let group_chat_id = match chat::get_chat_id_by_grpid(context, grpid).await? {
                     Some((chat_id, _protected, _blocked)) => {
-                        chat_id.unblock(context).await?;
+                        chat_id.unblock_ex(context, Nosync).await?;
                         chat_id
                     }
                     None => {
@@ -220,16 +222,13 @@ impl BobState {
     /// This creates an info message in the chat being joined.
     async fn notify_peer_verified(&self, context: &Context) -> Result<()> {
         let contact = Contact::get_by_id(context, self.invite().contact_id()).await?;
-        let msg = stock_str::contact_verified(context, &contact).await;
         let chat_id = self.joining_chat_id(context).await?;
-        chat::add_info_msg(context, chat_id, &msg, time()).await?;
 
         if context
             .get_config_bool(Config::VerifiedOneOnOneChats)
             .await?
-            && chat_id == self.alice_chat()
         {
-            chat_id
+            self.alice_chat()
                 .set_protection(
                     context,
                     ProtectionStatus::Protected,
@@ -255,8 +254,8 @@ enum JoinerProgress {
     ///
     /// Typically shows as "alice@addr verified, introducing myself."
     RequestWithAuthSent,
-    // /// Completed securejoin.
-    // Succeeded,
+    /// Completed securejoin.
+    Succeeded,
 }
 
 impl From<JoinerProgress> for usize {
@@ -264,7 +263,7 @@ impl From<JoinerProgress> for usize {
         match progress {
             JoinerProgress::Error => 0,
             JoinerProgress::RequestWithAuthSent => 400,
-            // JoinerProgress::Succeeded => 1000,
+            JoinerProgress::Succeeded => 1000,
         }
     }
 }
