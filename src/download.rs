@@ -21,7 +21,7 @@ use crate::{stock_str, EventType};
 /// should always be downloaded completely to handle them correctly,
 /// also in larger groups and if group and contact avatar are attached.
 /// Most of these cases are caught by `MIN_DOWNLOAD_LIMIT`.
-pub(crate) const MIN_DOWNLOAD_LIMIT: u32 = 163840;
+pub(crate) const MIN_DOWNLOAD_LIMIT: u32 = 32768;
 
 /// If a message is downloaded only partially
 /// and `delete_server_after` is set to small timeouts (eg. "at once"),
