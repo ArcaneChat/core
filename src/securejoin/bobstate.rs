@@ -291,7 +291,7 @@ impl BobState {
     ) -> Result<Option<BobHandshakeStage>> {
         info!(
             context,
-            "Bob Step 4 - handling vc-auth-require/vg-auth-required message"
+            "Bob Step 4 - handling {{vc,vg}}-auth-required message."
         );
         if !encrypted_and_signed(context, mime_message, Some(self.invite.fingerprint())) {
             let reason = if mime_message.was_encrypted() {
@@ -333,7 +333,7 @@ impl BobState {
     ) -> Result<Option<BobHandshakeStage>> {
         info!(
             context,
-            "Bob Step 7 - handling vc-contact-confirm/vg-member-added message"
+            "Bob Step 7 - handling vc-contact-confirm/vg-member-added message."
         );
         mark_peer_as_verified(
             context,
@@ -344,17 +344,6 @@ impl BobState {
         Contact::scaleup_origin_by_id(context, self.invite.contact_id(), Origin::SecurejoinJoined)
             .await?;
         context.emit_event(EventType::ContactsChanged(None));
-
-        self.send_handshake_message(context, BobHandshakeMsg::ContactConfirmReceived)
-            .await
-            .map_err(|_| {
-                warn!(
-                    context,
-                    "Failed to send vc-contact-confirm-received/vg-member-added-received"
-                );
-            })
-            // This is not an error affecting the protocol outcome.
-            .ok();
 
         self.update_next(&context.sql, SecureJoinStep::Completed)
             .await?;
@@ -401,9 +390,6 @@ async fn send_handshake_message(
             msg.param.set(Param::Arg2, invite.authcode());
             msg.param.set_int(Param::GuaranteeE2ee, 1);
         }
-        BobHandshakeMsg::ContactConfirmReceived => {
-            msg.param.set_int(Param::GuaranteeE2ee, 1);
-        }
     };
 
     // Sends our own fingerprint in the Secure-Join-Fingerprint header.
@@ -425,8 +411,6 @@ enum BobHandshakeMsg {
     Request,
     /// vc-request-with-auth or vg-request-with-auth
     RequestWithAuth,
-    /// vc-contact-confirm-received or vg-member-added-received
-    ContactConfirmReceived,
 }
 
 impl BobHandshakeMsg {
@@ -453,10 +437,6 @@ impl BobHandshakeMsg {
             Self::RequestWithAuth => match invite {
                 QrInvite::Contact { .. } => "vc-request-with-auth",
                 QrInvite::Group { .. } => "vg-request-with-auth",
-            },
-            Self::ContactConfirmReceived => match invite {
-                QrInvite::Contact { .. } => "vc-contact-confirm-received",
-                QrInvite::Group { .. } => "vg-member-added-received",
             },
         }
     }

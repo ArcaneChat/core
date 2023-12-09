@@ -580,7 +580,7 @@ impl TestContext {
         // MailinglistAddress is the lowest allowed origin, we'd prefer to not modify the
         // origin when creating this contact.
         let (contact_id, modified) =
-            Contact::add_or_lookup(self, &name, addr, Origin::MailinglistAddress)
+            Contact::add_or_lookup(self, &name, &addr, Origin::MailinglistAddress)
                 .await
                 .expect("add_or_lookup");
         match modified {
@@ -1065,6 +1065,13 @@ pub(crate) async fn mark_as_verified(this: &TestContext, other: &TestContext) {
     peerstate.verified_key_fingerprint = peerstate.public_key_fingerprint.clone();
 
     peerstate.save_to_db(&this.sql).await.unwrap();
+}
+
+/// Pops a sync message from alice0 and receives it on alice1. Should be used after an action on
+/// alice0's side that implies sending a sync message.
+pub(crate) async fn sync(alice0: &TestContext, alice1: &TestContext) {
+    let sync_msg = alice0.pop_sent_msg().await;
+    alice1.recv_msg(&sync_msg).await;
 }
 
 /// Pretty-print an event to stdout

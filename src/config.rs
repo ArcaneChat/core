@@ -5,6 +5,7 @@ use std::path::Path;
 use std::str::FromStr;
 
 use anyhow::{ensure, Context as _, Result};
+use serde::{Deserialize, Serialize};
 use strum::{EnumProperty, IntoEnumIterator};
 use strum_macros::{AsRefStr, Display, EnumIter, EnumProperty, EnumString};
 
@@ -13,8 +14,10 @@ use crate::constants::DC_VERSION_STR;
 use crate::contact::addr_cmp;
 use crate::context::Context;
 use crate::events::EventType;
+use crate::log::LogExt;
 use crate::mimefactory::RECOMMENDED_FILE_SIZE;
 use crate::provider::{get_provider_by_id, Provider};
+use crate::sync::{self, Sync::*, SyncData};
 use crate::tools::{get_abs_path, improve_single_line_input, EmailAddress};
 
 /// The available configuration keys.
@@ -31,6 +34,8 @@ use crate::tools::{get_abs_path, improve_single_line_input, EmailAddress};
     EnumProperty,
     PartialOrd,
     Ord,
+    Serialize,
+    Deserialize,
 )]
 #[strum(serialize_all = "snake_case")]
 pub enum Config {
@@ -344,6 +349,24 @@ pub enum Config {
     VerifiedOneOnOneChats,
 }
 
+impl Config {
+    /// Whether the config option is synced across devices.
+    ///
+    /// This must be checked on both sides so that if there are different client versions, the
+    /// synchronisation of a particular option is either done or not done in both directions.
+    /// Moreover, receivers of a config value need to check if a key can be synced because some
+    /// settings (e.g. Avatar path) could otherwise lead to exfiltration of files from a receiver's
+    /// device if we assume an attacker to have control of a device in a multi-device setting or if
+    /// multiple users are sharing an account. Another example is `Self::SyncMsgs` itself which
+    /// mustn't be controlled by other devices.
+    pub(crate) fn is_synced(&self) -> bool {
+        matches!(
+            self,
+            Self::Displayname | Self::MdnsEnabled | Self::ShowEmails
+        )
+    }
+}
+
 impl Context {
     /// Returns true if configuration value is set for the given key.
     pub async fn config_exists(&self, key: Config) -> Result<bool> {
@@ -464,6 +487,16 @@ impl Context {
     /// Set the given config key.
     /// If `None` is passed as a value the value is cleared and set to the default if there is one.
     pub async fn set_config(&self, key: Config, value: Option<&str>) -> Result<()> {
+        self.set_config_ex(key.is_synced().into(), key, value).await
+    }
+
+    pub(crate) async fn set_config_ex(
+        &self,
+        sync: sync::Sync,
+        key: Config,
+        mut value: Option<&str>,
+    ) -> Result<()> {
+        let better_value;
         match key {
             Config::Selfavatar => {
                 self.sql
@@ -490,10 +523,11 @@ impl Context {
                 ret?
             }
             Config::Displayname => {
-                let value = value.map(improve_single_line_input);
-                self.sql
-                    .set_raw_config(key.as_ref(), value.as_deref())
-                    .await?;
+                if let Some(v) = value {
+                    better_value = improve_single_line_input(v);
+                    value = Some(&better_value);
+                }
+                self.sql.set_raw_config(key.as_ref(), value).await?;
             }
             Config::Socks5Enabled
             | Config::BccSelf
@@ -517,10 +551,32 @@ impl Context {
                 );
                 self.sql.set_raw_config(key.as_ref(), value).await?;
             }
+            Config::Addr => {
+                self.sql
+                    .set_raw_config(key.as_ref(), value.map(|s| s.to_lowercase()).as_deref())
+                    .await?;
+            }
             _ => {
                 self.sql.set_raw_config(key.as_ref(), value).await?;
             }
         }
+
+        if sync != Sync {
+            return Ok(());
+        }
+        let Some(val) = value else {
+            return Ok(());
+        };
+        let val = val.to_string();
+        if self
+            .add_sync_item(SyncData::Config { key, val })
+            .await
+            .log_err(self)
+            .is_err()
+        {
+            return Ok(());
+        }
+        self.send_sync_msg().await.log_err(self).ok();
         Ok(())
     }
 
@@ -652,7 +708,7 @@ mod tests {
 
     use super::*;
     use crate::constants;
-    use crate::test_utils::TestContext;
+    use crate::test_utils::{sync, TestContext};
 
     #[test]
     fn test_to_string() {
@@ -663,6 +719,21 @@ mod tests {
         assert_eq!(
             Config::from_str("sys.config_keys"),
             Ok(Config::SysConfigKeys)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_set_config_addr() {
+        let t = TestContext::new().await;
+
+        // Test that uppercase address get lowercased.
+        assert!(t
+            .set_config(Config::Addr, Some("Foobar@eXample.oRg"))
+            .await
+            .is_ok());
+        assert_eq!(
+            t.get_config(Config::Addr).await.unwrap().unwrap(),
+            "foobar@example.org"
         );
     }
 
@@ -778,6 +849,67 @@ mod tests {
         assert!(alice.is_self_addr("alice@example.org").await?);
         assert!(alice.is_self_addr("alice@alice.com").await?);
         assert!(alice.is_self_addr("Alice@alice.xyz").await?);
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_sync() -> Result<()> {
+        let alice0 = TestContext::new_alice().await;
+        let alice1 = TestContext::new_alice().await;
+        for a in [&alice0, &alice1] {
+            a.set_config_bool(Config::SyncMsgs, true).await?;
+        }
+
+        let mdns_enabled = alice0.get_config_bool(Config::MdnsEnabled).await?;
+        // Alice1 has a different config value.
+        alice1
+            .set_config_bool(Config::MdnsEnabled, !mdns_enabled)
+            .await?;
+        // This changes nothing, but still sends a sync message.
+        alice0
+            .set_config_bool(Config::MdnsEnabled, mdns_enabled)
+            .await?;
+        sync(&alice0, &alice1).await;
+        assert_eq!(
+            alice1.get_config_bool(Config::MdnsEnabled).await?,
+            mdns_enabled
+        );
+
+        // Reset to default. Test that it's not synced because defaults may differ across client
+        // versions.
+        alice0.set_config(Config::MdnsEnabled, None).await?;
+        assert!(alice0.get_config_bool(Config::MdnsEnabled).await?);
+        alice0.set_config_bool(Config::MdnsEnabled, false).await?;
+        sync(&alice0, &alice1).await;
+        assert!(!alice1.get_config_bool(Config::MdnsEnabled).await?);
+
+        let show_emails = alice0.get_config_bool(Config::ShowEmails).await?;
+        alice0
+            .set_config_bool(Config::ShowEmails, !show_emails)
+            .await?;
+        sync(&alice0, &alice1).await;
+        assert_eq!(
+            alice1.get_config_bool(Config::ShowEmails).await?,
+            !show_emails
+        );
+
+        // `Config::SyncMsgs` mustn't be synced.
+        alice0.set_config_bool(Config::SyncMsgs, false).await?;
+        alice0.set_config_bool(Config::SyncMsgs, true).await?;
+        alice0.set_config_bool(Config::MdnsEnabled, true).await?;
+        sync(&alice0, &alice1).await;
+        assert!(alice1.get_config_bool(Config::MdnsEnabled).await?);
+
+        // Usual sync scenario.
+        alice0
+            .set_config(Config::Displayname, Some("Alice Sync"))
+            .await?;
+        sync(&alice0, &alice1).await;
+        assert_eq!(
+            alice1.get_config(Config::Displayname).await?,
+            Some("Alice Sync".to_string())
+        );
 
         Ok(())
     }

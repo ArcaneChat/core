@@ -25,7 +25,6 @@ typedef struct _dc_event     dc_event_t;
 typedef struct _dc_event_emitter dc_event_emitter_t;
 typedef struct _dc_jsonrpc_instance dc_jsonrpc_instance_t;
 typedef struct _dc_backup_provider dc_backup_provider_t;
-typedef struct _dc_http_response dc_http_response_t;
 
 // Alias for backwards compatibility, use dc_event_emitter_t instead.
 typedef struct _dc_event_emitter dc_accounts_event_emitter_t;
@@ -1112,6 +1111,7 @@ uint32_t dc_send_videochat_invitation (dc_context_t* context, uint32_t chat_id);
  * received overrides all previously received reactions. It is
  * possible to remove all reactions by sending an empty string.
  *
+ * @deprecated 2023-11-27, use jsonrpc method `send_reaction` instead
  * @memberof dc_context_t
  * @param context The context object.
  * @param msg_id ID of the message you react to.
@@ -1124,6 +1124,7 @@ uint32_t dc_send_reaction (dc_context_t* context, uint32_t msg_id, char *reactio
 /**
  * Get a structure with reactions to the message.
  *
+ * @deprecated 2023-11-27, use jsonrpc method `get_message_reactions` instead
  * @memberof dc_context_t
  * @param context The context object.
  * @param msg_id The message ID to get reactions for.
@@ -2561,7 +2562,7 @@ dc_lot_t*       dc_check_qr                  (dc_context_t* context, const char*
  *     the Verified-Group-Invite protocol is offered in the QR code;
  *     works for protected groups as well as for normal groups.
  *     If set to 0, the Setup-Contact protocol is offered in the QR code.
- *     See https://countermitm.readthedocs.io/en/latest/new.html
+ *     See https://securejoin.readthedocs.io/en/latest/new.html
  *     for details about both protocols.
  * @return The text that should go to the QR code,
  *     On errors, an empty QR code is returned, NULL is never returned.
@@ -2597,7 +2598,7 @@ char*           dc_get_securejoin_qr_svg         (dc_context_t* context, uint32_
  *
  * Subsequent calls of dc_join_securejoin() will abort previous, unfinished handshakes.
  *
- * See https://countermitm.readthedocs.io/en/latest/new.html
+ * See https://securejoin.readthedocs.io/en/latest/new.html
  * for details about both protocols.
  *
  * @memberof dc_context_t
@@ -5186,72 +5187,6 @@ void            dc_provider_unref                     (dc_provider_t* provider);
 
 
 /**
- * Return an HTTP(S) GET response.
- * This function can be used to download remote content for HTML emails.
- *
- * @memberof dc_context_t
- * @param context The context object to take proxy settings from.
- * @param url HTTP or HTTPS URL.
- * @return The response must be released using dc_http_response_unref() after usage.
- *     NULL is returned on errors.
- */
-dc_http_response_t*     dc_get_http_response      (const dc_context_t* context, const char* url);
-
-
-/**
- * @class dc_http_response_t
- *
- * An object containing an HTTP(S) GET response.
- * Created by dc_get_http_response().
- */
-
-
-/**
- * Returns HTTP response MIME type as a string, e.g. "text/plain" or "text/html".
- *
- * @memberof dc_http_response_t
- * @param response HTTP response as returned by dc_get_http_response().
- * @return The string which must be released using dc_str_unref() after usage. May be NULL.
- */
-char*                   dc_http_response_get_mimetype (const dc_http_response_t* response);
-
-/**
- * Returns HTTP response encoding, e.g. "utf-8".
- *
- * @memberof dc_http_response_t
- * @param response HTTP response as returned by dc_get_http_response().
- * @return The string which must be released using dc_str_unref() after usage. May be NULL.
- */
-char*                   dc_http_response_get_encoding (const dc_http_response_t* response);
-
-/**
- * Returns HTTP response contents.
- *
- * @memberof dc_http_response_t
- * @param response HTTP response as returned by dc_get_http_response().
- * @return The blob which must be released using dc_str_unref() after usage. NULL is never returned.
- */
-uint8_t*                dc_http_response_get_blob     (const dc_http_response_t* response);
-
-/**
- * Returns HTTP response content size.
- *
- * @memberof dc_http_response_t
- * @param response HTTP response as returned by dc_get_http_response().
- * @return The blob size.
- */
-size_t                  dc_http_response_get_size     (const dc_http_response_t* response);
-
-/**
- * Free an HTTP response object.
- *
- * @memberof dc_http_response_t
- * @param response HTTP response as returned by dc_get_http_response().
- */
-void                    dc_http_response_unref        (const dc_http_response_t* response);
-
-
-/**
  * @class dc_lot_t
  *
  * An object containing a set of values.
@@ -5350,6 +5285,7 @@ int64_t         dc_lot_get_timestamp     (const dc_lot_t* lot);
 
 /**
  * @class dc_reactions_t
+ * @deprecated 2023-11-27, use jsonrpc method `get_message_reactions` instead
  *
  * An object representing all reactions for a single message.
  */
@@ -5357,6 +5293,7 @@ int64_t         dc_lot_get_timestamp     (const dc_lot_t* lot);
 /**
  * Returns array of contacts which reacted to the given message.
  *
+ * @deprecated 2023-11-27, use jsonrpc method `get_message_reactions` instead
  * @memberof dc_reactions_t
  * @param reactions The object containing message reactions.
  * @return array of contact IDs. Use dc_array_get_cnt() to get array length and
@@ -5368,6 +5305,7 @@ dc_array_t*     dc_reactions_get_contacts(dc_reactions_t* reactions);
 /**
  * Returns a string containing space-separated reactions of a single contact.
  *
+ * @deprecated 2023-11-27, use jsonrpc method `get_message_reactions` instead
  * @memberof dc_reactions_t
  * @param reactions The object containing message reactions.
  * @param contact_id ID of the contact.
@@ -5383,6 +5321,7 @@ char*           dc_reactions_get_by_contact_id(dc_reactions_t* reactions, uint32
  *
  * Reactions objects are created by dc_get_msg_reactions().
  *
+ * @deprecated 2023-11-27
  * @memberof dc_reactions_t
  * @param reactions The object to free.
  *     If NULL is given, nothing is done.
@@ -6621,7 +6560,7 @@ void dc_event_unref(dc_event_t* event);
 /// - %1$s will be replaced by the name of the verified contact
 #define DC_STR_CONTACT_VERIFIED           35
 
-/// "Cannot verify %1$s."
+/// "Cannot establish guaranteed end-to-end encryption with %1$s."
 ///
 /// Used in status messages.
 /// - %1$s will be replaced by the name of the contact that cannot be verified

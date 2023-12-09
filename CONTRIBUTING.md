@@ -86,6 +86,17 @@ For example:
 .with_context(|| format!("Unable to trash message {msg_id}"))
 ```
 
+All errors should be handled in one of these ways:
+- With `if let Err() =` (incl. logging them into `warn!()`/`err!()`).
+- With `.log_err().ok()`.
+- Bubbled up with `?`.
+
+`backtrace` feature is enabled for `anyhow` crate
+and `debug = 1` option is set in the test profile.
+This allows to run `RUST_BACKTRACE=1 cargo test`
+and get a backtrace with line numbers in resultified tests
+which return `anyhow::Result`.
+
 ### Logging
 
 For logging, use `info!`, `warn!` and `error!` macros.

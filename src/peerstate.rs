@@ -26,17 +26,6 @@ pub enum PeerstateKeyType {
     PublicKey,
 }
 
-/// Verification status of the contact peerstate.
-#[derive(Debug, PartialEq, Eq, Clone, Copy, FromPrimitive)]
-#[repr(u8)]
-pub enum PeerstateVerifiedStatus {
-    /// Peerstate is not verified.
-    Unverified = 0,
-    //Verified = 1, // not used
-    /// Peerstate is verified and we assume that the contact has verified our peerstate.
-    BidirectVerified = 2,
-}
-
 /// Peerstate represents the state of an Autocrypt peer.
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Peerstate {
@@ -373,8 +362,8 @@ impl Peerstate {
     }
 
     /// Returns the contents of the `Autocrypt-Gossip` header for outgoing messages.
-    pub fn render_gossip_header(&self, min_verified: PeerstateVerifiedStatus) -> Option<String> {
-        if let Some(key) = self.peek_key(min_verified) {
+    pub fn render_gossip_header(&self, verified: bool) -> Option<String> {
+        if let Some(key) = self.peek_key(verified) {
             let header = Aheader::new(
                 self.addr.clone(),
                 key.clone(), // TODO: avoid cloning
@@ -397,43 +386,41 @@ impl Peerstate {
     /// Converts the peerstate into the contact public key.
     ///
     /// Similar to [`Self::peek_key`], but consumes the peerstate and returns owned key.
-    pub fn take_key(mut self, min_verified: PeerstateVerifiedStatus) -> Option<SignedPublicKey> {
-        match min_verified {
-            PeerstateVerifiedStatus::BidirectVerified => self.verified_key.take(),
-            PeerstateVerifiedStatus::Unverified => {
-                self.public_key.take().or_else(|| self.gossip_key.take())
-            }
+    pub fn take_key(mut self, verified: bool) -> Option<SignedPublicKey> {
+        if verified {
+            self.verified_key.take()
+        } else {
+            self.public_key.take().or_else(|| self.gossip_key.take())
         }
     }
 
     /// Returns a reference to the contact public key.
     ///
-    /// `min_verified` determines the minimum required verification status of the key.
+    /// `verified` determines the required verification status of the key.
     /// If verified key is requested, returns the verified key,
     /// otherwise returns the Autocrypt key.
     ///
     /// Returned key is suitable for sending in `Autocrypt-Gossip` header.
     ///
     /// Returns `None` if there is no suitable public key.
-    pub fn peek_key(&self, min_verified: PeerstateVerifiedStatus) -> Option<&SignedPublicKey> {
-        match min_verified {
-            PeerstateVerifiedStatus::BidirectVerified => self.verified_key.as_ref(),
-            PeerstateVerifiedStatus::Unverified => {
-                self.public_key.as_ref().or(self.gossip_key.as_ref())
-            }
+    pub fn peek_key(&self, verified: bool) -> Option<&SignedPublicKey> {
+        if verified {
+            self.verified_key.as_ref()
+        } else {
+            self.public_key.as_ref().or(self.gossip_key.as_ref())
         }
     }
 
     /// Returns a reference to the contact's public key fingerprint.
     ///
     /// Similar to [`Self::peek_key`], but returns the fingerprint instead of the key.
-    fn peek_key_fingerprint(&self, min_verified: PeerstateVerifiedStatus) -> Option<&Fingerprint> {
-        match min_verified {
-            PeerstateVerifiedStatus::BidirectVerified => self.verified_key_fingerprint.as_ref(),
-            PeerstateVerifiedStatus::Unverified => self
-                .public_key_fingerprint
+    fn peek_key_fingerprint(&self, verified: bool) -> Option<&Fingerprint> {
+        if verified {
+            self.verified_key_fingerprint.as_ref()
+        } else {
+            self.public_key_fingerprint
                 .as_ref()
-                .or(self.gossip_key_fingerprint.as_ref()),
+                .or(self.gossip_key_fingerprint.as_ref())
         }
     }
 
@@ -443,10 +430,9 @@ impl Peerstate {
     /// Note that verified groups always use the verified key no matter if the
     /// opportunistic key matches or not.
     pub(crate) fn is_using_verified_key(&self) -> bool {
-        let verified = self.peek_key_fingerprint(PeerstateVerifiedStatus::BidirectVerified);
+        let verified = self.peek_key_fingerprint(true);
 
-        verified.is_some()
-            && verified == self.peek_key_fingerprint(PeerstateVerifiedStatus::Unverified)
+        verified.is_some() && verified == self.peek_key_fingerprint(false)
     }
 
     /// Set this peerstate to verified
@@ -648,7 +634,7 @@ impl Peerstate {
                             let (new_contact_id, _) = Contact::add_or_lookup(
                                 context,
                                 "",
-                                new_addr,
+                                &new_addr,
                                 Origin::IncomingUnknownFrom,
                             )
                             .await?;
@@ -719,9 +705,7 @@ pub(crate) async fn maybe_do_aeap_transition(
                 // addresses with an MUA.
                 && mime_parser.has_chat_version()
                 // Check if the message is signed correctly.
-                // If it's not signed correctly, the whole autocrypt header will be mostly
-                // ignored anyway and the message shown as not encrypted, so we don't
-                // have to handle this case.
+                // Although checking `from_is_signed` below is sufficient, let's play it safe.
                 && !mime_parser.signatures.is_empty()
                 // Check if the From: address was also in the signed part of the email.
                 // Without this check, an attacker could replay a message from Alice 

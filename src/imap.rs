@@ -9,6 +9,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     iter::Peekable,
     mem::take,
+    time::Duration,
 };
 
 use anyhow::{bail, format_err, Context as _, Result};
@@ -16,6 +17,8 @@ use async_channel::Receiver;
 use async_imap::types::{Fetch, Flag, Name, NameAttribute, UnsolicitedResponse};
 use futures::{StreamExt, TryStreamExt};
 use num_traits::FromPrimitive;
+use ratelimit::Ratelimit;
+use tokio::sync::RwLock;
 
 use crate::chat::{self, ChatId, ChatIdBlocked};
 use crate::config::Config;
@@ -38,7 +41,7 @@ use crate::scheduler::connectivity::ConnectivityStore;
 use crate::socks::Socks5Config;
 use crate::sql;
 use crate::stock_str;
-use crate::tools::create_id;
+use crate::tools::{create_id, duration_to_str};
 
 pub(crate) mod capabilities;
 mod client;
@@ -91,6 +94,7 @@ pub struct Imap {
     login_failed_once: bool,
 
     pub(crate) connectivity: ConnectivityStore,
+    ratelimit: RwLock<Ratelimit>,
 }
 
 #[derive(Debug)]
@@ -252,6 +256,8 @@ impl Imap {
             session: None,
             login_failed_once: false,
             connectivity: Default::default(),
+            // 1 connection per minute + a burst of 2.
+            ratelimit: RwLock::new(Ratelimit::new(Duration::new(120, 0), 2.0)),
         };
 
         Ok(imap)
@@ -300,10 +306,20 @@ impl Imap {
         }
 
         self.connectivity.set_connecting(context).await;
+        let ratelimit_duration = self.ratelimit.read().await.until_can_send();
+        if !ratelimit_duration.is_zero() {
+            warn!(
+                context,
+                "IMAP got rate limited, waiting for {} until can connect",
+                duration_to_str(ratelimit_duration),
+            );
+            tokio::time::sleep(ratelimit_duration).await;
+        }
 
         let oauth2 = self.config.lp.oauth2;
 
         info!(context, "Connecting to IMAP server");
+        self.ratelimit.write().await.send();
         let connection_res: Result<Client> = if self.config.lp.security == Socket::Starttls
             || self.config.lp.security == Socket::Plain
         {
@@ -572,9 +588,6 @@ impl Imap {
     /// When selecting a folder for the first time, sets the uid_next to the current
     /// mailbox.uid_next so that no old emails are fetched.
     ///
-    /// Makes sure that UIDNEXT is known for `selected_mailbox`
-    /// and errors out if UIDNEXT cannot be determined.
-    ///
     /// Returns Result<new_emails> (i.e. whether new emails arrived),
     /// if in doubt, returns new_emails=true so emails are fetched.
     pub(crate) async fn select_with_uidvalidity(
@@ -592,11 +605,18 @@ impl Imap {
             .as_mut()
             .with_context(|| format!("No mailbox selected, folder: {folder}"))?;
 
+        let old_uid_validity = get_uidvalidity(context, folder)
+            .await
+            .with_context(|| format!("failed to get old UID validity for folder {folder}"))?;
+        let old_uid_next = get_uid_next(context, folder)
+            .await
+            .with_context(|| format!("failed to get old UID NEXT for folder {folder}"))?;
+
         let new_uid_validity = mailbox
             .uid_validity
             .with_context(|| format!("No UIDVALIDITY for folder {folder}"))?;
         let new_uid_next = if let Some(uid_next) = mailbox.uid_next {
-            uid_next
+            Some(uid_next)
         } else {
             warn!(
                 context,
@@ -621,18 +641,15 @@ impl Imap {
                 .await
                 .with_context(|| format!("STATUS (UIDNEXT) error for {folder:?}"))?;
 
-            status
-                .uid_next
-                .with_context(|| format!("STATUS {folder} (UIDNEXT) did not return UIDNEXT"))?
+            if status.uid_next.is_none() {
+                // This happens with mail.163.com as of 2023-11-26.
+                // It does not return UIDNEXT on SELECT and returns invalid
+                // `* STATUS "INBOX" ()` response on explicit request for UIDNEXT.
+                warn!(context, "STATUS {folder} (UIDNEXT) did not return UIDNEXT.");
+            }
+            status.uid_next
         };
-        mailbox.uid_next = Some(new_uid_next);
-
-        let old_uid_validity = get_uidvalidity(context, folder)
-            .await
-            .with_context(|| format!("failed to get old UID validity for folder {folder}"))?;
-        let old_uid_next = get_uid_next(context, folder)
-            .await
-            .with_context(|| format!("failed to get old UID NEXT for folder {folder}"))?;
+        mailbox.uid_next = new_uid_next;
 
         if new_uid_validity == old_uid_validity {
             let new_emails = if newly_selected == NewlySelected::No {
@@ -641,7 +658,7 @@ impl Imap {
                 // the caller tries to fetch new messages (we could of course run a SELECT command now, but trying to fetch
                 // new messages is only one command, just as a SELECT command)
                 true
-            } else {
+            } else if let Some(new_uid_next) = new_uid_next {
                 if new_uid_next < old_uid_next {
                     warn!(
                         context,
@@ -651,7 +668,11 @@ impl Imap {
                     context.schedule_resync().await?;
                 }
                 new_uid_next != old_uid_next // If UIDNEXT changed, there are new emails
+            } else {
+                // We have no UIDNEXT and if in doubt, return true.
+                true
             };
+
             return Ok(new_emails);
         }
 
@@ -660,6 +681,7 @@ impl Imap {
 
         // ==============  uid_validity has changed or is being set the first time.  ==============
 
+        let new_uid_next = new_uid_next.unwrap_or_default();
         set_uid_next(context, folder, new_uid_next).await?;
         set_uidvalidity(context, folder, new_uid_validity).await?;
 
@@ -876,11 +898,7 @@ impl Imap {
             .as_ref()
             .with_context(|| format!("Expected {folder:?} to be selected"))?
             .uid_next
-            .with_context(|| {
-                format!(
-                    "Expected UIDNEXT to be determined for {folder:?} by select_with_uidvalidity"
-                )
-            })?;
+            .unwrap_or_default();
         let new_uid_next = max(
             max(largest_uid_fetched, largest_uid_skipped.unwrap_or(0)) + 1,
             mailbox_uid_next,
@@ -1451,13 +1469,8 @@ impl Imap {
                             break;
                         };
 
-                    let next_fetch_response = match next_fetch_response {
-                        Ok(next_fetch_response) => next_fetch_response,
-                        Err(err) => {
-                            warn!(context, "Failed to process IMAP FETCH result: {}.", err);
-                            continue;
-                        }
-                    };
+                    let next_fetch_response =
+                        next_fetch_response.context("Failed to process IMAP FETCH result")?;
 
                     if let Some(next_uid) = next_fetch_response.uid {
                         if next_uid == request_uid {
@@ -2519,7 +2532,7 @@ async fn add_all_recipients_as_contacts(
         let (_, modified) = Contact::add_or_lookup(
             context,
             &display_name_normalized,
-            recipient_addr,
+            &recipient_addr,
             Origin::OutgoingTo,
         )
         .await?;

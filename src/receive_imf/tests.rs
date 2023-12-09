@@ -322,7 +322,7 @@ async fn test_no_from() {
     let chats = Chatlist::try_load(&t, 0, None, None).await.unwrap();
     assert!(chats.get_msg_id(0).is_err());
 
-    receive_imf(
+    let received = receive_imf(
         context,
         b"Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
                  To: bob@example.com\n\
@@ -335,7 +335,12 @@ async fn test_no_from() {
         false,
     )
     .await
+    .unwrap()
     .unwrap();
+
+    // Check that tombstone MsgId is returned.
+    assert_eq!(received.msg_ids.len(), 1);
+    assert!(!received.msg_ids[0].is_special());
 
     let chats = Chatlist::try_load(&t, 0, None, None).await.unwrap();
     // Check that the message is not shown to the user:
@@ -431,7 +436,7 @@ async fn test_escaped_recipients() {
     let carl_contact_id = Contact::add_or_lookup(
         &t,
         "Carl",
-        ContactAddress::new("carl@host.tld").unwrap(),
+        &ContactAddress::new("carl@host.tld").unwrap(),
         Origin::IncomingUnknownFrom,
     )
     .await
@@ -477,7 +482,7 @@ async fn test_cc_to_contact() {
     let carl_contact_id = Contact::add_or_lookup(
         &t,
         "garabage",
-        ContactAddress::new("carl@host.tld").unwrap(),
+        &ContactAddress::new("carl@host.tld").unwrap(),
         Origin::IncomingUnknownFrom,
     )
     .await
@@ -2003,7 +2008,7 @@ async fn test_duplicate_message() -> Result<()> {
     let bob_contact_id = Contact::add_or_lookup(
         &alice,
         "Bob",
-        ContactAddress::new("bob@example.org").unwrap(),
+        &ContactAddress::new("bob@example.org").unwrap(),
         Origin::IncomingUnknownFrom,
     )
     .await?
@@ -2060,7 +2065,7 @@ async fn test_ignore_footer_status_from_mailinglist() -> Result<()> {
     let bob_id = Contact::add_or_lookup(
         &t,
         "",
-        ContactAddress::new("bob@example.net").unwrap(),
+        &ContactAddress::new("bob@example.net").unwrap(),
         Origin::IncomingUnknownCc,
     )
     .await?
@@ -2139,7 +2144,7 @@ async fn test_ignore_old_status_updates() -> Result<()> {
     let bob_id = Contact::add_or_lookup(
         &t,
         "",
-        ContactAddress::new("bob@example.net")?,
+        &ContactAddress::new("bob@example.net")?,
         Origin::AddressBook,
     )
     .await?
@@ -2623,19 +2628,17 @@ async fn test_incoming_contact_request() -> Result<()> {
     let chat = chat::Chat::load_from_db(&t, msg.chat_id).await?;
     assert!(chat.is_contact_request());
 
-    loop {
-        let event = t
-            .evtracker
-            .get_matching(|evt| matches!(evt, EventType::IncomingMsg { .. }))
-            .await;
-        match event {
-            EventType::IncomingMsg { chat_id, msg_id } => {
-                assert_eq!(msg.chat_id, chat_id);
-                assert_eq!(msg.id, msg_id);
-                return Ok(());
-            }
-            _ => unreachable!(),
+    let event = t
+        .evtracker
+        .get_matching(|evt| matches!(evt, EventType::IncomingMsg { .. }))
+        .await;
+    match event {
+        EventType::IncomingMsg { chat_id, msg_id } => {
+            assert_eq!(msg.chat_id, chat_id);
+            assert_eq!(msg.id, msg_id);
+            Ok(())
         }
+        _ => unreachable!(),
     }
 }
 
@@ -3107,7 +3110,8 @@ async fn test_thunderbird_autocrypt() -> Result<()> {
     let t = TestContext::new_bob().await;
 
     let raw = include_bytes!("../../test-data/message/thunderbird_with_autocrypt.eml");
-    receive_imf(&t, raw, false).await?;
+    let received_msg = receive_imf(&t, raw, false).await?.unwrap();
+    assert!(received_msg.from_is_signed);
 
     let peerstate = Peerstate::from_addr(&t, "alice@example.org")
         .await?
@@ -3188,11 +3192,33 @@ async fn test_thunderbird_unsigned() -> Result<()> {
 
     // Alice receives an unsigned message from Bob.
     let raw = include_bytes!("../../test-data/message/thunderbird_encrypted_unsigned.eml");
-    receive_imf(&alice, raw, false).await?;
+    let received_msg = receive_imf(&alice, raw, false).await?.unwrap();
+    assert!(!received_msg.from_is_signed);
 
     let msg = alice.get_last_msg().await;
     assert!(!msg.get_showpadlock());
     assert!(msg.error().is_none());
+
+    Ok(())
+}
+
+/// Bob receives an encrypted unsigned message with only an unencrypted Subject.
+///
+/// Test that the message is displayed without any errors,
+/// but also without a padlock, but with the Subject.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_thunderbird_unsigned_with_unencrypted_subject() -> Result<()> {
+    let bob = TestContext::new_bob().await;
+
+    let raw = include_bytes!(
+        "../../test-data/message/thunderbird_encrypted_unsigned_with_unencrypted_subject.eml"
+    );
+    receive_imf(&bob, raw, false).await?;
+
+    let msg = bob.get_last_msg().await;
+    assert!(!msg.get_showpadlock());
+    assert!(msg.error().is_none());
+    assert_eq!(msg.get_subject(), "Hello!");
 
     Ok(())
 }

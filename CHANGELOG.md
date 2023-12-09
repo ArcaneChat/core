@@ -1,5 +1,113 @@
 # Changelog
 
+## [1.132.0] - 2023-12-06
+
+### Features / Changes
+
+- Increase TCP timeouts from 30 to 60 seconds.
+
+### Fixes
+
+- Don't sort message creating a protected group over a protection message ([#4963](https://github.com/deltachat/deltachat-core-rust/pull/4963)).
+- Do not lock accounts.toml on iOS.
+- Protect groups even if some members are not verified and add `test_securejoin_after_contact_resetup` regression test.
+
+## [1.131.9] - 2023-12-02
+
+### API-Changes
+
+- Remove `dc_get_http_response()`, `dc_http_response_get_mimetype()`, `dc_http_response_get_encoding()`, `dc_http_response_get_blob()`, `dc_http_response_get_size()`, `dc_http_response_unref()` and `dc_http_response_t` from cffi.
+- Deprecate CFFI APIs `dc_send_reaction()`, `dc_get_msg_reactions()`, `dc_reactions_get_contacts()`, `dc_reactions_get_by_contact_id()`, `dc_reactions_unref` and `dc_reactions_t`.
+- Make `Contact.is_verified()` return bool.
+
+### Build system
+
+- Switch from fork of iroh to iroh 0.4.2 pre-release.
+
+### Features / Changes
+
+- Send `Chat-Verified` headers in 1:1 chats.
+- Ratelimit IMAP connections ([#4940](https://github.com/deltachat/deltachat-core-rust/pull/4940)).
+- Remove receiver limit on `.xdc` size.
+- Don't affect MimeMessage with "From" and secured headers from encrypted unsigned messages.
+- Sync `Config::{MdnsEnabled,ShowEmails}` across devices ([#4954](https://github.com/deltachat/deltachat-core-rust/pull/4954)).
+- Sync `Config::Displayname` across devices ([#4893](https://github.com/deltachat/deltachat-core-rust/pull/4893)).
+- `Chat::rename_ex`: Don't send sync message if usual message is sent.
+
+### Fixes
+
+- Lock the database when INSERTing a webxdc update, avoid "Database is locked" errors.
+- Use keyring with all private keys when decrypting a message ([#5046](https://github.com/deltachat/deltachat-core-rust/pull/5046)).
+
+### Tests
+
+- Make Result-returning tests produce a line number.
+- Add `test_utils::sync()`.
+- Test inserting lots of webxdc updates.
+- Split `test_sync_alter_chat()` into smaller tests.
+
+## [1.131.8] - 2023-11-27
+
+### Features / Changes
+
+- webxdc: Add unique IDs to status updates sent outside and deduplicate based on IDs.
+
+### Fixes
+
+- Allow IMAP servers not returning UIDNEXT on SELECT and STATUS such as mail.163.com.
+- Use the correct securejoin strings used in the UI, remove old TODO ([#5047](https://github.com/deltachat/deltachat-core-rust/pull/5047)).
+- Do not emit events about webxdc update events logged into debug log webxdc.
+
+### Tests
+
+- Check that `receive_status_update` has forward compatibility and unique webxdc IDs will be ignored by previous Delta Chat versions.
+
+## [1.131.7] - 2023-11-24
+
+### Fixes
+
+- Revert "fix: check UIDNEXT with a STATUS command before going IDLE". This attempts to fix mail.163.com which has broken STATUS command.
+
+## [1.131.6] - 2023-11-21
+
+### Fixes
+
+- Fail fast if IMAP FETCH cannot be parsed instead of getting stuck in infinite loop.
+
+### Documentation
+
+- Generate deltachat-rpc-client documentation and publish it to <https://py.delta.chat>.
+
+## [1.131.5] - 2023-11-20
+
+### API-Changes
+
+- deltachat-rpc-client: Add `Message.get_sender_contact()`.
+- Turn `ContactAddress` into an owned type.
+
+### Features / Changes
+
+- Lowercase addresses in Autocrypt and Autocrypt-Gossip headers.
+- Lowercase the address in member added/removed messages.
+- Lowercase `addr` when it is set.
+- Do not replace the message with an error in square brackets when the sender is not a member of the protected group.
+
+### Fixes
+
+- `Chat::sync_contacts()`: Fetch contact addresses in a single query.
+- `Chat::rename_ex()`: Sync improved chat name to other devices.
+- Recognize `Chat-Group-Member-Added` of self case-insensitively.
+- Compare verifier addr to peerstate addr case-insensitively.
+
+### Tests
+
+- Port [Secure-Join](https://securejoin.readthedocs.io/) tests to JSON-RPC.
+
+### CI
+
+- Test with Rust 1.74.
+
+
 ## [1.131.4] - 2023-11-16
 
 ### Documentation
@@ -3221,3 +3329,8 @@ https://github.com/deltachat/deltachat-core-rust/pulls?q=is%3Apr+is%3Aclosed
 [1.131.2]: https://github.com/deltachat/deltachat-core-rust/compare/v1.131.1...v1.131.2
 [1.131.3]: https://github.com/deltachat/deltachat-core-rust/compare/v1.131.2...v1.131.3
 [1.131.4]: https://github.com/deltachat/deltachat-core-rust/compare/v1.131.3...v1.131.4
+[1.131.5]: https://github.com/deltachat/deltachat-core-rust/compare/v1.131.4...v1.131.5
+[1.131.6]: https://github.com/deltachat/deltachat-core-rust/compare/v1.131.5...v1.131.6
+[1.131.7]: https://github.com/deltachat/deltachat-core-rust/compare/v1.131.6...v1.131.7
+[1.131.8]: https://github.com/deltachat/deltachat-core-rust/compare/v1.131.7...v1.131.8
+[1.131.9]: https://github.com/deltachat/deltachat-core-rust/compare/v1.131.8...v1.131.9

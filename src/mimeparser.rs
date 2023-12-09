@@ -27,7 +27,7 @@ use crate::decrypt::{
 use crate::dehtml::dehtml;
 use crate::events::EventType;
 use crate::headerdef::{HeaderDef, HeaderDefMap};
-use crate::key::{load_self_secret_key, DcKey, Fingerprint, SignedPublicKey};
+use crate::key::{load_self_secret_keyring, DcKey, Fingerprint, SignedPublicKey};
 use crate::message::{
     self, set_msg_failed, update_msg_state, Message, MessageState, MsgId, Viewtype,
 };
@@ -259,14 +259,12 @@ impl MimeMessage {
             }
         }
 
-        // remove headers that are allowed _only_ in the encrypted part
-        headers.remove("secure-join-fingerprint");
-        headers.remove("chat-verified");
+        // Remove headers that are allowed _only_ in the encrypted+signed part. It's ok to leave
+        // them in signed-only emails, but has no value currently.
+        Self::remove_secured_headers(&mut headers);
 
         let from = from.context("No from in message")?;
-        let private_keyring = vec![load_self_secret_key(context)
-            .await
-            .context("Failed to get own key")?];
+        let private_keyring = load_self_secret_keyring(context).await?;
 
         let mut decryption_info =
             prepare_decryption(context, &mail, &from.addr, message_time).await?;
@@ -280,7 +278,7 @@ impl MimeMessage {
 
         let public_keyring = keyring_from_peerstate(decryption_info.peerstate.as_ref());
         let (mail, mut signatures, encrypted) = match tokio::task::block_in_place(|| {
-            try_decrypt(context, &mail, &private_keyring, &public_keyring)
+            try_decrypt(&mail, &private_keyring, &public_keyring)
         }) {
             Ok(Some((raw, signatures))) => {
                 mail_raw = raw;
@@ -307,10 +305,11 @@ impl MimeMessage {
             content
         });
         if let (Ok(mail), true) = (mail, encrypted) {
-            // Handle any gossip headers if the mail was encrypted.  See section
-            // "3.6 Key Gossip" of <https://autocrypt.org/autocrypt-spec-1.1.0.pdf>
-            // but only if the mail was correctly signed:
             if !signatures.is_empty() {
+                // Handle any gossip headers if the mail was encrypted. See section
+                // "3.6 Key Gossip" of <https://autocrypt.org/autocrypt-spec-1.1.0.pdf>
+                // but only if the mail was correctly signed. Probably it's ok to not require
+                // encryption here, but let's follow the standard.
                 let gossip_headers = mail.headers.get_all_values("Autocrypt-Gossip");
                 gossiped_addr = update_gossip_peerstates(
                     context,
@@ -320,6 +319,9 @@ impl MimeMessage {
                     gossip_headers,
                 )
                 .await?;
+                // Remove unsigned subject from messages displayed with padlock.
+                // See <https://github.com/deltachat/deltachat-core-rust/issues/1790>.
+                headers.remove("subject");
             }
 
             // let known protected headers from the decrypted
@@ -327,24 +329,20 @@ impl MimeMessage {
 
             // Signature was checked for original From, so we
             // do not allow overriding it.
-            let mut signed_from = None;
-
-            // We do not want to allow unencrypted subject in encrypted emails because the
-            // user might falsely think that the subject is safe.
-            // See <https://github.com/deltachat/deltachat-core-rust/issues/1790>.
-            headers.remove("subject");
+            let mut inner_from = None;
 
             MimeMessage::merge_headers(
                 context,
                 &mut headers,
                 &mut recipients,
-                &mut signed_from,
+                &mut inner_from,
                 &mut list_post,
                 &mut chat_disposition_notification_to,
                 &mail.headers,
             );
-            if let Some(signed_from) = signed_from {
-                if addr_cmp(&signed_from.addr, &from.addr) {
+
+            if let (Some(inner_from), true) = (inner_from, !signatures.is_empty()) {
+                if addr_cmp(&inner_from.addr, &from.addr) {
                     from_is_signed = true;
                 } else {
                     // There is a From: header in the encrypted &
@@ -362,6 +360,8 @@ impl MimeMessage {
             }
         }
         if signatures.is_empty() {
+            Self::remove_secured_headers(&mut headers);
+
             // If it is not a read receipt, degrade encryption.
             if let (Some(peerstate), Ok(mail)) = (&mut decryption_info.peerstate, mail) {
                 if message_time > peerstate.last_seen_autocrypt
@@ -459,20 +459,6 @@ impl MimeMessage {
 
         if parser.is_mime_modified {
             parser.decoded_data = mail_raw;
-        }
-
-        crate::peerstate::maybe_do_aeap_transition(context, &mut parser).await?;
-        if let Some(peerstate) = &parser.decryption_info.peerstate {
-            peerstate
-                .handle_fingerprint_change(context, message_time)
-                .await?;
-            // When peerstate is set to Mutual, it's saved immediately to not lose that fact in case
-            // of an error. Otherwise we don't save peerstate until get here to reduce the number of
-            // calls to save_to_db() and not to degrade encryption if a mail wasn't parsed
-            // successfully.
-            if peerstate.prefer_encrypt != EncryptPreference::Mutual {
-                peerstate.save_to_db(&context.sql).await?;
-            }
         }
 
         Ok(parser)
@@ -692,7 +678,7 @@ impl MimeMessage {
                 }
             }
 
-            self.parts.push(part);
+            self.do_add_single_part(part);
         }
 
         if self.headers.contains_key("auto-submitted") {
@@ -1375,6 +1361,11 @@ impl MimeMessage {
         self.get_header(HeaderDef::XMicrosoftOriginalMessageId)
             .or_else(|| self.get_header(HeaderDef::MessageId))
             .and_then(|msgid| parse_message_id(msgid).ok())
+    }
+
+    fn remove_secured_headers(headers: &mut HashMap<String, String>) {
+        headers.remove("secure-join-fingerprint");
+        headers.remove("chat-verified");
     }
 
     fn merge_headers(

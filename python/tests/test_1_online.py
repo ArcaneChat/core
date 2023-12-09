@@ -9,7 +9,7 @@ import pytest
 from imap_tools import AND, U
 
 import deltachat as dc
-from deltachat import account_hookimpl, Message, Chat
+from deltachat import account_hookimpl, Message
 from deltachat.tracker import ImexTracker
 
 
@@ -1658,128 +1658,6 @@ def test_ac_setup_message_twice(acfactory, lp):
     assert ac1.get_info()["fingerprint"] == ac2.get_info()["fingerprint"]
 
 
-def test_qr_setup_contact(acfactory, lp):
-    ac1, ac2 = acfactory.get_online_accounts(2)
-    lp.sec("ac1: create QR code and let ac2 scan it, starting the securejoin")
-    qr = ac1.get_setup_contact_qr()
-
-    lp.sec("ac2: start QR-code based setup contact protocol")
-    ch = ac2.qr_setup_contact(qr)
-    assert ch.id >= 10
-    ac1._evtracker.wait_securejoin_inviter_progress(1000)
-
-
-@pytest.mark.parametrize("verified_one_on_one_chats", [0, 1])
-def test_qr_join_chat(acfactory, lp, verified_one_on_one_chats):
-    ac1, ac2 = acfactory.get_online_accounts(2)
-    ac1.set_config("verified_one_on_one_chats", verified_one_on_one_chats)
-    ac2.set_config("verified_one_on_one_chats", verified_one_on_one_chats)
-
-    lp.sec("ac1: create QR code and let ac2 scan it, starting the securejoin")
-    chat = ac1.create_group_chat("hello")
-    qr = chat.get_join_qr()
-    lp.sec("ac2: start QR-code based join-group protocol")
-    ch = ac2.qr_join_chat(qr)
-    lp.sec("ac2: qr_join_chat() returned")
-    assert ch.id >= 10
-    # check that at least some of the handshake messages are deleted
-    ac1._evtracker.get_matching("DC_EVENT_IMAP_MESSAGE_DELETED")
-    ac2._evtracker.get_matching("DC_EVENT_IMAP_MESSAGE_DELETED")
-    ac1._evtracker.wait_securejoin_inviter_progress(1000)
-
-    msg = ac2._evtracker.wait_next_incoming_message()
-    assert msg.text == "Member Me ({}) added by {}.".format(ac2.get_config("addr"), ac1.get_config("addr"))
-
-    # ac1 reloads the chat.
-    chat = Chat(chat.account, chat.id)
-    assert not chat.is_protected()
-
-    # ac2 reloads the chat.
-    ch = Chat(ch.account, ch.id)
-    assert not ch.is_protected()
-
-
-def test_qr_join_chat_with_pending_bobstate_issue4894(acfactory, lp):
-    ac1, ac2, ac3, ac4 = acfactory.get_online_accounts(4)
-
-    lp.sec("ac3: verify with ac2")
-    ac3.qr_setup_contact(ac2.get_setup_contact_qr())
-    ac2._evtracker.wait_securejoin_inviter_progress(1000)
-
-    # in order for ac2 to have pending bobstate with a verified group
-    # we first create a fully joined verified group, and then start
-    # joining a second time but interrupt it, to create pending bob state
-
-    lp.sec("ac1: create verified group that ac2 fully joins")
-    ch1 = ac1.create_group_chat("ac1-shutoff group", verified=True)
-    ac2.qr_join_chat(ch1.get_join_qr())
-    ac1._evtracker.wait_securejoin_inviter_progress(1000)
-
-    # ensure ac1 can write and ac2 receives messages in verified chat
-    ch1.send_text("ac1 says hello")
-    while 1:
-        msg = ac2.wait_next_incoming_message()
-        if msg.text == "ac1 says hello":
-            assert msg.chat.is_protected()
-            break
-
-    lp.sec("ac1: let ac2 join again but shutoff ac1 in the middle of securejoin")
-    ac2.qr_join_chat(ch1.get_join_qr())
-    ac1.shutdown()
-    lp.sec("ac2 now has pending bobstate but ac1 is shutoff")
-
-    # we meanwhile expect ac3/ac2 verification started in the beginning to have completed
-    assert ac3.get_contact(ac2).is_verified()
-    assert ac2.get_contact(ac3).is_verified()
-
-    lp.sec("ac3: create a verified group VG with ac2")
-    vg = ac3.create_group_chat("ac3-created", [ac2], verified=True)
-
-    # ensure ac2 receives message in VG
-    vg.send_text("hello")
-    while 1:
-        msg = ac2.wait_next_incoming_message()
-        if msg.text == "hello":
-            assert msg.chat.is_protected()
-            break
-
-    lp.sec("ac3: create a join-code for group VG and let ac4 join, check that ac2 got it")
-    ac4.qr_join_chat(vg.get_join_qr())
-    ac3._evtracker.wait_securejoin_inviter_progress(1000)
-    while 1:
-        ev = ac2._evtracker.get()
-        if "added by unrelated SecureJoin" in str(ev):
-            return
-
-
-def test_qr_new_group_unblocked(acfactory, lp):
-    """Regression test for a bug intoduced in core v1.113.0.
-    ac2 scans a verified group QR code created by ac1.
-    This results in creation of a blocked 1:1 chat with ac1 on ac2,
-    but ac1 contact is not blocked on ac2.
-    Then ac1 creates a group, adds ac2 there and promotes it by sending a message.
-    ac2 should receive a message and create a contact request for the group.
-    Due to a bug previously ac2 created a blocked group.
-    """
-
-    ac1, ac2 = acfactory.get_online_accounts(2)
-    ac1_chat = ac1.create_group_chat("Group for joining", verified=True)
-    qr = ac1_chat.get_join_qr()
-    ac2.qr_join_chat(qr)
-
-    ac1._evtracker.wait_securejoin_inviter_progress(1000)
-
-    ac1_new_chat = ac1.create_group_chat("Another group")
-    ac1_new_chat.add_contact(ac2)
-    # Receive "Member added" message.
-    ac2._evtracker.wait_next_incoming_message()
-
-    ac1_new_chat.send_text("Hello!")
-    ac2_msg = ac2._evtracker.wait_next_incoming_message()
-    assert ac2_msg.text == "Hello!"
-    assert ac2_msg.chat.is_contact_request()
-
-
 def test_qr_email_capitalization(acfactory, lp):
     """Regression test for a bug
     that resulted in failure to propagate verification via gossip in a verified group
@@ -2525,47 +2403,6 @@ def test_delete_deltachat_folder(acfactory):
     assert msg.text == "hello"
 
     assert "DeltaChat" in ac1.direct_imap.list_folders()
-
-
-def test_aeap_flow_verified(acfactory, lp):
-    """Test that a new address is added to a contact when it changes its address."""
-    ac1, ac2, ac1new = acfactory.get_online_accounts(3)
-
-    lp.sec("ac1: create verified-group QR, ac2 scans and joins")
-    chat = ac1.create_group_chat("hello", verified=True)
-    assert chat.is_protected()
-    qr = chat.get_join_qr()
-    lp.sec("ac2: start QR-code based join-group protocol")
-    chat2 = ac2.qr_join_chat(qr)
-    assert chat2.id >= 10
-    ac1._evtracker.wait_securejoin_inviter_progress(1000)
-
-    lp.sec("sending first message")
-    msg_out = chat.send_text("old address")
-
-    lp.sec("receiving first message")
-    ac2._evtracker.wait_next_incoming_message()  # member added message
-    msg_in_1 = ac2._evtracker.wait_next_incoming_message()
-    assert msg_in_1.text == msg_out.text
-
-    lp.sec("changing email account")
-    ac1.set_config("addr", ac1new.get_config("addr"))
-    ac1.set_config("mail_pw", ac1new.get_config("mail_pw"))
-    ac1.stop_io()
-    configtracker = ac1.configure()
-    configtracker.wait_finish()
-    ac1.start_io()
-
-    lp.sec("sending second message")
-    msg_out = chat.send_text("changed address")
-
-    lp.sec("receiving second message")
-    msg_in_2 = ac2._evtracker.wait_next_incoming_message()
-    assert msg_in_2.text == msg_out.text
-    assert msg_in_2.chat.id == msg_in_1.chat.id
-    assert msg_in_2.get_sender_contact().addr == ac1new.get_config("addr")
-    assert len(msg_in_2.chat.get_contacts()) == 2
-    assert ac1new.get_config("addr") in [contact.addr for contact in msg_in_2.chat.get_contacts()]
 
 
 def test_archived_muted_chat(acfactory, lp):

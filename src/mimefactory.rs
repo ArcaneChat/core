@@ -1,5 +1,6 @@
 //! # MIME message production.
 
+use std::collections::HashSet;
 use std::convert::TryInto;
 
 use anyhow::{bail, ensure, Context as _, Result};
@@ -22,7 +23,7 @@ use crate::location;
 use crate::message::{self, Message, MsgId, Viewtype};
 use crate::mimeparser::SystemMessage;
 use crate::param::Param;
-use crate::peerstate::{Peerstate, PeerstateVerifiedStatus};
+use crate::peerstate::Peerstate;
 use crate::simplify::escape_message_footer_marks;
 use crate::stock_str;
 use crate::tools::IsNoneOrEmpty;
@@ -312,7 +313,7 @@ impl<'a> MimeFactory<'a> {
         }
     }
 
-    fn min_verified(&self) -> PeerstateVerifiedStatus {
+    fn verified(&self) -> bool {
         match &self.loaded {
             Loaded::Message { chat } => {
                 if chat.is_protected() {
@@ -321,15 +322,15 @@ impl<'a> MimeFactory<'a> {
                         // In order to do this, it is necessary that they can be sent
                         // to a key that is not yet verified.
                         // This has to work independently of whether the chat is protected right now.
-                        PeerstateVerifiedStatus::Unverified
+                        false
                     } else {
-                        PeerstateVerifiedStatus::BidirectVerified
+                        true
                     }
                 } else {
-                    PeerstateVerifiedStatus::Unverified
+                    false
                 }
             }
-            Loaded::Mdn { .. } => PeerstateVerifiedStatus::Unverified,
+            Loaded::Mdn { .. } => false,
         }
     }
 
@@ -510,6 +511,7 @@ impl<'a> MimeFactory<'a> {
         // <https://datatracker.ietf.org/doc/html/rfc5322#appendix-A.1.1>.
         let from_header = Header::new_with_value("From".into(), vec![from]).unwrap();
         headers.unprotected.push(from_header.clone());
+        headers.protected.push(from_header);
 
         if let Some(sender_displayname) = &self.sender_displayname {
             let sender =
@@ -622,7 +624,7 @@ impl<'a> MimeFactory<'a> {
             ));
         }
 
-        let min_verified = self.min_verified();
+        let verified = self.verified();
         let grpimage = self.grpimage();
         let force_plaintext = self.should_force_plaintext();
         let skip_autocrypt = self.should_skip_autocrypt();
@@ -699,8 +701,6 @@ impl<'a> MimeFactory<'a> {
             )
         };
         let outer_message = if is_encrypted {
-            headers.protected.push(from_header);
-
             // Store protected headers in the inner message.
             let message = headers
                 .protected
@@ -718,7 +718,7 @@ impl<'a> MimeFactory<'a> {
                 && self.should_do_gossip(context).await?
             {
                 for peerstate in peerstates.iter().filter_map(|(state, _)| state.as_ref()) {
-                    if let Some(header) = peerstate.render_gossip_header(min_verified) {
+                    if let Some(header) = peerstate.render_gossip_header(verified) {
                         message = message.header(Header::new("Autocrypt-Gossip".into(), header));
                         is_gossiped = true;
                     }
@@ -751,7 +751,7 @@ impl<'a> MimeFactory<'a> {
             }
 
             let encrypted = encrypt_helper
-                .encrypt(context, min_verified, message, peerstates)
+                .encrypt(context, verified, message, peerstates)
                 .await?;
 
             outer_message
@@ -795,12 +795,18 @@ impl<'a> MimeFactory<'a> {
             // Store protected headers in the outer message.
             let message = headers
                 .protected
-                .into_iter()
-                .fold(message, |message, header| message.header(header));
+                .iter()
+                .fold(message, |message, header| message.header(header.clone()));
 
             if self.should_skip_autocrypt()
                 || !context.get_config_bool(Config::SignUnencrypted).await?
             {
+                let protected: HashSet<Header> = HashSet::from_iter(headers.protected.into_iter());
+                for h in headers.unprotected.split_off(0) {
+                    if !protected.contains(&h) {
+                        headers.unprotected.push(h);
+                    }
+                }
                 message
             } else {
                 let message = message.header(get_content_type_directives_header());
@@ -919,9 +925,7 @@ impl<'a> MimeFactory<'a> {
         let mut meta_part = None;
 
         let send_verified_headers = match chat.typ {
-            // In single chats, the protection status isn't necessarily the same for both sides,
-            // so we don't send the Chat-Verified header:
-            Chattype::Single => false,
+            Chattype::Single => true,
             Chattype::Group => true,
             // Mailinglists and broadcast lists can actually never be verified:
             Chattype::Mailinglist => false,
@@ -985,8 +989,7 @@ impl<'a> MimeFactory<'a> {
                     {
                         info!(
                             context,
-                            "sending secure-join message \'{}\' >>>>>>>>>>>>>>>>>>>>>>>>>",
-                            "vg-member-added",
+                            "Sending secure-join message {:?}.", "vg-member-added",
                         );
                         headers.protected.push(Header::new(
                             "Secure-Join".to_string(),
@@ -1068,10 +1071,7 @@ impl<'a> MimeFactory<'a> {
                 let msg = &self.msg;
                 let step = msg.param.get(Param::Arg).unwrap_or_default();
                 if !step.is_empty() {
-                    info!(
-                        context,
-                        "sending secure-join message \'{}\' >>>>>>>>>>>>>>>>>>>>>>>>>", step,
-                    );
+                    info!(context, "Sending secure-join message {step:?}.");
                     headers
                         .protected
                         .push(Header::new("Secure-Join".into(), step.into()));
@@ -1914,7 +1914,7 @@ mod tests {
         let contact_id = Contact::add_or_lookup(
             &t,
             "Dave",
-            ContactAddress::new("dave@example.com").unwrap(),
+            &ContactAddress::new("dave@example.com").unwrap(),
             Origin::ManuallyCreated,
         )
         .await
@@ -2217,6 +2217,7 @@ mod tests {
 
         let part = payload.next().unwrap();
         assert_eq!(part.match_indices("multipart/signed").count(), 1);
+        assert_eq!(part.match_indices("From:").count(), 1);
         assert_eq!(part.match_indices("Subject:").count(), 0);
         assert_eq!(part.match_indices("Autocrypt:").count(), 1);
         assert_eq!(part.match_indices("Chat-User-Avatar:").count(), 0);
@@ -2227,12 +2228,14 @@ mod tests {
                 .count(),
             1
         );
+        assert_eq!(part.match_indices("From:").count(), 1);
         assert_eq!(part.match_indices("Subject:").count(), 1);
         assert_eq!(part.match_indices("Autocrypt:").count(), 0);
         assert_eq!(part.match_indices("Chat-User-Avatar:").count(), 0);
 
         let part = payload.next().unwrap();
         assert_eq!(part.match_indices("text/plain").count(), 1);
+        assert_eq!(part.match_indices("From:").count(), 0);
         assert_eq!(part.match_indices("Chat-User-Avatar:").count(), 1);
         assert_eq!(part.match_indices("Subject:").count(), 0);
 
@@ -2259,12 +2262,14 @@ mod tests {
 
         let part = payload.next().unwrap();
         assert_eq!(part.match_indices("multipart/signed").count(), 1);
+        assert_eq!(part.match_indices("From:").count(), 1);
         assert_eq!(part.match_indices("Subject:").count(), 0);
         assert_eq!(part.match_indices("Autocrypt:").count(), 1);
         assert_eq!(part.match_indices("Chat-User-Avatar:").count(), 0);
 
         let part = payload.next().unwrap();
         assert_eq!(part.match_indices("text/plain").count(), 1);
+        assert_eq!(part.match_indices("From:").count(), 1);
         assert_eq!(part.match_indices("Subject:").count(), 1);
         assert_eq!(part.match_indices("Autocrypt:").count(), 0);
         assert_eq!(part.match_indices("multipart/mixed").count(), 0);
@@ -2273,6 +2278,7 @@ mod tests {
         let body = payload.next().unwrap();
         assert_eq!(body.match_indices("this is the text!").count(), 1);
         assert_eq!(body.match_indices("text/plain").count(), 0);
+        assert_eq!(body.match_indices("From:").count(), 0);
         assert_eq!(body.match_indices("Chat-User-Avatar:").count(), 0);
         assert_eq!(body.match_indices("Subject:").count(), 0);
 
