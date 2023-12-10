@@ -372,7 +372,7 @@ impl ChatId {
                 }
             };
             let (contact_id, _) =
-                Contact::add_or_lookup(context, "", list_post, Origin::Hidden).await?;
+                Contact::add_or_lookup(context, "", &list_post, Origin::Hidden).await?;
             context
                 .sql
                 .execute(
@@ -3553,7 +3553,7 @@ pub(crate) async fn shall_attach_selfavatar(context: &Context, chat_id: ChatId) 
             }
         };
         let (contact_id, _) =
-            Contact::add_or_lookup(context, "", list_post, Origin::Hidden).await?;
+            Contact::add_or_lookup(context, "", &list_post, Origin::Hidden).await?;
         context
             .sql
             .query_map(
