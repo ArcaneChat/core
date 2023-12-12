@@ -224,9 +224,9 @@ dependencies = [
 
 [[package]]
 name = "async-imap"
-version = "0.9.4"
+version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d736a74edf6c327b53dd9c932eae834253470ac5f0c55770e7e133bcbf986362"
+checksum = "a9d69fc1499878158750f644c4eb46aff55bb9d32d77e3dc4aecf8308d5c3ba6"
 dependencies = [
  "async-channel 2.1.1",
  "base64 0.21.5",
@@ -1091,7 +1091,7 @@ dependencies = [
 
 [[package]]
 name = "deltachat"
-version = "1.132.0"
+version = "1.132.1"
 dependencies = [
  "ansi_term",
  "anyhow",
@@ -1169,7 +1169,7 @@ dependencies = [
 
 [[package]]
 name = "deltachat-jsonrpc"
-version = "1.132.0"
+version = "1.132.1"
 dependencies = [
  "anyhow",
  "async-channel 2.1.1",
@@ -1193,7 +1193,7 @@ dependencies = [
 
 [[package]]
 name = "deltachat-repl"
-version = "1.132.0"
+version = "1.132.1"
 dependencies = [
  "ansi_term",
  "anyhow",
@@ -1208,7 +1208,7 @@ dependencies = [
 
 [[package]]
 name = "deltachat-rpc-server"
-version = "1.132.0"
+version = "1.132.1"
 dependencies = [
  "anyhow",
  "deltachat",
@@ -1233,7 +1233,7 @@ dependencies = [
 
 [[package]]
 name = "deltachat_ffi"
-version = "1.132.0"
+version = "1.132.1"
 dependencies = [
  "anyhow",
  "deltachat",
@@ -2622,7 +2622,8 @@ checksum = "8f518f335dce6725a761382244631d86cf0ccb2863413590b31338feb467f9c3"
 [[package]]
 name = "iroh"
 version = "0.4.2"
-source = "git+https://github.com/n0-computer/iroh?branch=maint-0.4#9881b7886235035a1124e4371f7a4cd59379e51b"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85075391dcb8491a4939266334b28601052d418b37d20b33c58ffb5776adc912"
 dependencies = [
  "abao",
  "anyhow",
