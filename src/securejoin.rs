@@ -384,20 +384,17 @@ pub(crate) async fn handle_securejoin_handshake(
             }
             info!(context, "Fingerprint verified.",);
             // verify that the `Secure-Join-Auth:`-header matches the secret written to the QR code
-            let auth_0 = match mime_message.get_header(HeaderDef::SecureJoinAuth) {
-                Some(auth) => auth,
-                None => {
-                    could_not_establish_secure_connection(
-                        context,
-                        contact_id,
-                        info_chat_id(context, contact_id).await?,
-                        "Auth not provided.",
-                    )
-                    .await?;
-                    return Ok(HandshakeMessage::Ignore);
-                }
+            let Some(auth) = mime_message.get_header(HeaderDef::SecureJoinAuth) else {
+                could_not_establish_secure_connection(
+                    context,
+                    contact_id,
+                    info_chat_id(context, contact_id).await?,
+                    "Auth not provided.",
+                )
+                .await?;
+                return Ok(HandshakeMessage::Ignore);
             };
-            if !token::exists(context, token::Namespace::Auth, auth_0).await {
+            if !token::exists(context, token::Namespace::Auth, auth).await {
                 could_not_establish_secure_connection(
                     context,
                     contact_id,
@@ -614,7 +611,7 @@ pub(crate) async fn observe_securejoin_on_other_device(
                 };
                 peerstate.set_verified(PeerstateKeyType::GossipKey, fingerprint, addr)?;
                 peerstate.prefer_encrypt = EncryptPreference::Mutual;
-                peerstate.save_to_db(&context.sql).await.unwrap_or_default();
+                peerstate.save_to_db(&context.sql).await?;
 
                 ChatId::set_protection_for_contact(
                     context,
@@ -689,22 +686,17 @@ async fn secure_connection_established(
     chat_id: ChatId,
     timestamp: i64,
 ) -> Result<()> {
-    if context
-        .get_config_bool(Config::VerifiedOneOnOneChats)
+    let private_chat_id = ChatIdBlocked::get_for_contact(context, contact_id, Blocked::Yes)
         .await?
-    {
-        let private_chat_id = ChatIdBlocked::get_for_contact(context, contact_id, Blocked::Yes)
-            .await?
-            .id;
-        private_chat_id
-            .set_protection(
-                context,
-                ProtectionStatus::Protected,
-                timestamp,
-                Some(contact_id),
-            )
-            .await?;
-    }
+        .id;
+    private_chat_id
+        .set_protection(
+            context,
+            ProtectionStatus::Protected,
+            timestamp,
+            Some(contact_id),
+        )
+        .await?;
     context.emit_event(EventType::ChatModified(chat_id));
     Ok(())
 }
@@ -738,7 +730,7 @@ async fn mark_peer_as_verified(
     };
     peerstate.set_verified(PeerstateKeyType::PublicKey, fingerprint, verifier)?;
     peerstate.prefer_encrypt = EncryptPreference::Mutual;
-    peerstate.save_to_db(&context.sql).await.unwrap_or_default();
+    peerstate.save_to_db(&context.sql).await?;
     Ok(true)
 }
 
