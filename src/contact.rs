@@ -26,13 +26,14 @@ use crate::constants::{Blocked, Chattype, DC_GCL_ADD_SELF, DC_GCL_VERIFIED_ONLY}
 use crate::context::Context;
 use crate::events::EventType;
 use crate::key::{load_self_public_key, DcKey};
+use crate::log::LogExt;
 use crate::login_param::LoginParam;
 use crate::message::MessageState;
 use crate::mimeparser::AvatarAction;
 use crate::param::{Param, Params};
 use crate::peerstate::Peerstate;
 use crate::sql::{self, params_iter};
-use crate::sync::{self, Sync::*, SyncData};
+use crate::sync::{self, Sync::*};
 use crate::tools::{
     duration_to_str, get_abs_path, improve_single_line_input, strip_rtlo_characters, time,
     EmailAddress,
@@ -476,6 +477,15 @@ impl Contact {
     ///
     /// May result in a `#DC_EVENT_CONTACTS_CHANGED` event.
     pub async fn create(context: &Context, name: &str, addr: &str) -> Result<ContactId> {
+        Self::create_ex(context, Sync, name, addr).await
+    }
+
+    pub(crate) async fn create_ex(
+        context: &Context,
+        sync: sync::Sync,
+        name: &str,
+        addr: &str,
+    ) -> Result<ContactId> {
         let name = improve_single_line_input(name);
 
         let (name, addr) = sanitize_name_and_addr(&name, addr);
@@ -496,6 +506,16 @@ impl Contact {
             set_blocked(context, Nosync, contact_id, false).await?;
         }
 
+        if sync.into() {
+            chat::sync(
+                context,
+                chat::SyncId::ContactAddr(addr.to_string()),
+                chat::SyncAction::Rename(name.to_string()),
+            )
+            .await
+            .log_err(context)
+            .ok();
+        }
         Ok(contact_id)
     }
 
@@ -1268,13 +1288,30 @@ impl Contact {
             return Ok(true);
         }
 
-        if let Some(peerstate) = Peerstate::from_addr(context, &self.addr).await? {
-            if peerstate.is_using_verified_key() {
-                return Ok(true);
-            }
+        let Some(peerstate) = Peerstate::from_addr(context, &self.addr).await? else {
+            return Ok(false);
+        };
+
+        let forward_verified = peerstate.is_using_verified_key();
+        let backward_verified = peerstate.is_backward_verified(context).await?;
+        Ok(forward_verified && backward_verified)
+    }
+
+    /// Returns true if we have a verified key for the contact
+    /// and it is the same as Autocrypt key.
+    /// This is enough to send messages to the contact in verified chat
+    /// and verify received messages, but not enough to display green checkmark
+    /// or add the contact to verified groups.
+    pub async fn is_forward_verified(&self, context: &Context) -> Result<bool> {
+        if self.id == ContactId::SELF {
+            return Ok(true);
         }
 
-        Ok(false)
+        let Some(peerstate) = Peerstate::from_addr(context, &self.addr).await? else {
+            return Ok(false);
+        };
+
+        Ok(peerstate.is_using_verified_key())
     }
 
     /// Returns the `ContactId` that verified the contact.
@@ -1480,13 +1517,14 @@ WHERE type=? AND id IN (
                 true => chat::SyncAction::Block,
                 false => chat::SyncAction::Unblock,
             };
-            context
-                .add_sync_item(SyncData::AlterChat {
-                    id: chat::SyncId::ContactAddr(contact.addr.clone()),
-                    action,
-                })
-                .await?;
-            context.send_sync_msg().await?;
+            chat::sync(
+                context,
+                chat::SyncId::ContactAddr(contact.addr.clone()),
+                action,
+            )
+            .await
+            .log_err(context)
+            .ok();
         }
     }
 
@@ -1885,12 +1923,12 @@ mod tests {
         // Search by name.
         let contacts = Contact::get_all(&context.ctx, 0, Some("bob")).await?;
         assert_eq!(contacts.len(), 1);
-        assert_eq!(contacts.get(0), Some(&id));
+        assert_eq!(contacts.first(), Some(&id));
 
         // Search by address.
         let contacts = Contact::get_all(&context.ctx, 0, Some("user")).await?;
         assert_eq!(contacts.len(), 1);
-        assert_eq!(contacts.get(0), Some(&id));
+        assert_eq!(contacts.first(), Some(&id));
 
         let contacts = Contact::get_all(&context.ctx, 0, Some("alice")).await?;
         assert_eq!(contacts.len(), 0);
@@ -1917,7 +1955,7 @@ mod tests {
         // Search by display name (same as manually set name).
         let contacts = Contact::get_all(&context.ctx, 0, Some("someone")).await?;
         assert_eq!(contacts.len(), 1);
-        assert_eq!(contacts.get(0), Some(&id));
+        assert_eq!(contacts.first(), Some(&id));
 
         Ok(())
     }
@@ -2786,6 +2824,35 @@ Hi."#;
 
         let contact = Contact::get_by_id(&alice, contact_id).await?;
         assert!(contact.get_verifier_id(&alice).await?.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_sync_create() -> Result<()> {
+        let alice0 = &TestContext::new_alice().await;
+        let alice1 = &TestContext::new_alice().await;
+        for a in [alice0, alice1] {
+            a.set_config_bool(Config::SyncMsgs, true).await?;
+        }
+
+        Contact::create(alice0, "Bob", "bob@example.net").await?;
+        test_utils::sync(alice0, alice1).await;
+        let a1b_contact_id =
+            Contact::lookup_id_by_addr(alice1, "bob@example.net", Origin::ManuallyCreated)
+                .await?
+                .unwrap();
+        let a1b_contact = Contact::get_by_id(alice1, a1b_contact_id).await?;
+        assert_eq!(a1b_contact.name, "Bob");
+
+        Contact::create(alice0, "Bob Renamed", "bob@example.net").await?;
+        test_utils::sync(alice0, alice1).await;
+        let id = Contact::lookup_id_by_addr(alice1, "bob@example.net", Origin::ManuallyCreated)
+            .await?
+            .unwrap();
+        assert_eq!(id, a1b_contact_id);
+        let a1b_contact = Contact::get_by_id(alice1, a1b_contact_id).await?;
+        assert_eq!(a1b_contact.name, "Bob Renamed");
 
         Ok(())
     }

@@ -315,7 +315,7 @@ pub(crate) async fn receive_imf_inner(
             mime_parser.decryption_info.peerstate =
                 Peerstate::from_addr(context, contact.get_addr()).await?;
         } else {
-            let to_id = to_ids.get(0).copied().unwrap_or_default();
+            let to_id = to_ids.first().copied().unwrap_or_default();
             // handshake may mark contacts as verified and must be processed before chats are created
             res = observe_securejoin_on_other_device(context, &mime_parser, to_id)
                 .await
@@ -345,6 +345,24 @@ pub(crate) async fn receive_imf_inner(
 
     let verified_encryption =
         has_verified_encryption(context, &mime_parser, from_id, &to_ids).await?;
+
+    if verified_encryption == VerifiedEncryption::Verified
+        && mime_parser.get_header(HeaderDef::ChatVerified).is_some()
+    {
+        if let Some(peerstate) = &mut mime_parser.decryption_info.peerstate {
+            // NOTE: it might be better to remember ID of the key
+            // that we used to decrypt the message, but
+            // it is unlikely that default key ever changes
+            // as it only happens when user imports a new default key.
+            //
+            // Backward verification is not security-critical,
+            // it is only needed to avoid adding user who does not
+            // have our key as verified to protected chats.
+            peerstate.backward_verified_key_id =
+                Some(context.get_config_i64(Config::KeyId).await?).filter(|&id| id > 0);
+            peerstate.save_to_db(&context.sql).await?;
+        }
+    }
 
     let received_msg = if let Some(received_msg) = received_msg {
         received_msg
@@ -919,7 +937,7 @@ async fn add_parts(
         // the mail is on the IMAP server, probably it is also delivered.
         // We cannot recreate other states (read, error).
         state = MessageState::OutDelivered;
-        to_id = to_ids.get(0).copied().unwrap_or_default();
+        to_id = to_ids.first().copied().unwrap_or_default();
 
         let self_sent =
             from_id == ContactId::SELF && to_ids.len() == 1 && to_ids.contains(&ContactId::SELF);
@@ -2527,6 +2545,8 @@ async fn mark_recipients_as_verified(
                     info!(context, "{verifier_addr} has verified {to_addr}.");
                     if let Some(fp) = peerstate.gossip_key_fingerprint.clone() {
                         peerstate.set_verified(PeerstateKeyType::GossipKey, fp, verifier_addr)?;
+                        peerstate.backward_verified_key_id =
+                            Some(context.get_config_i64(Config::KeyId).await?).filter(|&id| id > 0);
                         peerstate.save_to_db(&context.sql).await?;
 
                         let (to_contact_id, _) = Contact::add_or_lookup(

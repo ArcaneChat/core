@@ -912,7 +912,7 @@ impl MimeMessage {
                 skip the rest.  (see
                 <https://k9mail.app/2016/11/24/OpenPGP-Considerations-Part-I.html>
                 for background information why we use encrypted+signed) */
-                if let Some(first) = mail.subparts.get(0) {
+                if let Some(first) = mail.subparts.first() {
                     any_part_added = self
                         .parse_mime_recursive(context, first, is_related)
                         .await?;
@@ -968,7 +968,7 @@ impl MimeMessage {
                             }
                         }
                         Some(_) => {
-                            if let Some(first) = mail.subparts.get(0) {
+                            if let Some(first) = mail.subparts.first() {
                                 any_part_added = self
                                     .parse_mime_recursive(context, first, is_related)
                                     .await?;
