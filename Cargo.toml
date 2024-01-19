@@ -1,6 +1,6 @@
 [package]
 name = "deltachat"
-version = "1.132.1"
+version = "1.133.0"
 edition = "2021"
 license = "MPL-2.0"
 rust-version = "1.70"
@@ -76,6 +76,7 @@ pin-project = "1"
 pretty_env_logger = { version = "0.5", optional = true }
 qrcodegen = "1.7.0"
 quick-xml = "0.31"
+quoted_printable = "0.5"
 rand = "0.8"
 regex = "1.9"
 reqwest = { version = "0.11.23", features = ["json"] }

@@ -2677,6 +2677,11 @@ pub async fn send_msg(context: &Context, chat_id: ChatId, msg: &mut Message) -> 
         return send_msg_inner(context, chat_id, msg).await;
     }
 
+    if msg.state != MessageState::Undefined && msg.state != MessageState::OutPreparing {
+        msg.param.remove(Param::GuaranteeE2ee);
+        msg.param.remove(Param::ForcePlaintext);
+        msg.update_param(context).await?;
+    }
     send_msg_inner(context, chat_id, msg).await
 }
 
@@ -2766,10 +2771,18 @@ pub(crate) async fn create_send_msg_jobs(context: &Context, msg: &mut Message) -
     let from = context.get_primary_self_addr().await?;
     let lowercase_from = from.to_lowercase();
 
-    // Send BCC to self if it is enabled and we are not going to
-    // delete it immediately. `from` must be the last addr, see `receive_imf_inner()` why.
+    // Send BCC to self if it is enabled.
+    //
+    // Previous versions of Delta Chat did not send BCC self
+    // if DeleteServerAfter was set to immediately delete messages
+    // from the server. This is not the case anymore
+    // because BCC-self messages are also used to detect
+    // that message was sent if SMTP server is slow to respond
+    // and connection is frequently lost
+    // before receiving status line.
+    //
+    // `from` must be the last addr, see `receive_imf_inner()` why.
     if context.get_config_bool(Config::BccSelf).await?
-        && context.get_config_delete_server_after().await? != Some(0)
         && !recipients
             .iter()
             .any(|x| x.to_lowercase() == lowercase_from)
