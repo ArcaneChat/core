@@ -4397,6 +4397,9 @@ int             dc_msg_is_info                (const dc_msg_t* msg);
  * Currently, the following types are defined:
  * - DC_INFO_PROTECTION_ENABLED (11) - Info-message for "Chat is now protected"
  * - DC_INFO_PROTECTION_DISABLED (12) - Info-message for "Chat is no longer protected"
+ * - DC_INFO_INVALID_UNENCRYPTED_MAIL (13) - Info-message for "Provider requires end-to-end encryption which is not setup yet",
+ *   the UI should change the corresponding string using #DC_STR_INVALID_UNENCRYPTED_MAIL
+ *   and also offer a way to fix the encryption, eg. by a button offering a QR scan
  *
  * Even when you display an icon,
  * you should still display the text of the informational message using dc_msg_get_text()
@@ -4423,6 +4426,7 @@ int             dc_msg_get_info_type          (const dc_msg_t* msg);
 #define         DC_INFO_EPHEMERAL_TIMER_CHANGED   10
 #define         DC_INFO_PROTECTION_ENABLED        11
 #define         DC_INFO_PROTECTION_DISABLED       12
+#define         DC_INFO_INVALID_UNENCRYPTED_MAIL  13
 #define         DC_INFO_WEBXDC_INFO_MESSAGE       32
 
 /**
@@ -5076,6 +5080,15 @@ int             dc_contact_is_bot        (const dc_contact_t* contact);
  *    2: SELF and contact have verified their fingerprints in both directions; in the UI typically checkmarks are shown.
  */
 int             dc_contact_is_verified       (dc_contact_t* contact);
+
+/**
+ * Returns whether contact is a bot.
+ *
+ * @memberof dc_contact_t
+ * @param contact The contact object.
+ * @return 0 if the contact is not a bot, 1 otherwise.
+ */
+int             dc_contact_is_bot            (dc_contact_t* contact);
 
 
 /**
@@ -7019,6 +7032,8 @@ void dc_event_unref(dc_event_t* event);
 /// "You added member %1$s."
 ///
 /// Used in status messages.
+///
+/// `%1$s` will be replaced by the added member's name.
 #define DC_STR_ADD_MEMBER_BY_YOU 128
 
 /// "Member %1$s added by %2$s."
@@ -7239,6 +7254,21 @@ void dc_event_unref(dc_event_t* event);
 ///
 /// Used as the first info messages in newly created groups.
 #define DC_STR_NEW_GROUP_SEND_FIRST_MESSAGE 172
+
+/// "Member %1$s added."
+///
+/// Used as info messages.
+///
+/// `%1$s` will be replaced by the added member's name.
+#define DC_STR_MESSAGE_ADD_MEMBER 173
+
+/// "Your email provider %1$s requires end-to-end encryption which is not setup yet."
+///
+/// Used as info messages when a message cannot be sent because it cannot be encrypted.
+///
+/// `%1$s` will be replaced by the provider's domain.
+#define DC_STR_INVALID_UNENCRYPTED_MAIL 174
+
 
 /**
  * @}
