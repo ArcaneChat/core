@@ -5052,15 +5052,6 @@ int             dc_contact_was_seen_recently (const dc_contact_t* contact);
  */
 int             dc_contact_is_blocked        (const dc_contact_t* contact);
 
-/**
- * Check if a contact is a bot.
- *
- * @memberof dc_contact_t
- * @param contact The contact object.
- * @return 1=contact is a bot, 0=contact is not a bot.
- */
-int             dc_contact_is_bot        (const dc_contact_t* contact);
-
 
 /**
  * Check if the contact
