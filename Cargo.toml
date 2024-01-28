@@ -1,6 +1,6 @@
 [package]
 name = "deltachat"
-version = "1.133.1"
+version = "1.133.2"
 edition = "2021"
 license = "MPL-2.0"
 rust-version = "1.70"
@@ -101,6 +101,14 @@ tokio-util = "0.7.9"
 toml = "0.8"
 url = "2"
 uuid = { version = "1", features = ["serde", "v4"] }
+
+# Pin OpenSSL to 3.1 releases.
+# OpenSSL 3.2 has a regression tracked at <https://github.com/openssl/openssl/issues/23376>
+# which results in broken `deltachat-rpc-server` binaries when cross-compiled using Zig toolchain.
+# See <https://github.com/deltachat/deltachat-core-rust/issues/5206> for Delta Chat issue.
+# According to <https://www.openssl.org/policies/releasestrat.html>
+# 3.1 branch will be supported until 2025-03-14.
+openssl-src = "~300.1"
 
 [dev-dependencies]
 ansi_term = "0.12.0"

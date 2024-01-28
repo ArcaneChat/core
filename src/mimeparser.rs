@@ -117,8 +117,8 @@ pub(crate) struct MimeMessage {
     /// Hop info for debugging.
     pub(crate) hop_info: String,
 
-    /// Whether the contact sending this should be marked as bot.
-    pub(crate) is_bot: bool,
+    /// Whether the contact sending this should be marked as bot or non-bot.
+    pub(crate) is_bot: Option<bool>,
 
     /// When the message was received, in secs since epoch.
     pub(crate) timestamp_rcvd: i64,
@@ -394,9 +394,6 @@ impl MimeMessage {
             }
         }
 
-        // Auto-submitted is also set by holiday-notices so we also check `chat-version`
-        let is_bot = headers.contains_key("auto-submitted") && headers.contains_key("chat-version");
-
         let timestamp_rcvd = smeared_time(context);
         let timestamp_sent = headers
             .get(HeaderDef::Date.get_headername())
@@ -431,7 +428,7 @@ impl MimeMessage {
             is_mime_modified: false,
             decoded_data: Vec::new(),
             hop_info,
-            is_bot,
+            is_bot: None,
             timestamp_rcvd,
             timestamp_sent,
         };
@@ -464,6 +461,13 @@ impl MimeMessage {
             },
         };
 
+        if parser.mdn_reports.is_empty() {
+            // "Auto-Submitted" is also set by holiday-notices so we also check "chat-version".
+            let is_bot = parser.headers.get("auto-submitted")
+                == Some(&"auto-generated".to_string())
+                && parser.headers.contains_key("chat-version");
+            parser.is_bot = Some(is_bot);
+        }
         parser.maybe_remove_bad_parts();
         parser.maybe_remove_inline_mailinglist_footer();
         parser.heuristically_parse_ndn(context).await;
@@ -700,7 +704,7 @@ impl MimeMessage {
             self.do_add_single_part(part);
         }
 
-        if self.headers.contains_key("auto-submitted") {
+        if self.is_bot == Some(true) {
             for part in &mut self.parts {
                 part.param.set(Param::Bot, "1");
             }
@@ -972,10 +976,13 @@ impl MimeMessage {
                             }
                         }
                         Some(_) => {
-                            if let Some(first) = mail.subparts.first() {
-                                any_part_added = self
-                                    .parse_mime_recursive(context, first, is_related)
-                                    .await?;
+                            for cur_data in &mail.subparts {
+                                if self
+                                    .parse_mime_recursive(context, cur_data, is_related)
+                                    .await?
+                                {
+                                    any_part_added = true;
+                                }
                             }
                         }
                     }
@@ -2734,6 +2741,7 @@ Chat-Version: 1.0\n\
 Message-ID: <bar@example.org>\n\
 To: Alice <alice@example.org>\n\
 From: Bob <bob@example.org>\n\
+Auto-Submitted: auto-replied\n\
 Content-Type: multipart/report; report-type=disposition-notification;\n\t\
 boundary=\"kJBbU58X1xeWNHgBtTbMk80M5qnV4N\"\n\
 \n\
@@ -2769,6 +2777,7 @@ Disposition: manual-action/MDN-sent-automatically; displayed\n\
 
         assert_eq!(message.parts.len(), 1);
         assert_eq!(message.mdn_reports.len(), 1);
+        assert_eq!(message.is_bot, None);
     }
 
     /// Test parsing multiple MDNs combined in a single message.
@@ -3817,6 +3826,22 @@ Content-Disposition: reaction\n\
         // Actual contents part.
         assert_eq!(msg.parts[1].typ, Viewtype::Text);
         assert_eq!(msg.parts[1].msg, "hello,\nbye");
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_tlsrpt() -> Result<()> {
+        let context = TestContext::new_alice().await;
+        let raw = include_bytes!("../test-data/message/tlsrpt.eml");
+
+        let msg = MimeMessage::from_bytes(&context.ctx, &raw[..], None)
+            .await
+            .unwrap();
+        assert_eq!(msg.parts.len(), 1);
+
+        assert_eq!(msg.parts[0].typ, Viewtype::File);
+        assert_eq!(msg.parts[0].msg, "Report Domain: nine.testrun.org Submitter: google.com Report-ID: <2024.01.20T00.00.00Z+nine.testrun.org@google.com> – This is an aggregate TLS report from google.com");
 
         Ok(())
     }
