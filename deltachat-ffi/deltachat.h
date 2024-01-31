@@ -3152,6 +3152,23 @@ void           dc_accounts_maybe_network_lost    (dc_accounts_t* accounts);
 
 
 /**
+ * Perform a background fetch for all accounts in parallel with a timeout.
+ * Pauses the scheduler, fetches messages from imap and then resumes the scheduler.
+ *
+ * dc_accounts_background_fetch() was created for the iOS Background fetch.
+ *
+ * The `DC_EVENT_ACCOUNTS_BACKGROUND_FETCH_DONE` event is emitted at the end
+ * even in case of timeout, unless the function fails and returns 0.
+ * Process all events until you get this one and you can safely return to the background
+ * without forgetting to create notifications caused by timing race conditions.
+ *
+ * @memberof dc_accounts_t
+ * @param timeout The timeout in seconds
+ * @return Return 1 if DC_EVENT_ACCOUNTS_BACKGROUND_FETCH_DONE was emitted and 0 otherwise.
+ */
+int            dc_accounts_background_fetch    (dc_accounts_t* accounts, uint64_t timeout);
+
+/**
  * Create the event emitter that is used to receive events.
  *
  * The library will emit various @ref DC_EVENT events as "new message", "message read" etc.
@@ -6255,6 +6272,16 @@ void dc_event_unref(dc_event_t* event);
 
 #define DC_EVENT_WEBXDC_INSTANCE_DELETED          2121
 
+/**
+ * Tells that the Background fetch was completed (or timed out).
+ *
+ * This event acts as a marker, when you reach this event you can be sure
+ * that all events emitted during the background fetch were processed.
+ * 
+ * This event is only emitted by the account manager
+ */
+
+#define DC_EVENT_ACCOUNTS_BACKGROUND_FETCH_DONE  2200
 
 /**
  * @}

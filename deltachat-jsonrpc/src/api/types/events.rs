@@ -245,6 +245,13 @@ pub enum EventType {
     /// Inform that a message containing a webxdc instance has been deleted
     #[serde(rename_all = "camelCase")]
     WebxdcInstanceDeleted { msg_id: u32 },
+
+    /// Tells that the Background fetch was completed (or timed out).
+    /// This event acts as a marker, when you reach this event you can be sure
+    /// that all events emitted during the background fetch were processed.
+    ///
+    /// This event is only emitted by the account manager
+    AccountsBackgroundFetchDone,
 }
 
 impl From<CoreEventType> for EventType {
@@ -353,6 +360,7 @@ impl From<CoreEventType> for EventType {
             CoreEventType::WebxdcInstanceDeleted { msg_id } => WebxdcInstanceDeleted {
                 msg_id: msg_id.to_u32(),
             },
+            CoreEventType::AccountsBackgroundFetchDone => AccountsBackgroundFetchDone,
         }
     }
 }

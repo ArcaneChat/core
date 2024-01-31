@@ -5,6 +5,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 
 use anyhow::{ensure, Context as _, Result};
+use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
@@ -289,6 +290,42 @@ impl Accounts {
         for account in self.accounts.values() {
             account.scheduler.maybe_network_lost(account).await;
         }
+    }
+
+    /// Performs a background fetch for all accounts in parallel.
+    ///
+    /// This is an auxiliary function and not part of public API.
+    /// Use [Accounts::background_fetch] instead.
+    async fn background_fetch_without_timeout(&self) {
+        async fn background_fetch_and_log_error(account: Context) {
+            if let Err(error) = account.background_fetch().await {
+                warn!(account, "{error:#}");
+            }
+        }
+
+        join_all(
+            self.accounts
+                .values()
+                .cloned()
+                .map(background_fetch_and_log_error),
+        )
+        .await;
+    }
+
+    /// Performs a background fetch for all accounts in parallel with a timeout.
+    ///
+    /// The `AccountsBackgroundFetchDone` event is emitted at the end,
+    /// process all events until you get this one and you can safely return to the background
+    /// without forgetting to create notifications caused by timing race conditions.
+    pub async fn background_fetch(&self, timeout: std::time::Duration) {
+        if let Err(_err) =
+            tokio::time::timeout(timeout, self.background_fetch_without_timeout()).await
+        {
+            self.emit_event(EventType::Warning(
+                "Background fetch timed out.".to_string(),
+            ));
+        }
+        self.emit_event(EventType::AccountsBackgroundFetchDone);
     }
 
     /// Emits a single event.

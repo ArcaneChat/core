@@ -559,6 +559,7 @@ pub unsafe extern "C" fn dc_event_get_id(event: *mut dc_event_t) -> libc::c_int 
         EventType::ConfigSynced { .. } => 2111,
         EventType::WebxdcStatusUpdate { .. } => 2120,
         EventType::WebxdcInstanceDeleted { .. } => 2121,
+        EventType::AccountsBackgroundFetchDone => 2200,
     }
 }
 
@@ -586,7 +587,8 @@ pub unsafe extern "C" fn dc_event_get_data1_int(event: *mut dc_event_t) -> libc:
         | EventType::SelfavatarChanged
         | EventType::ConfigSynced { .. }
         | EventType::IncomingMsgBunch { .. }
-        | EventType::ErrorSelfNotInGroup(_) => 0,
+        | EventType::ErrorSelfNotInGroup(_)
+        | EventType::AccountsBackgroundFetchDone => 0,
         EventType::MsgsChanged { chat_id, .. }
         | EventType::ReactionsChanged { chat_id, .. }
         | EventType::IncomingMsg { chat_id, .. }
@@ -646,6 +648,7 @@ pub unsafe extern "C" fn dc_event_get_data2_int(event: *mut dc_event_t) -> libc:
         | EventType::WebxdcInstanceDeleted { .. }
         | EventType::IncomingMsgBunch { .. }
         | EventType::SelfavatarChanged
+        | EventType::AccountsBackgroundFetchDone
         | EventType::ConfigSynced { .. } => 0,
         EventType::ChatModified(_) => 0,
         EventType::MsgsChanged { msg_id, .. }
@@ -708,6 +711,7 @@ pub unsafe extern "C" fn dc_event_get_data2_str(event: *mut dc_event_t) -> *mut 
         | EventType::SelfavatarChanged
         | EventType::WebxdcStatusUpdate { .. }
         | EventType::WebxdcInstanceDeleted { .. }
+        | EventType::AccountsBackgroundFetchDone
         | EventType::ChatEphemeralTimerModified { .. } => ptr::null_mut(),
         EventType::ConfigureProgress { comment, .. } => {
             if let Some(comment) = comment {
@@ -4896,6 +4900,26 @@ pub unsafe extern "C" fn dc_accounts_maybe_network_lost(accounts: *mut dc_accoun
 
     let accounts = &*accounts;
     block_on(async move { accounts.write().await.maybe_network_lost().await });
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_accounts_background_fetch(
+    accounts: *mut dc_accounts_t,
+    timeout_in_seconds: u64,
+) -> libc::c_int {
+    if accounts.is_null() || timeout_in_seconds <= 2 {
+        eprintln!("ignoring careless call to dc_accounts_background_fetch()");
+        return 0;
+    }
+
+    let accounts = &*accounts;
+    block_on(async move {
+        let accounts = accounts.read().await;
+        accounts
+            .background_fetch(Duration::from_secs(timeout_in_seconds))
+            .await;
+    });
+    1
 }
 
 #[no_mangle]

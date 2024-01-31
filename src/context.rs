@@ -15,15 +15,16 @@ use tokio::sync::{Mutex, Notify, RwLock};
 
 use crate::chat::{get_chat_cnt, ChatId};
 use crate::config::Config;
-use crate::constants::DC_VERSION_STR;
+use crate::constants::{DC_BACKGROUND_FETCH_QUOTA_CHECK_RATELIMIT, DC_VERSION_STR};
 use crate::contact::Contact;
 use crate::debug_logging::DebugLogging;
 use crate::events::{Event, EventEmitter, EventType, Events};
+use crate::imap::{FolderMeaning, Imap, ServerMetadata};
 use crate::key::{load_self_public_key, DcKey as _};
 use crate::login_param::LoginParam;
 use crate::message::{self, MessageState, MsgId};
 use crate::quota::QuotaInfo;
-use crate::scheduler::SchedulerState;
+use crate::scheduler::{convert_folder_meaning, SchedulerState};
 use crate::sql::Sql;
 use crate::stock_str::StockStrings;
 use crate::timesmearing::SmearedTimestamp;
@@ -224,6 +225,9 @@ pub struct InnerContext {
     /// <https://datatracker.ietf.org/doc/html/rfc2971>
     pub(crate) server_id: RwLock<Option<HashMap<String, String>>>,
 
+    /// IMAP METADATA.
+    pub(crate) metadata: RwLock<Option<ServerMetadata>>,
+
     pub(crate) last_full_folder_scan: Mutex<Option<Instant>>,
 
     /// ID for this `Context` in the current process.
@@ -384,6 +388,7 @@ impl Context {
             resync_request: AtomicBool::new(false),
             new_msgs_notify,
             server_id: RwLock::new(None),
+            metadata: RwLock::new(None),
             creation_time: std::time::SystemTime::now(),
             last_full_folder_scan: Mutex::new(None),
             last_error: std::sync::RwLock::new("".to_string()),
@@ -434,6 +439,55 @@ impl Context {
     /// Indicate that the network likely has come back.
     pub async fn maybe_network(&self) {
         self.scheduler.maybe_network().await;
+    }
+
+    /// Does a background fetch
+    /// pauses the scheduler and does one imap fetch, then unpauses and returns
+    pub async fn background_fetch(&self) -> Result<()> {
+        if !(self.is_configured().await?) {
+            return Ok(());
+        }
+
+        let address = self.get_primary_self_addr().await?;
+        let time_start = std::time::SystemTime::now();
+        info!(self, "background_fetch started fetching {address}");
+
+        let _pause_guard = self.scheduler.pause(self.clone()).await?;
+
+        // connection
+        let mut connection = Imap::new_configured(self, channel::bounded(1).1).await?;
+        connection.prepare(self).await?;
+
+        // fetch imap folders
+        for folder_meaning in [FolderMeaning::Inbox, FolderMeaning::Mvbox] {
+            let (_, watch_folder) = convert_folder_meaning(self, folder_meaning).await?;
+            connection
+                .fetch_move_delete(self, &watch_folder, folder_meaning)
+                .await?;
+        }
+
+        // update quota (to send warning if full) - but only check it once in a while
+        let quota_needs_update = {
+            let quota = self.quota.read().await;
+            quota
+                .as_ref()
+                .filter(|quota| quota.modified + DC_BACKGROUND_FETCH_QUOTA_CHECK_RATELIMIT > time())
+                .is_none()
+        };
+
+        if quota_needs_update {
+            if let Err(err) = self.update_recent_quota(&mut connection).await {
+                warn!(self, "Failed to update quota: {err:#}.");
+            }
+        }
+
+        info!(
+            self,
+            "background_fetch done for {address} took {:?}",
+            time_start.elapsed().unwrap_or_default()
+        );
+
+        Ok(())
     }
 
     pub(crate) async fn schedule_resync(&self) -> Result<()> {
@@ -668,6 +722,16 @@ impl Context {
 
         if let Some(server_id) = &*self.server_id.read().await {
             res.insert("imap_server_id", format!("{server_id:?}"));
+        }
+
+        if let Some(metadata) = &*self.metadata.read().await {
+            if let Some(comment) = &metadata.comment {
+                res.insert("imap_server_comment", format!("{comment:?}"));
+            }
+
+            if let Some(admin) = &metadata.admin {
+                res.insert("imap_server_admin", format!("{admin:?}"));
+            }
         }
 
         res.insert("secondary_addrs", secondary_addrs);
