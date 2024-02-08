@@ -868,7 +868,7 @@ impl Context {
 
     async fn get_self_report(&self) -> Result<String> {
         let mut res = String::new();
-        res += &format!("core_version {}\n", get_version_str());
+        res += &format!("core_version DeltaLab-{}\n", get_version_str());
 
         let num_msgs: u32 = self
             .sql
