@@ -2,6 +2,7 @@ use std::cmp;
 use std::iter::{self, once};
 use std::num::NonZeroUsize;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use anyhow::{bail, Context as _, Error, Result};
 use async_channel::{self as channel, Receiver, Sender};
@@ -12,7 +13,7 @@ use tokio::sync::{oneshot, RwLock, RwLockWriteGuard};
 use tokio::task;
 
 use self::connectivity::ConnectivityStore;
-use crate::config::Config;
+use crate::config::{self, Config};
 use crate::contact::{ContactId, RecentlySeenLoop};
 use crate::context::Context;
 use crate::download::{download_msg, DownloadState};
@@ -24,7 +25,7 @@ use crate::log::LogExt;
 use crate::message::MsgId;
 use crate::smtp::{send_smtp_messages, Smtp};
 use crate::sql;
-use crate::tools::{duration_to_str, maybe_add_time_based_warnings, time};
+use crate::tools::{self, duration_to_str, maybe_add_time_based_warnings, time, time_elapsed};
 
 pub(crate) mod connectivity;
 
@@ -290,7 +291,7 @@ enum InnerSchedulerState {
 ///
 /// Returned by [`SchedulerState::pause`].  To resume the IO scheduler simply drop this
 /// guard.
-#[derive(Debug)]
+#[derive(Default, Debug)]
 pub(crate) struct IoPausedGuard {
     sender: Option<oneshot::Sender<()>>,
 }
@@ -398,7 +399,7 @@ async fn inbox_loop(
                     let quota = ctx.quota.read().await;
                     quota
                         .as_ref()
-                        .filter(|quota| quota.modified + 60 > time())
+                        .filter(|quota| time_elapsed(&quota.modified) > Duration::from_secs(60))
                         .is_none()
                 };
 
@@ -439,8 +440,12 @@ async fn inbox_loop(
                         //
                         // This operation is not critical enough to retry,
                         // especially if the error is persistent.
-                        if let Err(err) =
-                            ctx.set_config_bool(Config::FetchedExistingMsgs, true).await
+                        if let Err(err) = ctx
+                            .set_config_internal(
+                                Config::FetchedExistingMsgs,
+                                config::from_bool(true),
+                            )
+                            .await
                         {
                             warn!(ctx, "Can't set Config::FetchedExistingMsgs: {:#}", err);
                         }
@@ -517,6 +522,20 @@ pub async fn convert_folder_meaning(
 /// critical operation fails such as fetching new messages fails, connection is reset via
 /// `trigger_reconnect`, so a fresh one can be opened.
 async fn fetch_idle(ctx: &Context, connection: &mut Imap, folder_meaning: FolderMeaning) {
+    let create_mvbox = true;
+    if let Err(err) = connection
+        .ensure_configured_folders(ctx, create_mvbox)
+        .await
+    {
+        warn!(
+            ctx,
+            "Cannot watch {folder_meaning}, ensure_configured_folders() failed: {:#}", err,
+        );
+        connection
+            .fake_idle(ctx, None, FolderMeaning::Unknown)
+            .await;
+        return;
+    }
     let (folder_config, watch_folder) = match convert_folder_meaning(ctx, folder_meaning).await {
         Ok(meaning) => meaning,
         Err(error) => {
@@ -540,9 +559,6 @@ async fn fetch_idle(ctx: &Context, connection: &mut Imap, folder_meaning: Folder
     {
         warn!(ctx, "{:#}", err);
         connection.trigger_reconnect(ctx);
-        connection
-            .fake_idle(ctx, Some(watch_folder), folder_meaning)
-            .await;
         return;
     }
 
@@ -767,7 +783,7 @@ async fn smtp_loop(
             // again, we increase the timeout exponentially, in order not to do lots of
             // unnecessary retries.
             if let Some(t) = timeout {
-                let now = tokio::time::Instant::now();
+                let now = tools::Time::now();
                 info!(
                     ctx,
                     "smtp has messages to retry, planning to retry {} seconds later", t,
@@ -778,7 +794,7 @@ async fn smtp_loop(
                 })
                 .await
                 .unwrap_or_default();
-                let slept = (tokio::time::Instant::now() - now).as_secs();
+                let slept = time_elapsed(&now).as_secs();
                 timeout = Some(cmp::max(
                     t,
                     slept.saturating_add(rand::thread_rng().gen_range((slept / 2)..=slept)),

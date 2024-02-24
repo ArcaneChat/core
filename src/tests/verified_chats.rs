@@ -12,6 +12,7 @@ use crate::mimeparser::SystemMessage;
 use crate::receive_imf::receive_imf;
 use crate::stock_str;
 use crate::test_utils::{get_chat_msg, mark_as_verified, TestContext, TestContextManager};
+use crate::tools::SystemTime;
 use crate::{e2ee, message};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -42,7 +43,7 @@ async fn check_verified_oneonone_chat(broken_by_classical_email: bool) {
             b"Subject: Re: Message from alice\r\n\
           From: <bob@example.net>\r\n\
           To: <alice@example.org>\r\n\
-          Date: Mon, 12 Dec 2022 14:33:39 +0000\r\n\
+          Date: Mon, 12 Dec 3000 14:33:39 +0000\r\n\
           Message-ID: <abcd@example.net>\r\n\
           \r\n\
           Heyho!\r\n",
@@ -51,25 +52,27 @@ async fn check_verified_oneonone_chat(broken_by_classical_email: bool) {
         .await
         .unwrap()
         .unwrap();
+        // Bob's contact is still verified, but the chat isn't marked as protected anymore
+        let contact = alice.add_or_lookup_contact(&bob).await;
+        assert_eq!(contact.is_verified(&alice).await.unwrap(), true);
+        assert_verified(&alice, &bob, ProtectionStatus::ProtectionBroken).await;
     } else {
         tcm.section("Bob sets up another Delta Chat device");
         let bob2 = TestContext::new().await;
-        enable_verified_oneonone_chats(&[&bob2]).await;
         bob2.set_name("bob2");
         bob2.configure_addr("bob@example.net").await;
 
+        SystemTime::shift(std::time::Duration::from_secs(3600));
         tcm.send_recv(&bob2, &alice, "Using another device now")
             .await;
+        let contact = alice.add_or_lookup_contact(&bob).await;
+        assert_eq!(contact.is_verified(&alice).await.unwrap(), false);
+        assert_verified(&alice, &bob, ProtectionStatus::ProtectionBroken).await;
     }
 
-    // Bob's contact is still verified, but the chat isn't marked as protected anymore
-    assert_verified(&alice, &bob, ProtectionStatus::ProtectionBroken).await;
-
     tcm.section("Bob sends another message from DC");
+    SystemTime::shift(std::time::Duration::from_secs(3600));
     tcm.send_recv(&bob, &alice, "Using DC again").await;
-
-    let contact = alice.add_or_lookup_contact(&bob).await;
-    assert_eq!(contact.is_verified(&alice.ctx).await.unwrap(), true);
 
     // Bob's chat is marked as verified again
     assert_verified(&alice, &bob, ProtectionStatus::Protected).await;
@@ -792,10 +795,9 @@ async fn test_create_protected_grp_multidev() -> Result<()> {
     );
 
     let sent = alice.send_text(group_id, "Hey").await;
-    // This sleep is necessary to reproduce the bug when the original message is sorted over the
-    // "protection enabled" message so that these messages have different timestamps. The better way
-    // would be to adjust the system time here if we could mock the system clock for the tests.
-    tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+    // This time shift is necessary to reproduce the bug when the original message is sorted over
+    // the "protection enabled" message so that these messages have different timestamps.
+    SystemTime::shift(std::time::Duration::from_secs(3600));
     let msg = alice1.recv_msg(&sent).await;
     let group1 = Chat::load_from_db(alice1, msg.chat_id).await?;
     assert_eq!(group1.get_type(), Chattype::Group);
@@ -816,8 +818,10 @@ async fn test_create_protected_grp_multidev() -> Result<()> {
 // ============== Helper Functions ==============
 
 async fn assert_verified(this: &TestContext, other: &TestContext, protected: ProtectionStatus) {
-    let contact = this.add_or_lookup_contact(other).await;
-    assert_eq!(contact.is_verified(this).await.unwrap(), true);
+    if protected != ProtectionStatus::ProtectionBroken {
+        let contact = this.add_or_lookup_contact(other).await;
+        assert_eq!(contact.is_verified(this).await.unwrap(), true);
+    }
 
     let chat = this.get_chat(other).await;
     let (expect_protected, expect_broken) = match protected {

@@ -206,6 +206,8 @@ pub(crate) const WORSE_AVATAR_SIZE: u32 = 128;
 pub const BALANCED_IMAGE_SIZE: u32 = 1280;
 pub const WORSE_IMAGE_SIZE: u32 = 640;
 
+// Key for the folder configuration version (see below).
+pub(crate) const DC_FOLDERS_CONFIGURED_KEY: &str = "folders_configured";
 // this value can be increased if the folder configuration is changed and must be redone on next program start
 pub(crate) const DC_FOLDERS_CONFIGURED_VERSION: i32 = 4;
 
@@ -215,7 +217,7 @@ pub(crate) const DC_FOLDERS_CONFIGURED_VERSION: i32 = 4;
 pub(crate) const DEFAULT_MAX_SMTP_RCPT_TO: usize = 50;
 
 /// How far the last quota check needs to be in the past to be checked by the background function (in seconds).
-pub(crate) const DC_BACKGROUND_FETCH_QUOTA_CHECK_RATELIMIT: i64 = 12 * 60 * 60; // 12 hours
+pub(crate) const DC_BACKGROUND_FETCH_QUOTA_CHECK_RATELIMIT: u64 = 12 * 60 * 60; // 12 hours
 
 #[cfg(test)]
 mod tests {

@@ -5,12 +5,14 @@ use std::path::Path;
 use std::str::FromStr;
 
 use anyhow::{ensure, Context as _, Result};
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use strum::{EnumProperty, IntoEnumIterator};
 use strum_macros::{AsRefStr, Display, EnumIter, EnumProperty, EnumString};
+use tokio::fs;
 
 use crate::blob::BlobObject;
-use crate::constants::DC_VERSION_STR;
+use crate::constants::{self, DC_VERSION_STR};
 use crate::contact::addr_cmp;
 use crate::context::Context;
 use crate::events::EventType;
@@ -365,15 +367,31 @@ impl Config {
     ///
     /// This must be checked on both sides so that if there are different client versions, the
     /// synchronisation of a particular option is either done or not done in both directions.
-    /// Moreover, receivers of a config value need to check if a key can be synced because some
-    /// settings (e.g. Avatar path) could otherwise lead to exfiltration of files from a receiver's
+    /// Moreover, receivers of a config value need to check if a key can be synced because if it is
+    /// a file path, it could otherwise lead to exfiltration of files from a receiver's
     /// device if we assume an attacker to have control of a device in a multi-device setting or if
     /// multiple users are sharing an account. Another example is `Self::SyncMsgs` itself which
     /// mustn't be controlled by other devices.
     pub(crate) fn is_synced(&self) -> bool {
+        // We don't restart IO from the synchronisation code, so this is to be on the safe side.
+        if self.needs_io_restart() {
+            return false;
+        }
         matches!(
             self,
-            Self::Displayname | Self::MdnsEnabled | Self::ShowEmails
+            Self::Displayname
+                | Self::MdnsEnabled
+                | Self::ShowEmails
+                | Self::Selfavatar
+                | Self::Selfstatus,
+        )
+    }
+
+    /// Whether the config option needs an IO scheduler restart to take effect.
+    pub(crate) fn needs_io_restart(&self) -> bool {
+        matches!(
+            self,
+            Config::MvboxMove | Config::OnlyFetchMvbox | Config::SentboxWatch
         )
     }
 }
@@ -495,51 +513,25 @@ impl Context {
         }
     }
 
-    /// Set the given config key.
-    /// If `None` is passed as a value the value is cleared and set to the default if there is one.
-    pub async fn set_config(&self, key: Config, value: Option<&str>) -> Result<()> {
-        self.set_config_ex(key.is_synced().into(), key, value).await
+    /// Executes [`SyncData::Config`] item sent by other device.
+    pub(crate) async fn sync_config(&self, key: &Config, value: &str) -> Result<()> {
+        let config_value;
+        let value = match key {
+            Config::Selfavatar if value.is_empty() => None,
+            Config::Selfavatar => {
+                config_value = BlobObject::store_from_base64(self, value, "avatar").await?;
+                Some(config_value.as_str())
+            }
+            _ => Some(value),
+        };
+        match key.is_synced() {
+            true => self.set_config_ex(Nosync, *key, value).await,
+            false => Ok(()),
+        }
     }
 
-    pub(crate) async fn set_config_ex(
-        &self,
-        sync: sync::Sync,
-        key: Config,
-        mut value: Option<&str>,
-    ) -> Result<()> {
-        let better_value;
+    fn check_config(key: Config, value: Option<&str>) -> Result<()> {
         match key {
-            Config::Selfavatar => {
-                self.sql
-                    .execute("UPDATE contacts SET selfavatar_sent=0;", ())
-                    .await?;
-                match value {
-                    Some(value) => {
-                        let mut blob = BlobObject::new_from_path(self, value.as_ref()).await?;
-                        blob.recode_to_avatar_size(self).await?;
-                        self.sql
-                            .set_raw_config(key.as_ref(), Some(blob.as_name()))
-                            .await?;
-                    }
-                    None => {
-                        self.sql.set_raw_config(key.as_ref(), None).await?;
-                    }
-                }
-                self.emit_event(EventType::SelfavatarChanged);
-            }
-            Config::DeleteDeviceAfter => {
-                let ret = self.sql.set_raw_config(key.as_ref(), value).await;
-                // Interrupt ephemeral loop to delete old messages immediately.
-                self.scheduler.interrupt_ephemeral_task().await;
-                ret?
-            }
-            Config::Displayname => {
-                if let Some(v) = value {
-                    better_value = improve_single_line_input(v);
-                    value = Some(&better_value);
-                }
-                self.sql.set_raw_config(key.as_ref(), value).await?;
-            }
             Config::Socks5Enabled
             | Config::BccSelf
             | Config::E2eeEnabled
@@ -560,11 +552,90 @@ impl Context {
                     matches!(value, None | Some("0") | Some("1")),
                     "Boolean value must be either 0 or 1"
                 );
+            }
+            _ => (),
+        }
+        Ok(())
+    }
+
+    /// Set the given config key and make it effective.
+    /// This may restart the IO scheduler. If `None` is passed as a value the value is cleared and
+    /// set to the default if there is one.
+    pub async fn set_config(&self, key: Config, value: Option<&str>) -> Result<()> {
+        Self::check_config(key, value)?;
+
+        let _pause = match key.needs_io_restart() {
+            true => self.scheduler.pause(self.clone()).await?,
+            _ => Default::default(),
+        };
+        self.set_config_internal(key, value).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn set_config_internal(&self, key: Config, value: Option<&str>) -> Result<()> {
+        self.set_config_ex(Sync, key, value).await
+    }
+
+    pub(crate) async fn set_config_ex(
+        &self,
+        sync: sync::Sync,
+        key: Config,
+        mut value: Option<&str>,
+    ) -> Result<()> {
+        Self::check_config(key, value)?;
+        let sync = sync == Sync && key.is_synced();
+        let better_value;
+
+        match key {
+            Config::Selfavatar => {
+                self.sql
+                    .execute("UPDATE contacts SET selfavatar_sent=0;", ())
+                    .await?;
+                match value {
+                    Some(path) => {
+                        let mut blob = BlobObject::new_from_path(self, path.as_ref()).await?;
+                        blob.recode_to_avatar_size(self).await?;
+                        self.sql
+                            .set_raw_config(key.as_ref(), Some(blob.as_name()))
+                            .await?;
+                        if sync {
+                            let buf = fs::read(blob.to_abs_path()).await?;
+                            better_value = base64::engine::general_purpose::STANDARD.encode(buf);
+                            value = Some(&better_value);
+                        }
+                    }
+                    None => {
+                        self.sql.set_raw_config(key.as_ref(), None).await?;
+                        if sync {
+                            better_value = String::new();
+                            value = Some(&better_value);
+                        }
+                    }
+                }
+                self.emit_event(EventType::SelfavatarChanged);
+            }
+            Config::DeleteDeviceAfter => {
+                let ret = self.sql.set_raw_config(key.as_ref(), value).await;
+                // Interrupt ephemeral loop to delete old messages immediately.
+                self.scheduler.interrupt_ephemeral_task().await;
+                ret?
+            }
+            Config::Displayname => {
+                if let Some(v) = value {
+                    better_value = improve_single_line_input(v);
+                    value = Some(&better_value);
+                }
                 self.sql.set_raw_config(key.as_ref(), value).await?;
             }
             Config::Addr => {
                 self.sql
                     .set_raw_config(key.as_ref(), value.map(|s| s.to_lowercase()).as_deref())
+                    .await?;
+            }
+            Config::MvboxMove => {
+                self.sql.set_raw_config(key.as_ref(), value).await?;
+                self.sql
+                    .set_raw_config(constants::DC_FOLDERS_CONFIGURED_KEY, None)
                     .await?;
             }
             _ => {
@@ -574,7 +645,7 @@ impl Context {
         if key.is_synced() {
             self.emit_event(EventType::ConfigSynced { key });
         }
-        if sync != Sync {
+        if !sync {
             return Ok(());
         }
         let Some(val) = value else {
@@ -601,8 +672,7 @@ impl Context {
 
     /// Set the given config to a boolean value.
     pub async fn set_config_bool(&self, key: Config, value: bool) -> Result<()> {
-        self.set_config(key, if value { Some("1") } else { Some("0") })
-            .await?;
+        self.set_config(key, from_bool(value)).await?;
         Ok(())
     }
 
@@ -620,6 +690,11 @@ impl Context {
         ensure!(key.starts_with("ui."), "get_ui_config(): prefix missing.");
         self.sql.get_raw_config(key).await
     }
+}
+
+/// Returns a value for use in `Context::set_config_*()` for the given `bool`.
+pub(crate) fn from_bool(val: bool) -> Option<&'static str> {
+    Some(if val { "1" } else { "0" })
 }
 
 // Separate impl block for self address handling
@@ -648,13 +723,13 @@ impl Context {
         let mut secondary_addrs = self.get_all_self_addrs().await?;
         // never store a primary address also as a secondary
         secondary_addrs.retain(|a| !addr_cmp(a, primary_new));
-        self.set_config(
+        self.set_config_internal(
             Config::SecondaryAddrs,
             Some(secondary_addrs.join(" ").as_str()),
         )
         .await?;
 
-        self.set_config(Config::ConfiguredAddr, Some(primary_new))
+        self.set_config_internal(Config::ConfiguredAddr, Some(primary_new))
             .await?;
 
         Ok(())
@@ -902,14 +977,36 @@ mod tests {
         assert!(alice1.get_config_bool(Config::MdnsEnabled).await?);
 
         // Usual sync scenario.
+        async fn test_config_str(
+            alice0: &TestContext,
+            alice1: &TestContext,
+            key: Config,
+            val: &str,
+        ) -> Result<()> {
+            alice0.set_config(key, Some(val)).await?;
+            sync(alice0, alice1).await;
+            assert_eq!(alice1.get_config(key).await?, Some(val.to_string()));
+            Ok(())
+        }
+        test_config_str(&alice0, &alice1, Config::Displayname, "Alice Sync").await?;
+        test_config_str(&alice0, &alice1, Config::Selfstatus, "My status").await?;
+
+        assert!(alice0.get_config(Config::Selfavatar).await?.is_none());
+        let file = alice0.dir.path().join("avatar.png");
+        let bytes = include_bytes!("../test-data/image/avatar64x64.png");
+        tokio::fs::write(&file, bytes).await?;
         alice0
-            .set_config(Config::Displayname, Some("Alice Sync"))
+            .set_config(Config::Selfavatar, Some(file.to_str().unwrap()))
             .await?;
         sync(&alice0, &alice1).await;
-        assert_eq!(
-            alice1.get_config(Config::Displayname).await?,
-            Some("Alice Sync".to_string())
-        );
+        assert!(alice1
+            .get_config(Config::Selfavatar)
+            .await?
+            .filter(|path| path.ends_with(".png"))
+            .is_some());
+        alice0.set_config(Config::Selfavatar, None).await?;
+        sync(&alice0, &alice1).await;
+        assert!(alice1.get_config(Config::Selfavatar).await?.is_none());
 
         Ok(())
     }

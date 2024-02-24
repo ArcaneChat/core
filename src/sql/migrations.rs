@@ -368,7 +368,7 @@ UPDATE chats SET protected=1, type=120 WHERE type=130;"#,
         if let Ok(addr) = context.get_primary_self_addr().await {
             if let Ok(domain) = EmailAddress::new(&addr).map(|email| email.domain) {
                 context
-                    .set_config(
+                    .set_config_internal(
                         Config::ConfiguredProvider,
                         get_provider_by_domain(&domain).map(|provider| provider.id),
                     )
@@ -896,6 +896,17 @@ CREATE INDEX msgs_status_updates_index2 ON msgs_status_updates (uid);
                WHERE verified_key IS NOT NULL
                "#,
             109,
+        )
+        .await?;
+    }
+
+    if dbversion < 110 {
+        sql.execute_migration(
+            "ALTER TABLE keypairs ADD COLUMN addr TEXT DEFAULT '' COLLATE NOCASE;
+            ALTER TABLE keypairs ADD COLUMN is_default INTEGER DEFAULT 0;
+            ALTER TABLE keypairs ADD COLUMN created INTEGER DEFAULT 0;
+            UPDATE keypairs SET addr=(SELECT value FROM config WHERE keyname='configured_addr'), is_default=1;",
+            110,
         )
         .await?;
     }

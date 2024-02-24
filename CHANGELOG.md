@@ -1,5 +1,144 @@
 # Changelog
 
+## [1.135.1] - 2024-02-20
+
+### Features / Changes
+
+- Sync self-avatar across devices ([#4893](https://github.com/deltachat/deltachat-core-rust/pull/4893)).
+- Sync Config::Selfstatus across devices ([#4893](https://github.com/deltachat/deltachat-core-rust/pull/4893)).
+- Remove webxdc sending limit.
+
+### Fixes
+
+- Never encrypt `{vc,vg}-request` SecureJoin messages.
+- Apply Autocrypt headers if timestamp is unchanged.
+- `Context::get_info`: Report displayname as "displayname" (w/o underscore).
+
+### Tests
+
+- Mock `SystemTime::now()` for the tests.
+- Add a test on protection message sort timestamp ([#5088](https://github.com/deltachat/deltachat-core-rust/pull/5088)).
+
+### Build system
+
+- Add flake.nix.
+- Add footer template for git-cliff.
+
+### CI
+
+- Update GitHub Actions `actions/upload-artifact`, `actions/download-artifact`, `actions/checkout`.
+- Build deltachat-repl for Windows with nix.
+- Build deltachat-rpc-server with nix.
+- Try to upload deltachat-rpc-server only on release.
+
+### Refactor
+
+- `create_keypair`: Remove unnecessary `map_err`.
+- Return error with a cause when failing to export keys.
+- Rename incorrectly named variables in `create_keypair`.
+
+## [1.135.1] - 2024-02-20
+
+### CI
+
+- Update actions/upload-artifact.
+- Use actions/download-artifact@v4.
+- Replace download-artifact v1 with v4.
+- Update to actions/checkout@v4.
+- Fixup node-package.yml after artifact actions upgrade.
+
+### Features / Changes
+
+- Mock SystemTime::now() for the tests.
+- Remove webxdc sending limit.
+- Sync self-avatar across devices ([#4893](https://github.com/deltachat/deltachat-core-rust/pull/4893)).
+- Sync Config::Selfstatus across devices ([#4893](https://github.com/deltachat/deltachat-core-rust/pull/4893)).
+
+### Fixes
+
+- Context::get_info: Report displayname as "displayname" (w/o underscore).
+- Never encrypt {vc,vg}-request.
+
+### Other
+
+- Cleanup changelog ([#5265](https://github.com/deltachat/deltachat-core-rust/pull/5265))
+
+somehow a whole issue sneaked in :).
+
+### Refactor
+
+- create_keypair: Remove unnecessary map_err.
+- Return error with a cause when failing to export keys.
+- Rename incorrectly named variables in create_keypair.
+
+### Tests
+
+- Add a test on protection message sort timestamp ([#5088](https://github.com/deltachat/deltachat-core-rust/pull/5088)).
+
+## [1.135.0] - 2024-02-13
+
+### Features / Changes
+
+- Add wildcard pattern support to provider database.
+- Add device message about outgoing undecryptable messages ([#5164](https://github.com/deltachat/deltachat-core-rust/pull/5164)).
+- Context::set_config(): Restart IO scheduler if needed ([#5111](https://github.com/deltachat/deltachat-core-rust/pull/5111)).
+- Server_sent_unsolicited_exists(): Log folder name.
+- Cache system time instead of looking at the clock several times in a row.
+- Basic self-reporting ([#5129](https://github.com/deltachat/deltachat-core-rust/pull/5129)).
+
+### Fixes
+
+- Dehtml: Don't just truncate text when trying to decode ([#5223](https://github.com/deltachat/deltachat-core-rust/pull/5223)).
+- Mark the gossip keys from the message as verified, not the ones from the db ([#5247](https://github.com/deltachat/deltachat-core-rust/pull/5247)).
+- Guarantee immediate message deletion if delete_server_after == 0 ([#5201](https://github.com/deltachat/deltachat-core-rust/pull/5201)).
+- Never allow a message timestamp to be a lot in the future ([#5249](https://github.com/deltachat/deltachat-core-rust/pull/5249)).
+- Imap::configure_mvbox: Do select_with_uidvalidity() before return.
+- ImapSession::select_or_create_folder(): Don't fail if folder is created in parallel.
+- Emit ConfigSynced event on the second device.
+- Create mvbox on setting mvbox_move.
+- Use SystemTime instead of Instant everywhere.
+- Restore database rows removed in previous release; this ensures compatibility when adding second device or importing backup and not all devices run the new core ([#5254](https://github.com/deltachat/deltachat-core-rust/pull/5254))
+
+### Miscellaneous Tasks
+
+- cargo: Bump image from 0.24.7 to 0.24.8.
+- cargo: Bump chrono from 0.4.31 to 0.4.33.
+- cargo: Bump futures-lite from 2.1.0 to 2.2.0.
+- cargo: Bump pin-project from 1.1.3 to 1.1.4.
+- cargo: Bump iana-time-zone from yanked 0.1.59 to 0.1.60.
+- cargo: Bump smallvec from 1.11.2 to 1.13.1.
+- cargo: Bump base64 from 0.21.5 to 0.21.7.
+- cargo: Bump regex from 1.10.2 to 1.10.3.
+- cargo: Bump libc from 0.2.151 to 0.2.153.
+- cargo: Bump reqwest from 0.11.23 to 0.11.24.
+- cargo: Bump axum from 0.7.3 to 0.7.4.
+- cargo: Bump uuid from 1.6.1 to 1.7.0.
+- cargo: Bump fast-socks5 from 0.9.2 to 0.9.5.
+- cargo: Bump serde_json from 1.0.111 to 1.0.113.
+- cargo: Bump syn from 2.0.46 to 2.0.48.
+- cargo: Bump serde from 1.0.194 to 1.0.196.
+- cargo: Bump toml from 0.8.8 to 0.8.10.
+- cargo: Update to strum 0.26.
+- Cargo update.
+- scripts: Do not install deltachat-rpc-client twice.
+
+### Other
+
+- Update welcome image, thanks @paulaluap
+- Merge pull request #5243 from deltachat/dependabot/cargo/pin-project-1.1.4
+- Merge pull request #5241 from deltachat/dependabot/cargo/futures-lite-2.2.0
+- Merge pull request #5236 from deltachat/dependabot/cargo/chrono-0.4.33
+- Merge pull request #5235 from deltachat/dependabot/cargo/image-0.24.8
+
+
+### Refactor
+
+- Resultify token::exists.
+
+### Tests
+
+- Delete_server_after="1" should cause immediate message deletion ([#5201](https://github.com/deltachat/deltachat-core-rust/pull/5201)).
+
 ## [1.134.0] - 2024-01-31
 
 ### API-Changes
@@ -3476,3 +3615,5 @@ https://github.com/deltachat/deltachat-core-rust/pulls?q=is%3Apr+is%3Aclosed
 [1.133.1]: https://github.com/deltachat/deltachat-core-rust/compare/v1.133.0...v1.133.1
 [1.133.2]: https://github.com/deltachat/deltachat-core-rust/compare/v1.133.1...v1.133.2
 [1.134.0]: https://github.com/deltachat/deltachat-core-rust/compare/v1.133.2...v1.134.0
+[1.135.0]: https://github.com/deltachat/deltachat-core-rust/compare/v1.134.0...v1.135.0
+[1.135.1]: https://github.com/deltachat/deltachat-core-rust/compare/v1.135.0...v1.135.1

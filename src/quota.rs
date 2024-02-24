@@ -12,7 +12,7 @@ use crate::imap::scan_folders::get_watched_folders;
 use crate::imap::session::Session as ImapSession;
 use crate::imap::Imap;
 use crate::message::{Message, Viewtype};
-use crate::tools::time;
+use crate::tools;
 use crate::{stock_str, EventType};
 
 /// warn about a nearly full mailbox after this usage percentage is reached.
@@ -40,8 +40,8 @@ pub struct QuotaInfo {
     /// set to `Ok()` for valid quota information.
     pub(crate) recent: Result<BTreeMap<String, Vec<QuotaResource>>>,
 
-    /// Timestamp when structure was modified.
-    pub(crate) modified: i64,
+    /// When the structure was modified.
+    pub(crate) modified: tools::Time,
 }
 
 async fn get_unique_quota_roots_and_usage(
@@ -132,13 +132,17 @@ impl Context {
                         highest,
                         self.get_config_int(Config::QuotaExceeding).await? as u64,
                     ) {
-                        self.set_config(Config::QuotaExceeding, Some(&highest.to_string()))
-                            .await?;
+                        self.set_config_internal(
+                            Config::QuotaExceeding,
+                            Some(&highest.to_string()),
+                        )
+                        .await?;
                         let mut msg = Message::new(Viewtype::Text);
                         msg.text = stock_str::quota_exceeding(self, highest).await;
                         add_device_msg_with_importance(self, None, Some(&mut msg), true).await?;
                     } else if highest <= QUOTA_ALLCLEAR_PERCENTAGE {
-                        self.set_config(Config::QuotaExceeding, None).await?;
+                        self.set_config_internal(Config::QuotaExceeding, None)
+                            .await?;
                     }
                 }
                 Err(err) => warn!(self, "cannot get highest quota usage: {:#}", err),
@@ -147,7 +151,7 @@ impl Context {
 
         *self.quota.write().await = Some(QuotaInfo {
             recent: quota,
-            modified: time(),
+            modified: tools::Time::now(),
         });
 
         self.emit_event(EventType::ConnectivityChanged);

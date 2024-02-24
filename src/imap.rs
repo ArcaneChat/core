@@ -22,9 +22,7 @@ use tokio::sync::RwLock;
 
 use crate::chat::{self, ChatId, ChatIdBlocked};
 use crate::config::Config;
-use crate::constants::{
-    Blocked, Chattype, ShowEmails, DC_FETCH_EXISTING_MSGS_COUNT, DC_FOLDERS_CONFIGURED_VERSION,
-};
+use crate::constants::{self, Blocked, Chattype, ShowEmails, DC_FETCH_EXISTING_MSGS_COUNT};
 use crate::contact::{normalize_name, Contact, ContactAddress, ContactId, Modifier, Origin};
 use crate::context::Context;
 use crate::events::EventType;
@@ -96,16 +94,11 @@ pub struct Imap {
 
     pub(crate) connectivity: ConnectivityStore,
 
-    /// Rate limit for IMAP connection usage attempts.
+    /// Rate limit for IMAP connection attempts.
     ///
-    /// Rate limit is checked before connecting
-    /// and updated right before login attempt.
-    /// It does not limit the number of connection attempts
-    /// if the network is bad as only successful connections are counted.
-    ///
-    /// Main purpose of this rate limit is
-    /// to prevent busy loop in case
-    /// connection gets dropped over and over due to IMAP bug,
+    /// This rate limit prevents busy loop
+    /// in case the server refuses connections
+    /// or in case connection gets dropped over and over due to IMAP bug,
     /// e.g. the server returning invalid response to SELECT command
     /// immediately after logging in or returning an error in response to LOGIN command
     /// due to internal server error.
@@ -282,7 +275,7 @@ impl Imap {
             session: None,
             login_failed_once: false,
             connectivity: Default::default(),
-            // 1 login per minute + a burst of 2.
+            // 1 connection per minute + a burst of 2.
             ratelimit: RwLock::new(Ratelimit::new(Duration::new(120, 0), 2.0)),
         };
 
@@ -331,13 +324,6 @@ impl Imap {
             return Ok(());
         }
 
-        self.connectivity.set_connecting(context).await;
-
-        // Check rate limit before trying to connect
-        // to avoid connecting and not using the connection
-        // in case we are currently ratelimited.
-        // Otherwise connection may become unusable due to NAT forgetting about it
-        // before we attempt to actually login.
         let ratelimit_duration = self.ratelimit.read().await.until_can_send();
         if !ratelimit_duration.is_zero() {
             warn!(
@@ -349,6 +335,8 @@ impl Imap {
         }
 
         info!(context, "Connecting to IMAP server");
+        self.connectivity.set_connecting(context).await;
+        self.ratelimit.write().await.send();
         let connection_res: Result<Client> = if self.config.lp.security == Socket::Starttls
             || self.config.lp.security == Socket::Plain
         {
@@ -399,7 +387,6 @@ impl Imap {
             }
         };
         let client = connection_res?;
-        self.ratelimit.write().await.send();
 
         let config = &self.config;
         let imap_user: &str = config.lp.user.as_ref();
@@ -451,7 +438,10 @@ impl Imap {
                     && err.to_string().to_lowercase().contains("authentication")
                     && context.get_config_bool(Config::NotifyAboutWrongPw).await?
                 {
-                    if let Err(e) = context.set_config(Config::NotifyAboutWrongPw, None).await {
+                    if let Err(e) = context
+                        .set_config_internal(Config::NotifyAboutWrongPw, None)
+                        .await
+                    {
                         warn!(context, "{:#}", e);
                     }
                     drop(lock);
@@ -989,7 +979,7 @@ impl Imap {
             .context("failed to get recipients from the sentbox")?;
         add_all_recipients_as_contacts(context, self, Config::ConfiguredMvboxFolder)
             .await
-            .context("failed to ge recipients from the movebox")?;
+            .context("failed to get recipients from the movebox")?;
         add_all_recipients_as_contacts(context, self, Config::ConfiguredInboxFolder)
             .await
             .context("failed to get recipients from the inbox")?;
@@ -1764,11 +1754,17 @@ impl Imap {
         context: &Context,
         create_mvbox: bool,
     ) -> Result<()> {
-        let folders_configured = context.sql.get_raw_config_int("folders_configured").await?;
-        if folders_configured.unwrap_or_default() >= DC_FOLDERS_CONFIGURED_VERSION {
+        let folders_configured = context
+            .sql
+            .get_raw_config_int(constants::DC_FOLDERS_CONFIGURED_KEY)
+            .await?;
+        if folders_configured.unwrap_or_default() >= constants::DC_FOLDERS_CONFIGURED_VERSION {
             return Ok(());
         }
-
+        if let Err(err) = self.connect(context).await {
+            self.connectivity.set_err(context, &err).await;
+            return Err(err);
+        }
         self.configure_folders(context, create_mvbox).await
     }
 
@@ -1877,20 +1873,23 @@ impl Imap {
             .context("failed to configure mvbox")?;
 
         context
-            .set_config(Config::ConfiguredInboxFolder, Some("INBOX"))
+            .set_config_internal(Config::ConfiguredInboxFolder, Some("INBOX"))
             .await?;
         if let Some(mvbox_folder) = mvbox_folder {
             info!(context, "Setting MVBOX FOLDER TO {}", &mvbox_folder);
             context
-                .set_config(Config::ConfiguredMvboxFolder, Some(mvbox_folder))
+                .set_config_internal(Config::ConfiguredMvboxFolder, Some(mvbox_folder))
                 .await?;
         }
         for (config, name) in folder_configs {
-            context.set_config(config, Some(&name)).await?;
+            context.set_config_internal(config, Some(&name)).await?;
         }
         context
             .sql
-            .set_raw_config_int("folders_configured", DC_FOLDERS_CONFIGURED_VERSION)
+            .set_raw_config_int(
+                constants::DC_FOLDERS_CONFIGURED_KEY,
+                constants::DC_FOLDERS_CONFIGURED_VERSION,
+            )
             .await?;
 
         info!(context, "FINISHED configuring IMAP-folders.");
@@ -1908,13 +1907,14 @@ impl Session {
         use async_imap::imap_proto::ResponseCode;
         use UnsolicitedResponse::*;
 
+        let folder = self.selected_folder.as_deref().unwrap_or_default();
         let mut unsolicited_exists = false;
         while let Ok(response) = self.unsolicited_responses.try_recv() {
             match response {
                 Exists(_) => {
                     info!(
                         context,
-                        "Need to fetch again, got unsolicited EXISTS {:?}", response
+                        "Need to refetch {folder:?}, got unsolicited EXISTS {response:?}"
                     );
                     unsolicited_exists = true;
                 }
@@ -1933,7 +1933,7 @@ impl Session {
                     ) => {}
 
                 _ => {
-                    info!(context, "got unsolicited response {:?}", response)
+                    info!(context, "{folder:?}: got unsolicited response {response:?}")
                 }
             }
         }
@@ -2172,6 +2172,26 @@ fn get_folder_meaning_by_name(folder_name: &str) -> FolderMeaning {
         "草稿",
         "임시보관함",
     ];
+    const TRASH_NAMES: &[&str] = &[
+        "Trash",
+        "Bin",
+        "Caixote do lixo",
+        "Cestino",
+        "Corbeille",
+        "Papelera",
+        "Papierkorb",
+        "Papirkurv",
+        "Papperskorgen",
+        "Prullenbak",
+        "Rubujo",
+        "Κάδος απορριμμάτων",
+        "Корзина",
+        "Кошик",
+        "ゴミ箱",
+        "垃圾桶",
+        "已删除邮件",
+        "휴지통",
+    ];
     let lower = folder_name.to_lowercase();
 
     if SENT_NAMES.iter().any(|s| s.to_lowercase() == lower) {
@@ -2180,6 +2200,8 @@ fn get_folder_meaning_by_name(folder_name: &str) -> FolderMeaning {
         FolderMeaning::Spam
     } else if DRAFT_NAMES.iter().any(|s| s.to_lowercase() == lower) {
         FolderMeaning::Drafts
+    } else if TRASH_NAMES.iter().any(|s| s.to_lowercase() == lower) {
+        FolderMeaning::Trash
     } else {
         FolderMeaning::Unknown
     }
@@ -2682,6 +2704,7 @@ mod tests {
         );
         assert_eq!(get_folder_meaning_by_name("xxx"), FolderMeaning::Unknown);
         assert_eq!(get_folder_meaning_by_name("SPAM"), FolderMeaning::Spam);
+        assert_eq!(get_folder_meaning_by_name("Trash"), FolderMeaning::Trash);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

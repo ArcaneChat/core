@@ -6,7 +6,7 @@ use std::convert::{TryFrom, TryInto};
 use std::fmt;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::UNIX_EPOCH;
 
 use anyhow::{bail, ensure, Context as _, Result};
 use async_channel::{self as channel, Receiver, Sender};
@@ -36,7 +36,7 @@ use crate::sql::{self, params_iter};
 use crate::sync::{self, Sync::*};
 use crate::tools::{
     duration_to_str, get_abs_path, improve_single_line_input, strip_rtlo_characters, time,
-    EmailAddress,
+    EmailAddress, SystemTime,
 };
 use crate::{chat, stock_str};
 
@@ -1550,7 +1550,7 @@ pub(crate) async fn set_profile_image(
             if contact_id == ContactId::SELF {
                 if was_encrypted {
                     context
-                        .set_config(Config::Selfavatar, Some(profile_image))
+                        .set_config_internal(Config::Selfavatar, Some(profile_image))
                         .await?;
                 } else {
                     info!(context, "Do not use unencrypted selfavatar.");
@@ -1563,7 +1563,9 @@ pub(crate) async fn set_profile_image(
         AvatarAction::Delete => {
             if contact_id == ContactId::SELF {
                 if was_encrypted {
-                    context.set_config(Config::Selfavatar, None).await?;
+                    context
+                        .set_config_internal(Config::Selfavatar, None)
+                        .await?;
                 } else {
                     info!(context, "Do not use unencrypted selfavatar deletion.");
                 }
@@ -1595,7 +1597,7 @@ pub(crate) async fn set_status(
     if contact_id == ContactId::SELF {
         if encrypted && has_chat_version {
             context
-                .set_config(Config::Selfstatus, Some(&status))
+                .set_config_internal(Config::Selfstatus, Some(&status))
                 .await?;
         }
     } else {
@@ -1730,6 +1732,12 @@ impl RecentlySeenLoop {
     async fn run(context: Context, interrupt: Receiver<RecentlySeenInterrupt>) {
         type MyHeapElem = (Reverse<i64>, ContactId);
 
+        let now = SystemTime::now();
+        let now_ts = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
         // Priority contains all recently seen sorted by the timestamp
         // when they become not recently seen.
         //
@@ -1740,7 +1748,7 @@ impl RecentlySeenLoop {
             .query_map(
                 "SELECT id, last_seen FROM contacts
                  WHERE last_seen > ?",
-                (time() - SEEN_RECENTLY_SECONDS,),
+                (now_ts - SEEN_RECENTLY_SECONDS,),
                 |row| {
                     let contact_id: ContactId = row.get("id")?;
                     let last_seen: i64 = row.get("last_seen")?;
@@ -1755,8 +1763,6 @@ impl RecentlySeenLoop {
             .unwrap_or_default();
 
         loop {
-            let now = SystemTime::now();
-
             let (until, contact_id) =
                 if let Some((Reverse(timestamp), contact_id)) = unseen_queue.peek() {
                     (

@@ -18,7 +18,7 @@ use crate::constants::KeyGenType;
 use crate::context::Context;
 use crate::log::LogExt;
 use crate::pgp::KeyPair;
-use crate::tools::EmailAddress;
+use crate::tools::{self, time_elapsed, EmailAddress};
 
 /// Convenience trait for working with keys.
 ///
@@ -204,7 +204,7 @@ async fn generate_keypair(context: &Context) -> Result<KeyPair> {
     match load_keypair(context, &addr).await? {
         Some(key_pair) => Ok(key_pair),
         None => {
-            let start = std::time::SystemTime::now();
+            let start = tools::Time::now();
             let keytype = KeyGenType::from_i32(context.get_config_int(Config::KeyGenType).await?)
                 .unwrap_or_default();
             info!(context, "Generating keypair with type {}", keytype);
@@ -216,7 +216,7 @@ async fn generate_keypair(context: &Context) -> Result<KeyPair> {
             info!(
                 context,
                 "Keypair generated in {:.3}s.",
-                start.elapsed().unwrap_or_default().as_secs()
+                time_elapsed(&start).as_secs(),
             );
             Ok(keypair)
         }
@@ -255,7 +255,7 @@ pub(crate) async fn load_keypair(
 
 /// Use of a key pair for encryption or decryption.
 ///
-/// This is used by [store_self_keypair] to know what kind of key is
+/// This is used by `store_self_keypair` to know what kind of key is
 /// being saved.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum KeyPairUse {
@@ -277,7 +277,7 @@ pub enum KeyPairUse {
 /// same key again overwrites it.
 ///
 /// [Config::ConfiguredAddr]: crate::config::Config::ConfiguredAddr
-pub async fn store_self_keypair(
+pub(crate) async fn store_self_keypair(
     context: &Context,
     keypair: &KeyPair,
     default: KeyPairUse,
@@ -294,11 +294,17 @@ pub async fn store_self_keypair(
                 KeyPairUse::ReadOnly => false,
             };
 
+            // `addr` and `is_default` written for compatibility with older versions,
+            // until new cores are rolled out everywhere.
+            // otherwise "add second device" or "backup" may break.
+            // moreover, this allows downgrades to the previous version.
+            // writing of `addr` and `is_default` can be removed ~ 2024-08
+            let addr = keypair.addr.to_string();
             transaction
                 .execute(
-                    "INSERT OR REPLACE INTO keypairs (public_key, private_key)
-                     VALUES (?,?)",
-                    (&public_key, &secret_key),
+                    "INSERT OR REPLACE INTO keypairs (public_key, private_key, addr, is_default)
+                     VALUES (?,?,?,?)",
+                    (&public_key, &secret_key, addr, is_default),
                 )
                 .context("Failed to insert keypair")?;
 

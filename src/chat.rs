@@ -6,7 +6,7 @@ use std::convert::{TryFrom, TryInto};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, ensure, Context as _, Result};
 use deltachat_derive::{FromSql, ToSql};
@@ -44,7 +44,7 @@ use crate::sync::{self, Sync::*, SyncData};
 use crate::tools::{
     buf_compress, create_id, create_outgoing_rfc724_mid, create_smeared_timestamp,
     create_smeared_timestamps, get_abs_path, gm2local_offset, improve_single_line_input,
-    smeared_time, strip_rtlo_characters, time, IsNoneOrEmpty,
+    smeared_time, strip_rtlo_characters, time, IsNoneOrEmpty, SystemTime,
 };
 use crate::webxdc::WEBXDC_SUFFIX;
 
@@ -803,7 +803,9 @@ impl ChatId {
 
         context.emit_msgs_changed_without_ids();
 
-        context.set_config(Config::LastHousekeeping, None).await?;
+        context
+            .set_config_internal(Config::LastHousekeeping, None)
+            .await?;
         context.scheduler.interrupt_inbox().await;
 
         if chat.is_self_talk() {
@@ -2824,12 +2826,14 @@ pub(crate) async fn create_send_msg_jobs(context: &Context, msg: &mut Message) -
         );
     }
 
+    let now = time();
+
     if rendered_msg.is_gossiped {
-        msg.chat_id.set_gossiped_timestamp(context, time()).await?;
+        msg.chat_id.set_gossiped_timestamp(context, now).await?;
     }
 
     if let Some(last_added_location_id) = rendered_msg.last_added_location_id {
-        if let Err(err) = location::set_kml_sent_timestamp(context, msg.chat_id, time()).await {
+        if let Err(err) = location::set_kml_sent_timestamp(context, msg.chat_id, now).await {
             error!(context, "Failed to set kml sent_timestamp: {err:#}.");
         }
         if !msg.hidden {
@@ -2848,7 +2852,7 @@ pub(crate) async fn create_send_msg_jobs(context: &Context, msg: &mut Message) -
     }
 
     if attach_selfavatar {
-        if let Err(err) = msg.chat_id.set_selfavatar_timestamp(context, time()).await {
+        if let Err(err) = msg.chat_id.set_selfavatar_timestamp(context, now).await {
             error!(context, "Failed to set selfavatar timestamp: {err:#}.");
         }
     }
@@ -3704,7 +3708,7 @@ pub enum MuteDuration {
     Forever,
 
     /// Chat is muted for a limited period of time.
-    Until(SystemTime),
+    Until(std::time::SystemTime),
 }
 
 impl rusqlite::types::ToSql for MuteDuration {
@@ -4318,7 +4322,9 @@ pub(crate) async fn delete_and_reset_all_device_msgs(context: &Context) -> Resul
             (),
         )
         .await?;
-    context.set_config(Config::QuotaExceeding, None).await?;
+    context
+        .set_config_internal(Config::QuotaExceeding, None)
+        .await?;
     Ok(())
 }
 

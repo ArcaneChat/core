@@ -9,11 +9,22 @@ use std::io::{Cursor, Write};
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::str::from_utf8;
-use std::time::{Duration, SystemTime};
+// If a time value doesn't need to be sent to another host, saved to the db or otherwise used across
+// program restarts, a monotonically nondecreasing clock (`Instant`) should be used. But as
+// `Instant` may use `libc::clock_gettime(CLOCK_MONOTONIC)`, e.g. on Android, and does not advance
+// while being in deep sleep mode, we use `SystemTime` instead, but add an alias for it to document
+// why `Instant` isn't used in those places. Also this can help to switch to another clock impl if
+// we find any.
+use std::time::Duration;
+pub use std::time::SystemTime as Time;
+#[cfg(not(test))]
+pub use std::time::SystemTime;
 
 use anyhow::{bail, Context as _, Result};
 use base64::Engine as _;
 use chrono::{Local, NaiveDateTime, NaiveTime, TimeZone};
+#[cfg(test)]
+pub use deltachat_time::SystemTimeTools as SystemTime;
 use futures::{StreamExt, TryStreamExt};
 use mailparse::dateparse;
 use mailparse::headers::Headers;
@@ -480,6 +491,10 @@ pub(crate) fn time() -> i64 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+pub(crate) fn time_elapsed(time: &Time) -> Duration {
+    time.elapsed().unwrap_or_default()
 }
 
 /// Struct containing all mailto information
