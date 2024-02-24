@@ -312,7 +312,7 @@ pub enum Config {
 
     /// Defines the max. size (in bytes) of messages downloaded automatically.
     /// 0 = no limit.
-    #[strum(props(default = "163840"))]
+    #[strum(props(default = "655360"))]
     DownloadLimit,
 
     /// Enable sending and executing (applying) sync messages. Sending requires `BccSelf` to be set.
