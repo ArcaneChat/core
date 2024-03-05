@@ -1,5 +1,85 @@
 # Changelog
 
+## [1.136.2] - 2024-03-05
+
+### Build system
+
+- Downgrade `cc` to 1.0.83 to fix build for Android.
+
+### CI
+
+- Update setup-node action.
+
+## [1.136.1] - 2024-03-05
+
+### Build system
+
+- Revert to OpenSSL 3.1.
+- Restore MSRV 1.70.0.
+
+### Miscellaneous Tasks
+
+- Update node constants.
+
+## [1.136.0] - 2024-03-04
+
+### Features / Changes
+
+- Recognise Trash folder by name ([#5275](https://github.com/deltachat/deltachat-core-rust/pull/5275)).
+- Send Chat-Group-Avatar as inline base64 ([#5253](https://github.com/deltachat/deltachat-core-rust/pull/5253)).
+- Self-Reporting: Report number of protected/encrypted/unencrypted chats ([#5292](https://github.com/deltachat/deltachat-core-rust/pull/5292)).
+
+### Fixes
+
+- Don't send sync messages on self-{status,avatar} update from self-sent messages ([#5289](https://github.com/deltachat/deltachat-core-rust/pull/5289)).
+- imap: Allow `maybe_network` to interrupt connection ratelimit.
+- imap: Set connectivity to "connecting" only after ratelimit.
+- Remove `Group-ID` from `Message-ID`.
+- Prioritize protected `Message-ID` over `X-Microsoft-Original-Message-ID`.
+
+### API-Changes
+
+- Make `store_self_keypair` private.
+- Add `ContextBuilder.build()` to build Context without opening.
+- `dc_accounts_set_push_device_token` and `dc_get_push_state` APIs for iOS push notifications.
+
+### Build system
+
+- Tag armv6 wheels with tags accepted by PyPI.
+- Unpin OpenSSL.
+- Remove deprecated `unmaintained` field from deny.toml.
+- Do not vendor OpenSSL when cross-compiling ([#5316](https://github.com/deltachat/deltachat-core-rust/pull/5316)).
+- Increase MSRV to 1.74.0.
+
+### CI
+
+- Upgrade setup-python GitHub Action.
+- Update to Rust 1.76 and fix clippy warnings.
+- Build Python docs with Nix.
+- Upload python docs without GH actions.
+- Upload cffi docs without GH actions.
+- Build c.delta.chat docs with nix.
+
+### Other
+
+- refactor: move more methods from Imap into Session.
+- Add deltachat-time to sources.
+
+### Refactor
+
+- Remove Session from Imap structure.
+- Merge ImapConfig into Imap.
+- Get rid of ImapActionResult.
+- Build contexts using ContextBuilder.
+- Do not send `Secure-Join-Group` in `vg-request`.
+
+### Tests
+
+- Fix `test_verified_oneonone_chat_broken_by_device_change()` ([#5280](https://github.com/deltachat/deltachat-core-rust/pull/5280)).
+- `get_protected_chat()`: Use FFIEventTracker instead of `dc_wait_next_msgs()` ([#5207](https://github.com/deltachat/deltachat-core-rust/pull/5207)).
+- Fixup `tests/test_3_offline.py::TestOfflineAccountBasic::test_wrong_db`.
+- Fix pytest compat ([#5317](https://github.com/deltachat/deltachat-core-rust/pull/5317)).
+
 ## [1.135.1] - 2024-02-20
 
 ### Features / Changes
@@ -3617,3 +3697,6 @@ https://github.com/deltachat/deltachat-core-rust/pulls?q=is%3Apr+is%3Aclosed
 [1.134.0]: https://github.com/deltachat/deltachat-core-rust/compare/v1.133.2...v1.134.0
 [1.135.0]: https://github.com/deltachat/deltachat-core-rust/compare/v1.134.0...v1.135.0
 [1.135.1]: https://github.com/deltachat/deltachat-core-rust/compare/v1.135.0...v1.135.1
+[1.136.0]: https://github.com/deltachat/deltachat-core-rust/compare/v1.135.1...v1.136.0
+[1.136.1]: https://github.com/deltachat/deltachat-core-rust/compare/v1.136.0...v1.136.1
+[1.136.2]: https://github.com/deltachat/deltachat-core-rust/compare/v1.136.1...v1.136.2

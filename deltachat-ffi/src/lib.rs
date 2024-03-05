@@ -26,7 +26,7 @@ use anyhow::Context as _;
 use deltachat::chat::{ChatId, ChatVisibility, MessageListOptions, MuteDuration, ProtectionStatus};
 use deltachat::constants::DC_MSG_ID_LAST_SPECIAL;
 use deltachat::contact::{Contact, ContactId, Origin};
-use deltachat::context::Context;
+use deltachat::context::{Context, ContextBuilder};
 use deltachat::ephemeral::Timer as EphemeralTimer;
 use deltachat::imex::BackupProvider;
 use deltachat::key::preconfigure_keypair;
@@ -34,7 +34,6 @@ use deltachat::message::MsgId;
 use deltachat::qr_code_generator::{generate_backup_qr, get_securejoin_qr_svg};
 use deltachat::reaction::{get_msg_reactions, send_reaction, Reactions};
 use deltachat::stock_str::StockMessage;
-use deltachat::stock_str::StockStrings;
 use deltachat::webxdc::StatusUpdateSerial;
 use deltachat::*;
 use deltachat::{accounts::Accounts, log::LogExt};
@@ -104,12 +103,11 @@ pub unsafe extern "C" fn dc_context_new(
     let ctx = if blobdir.is_null() || *blobdir == 0 {
         // generate random ID as this functionality is not yet available on the C-api.
         let id = rand::thread_rng().gen();
-        block_on(Context::new(
-            as_path(dbfile),
-            id,
-            Events::new(),
-            StockStrings::new(),
-        ))
+        block_on(
+            ContextBuilder::new(as_path(dbfile).to_path_buf())
+                .with_id(id)
+                .open(),
+        )
     } else {
         eprintln!("blobdir can not be defined explicitly anymore");
         return ptr::null_mut();
@@ -133,12 +131,11 @@ pub unsafe extern "C" fn dc_context_new_closed(dbfile: *const libc::c_char) -> *
     }
 
     let id = rand::thread_rng().gen();
-    match block_on(Context::new_closed(
-        as_path(dbfile),
-        id,
-        Events::new(),
-        StockStrings::new(),
-    )) {
+    match block_on(
+        ContextBuilder::new(as_path(dbfile).to_path_buf())
+            .with_id(id)
+            .build(),
+    ) {
         Ok(context) => Box::into_raw(Box::new(context)),
         Err(err) => {
             eprintln!("failed to create context: {err:#}");
@@ -387,7 +384,7 @@ pub unsafe extern "C" fn dc_get_connectivity(context: *const dc_context_t) -> li
         return 0;
     }
     let ctx = &*context;
-    block_on(async move { ctx.get_connectivity().await as u32 as libc::c_int })
+    block_on(ctx.get_connectivity()) as u32 as libc::c_int
 }
 
 #[no_mangle]
@@ -408,6 +405,16 @@ pub unsafe extern "C" fn dc_get_connectivity_html(
             }
         }
     })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_get_push_state(context: *const dc_context_t) -> libc::c_int {
+    if context.is_null() {
+        eprintln!("ignoring careless call to dc_get_push_state()");
+        return 0;
+    }
+    let ctx = &*context;
+    block_on(ctx.push_state()) as libc::c_int
 }
 
 #[no_mangle]
@@ -4920,6 +4927,29 @@ pub unsafe extern "C" fn dc_accounts_background_fetch(
             .await;
     });
     1
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_accounts_set_push_device_token(
+    accounts: *mut dc_accounts_t,
+    token: *const libc::c_char,
+) {
+    if accounts.is_null() {
+        eprintln!("ignoring careless call to dc_accounts_set_push_device_token()");
+        return;
+    }
+
+    let accounts = &*accounts;
+    let token = to_string_lossy(token);
+
+    block_on(async move {
+        let mut accounts = accounts.write().await;
+        if let Err(err) = accounts.set_push_device_token(&token).await {
+            accounts.emit_event(EventType::Error(format!(
+                "Failed to set notify token: {err:#}."
+            )));
+        }
+    })
 }
 
 #[no_mangle]

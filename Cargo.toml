@@ -1,6 +1,6 @@
 [package]
 name = "deltachat"
-version = "1.135.1"
+version = "1.136.2"
 edition = "2021"
 license = "MPL-2.0"
 rust-version = "1.70"
@@ -56,7 +56,7 @@ futures-lite = "2.2.0"
 hex = "0.4.0"
 hickory-resolver = "0.24"
 humansize = "2"
-image = { version = "0.24.8", default-features=false, features = ["gif", "jpeg", "ico", "png", "pnm", "webp", "bmp"] }
+image = { version = "0.24.9", default-features=false, features = ["gif", "jpeg", "ico", "png", "pnm", "webp", "bmp"] }
 iroh = { version = "0.4.2", default-features = false }
 kamadak-exif = "0.5"
 lettre_email = { git = "https://github.com/deltachat/lettre", branch = "master" }
@@ -78,7 +78,7 @@ quoted_printable = "0.5"
 rand = "0.8"
 regex = "1.10"
 reqwest = { version = "0.11.24", features = ["json"] }
-rusqlite = { version = "0.30", features = ["sqlcipher"] }
+rusqlite = { version = "0.31", features = ["sqlcipher"] }
 rust-hsluv = "0.1"
 sanitize-filename = "0.5"
 serde_json = "1"
@@ -89,7 +89,7 @@ smallvec = "1"
 strum = "0.26"
 strum_macros = "0.26"
 tagger = "4.3.4"
-textwrap = "0.16.0"
+textwrap = "0.16.1"
 thiserror = "1"
 tokio = { version = "1", features = ["fs", "rt-multi-thread", "macros"] }
 tokio-io-timeout = "1.2.0"

@@ -1,6 +1,6 @@
 [package]
 name = "deltachat-repl"
-version = "1.135.1"
+version = "1.136.2"
 license = "MPL-2.0"
 edition = "2021"
 
@@ -9,9 +9,9 @@ ansi_term = "0.12.1"
 anyhow = "1"
 deltachat = { path = "..", features = ["internals"]}
 dirs = "5"
-log = "0.4.20"
+log = "0.4.21"
 pretty_env_logger = "0.5"
-rusqlite = "0.30"
+rusqlite = "0.31"
 rustyline = "13"
 tokio = { version = "1", features = ["fs", "rt-multi-thread", "macros"] }
 

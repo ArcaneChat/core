@@ -124,8 +124,7 @@ pub async fn get_securejoin_qr(context: &Context, group: Option<ChatId>) -> Resu
         )
     };
 
-    info!(context, "Generated QR code: {}", qr);
-
+    info!(context, "Generated QR code.");
     Ok(qr)
 }
 
@@ -296,6 +295,23 @@ pub(crate) async fn handle_securejoin_handshake(
 
     let join_vg = step.starts_with("vg-");
 
+    if !matches!(step.as_str(), "vg-request" | "vc-request") {
+        let mut self_found = false;
+        let self_fingerprint = load_self_public_key(context).await?.fingerprint();
+        for (addr, key) in &mime_message.gossiped_keys {
+            if key.fingerprint() == self_fingerprint && context.is_self_addr(addr).await? {
+                self_found = true;
+                break;
+            }
+        }
+        if !self_found {
+            // This message isn't intended for us. Possibly the peer doesn't own the key which the
+            // message is signed with but forwarded someone's message to us.
+            warn!(context, "Step {step}: No self addr+pubkey gossip found.");
+            return Ok(HandshakeMessage::Ignore);
+        }
+    }
+
     match step.as_str() {
         "vg-request" | "vc-request" => {
             /*=======================================================
@@ -398,7 +414,7 @@ pub(crate) async fn handle_securejoin_handshake(
                 .await?;
                 return Ok(HandshakeMessage::Ignore);
             };
-            if !token::exists(context, token::Namespace::Auth, auth).await? {
+            let Some(group_chat_id) = token::auth_chat_id(context, auth).await? else {
                 could_not_establish_secure_connection(
                     context,
                     contact_id,
@@ -407,7 +423,8 @@ pub(crate) async fn handle_securejoin_handshake(
                 )
                 .await?;
                 return Ok(HandshakeMessage::Ignore);
-            }
+            };
+
             let contact_addr = Contact::get_by_id(context, contact_id)
                 .await?
                 .get_addr()
@@ -435,41 +452,8 @@ pub(crate) async fn handle_securejoin_handshake(
             info!(context, "Auth verified.",);
             context.emit_event(EventType::ContactsChanged(Some(contact_id)));
             inviter_progress(context, contact_id, 600);
-            if join_vg {
-                // the vg-member-added message is special:
-                // this is a normal Chat-Group-Member-Added message
-                // with an additional Secure-Join header
-                let field_grpid = match mime_message.get_header(HeaderDef::SecureJoinGroup) {
-                    Some(s) => s.as_str(),
-                    None => {
-                        warn!(context, "Missing Secure-Join-Group header");
-                        return Ok(HandshakeMessage::Ignore);
-                    }
-                };
-                match chat::get_chat_id_by_grpid(context, field_grpid).await? {
-                    Some((group_chat_id, _, _)) => {
-                        secure_connection_established(
-                            context,
-                            contact_id,
-                            group_chat_id,
-                            mime_message.timestamp_sent,
-                        )
-                        .await?;
-                        chat::add_contact_to_chat_ex(
-                            context,
-                            Nosync,
-                            group_chat_id,
-                            contact_id,
-                            true,
-                        )
-                        .await?;
-                    }
-                    None => bail!("Chat {} not found", &field_grpid),
-                }
-                inviter_progress(context, contact_id, 800);
-                inviter_progress(context, contact_id, 1000);
-            } else {
-                // Alice -> Bob
+            if group_chat_id.is_unset() {
+                // Setup verified contact.
                 secure_connection_established(
                     context,
                     contact_id,
@@ -481,6 +465,19 @@ pub(crate) async fn handle_securejoin_handshake(
                     .await
                     .context("failed sending vc-contact-confirm message")?;
 
+                inviter_progress(context, contact_id, 1000);
+            } else {
+                // Join group.
+                secure_connection_established(
+                    context,
+                    contact_id,
+                    group_chat_id,
+                    mime_message.timestamp_sent,
+                )
+                .await?;
+                chat::add_contact_to_chat_ex(context, Nosync, group_chat_id, contact_id, true)
+                    .await?;
+                inviter_progress(context, contact_id, 800);
                 inviter_progress(context, contact_id, 1000);
             }
             Ok(HandshakeMessage::Ignore) // "Done" would delete the message and break multi-device (the key from Autocrypt-header is needed)
@@ -773,19 +770,32 @@ mod tests {
     use crate::tools::{EmailAddress, SystemTime};
     use std::time::Duration;
 
+    #[derive(PartialEq)]
+    enum SetupContactCase {
+        Normal,
+        CheckProtectionTimestamp,
+        WrongAliceGossip,
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_setup_contact() {
-        test_setup_contact_ex(false).await
+        test_setup_contact_ex(SetupContactCase::Normal).await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_setup_contact_protection_timestamp() {
-        test_setup_contact_ex(true).await
+        test_setup_contact_ex(SetupContactCase::CheckProtectionTimestamp).await
     }
 
-    async fn test_setup_contact_ex(check_protection_timestamp: bool) {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_setup_contact_wrong_alice_gossip() {
+        test_setup_contact_ex(SetupContactCase::WrongAliceGossip).await
+    }
+
+    async fn test_setup_contact_ex(case: SetupContactCase) {
         let mut tcm = TestContextManager::new();
         let alice = tcm.alice().await;
+        let alice_addr = &alice.get_config(Config::Addr).await.unwrap().unwrap();
         let bob = tcm.bob().await;
         alice
             .set_config(Config::VerifiedOneOnOneChats, Some("1"))
@@ -818,10 +828,7 @@ mod tests {
         );
 
         let sent = bob.pop_sent_msg().await;
-        assert_eq!(
-            sent.recipient(),
-            EmailAddress::new("alice@example.org").unwrap()
-        );
+        assert_eq!(sent.recipient(), EmailAddress::new(alice_addr).unwrap());
         let msg = alice.parse_msg(&sent).await;
         assert!(!msg.was_encrypted());
         assert_eq!(msg.get_header(HeaderDef::SecureJoin).unwrap(), "vc-request");
@@ -859,7 +866,7 @@ mod tests {
                 progress,
             } => {
                 let alice_contact_id =
-                    Contact::lookup_id_by_addr(&bob.ctx, "alice@example.org", Origin::Unknown)
+                    Contact::lookup_id_by_addr(&bob.ctx, alice_addr, Origin::Unknown)
                         .await
                         .expect("Error looking up contact")
                         .expect("Contact not found");
@@ -871,7 +878,7 @@ mod tests {
 
         // Check Bob sent the right message.
         let sent = bob.pop_sent_msg().await;
-        let msg = alice.parse_msg(&sent).await;
+        let mut msg = alice.parse_msg(&sent).await;
         let vc_request_with_auth_ts_sent = msg
             .get_header(HeaderDef::Date)
             .and_then(|value| mailparse::dateparse(value).ok())
@@ -888,6 +895,30 @@ mod tests {
             bob_fp.hex()
         );
 
+        if case == SetupContactCase::WrongAliceGossip {
+            let wrong_pubkey = load_self_public_key(&bob).await.unwrap();
+            let alice_pubkey = msg
+                .gossiped_keys
+                .insert(alice_addr.to_string(), wrong_pubkey)
+                .unwrap();
+            let contact_bob = alice.add_or_lookup_contact(&bob).await;
+            let handshake_msg = handle_securejoin_handshake(&alice, &msg, contact_bob.id)
+                .await
+                .unwrap();
+            assert_eq!(handshake_msg, HandshakeMessage::Ignore);
+            assert_eq!(contact_bob.is_verified(&alice.ctx).await.unwrap(), false);
+
+            msg.gossiped_keys
+                .insert(alice_addr.to_string(), alice_pubkey)
+                .unwrap();
+            let handshake_msg = handle_securejoin_handshake(&alice, &msg, contact_bob.id)
+                .await
+                .unwrap();
+            assert_eq!(handshake_msg, HandshakeMessage::Ignore);
+            assert!(contact_bob.is_verified(&alice.ctx).await.unwrap());
+            return;
+        }
+
         // Alice should not yet have Bob verified
         let contact_bob_id =
             Contact::lookup_id_by_addr(&alice.ctx, "bob@example.net", Origin::Unknown)
@@ -899,7 +930,7 @@ mod tests {
             .unwrap();
         assert_eq!(contact_bob.is_verified(&alice.ctx).await.unwrap(), false);
 
-        if check_protection_timestamp {
+        if case == SetupContactCase::CheckProtectionTimestamp {
             SystemTime::shift(Duration::from_secs(3600));
         }
 
@@ -928,7 +959,7 @@ mod tests {
             assert!(msg.is_info());
             let expected_text = chat_protection_enabled(&alice).await;
             assert_eq!(msg.get_text(), expected_text);
-            if check_protection_timestamp {
+            if case == SetupContactCase::CheckProtectionTimestamp {
                 assert_eq!(msg.timestamp_sort, vc_request_with_auth_ts_sent);
             }
         }
@@ -943,11 +974,10 @@ mod tests {
         );
 
         // Bob should not yet have Alice verified
-        let contact_alice_id =
-            Contact::lookup_id_by_addr(&bob.ctx, "alice@example.org", Origin::Unknown)
-                .await
-                .expect("Error looking up contact")
-                .expect("Contact not found");
+        let contact_alice_id = Contact::lookup_id_by_addr(&bob.ctx, alice_addr, Origin::Unknown)
+            .await
+            .expect("Error looking up contact")
+            .expect("Contact not found");
         let contact_alice = Contact::get_by_id(&bob.ctx, contact_alice_id)
             .await
             .unwrap();
@@ -1144,6 +1174,14 @@ mod tests {
         assert!(!msg.was_encrypted());
         assert_eq!(msg.get_header(HeaderDef::SecureJoin).unwrap(), "vg-request");
         assert!(msg.get_header(HeaderDef::SecureJoinInvitenumber).is_some());
+
+        // Old Delta Chat core sent `Secure-Join-Group` header in `vg-request`,
+        // but it was only used by Alice in `vg-request-with-auth`.
+        // New Delta Chat versions do not use `Secure-Join-Group` header at all
+        // and it is deprecated.
+        // Now `Secure-Join-Group` header
+        // is only sent in `vg-request-with-auth` for compatibility.
+        assert!(msg.get_header(HeaderDef::SecureJoinGroup).is_none());
 
         // Step 3: Alice receives vg-request, sends vg-auth-required
         alice.recv_msg(&sent).await;

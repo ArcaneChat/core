@@ -20,14 +20,17 @@ use crate::config::Config;
 use crate::constants::{
     self, DC_BACKGROUND_FETCH_QUOTA_CHECK_RATELIMIT, DC_CHAT_ID_TRASH, DC_VERSION_STR,
 };
-use crate::contact::Contact;
+use crate::contact::{Contact, ContactId};
 use crate::debug_logging::DebugLogging;
+use crate::download::DownloadState;
 use crate::events::{Event, EventEmitter, EventType, Events};
 use crate::imap::{FolderMeaning, Imap, ServerMetadata};
 use crate::key::{load_self_public_key, load_self_secret_key, DcKey as _};
 use crate::login_param::LoginParam;
 use crate::message::{self, Message, MessageState, MsgId, Viewtype};
+use crate::param::{Param, Params};
 use crate::peerstate::Peerstate;
+use crate::push::PushSubscriber;
 use crate::quota::QuotaInfo;
 use crate::scheduler::{convert_folder_meaning, SchedulerState};
 use crate::sql::Sql;
@@ -84,6 +87,8 @@ pub struct ContextBuilder {
     events: Events,
     stock_strings: StockStrings,
     password: Option<String>,
+
+    push_subscriber: Option<PushSubscriber>,
 }
 
 impl ContextBuilder {
@@ -99,6 +104,7 @@ impl ContextBuilder {
             events: Events::new(),
             stock_strings: StockStrings::new(),
             password: None,
+            push_subscriber: None,
         }
     }
 
@@ -153,11 +159,32 @@ impl ContextBuilder {
         self
     }
 
-    /// Opens the [`Context`].
+    /// Sets push subscriber.
+    pub(crate) fn with_push_subscriber(mut self, push_subscriber: PushSubscriber) -> Self {
+        self.push_subscriber = Some(push_subscriber);
+        self
+    }
+
+    /// Builds the [`Context`] without opening it.
+    pub async fn build(self) -> Result<Context> {
+        let push_subscriber = self.push_subscriber.unwrap_or_default();
+        let context = Context::new_closed(
+            &self.dbfile,
+            self.id,
+            self.events,
+            self.stock_strings,
+            push_subscriber,
+        )
+        .await?;
+        Ok(context)
+    }
+
+    /// Builds the [`Context`] and opens it.
+    ///
+    /// Returns error if context cannot be opened with the given passphrase.
     pub async fn open(self) -> Result<Context> {
-        let context =
-            Context::new_closed(&self.dbfile, self.id, self.events, self.stock_strings).await?;
-        let password = self.password.unwrap_or_default();
+        let password = self.password.clone().unwrap_or_default();
+        let context = self.build().await?;
         match context.open(password).await? {
             true => Ok(context),
             false => bail!("database could not be decrypted, incorrect or missing password"),
@@ -253,6 +280,13 @@ pub struct InnerContext {
     /// Standard RwLock instead of [`tokio::sync::RwLock`] is used
     /// because the lock is used from synchronous [`Context::emit_event`].
     pub(crate) debug_logging: std::sync::RwLock<Option<DebugLogging>>,
+
+    /// Push subscriber to store device token
+    /// and register for heartbeat notifications.
+    pub(crate) push_subscriber: PushSubscriber,
+
+    /// True if account has subscribed to push notifications via IMAP.
+    pub(crate) push_subscribed: AtomicBool,
 }
 
 /// The state of ongoing process.
@@ -298,7 +332,8 @@ impl Context {
         events: Events,
         stock_strings: StockStrings,
     ) -> Result<Context> {
-        let context = Self::new_closed(dbfile, id, events, stock_strings).await?;
+        let context =
+            Self::new_closed(dbfile, id, events, stock_strings, Default::default()).await?;
 
         // Open the database if is not encrypted.
         if context.check_passphrase("".to_string()).await? {
@@ -313,6 +348,7 @@ impl Context {
         id: u32,
         events: Events,
         stockstrings: StockStrings,
+        push_subscriber: PushSubscriber,
     ) -> Result<Context> {
         let mut blob_fname = OsString::new();
         blob_fname.push(dbfile.file_name().unwrap_or_default());
@@ -321,7 +357,14 @@ impl Context {
         if !blobdir.exists() {
             tokio::fs::create_dir_all(&blobdir).await?;
         }
-        let context = Context::with_blobdir(dbfile.into(), blobdir, id, events, stockstrings)?;
+        let context = Context::with_blobdir(
+            dbfile.into(),
+            blobdir,
+            id,
+            events,
+            stockstrings,
+            push_subscriber,
+        )?;
         Ok(context)
     }
 
@@ -364,6 +407,7 @@ impl Context {
         id: u32,
         events: Events,
         stockstrings: StockStrings,
+        push_subscriber: PushSubscriber,
     ) -> Result<Context> {
         ensure!(
             blobdir.is_dir(),
@@ -398,6 +442,8 @@ impl Context {
             last_full_folder_scan: Mutex::new(None),
             last_error: std::sync::RwLock::new("".to_string()),
             debug_logging: std::sync::RwLock::new(None),
+            push_subscriber,
+            push_subscribed: AtomicBool::new(false),
         };
 
         let ctx = Context {
@@ -461,13 +507,13 @@ impl Context {
 
         // connection
         let mut connection = Imap::new_configured(self, channel::bounded(1).1).await?;
-        connection.prepare(self).await?;
+        let mut session = connection.prepare(self).await?;
 
         // fetch imap folders
         for folder_meaning in [FolderMeaning::Inbox, FolderMeaning::Mvbox] {
             let (_, watch_folder) = convert_folder_meaning(self, folder_meaning).await?;
             connection
-                .fetch_move_delete(self, &watch_folder, folder_meaning)
+                .fetch_move_delete(self, &mut session, &watch_folder, folder_meaning)
                 .await?;
         }
 
@@ -484,7 +530,7 @@ impl Context {
         };
 
         if quota_needs_update {
-            if let Err(err) = self.update_recent_quota(&mut connection).await {
+            if let Err(err) = self.update_recent_quota(&mut session).await {
                 warn!(self, "Failed to update quota: {err:#}.");
             }
         }
@@ -879,6 +925,16 @@ impl Context {
     }
 
     async fn get_self_report(&self) -> Result<String> {
+        #[derive(Default)]
+        struct ChatNumbers {
+            protected: u32,
+            protection_broken: u32,
+            opportunistic_dc: u32,
+            opportunistic_mua: u32,
+            unencrypted_dc: u32,
+            unencrypted_mua: u32,
+        }
+
         let mut res = String::new();
         res += &format!("core_version DeltaLab-{}\n", get_version_str());
 
@@ -905,6 +961,76 @@ impl Context {
         let secret_key = &load_self_secret_key(self).await?.primary_key;
         let key_created = secret_key.created_at().timestamp();
         res += &format!("key_created {}\n", key_created);
+
+        // how many of the chats active in the last months are:
+        // - protected
+        // - protection-broken
+        // - opportunistic-encrypted and the contact uses Delta Chat
+        // - opportunistic-encrypted and the contact uses a classical MUA
+        // - unencrypted and the contact uses Delta Chat
+        // - unencrypted and the contact uses a classical MUA
+        let three_months_ago = time().saturating_sub(3600 * 24 * 30 * 3);
+        let chats = self
+            .sql
+            .query_map(
+                "SELECT c.protected, m.param, m.msgrmsg
+                    FROM chats c
+                    JOIN msgs m
+                        ON c.id=m.chat_id
+                        AND m.id=(
+                                SELECT id
+                                FROM msgs
+                                WHERE chat_id=c.id
+                                AND hidden=0
+                                AND download_state=?
+                                AND to_id!=?
+                                ORDER BY timestamp DESC, id DESC LIMIT 1)
+                    WHERE c.id>9
+                    AND (c.blocked=0 OR c.blocked=2)
+                    AND IFNULL(m.timestamp,c.created_timestamp) > ?
+                    GROUP BY c.id",
+                (DownloadState::Done, ContactId::INFO, three_months_ago),
+                |row| {
+                    let protected: ProtectionStatus = row.get(0)?;
+                    let message_param: Params =
+                        row.get::<_, String>(1)?.parse().unwrap_or_default();
+                    let is_dc_message: bool = row.get(2)?;
+                    Ok((protected, message_param, is_dc_message))
+                },
+                |rows| {
+                    let mut chats = ChatNumbers::default();
+                    for row in rows {
+                        let (protected, message_param, is_dc_message) = row?;
+                        let encrypted = message_param
+                            .get_bool(Param::GuaranteeE2ee)
+                            .unwrap_or(false);
+
+                        if protected == ProtectionStatus::Protected {
+                            chats.protected += 1;
+                        } else if protected == ProtectionStatus::ProtectionBroken {
+                            chats.protection_broken += 1;
+                        } else if encrypted {
+                            if is_dc_message {
+                                chats.opportunistic_dc += 1;
+                            } else {
+                                chats.opportunistic_mua += 1;
+                            }
+                        } else if is_dc_message {
+                            chats.unencrypted_dc += 1;
+                        } else {
+                            chats.unencrypted_mua += 1;
+                        }
+                    }
+                    Ok(chats)
+                },
+            )
+            .await?;
+        res += &format!("chats_protected {}\n", chats.protected);
+        res += &format!("chats_protection_broken {}\n", chats.protection_broken);
+        res += &format!("chats_opportunistic_dc {}\n", chats.opportunistic_dc);
+        res += &format!("chats_opportunistic_mua {}\n", chats.opportunistic_mua);
+        res += &format!("chats_unencrypted_dc {}\n", chats.unencrypted_dc);
+        res += &format!("chats_unencrypted_mua {}\n", chats.unencrypted_mua);
 
         let self_reporting_id = match self.get_config(Config::SelfReportingId).await? {
             Some(id) => id,
@@ -1271,7 +1397,7 @@ mod tests {
              \n\
              hello\n",
             contact.get_addr(),
-            create_outgoing_rfc724_mid(None, contact.get_addr())
+            create_outgoing_rfc724_mid(contact.get_addr())
         );
         println!("{msg}");
         receive_imf(t, msg.as_bytes(), false).await.unwrap();
@@ -1421,7 +1547,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dbfile = tmp.path().join("db.sqlite");
         let blobdir = PathBuf::new();
-        let res = Context::with_blobdir(dbfile, blobdir, 1, Events::new(), StockStrings::new());
+        let res = Context::with_blobdir(
+            dbfile,
+            blobdir,
+            1,
+            Events::new(),
+            StockStrings::new(),
+            Default::default(),
+        );
         assert!(res.is_err());
     }
 
@@ -1430,7 +1563,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dbfile = tmp.path().join("db.sqlite");
         let blobdir = tmp.path().join("blobs");
-        let res = Context::with_blobdir(dbfile, blobdir, 1, Events::new(), StockStrings::new());
+        let res = Context::with_blobdir(
+            dbfile,
+            blobdir,
+            1,
+            Events::new(),
+            StockStrings::new(),
+            Default::default(),
+        );
         assert!(res.is_err());
     }
 
@@ -1653,16 +1793,18 @@ mod tests {
         let dir = tempdir()?;
         let dbfile = dir.path().join("db.sqlite");
 
-        let id = 1;
-        let context = Context::new_closed(&dbfile, id, Events::new(), StockStrings::new())
+        let context = ContextBuilder::new(dbfile.clone())
+            .with_id(1)
+            .build()
             .await
             .context("failed to create context")?;
         assert_eq!(context.open("foo".to_string()).await?, true);
         assert_eq!(context.is_open().await, true);
         drop(context);
 
-        let id = 2;
-        let context = Context::new(&dbfile, id, Events::new(), StockStrings::new())
+        let context = ContextBuilder::new(dbfile)
+            .with_id(2)
+            .build()
             .await
             .context("failed to create context")?;
         assert_eq!(context.is_open().await, false);
@@ -1678,8 +1820,9 @@ mod tests {
         let dir = tempdir()?;
         let dbfile = dir.path().join("db.sqlite");
 
-        let id = 1;
-        let context = Context::new_closed(&dbfile, id, Events::new(), StockStrings::new())
+        let context = ContextBuilder::new(dbfile)
+            .with_id(1)
+            .build()
             .await
             .context("failed to create context")?;
         assert_eq!(context.open("foo".to_string()).await?, true);

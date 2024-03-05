@@ -265,12 +265,26 @@ impl MimeMessage {
                 for field in &part.headers {
                     let key = field.get_key().to_lowercase();
 
-                    // For now only Chat-User-Avatar can be hidden.
-                    if !headers.contains_key(&key) && key == "chat-user-avatar" {
+                    // For now only avatar headers can be hidden.
+                    if !headers.contains_key(&key)
+                        && (key == "chat-user-avatar" || key == "chat-group-avatar")
+                    {
                         headers.insert(key.to_string(), field.get_value());
                     }
                 }
             }
+        }
+
+        // Overwrite Message-ID with X-Microsoft-Original-Message-ID.
+        // However if we later find Message-ID in the protected part,
+        // it will overwrite both.
+        if let Some(microsoft_message_id) =
+            headers.remove(HeaderDef::XMicrosoftOriginalMessageId.get_headername())
+        {
+            headers.insert(
+                HeaderDef::MessageId.get_headername().to_string(),
+                microsoft_message_id,
+            );
         }
 
         // Remove headers that are allowed _only_ in the encrypted+signed part. It's ok to leave
@@ -290,7 +304,8 @@ impl MimeMessage {
         hop_info += "\n\n";
         hop_info += &decryption_info.dkim_results.to_string();
 
-        let public_keyring = keyring_from_peerstate(decryption_info.peerstate.as_ref());
+        let public_keyring =
+            keyring_from_peerstate(context, decryption_info.peerstate.as_ref()).await?;
         let (mail, mut signatures, encrypted) = match tokio::task::block_in_place(|| {
             try_decrypt(&mail, &private_keyring, &public_keyring)
         }) {
@@ -333,9 +348,20 @@ impl MimeMessage {
                     gossip_headers,
                 )
                 .await?;
-                // Remove unsigned subject from messages displayed with padlock.
-                // See <https://github.com/deltachat/deltachat-core-rust/issues/1790>.
-                headers.remove("subject");
+                // Remove unsigned opportunistically protected headers from messages considered
+                // Autocrypt-encrypted / displayed with padlock.
+                // For "Subject" see <https://github.com/deltachat/deltachat-core-rust/issues/1790>.
+                for h in [
+                    HeaderDef::Subject,
+                    HeaderDef::ChatGroupId,
+                    HeaderDef::ChatGroupName,
+                    HeaderDef::ChatGroupNameChanged,
+                    HeaderDef::ChatGroupAvatar,
+                    HeaderDef::ChatGroupMemberRemoved,
+                    HeaderDef::ChatGroupMemberAdded,
+                ] {
+                    headers.remove(h.get_headername());
+                }
             }
 
             // let known protected headers from the decrypted
@@ -363,13 +389,20 @@ impl MimeMessage {
                     // signed part, but it doesn't match the outer one.
                     // This _might_ be because the sender's mail server
                     // replaced the sending address, e.g. in a mailing list.
-                    // Or it's because someone is doing some replay attack
-                    // - OTOH, I can't come up with an attack scenario
-                    // where this would be useful.
+                    // Or it's because someone is doing some replay attack.
+                    // Resending encrypted messages via mailing lists
+                    // without reencrypting is not useful anyway,
+                    // so we return an error below.
                     warn!(
                         context,
                         "From header in signed part doesn't match the outer one",
                     );
+
+                    // Return an error from the parser.
+                    // This will result in creating a tombstone
+                    // and no further message processing
+                    // as if the MIME structure is broken.
+                    bail!("From header is forged");
                 }
             }
         }
@@ -488,7 +521,7 @@ impl MimeMessage {
 
     /// Parses system messages.
     fn parse_system_message_headers(&mut self, context: &Context) {
-        if self.get_header(HeaderDef::AutocryptSetupMessage).is_some() {
+        if self.get_header(HeaderDef::AutocryptSetupMessage).is_some() && !self.incoming {
             self.parts.retain(|part| {
                 part.mimetype.is_none()
                     || part.mimetype.as_ref().unwrap().as_ref() == MIME_AC_SETUP_FILE
@@ -1375,14 +1408,22 @@ impl MimeMessage {
     }
 
     pub(crate) fn get_rfc724_mid(&self) -> Option<String> {
-        self.get_header(HeaderDef::XMicrosoftOriginalMessageId)
-            .or_else(|| self.get_header(HeaderDef::MessageId))
+        self.get_header(HeaderDef::MessageId)
             .and_then(|msgid| parse_message_id(msgid).ok())
     }
 
     fn remove_secured_headers(headers: &mut HashMap<String, String>) {
         headers.remove("secure-join-fingerprint");
+        headers.remove("secure-join-auth");
         headers.remove("chat-verified");
+        headers.remove("autocrypt-gossip");
+
+        // Secure-Join is secured unless it is an initial "vc-request"/"vg-request".
+        if let Some(secure_join) = headers.remove("secure-join") {
+            if secure_join == "vc-request" || secure_join == "vg-request" {
+                headers.insert("secure-join".to_string(), secure_join);
+            }
+        }
     }
 
     fn merge_headers(
@@ -1807,6 +1848,8 @@ pub(crate) fn parse_message_id(ids: &str) -> Result<String> {
     }
 }
 
+/// Returns true if the header overwrites outer header
+/// when it comes from protected headers.
 fn is_known(key: &str) -> bool {
     matches!(
         key,
@@ -1822,6 +1865,7 @@ fn is_known(key: &str) -> bool {
             | "in-reply-to"
             | "references"
             | "subject"
+            | "secure-join"
     )
 }
 
@@ -2210,11 +2254,12 @@ mod tests {
 
     use super::*;
     use crate::{
+        chat,
         chatlist::Chatlist,
         constants::{Blocked, DC_DESIRED_TEXT_LEN, DC_ELLIPSIS},
         message::{Message, MessageState, MessengerMessage},
         receive_imf::receive_imf,
-        test_utils::TestContext,
+        test_utils::{TestContext, TestContextManager},
         tools::time,
     };
 
@@ -3531,6 +3576,29 @@ On 2020-10-25, Bob wrote:
             message.get_rfc724_mid(),
             Some("Mr.6Dx7ITn4w38.n9j7epIcuQI@outlook.com".to_string())
         );
+    }
+
+    /// Tests that X-Microsoft-Original-Message-ID does not overwrite encrypted Message-ID.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_x_microsoft_original_message_id_precedence() -> Result<()> {
+        let mut tcm = TestContextManager::new();
+        let alice = tcm.alice().await;
+        let bob = tcm.bob().await;
+
+        let bob_chat_id = tcm.send_recv_accept(&alice, &bob, "hi").await.chat_id;
+        chat::send_text_msg(&bob, bob_chat_id, "hi!".to_string()).await?;
+        let mut sent_msg = bob.pop_sent_msg().await;
+
+        // Insert X-Microsoft-Original-Message-ID.
+        // It should be ignored because there is a Message-ID in the encrypted part.
+        sent_msg.payload = sent_msg.payload.replace(
+            "Message-ID:",
+            "X-Microsoft-Original-Message-ID: <fake-message-id@example.net>\r\nMessage-ID:",
+        );
+
+        let msg = alice.recv_msg(&sent_msg).await;
+        assert!(!msg.rfc724_mid.contains("fake-message-id"));
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

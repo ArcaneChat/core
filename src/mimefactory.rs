@@ -359,20 +359,25 @@ impl<'a> MimeFactory<'a> {
         }
     }
 
-    async fn should_do_gossip(&self, context: &Context) -> Result<bool> {
+    async fn should_do_gossip(&self, context: &Context, multiple_recipients: bool) -> Result<bool> {
         match &self.loaded {
             Loaded::Message { chat } => {
-                // beside key- and member-changes, force a periodic re-gossip.
-                let gossiped_timestamp = chat.id.get_gossiped_timestamp(context).await?;
-                let gossip_period = context.get_config_i64(Config::GossipPeriod).await?;
-                if time() >= gossiped_timestamp + gossip_period {
+                let cmd = self.msg.param.get_cmd();
+                if cmd == SystemMessage::MemberAddedToGroup
+                    || cmd == SystemMessage::SecurejoinMessage
+                {
                     Ok(true)
+                } else if multiple_recipients {
+                    // beside key- and member-changes, force a periodic re-gossip.
+                    let gossiped_timestamp = chat.id.get_gossiped_timestamp(context).await?;
+                    let gossip_period = context.get_config_i64(Config::GossipPeriod).await?;
+                    if time() >= gossiped_timestamp + gossip_period {
+                        Ok(true)
+                    } else {
+                        Ok(false)
+                    }
                 } else {
-                    let cmd = self.msg.param.get_cmd();
-                    // Do gossip in all Securejoin messages not to complicate the code. There's no
-                    // need in gossips in "vg-auth-required" messages f.e., but let them be.
-                    Ok(cmd == SystemMessage::MemberAddedToGroup
-                        || cmd == SystemMessage::SecurejoinMessage)
+                    Ok(false)
                 }
             }
             Loaded::Mdn { .. } => Ok(false),
@@ -546,7 +551,7 @@ impl<'a> MimeFactory<'a> {
 
         let rfc724_mid = match self.loaded {
             Loaded::Message { .. } => self.msg.rfc724_mid.clone(),
-            Loaded::Mdn { .. } => create_outgoing_rfc724_mid(None, &self.from_addr),
+            Loaded::Mdn { .. } => create_outgoing_rfc724_mid(&self.from_addr),
         };
         let rfc724_mid_headervalue = render_rfc724_mid(&rfc724_mid);
         let rfc724_mid_header = Header::new("Message-ID".into(), rfc724_mid_headervalue);
@@ -693,9 +698,9 @@ impl<'a> MimeFactory<'a> {
                 .fold(message, |message, header| message.header(header));
 
             // Add gossip headers in chats with multiple recipients
-            if (peerstates.len() > 1 || context.get_config_bool(Config::BccSelf).await?)
-                && self.should_do_gossip(context).await?
-            {
+            let multiple_recipients =
+                peerstates.len() > 1 || context.get_config_bool(Config::BccSelf).await?;
+            if self.should_do_gossip(context, multiple_recipients).await? {
                 for peerstate in peerstates.iter().filter_map(|(state, _)| state.as_ref()) {
                     if let Some(header) = peerstate.render_gossip_header(verified) {
                         message = message.header(Header::new("Autocrypt-Gossip".into(), header));
@@ -729,8 +734,12 @@ impl<'a> MimeFactory<'a> {
                 );
             }
 
+            // Disable compression for SecureJoin to ensure
+            // there are no compression side channels
+            // leaking information about the tokens.
+            let compress = self.msg.param.get_cmd() != SystemMessage::SecurejoinMessage;
             let encrypted = encrypt_helper
-                .encrypt(context, verified, message, peerstates)
+                .encrypt(context, verified, message, peerstates, compress)
                 .await?;
 
             outer_message
@@ -928,7 +937,6 @@ impl<'a> MimeFactory<'a> {
         };
         let command = self.msg.param.get_cmd();
         let mut placeholdertext = None;
-        let mut meta_part = None;
 
         let send_verified_headers = match chat.typ {
             Chattype::Single => true,
@@ -1114,17 +1122,13 @@ impl<'a> MimeFactory<'a> {
 
         if let Some(grpimage) = grpimage {
             info!(context, "setting group image '{}'", grpimage);
-            let mut meta = Message {
-                viewtype: Viewtype::Image,
-                ..Default::default()
-            };
-            meta.param.set(Param::File, grpimage);
-
-            let (mail, filename_as_sent) = build_body_file(context, &meta, "group-image").await?;
-            meta_part = Some(mail);
-            headers
-                .protected
-                .push(Header::new("Chat-Group-Avatar".into(), filename_as_sent));
+            let avatar = build_avatar_file(context, grpimage)
+                .await
+                .context("Cannot attach group image")?;
+            headers.hidden.push(Header::new(
+                "Chat-Group-Avatar".into(),
+                format!("base64:{avatar}"),
+            ));
         }
 
         if self.msg.viewtype == Viewtype::Sticker {
@@ -1248,10 +1252,6 @@ impl<'a> MimeFactory<'a> {
             parts.push(file_part);
         }
 
-        if let Some(meta_part) = meta_part {
-            parts.push(meta_part);
-        }
-
         if let Some(msg_kml_part) = self.get_message_kml_part() {
             parts.push(msg_kml_part);
         }
@@ -1283,7 +1283,7 @@ impl<'a> MimeFactory<'a> {
 
         if self.attach_selfavatar {
             match context.get_config(Config::Selfavatar).await? {
-                Some(path) => match build_selfavatar_file(context, &path).await {
+                Some(path) => match build_avatar_file(context, &path).await {
                     Ok(avatar) => headers.hidden.push(Header::new(
                         "Chat-User-Avatar".into(),
                         format!("base64:{avatar}"),
@@ -1492,8 +1492,11 @@ async fn build_body_file(
     Ok((mail, filename_to_send))
 }
 
-async fn build_selfavatar_file(context: &Context, path: &str) -> Result<String> {
-    let blob = BlobObject::from_path(context, path.as_ref())?;
+async fn build_avatar_file(context: &Context, path: &str) -> Result<String> {
+    let blob = match path.starts_with("$BLOBDIR/") {
+        true => BlobObject::from_name(context, path.to_string())?,
+        false => BlobObject::from_path(context, path.as_ref())?,
+    };
     let body = fs::read(blob.to_abs_path()).await?;
     let encoded_body = wrapped_base64_encode(&body);
     Ok(encoded_body)

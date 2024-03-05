@@ -827,7 +827,7 @@ mod tests {
     use crate::key;
     use crate::pgp::{split_armored_data, HEADER_AUTOCRYPT, HEADER_SETUPCODE};
     use crate::stock_str::StockMessage;
-    use crate::test_utils::{alice_keypair, TestContext};
+    use crate::test_utils::{alice_keypair, TestContext, TestContextManager};
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_render_setup_file() {
@@ -1095,6 +1095,10 @@ mod tests {
     const S_EM_SETUPCODE: &str = "1742-0185-6197-1303-7016-8412-3581-4441-0597";
     const S_EM_SETUPFILE: &str = include_str!("../test-data/message/stress.txt");
 
+    // Autocrypt Setup Message payload "encrypted" with plaintext algorithm.
+    const S_PLAINTEXT_SETUPFILE: &str =
+        include_str!("../test-data/message/plaintext-autocrypt-setup.txt");
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_split_and_decrypt() {
         let buf_1 = S_EM_SETUPFILE.as_bytes().to_vec();
@@ -1118,6 +1122,23 @@ mod tests {
         assert!(headers.get(HEADER_SETUPCODE).is_none());
     }
 
+    /// Tests that Autocrypt Setup Message encrypted with "plaintext" algorithm cannot be
+    /// decrypted.
+    ///
+    /// According to <https://datatracker.ietf.org/doc/html/rfc4880#section-13.4>
+    /// "Implementations MUST NOT use plaintext in Symmetrically Encrypted Data packets".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_decrypt_plaintext_autocrypt_setup_message() {
+        let setup_file = S_PLAINTEXT_SETUPFILE.to_string();
+        let incorrect_setupcode = "0000-0000-0000-0000-0000-0000-0000-0000-0000";
+        assert!(decrypt_setup_file(
+            incorrect_setupcode,
+            std::io::Cursor::new(setup_file.as_bytes()),
+        )
+        .await
+        .is_err());
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_key_transfer() -> Result<()> {
         let alice = TestContext::new_alice().await;
@@ -1133,6 +1154,7 @@ mod tests {
         alice2.configure_addr("alice@example.org").await;
         alice2.recv_msg(&sent).await;
         let msg = alice2.get_last_msg().await;
+        assert!(msg.is_setupmessage());
 
         // Send a message that cannot be decrypted because the keys are
         // not synchronized yet.
@@ -1147,6 +1169,27 @@ mod tests {
         let sent = alice2.send_text(msg.chat_id, "Test").await;
         alice.recv_msg(&sent).await;
         assert_eq!(alice.get_last_msg().await.get_text(), "Test");
+
+        Ok(())
+    }
+
+    /// Tests that Autocrypt Setup Messages is only clickable if it is self-sent.
+    /// This prevents Bob from tricking Alice into changing the key
+    /// by sending her an Autocrypt Setup Message as long as Alice's server
+    /// does not allow to forge the `From:` header.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_key_transfer_non_self_sent() -> Result<()> {
+        let mut tcm = TestContextManager::new();
+        let alice = tcm.alice().await;
+        let bob = tcm.bob().await;
+
+        let _setup_code = initiate_key_transfer(&alice).await?;
+
+        // Get Autocrypt Setup Message.
+        let sent = alice.pop_sent_msg().await;
+
+        let rcvd = bob.recv_msg(&sent).await;
+        assert!(!rcvd.is_setupmessage());
 
         Ok(())
     }

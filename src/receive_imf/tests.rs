@@ -12,6 +12,7 @@ use crate::config::Config;
 use crate::constants::{DC_GCL_FOR_FORWARDING, DC_GCL_NO_SPECIALS};
 use crate::download::{DownloadState, MIN_DOWNLOAD_LIMIT};
 use crate::imap::prefetch_should_download;
+use crate::imex::{imex, ImexMode};
 use crate::message::{self, Message};
 use crate::test_utils::{get_chat_msg, TestContext, TestContextManager};
 
@@ -1692,7 +1693,7 @@ async fn test_in_reply_to_two_member_group() {
                  Subject: foo\n\
                  Message-ID: <message@example.org>\n\
                  Chat-Version: 1.0\n\
-                 Chat-Group-ID: foo\n\
+                 Chat-Group-ID: foobarbaz12\n\
                  Chat-Group-Name: foo\n\
                  Date: Sun, 22 Mar 2020 22:37:57 +0000\n\
                  \n\
@@ -1737,7 +1738,7 @@ async fn test_in_reply_to_two_member_group() {
                  Message-ID: <chatreply@example.org>\n\
                  In-Reply-To: <message@example.org>\n\
                  Chat-Version: 1.0\n\
-                 Chat-Group-ID: foo\n\
+                 Chat-Group-ID: foobarbaz12\n\
                  Date: Sun, 22 Mar 2020 22:37:57 +0000\n\
                  \n\
                  chat reply\n",
@@ -3546,6 +3547,32 @@ async fn test_mua_user_adds_recipient_to_single_chat() -> Result<()> {
     Ok(())
 }
 
+/// If a message is Autocrypt-encrypted, unsigned Chat-Group-* headers have no effect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_unsigned_chat_group_hdr() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+    let bob_addr = bob.get_config(Config::Addr).await?.unwrap();
+    let bob_id = Contact::create(alice, "Bob", &bob_addr).await?;
+    let alice_chat_id = create_group_chat(alice, ProtectionStatus::Unprotected, "foos").await?;
+    add_contact_to_chat(alice, alice_chat_id, bob_id).await?;
+    send_text_msg(alice, alice_chat_id, "populate".to_string()).await?;
+    let sent_msg = alice.pop_sent_msg().await;
+    let bob_chat_id = bob.recv_msg(&sent_msg).await.chat_id;
+    bob_chat_id.accept(bob).await?;
+    send_text_msg(bob, bob_chat_id, "hi all!".to_string()).await?;
+    let mut sent_msg = bob.pop_sent_msg().await;
+    sent_msg.payload = sent_msg.payload.replace(
+        "Chat-Version:",
+        &format!("Chat-Group-Member-Removed: {bob_addr}\r\nChat-Version:"),
+    );
+    let chat_id = alice.recv_msg(&sent_msg).await.chat_id;
+    assert_eq!(chat_id, alice_chat_id);
+    assert_eq!(get_chat_contacts(alice, alice_chat_id).await?.len(), 2);
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_sync_member_list_on_rejoin() -> Result<()> {
     let mut tcm = TestContextManager::new();
@@ -4016,6 +4043,37 @@ async fn test_download_later() -> Result<()> {
     Ok(())
 }
 
+/// Malice can pretend they have the same address as Alice and sends a message encrypted to Alice's
+/// key but signed with another one. Alice must detect that this message is wrongly signed and not
+/// treat it as Autocrypt-encrypted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_outgoing_msg_forgery() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let export_dir = tempfile::tempdir().unwrap();
+    let alice = &tcm.alice().await;
+    let alice_addr = &alice.get_config(Config::Addr).await?.unwrap();
+    imex(alice, ImexMode::ExportSelfKeys, export_dir.path(), None).await?;
+    // We need Bob only to encrypt the forged message to Alice's key, actually Bob doesn't
+    // participate in the scenario.
+    let bob = &TestContext::new().await;
+    bob.configure_addr("bob@example.net").await;
+    imex(bob, ImexMode::ImportSelfKeys, export_dir.path(), None).await?;
+    let malice = &TestContext::new().await;
+    malice.configure_addr(alice_addr).await;
+
+    let malice_chat_id = tcm
+        .send_recv_accept(bob, malice, "hi from bob")
+        .await
+        .chat_id;
+
+    let sent_msg = malice.send_text(malice_chat_id, "hi from malice").await;
+    let msg = alice.recv_msg(&sent_msg).await;
+    assert_eq!(msg.state, MessageState::OutDelivered);
+    assert!(!msg.get_showpadlock());
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_create_group_with_big_msg() -> Result<()> {
     let mut tcm = TestContextManager::new();
@@ -4207,5 +4265,24 @@ Chat-Group-Member-Added: charlie@example.com",
     assert_eq!(timestamp3, timestamp4);
     assert_eq!(get_chat_contacts(&bob, bob_chat_id).await?, contacts);
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_forged_from() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = tcm.alice().await;
+    let bob = tcm.bob().await;
+
+    let bob_chat_id = tcm.send_recv_accept(&alice, &bob, "hi").await.chat_id;
+    chat::send_text_msg(&bob, bob_chat_id, "hi!".to_string()).await?;
+
+    let mut sent_msg = bob.pop_sent_msg().await;
+    sent_msg.payload = sent_msg
+        .payload
+        .replace("bob@example.net", "notbob@example.net");
+
+    let msg = alice.recv_msg(&sent_msg).await;
+    assert!(msg.chat_id.is_trash());
     Ok(())
 }

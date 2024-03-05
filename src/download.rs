@@ -3,13 +3,13 @@
 use std::cmp::max;
 use std::collections::BTreeMap;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use deltachat_derive::{FromSql, ToSql};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::context::Context;
-use crate::imap::{Imap, ImapActionResult};
+use crate::imap::session::Session;
 use crate::message::{Message, MsgId, Viewtype};
 use crate::mimeparser::{MimeMessage, Part};
 use crate::tools::time;
@@ -129,9 +129,11 @@ impl Message {
 /// Actually download a message partially downloaded before.
 ///
 /// Most messages are downloaded automatically on fetch instead.
-pub(crate) async fn download_msg(context: &Context, msg_id: MsgId, imap: &mut Imap) -> Result<()> {
-    imap.prepare(context).await?;
-
+pub(crate) async fn download_msg(
+    context: &Context,
+    msg_id: MsgId,
+    session: &mut Session,
+) -> Result<()> {
     let msg = Message::load_from_db(context, msg_id).await?;
     let row = context
         .sql
@@ -152,7 +154,7 @@ pub(crate) async fn download_msg(context: &Context, msg_id: MsgId, imap: &mut Im
         return Err(anyhow!("Call download_full() again to try over."));
     };
 
-    match imap
+    session
         .fetch_single_msg(
             context,
             &server_folder,
@@ -160,16 +162,11 @@ pub(crate) async fn download_msg(context: &Context, msg_id: MsgId, imap: &mut Im
             server_uid,
             msg.rfc724_mid.clone(),
         )
-        .await
-    {
-        ImapActionResult::RetryLater | ImapActionResult::Failed => {
-            Err(anyhow!("Call download_full() again to try over."))
-        }
-        ImapActionResult::Success => Ok(()),
-    }
+        .await?;
+    Ok(())
 }
 
-impl Imap {
+impl Session {
     /// Download a single message and pipe it to receive_imf().
     ///
     /// receive_imf() is not directly aware that this is a result of a call to download_msg(),
@@ -181,20 +178,19 @@ impl Imap {
         uidvalidity: u32,
         uid: u32,
         rfc724_mid: String,
-    ) -> ImapActionResult {
-        if let Some(imapresult) = self
-            .prepare_imap_operation_on_msg(context, folder, uid)
-            .await
-        {
-            return imapresult;
+    ) -> Result<()> {
+        if uid == 0 {
+            bail!("Attempt to fetch UID 0");
         }
+
+        self.select_folder(context, Some(folder)).await?;
 
         // we are connected, and the folder is selected
         info!(context, "Downloading message {}/{} fully...", folder, uid);
 
         let mut uid_message_ids: BTreeMap<u32, String> = BTreeMap::new();
         uid_message_ids.insert(uid, rfc724_mid);
-        let (last_uid, _received) = match self
+        let (last_uid, _received) = self
             .fetch_many_msgs(
                 context,
                 folder,
@@ -204,16 +200,11 @@ impl Imap {
                 false,
                 false,
             )
-            .await
-        {
-            Ok(res) => res,
-            Err(_) => return ImapActionResult::Failed,
-        };
+            .await?;
         if last_uid.is_none() {
-            ImapActionResult::Failed
-        } else {
-            ImapActionResult::Success
+            bail!("Failed to fetch UID {uid}");
         }
+        Ok(())
     }
 }
 
