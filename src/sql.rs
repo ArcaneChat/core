@@ -1,11 +1,10 @@
 //! # SQLite wrapper.
 
 use std::collections::{HashMap, HashSet};
-use std::convert::TryFrom;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context as _, Result};
-use rusqlite::{self, config::DbConfig, types::ValueRef, Connection, OpenFlags, Row};
+use rusqlite::{config::DbConfig, types::ValueRef, Connection, OpenFlags, Row};
 use tokio::sync::{Mutex, MutexGuard, RwLock};
 
 use crate::blob::BlobObject;
@@ -19,7 +18,7 @@ use crate::imex::BLOBS_BACKUP_NAME;
 use crate::log::LogExt;
 use crate::message::{Message, MsgId, Viewtype};
 use crate::param::{Param, Params};
-use crate::peerstate::{deduplicate_peerstates, Peerstate};
+use crate::peerstate::Peerstate;
 use crate::stock_str;
 use crate::tools::{delete_file, time, SystemTime};
 
@@ -731,10 +730,6 @@ pub async fn housekeeping(context: &Context) -> Result<()> {
         );
     }
 
-    if let Err(err) = deduplicate_peerstates(&context.sql).await {
-        warn!(context, "Failed to deduplicate peerstates: {:#}.", err)
-    }
-
     // Try to clear the freelist to free some space on the disk. This
     // only works if auto_vacuum is enabled.
     match context
@@ -1015,7 +1010,6 @@ mod tests {
     use async_channel as channel;
 
     use super::*;
-    use crate::config::Config;
     use crate::{test_utils::TestContext, EventType};
 
     #[test]

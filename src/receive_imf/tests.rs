@@ -1,19 +1,16 @@
 use tokio::fs;
 
 use super::*;
-use crate::aheader::EncryptPreference;
-use crate::chat::{self, get_chat_msgs, ChatItem, ChatVisibility};
 use crate::chat::{
     add_contact_to_chat, add_to_chat_contacts_table, create_group_chat, get_chat_contacts,
-    is_contact_in_chat, remove_contact_from_chat, send_text_msg,
+    get_chat_msgs, is_contact_in_chat, remove_contact_from_chat, send_text_msg, ChatItem,
+    ChatVisibility,
 };
 use crate::chatlist::Chatlist;
-use crate::config::Config;
 use crate::constants::{DC_GCL_FOR_FORWARDING, DC_GCL_NO_SPECIALS};
-use crate::download::{DownloadState, MIN_DOWNLOAD_LIMIT};
+use crate::download::MIN_DOWNLOAD_LIMIT;
 use crate::imap::prefetch_should_download;
 use crate::imex::{imex, ImexMode};
-use crate::message::{self, Message};
 use crate::test_utils::{get_chat_msg, TestContext, TestContextManager};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4284,5 +4281,27 @@ async fn test_forged_from() -> Result<()> {
 
     let msg = alice.recv_msg(&sent_msg).await;
     assert!(msg.chat_id.is_trash());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_multiline_iso_8859_1_subject() -> Result<()> {
+    let t = &TestContext::new_alice().await;
+    let mail = b"Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
+        From: bob@example.com\n\
+        To: alice@example.org, claire@example.com\n\
+        Subject:\n \
+        =?iso-8859-1?Q?Weihnachten_&_Silvester:_Feiern,_genie=DFen_&_entspannen_i?=\n \
+        =?iso-8859-1?Q?nmitten_der_Weing=E4rten?=\n\
+        Message-ID: <3333@example.com>\n\
+        Date: Sun, 22 Mar 2020 22:37:57 +0000\n\
+        \n\
+        hello\n";
+    receive_imf(t, mail, false).await?;
+    let msg = t.get_last_msg().await;
+    assert_eq!(
+        msg.get_subject(),
+        "Weihnachten & Silvester: Feiern, genießen & entspannen inmitten der Weingärten"
+    );
     Ok(())
 }
