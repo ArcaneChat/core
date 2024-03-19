@@ -9,10 +9,14 @@ from io import BytesIO
 
 
 def metadata_contents(version):
+    readme_text = (Path("deltachat-rpc-server") / "README.md").read_text()
     return f"""Metadata-Version: 2.1
 Name: deltachat-rpc-server
 Version: {version}
 Summary: Delta Chat JSON-RPC server
+Description-Content-Type: text/markdown
+
+{readme_text}
 """
 
 
@@ -124,9 +128,11 @@ def main():
         Path(binary).chmod(0o755)
         wheel.write(
             binary,
-            "deltachat_rpc_server/deltachat-rpc-server.exe"
-            if windows
-            else "deltachat_rpc_server/deltachat-rpc-server",
+            (
+                "deltachat_rpc_server/deltachat-rpc-server.exe"
+                if windows
+                else "deltachat_rpc_server/deltachat-rpc-server"
+            ),
         )
         wheel.writestr(
             f"deltachat_rpc_server-{version}.dist-info/METADATA",
@@ -157,13 +163,15 @@ arch2tags = {
 
 
 def main():
-    version = sys.argv[1]
-    if sys.argv[2] == "source":
+    with Path("Cargo.toml").open("rb") as fp:
+        cargo_manifest = tomllib.load(fp)
+    version = cargo_manifest["package"]["version"]
+    if sys.argv[1] == "source":
         filename = f"deltachat-rpc-server-{version}.tar.gz"
         build_source_package(version, filename)
     else:
-        arch = sys.argv[2]
-        executable = sys.argv[3]
+        arch = sys.argv[1]
+        executable = sys.argv[2]
         tags = arch2tags[arch]
 
         if arch in ["win32", "win64"]:
