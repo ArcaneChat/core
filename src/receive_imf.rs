@@ -316,6 +316,9 @@ pub(crate) async fn receive_imf_inner(
     //
     // If this is a mailing list email (i.e. list_id_header is some), don't change the displayname because in
     // a mailing list the sender displayname sometimes does not belong to the sender email address.
+    // For example, GitHub sends messages from `notifications@github.com`,
+    // but uses display name of the user whose action generated the notification
+    // as the display name.
     let (from_id, _from_id_blocked, incoming_origin) =
         match from_field_to_contact_id(context, &mime_parser.from, prevent_rename).await? {
             Some(contact_id_res) => contact_id_res,
@@ -628,12 +631,9 @@ pub async fn from_field_to_contact_id(
     if from_id == ContactId::SELF {
         Ok(Some((ContactId::SELF, false, Origin::OutgoingBcc)))
     } else {
-        let mut from_id_blocked = false;
-        let mut incoming_origin = Origin::Unknown;
-        if let Ok(contact) = Contact::get_by_id(context, from_id).await {
-            from_id_blocked = contact.blocked;
-            incoming_origin = contact.origin;
-        }
+        let contact = Contact::get_by_id(context, from_id).await?;
+        let from_id_blocked = contact.blocked;
+        let incoming_origin = contact.origin;
         Ok(Some((from_id, from_id_blocked, incoming_origin)))
     }
 }
@@ -2683,7 +2683,6 @@ async fn get_rfc724_mid_in_list(context: &Context, mid_list: &str) -> Result<Opt
 ///
 /// If none found, tries In-Reply-To: as a fallback for classic MUAs that don't set the
 /// References: header.
-// TODO also save first entry of References and look for this?
 async fn get_parent_message(
     context: &Context,
     mime_parser: &MimeMessage,
