@@ -10,7 +10,9 @@ use crate::context::Context;
 use crate::message::{Message, MessageState, Viewtype};
 use crate::mimeparser::SystemMessage;
 use crate::stock_str;
+use crate::stock_str::msg_reacted;
 use crate::tools::truncate;
+use anyhow::Result;
 
 /// Prefix displayed before message and separated by ":" in the chatlist.
 #[derive(Debug)]
@@ -62,7 +64,24 @@ impl Summary {
         msg: &Message,
         chat: &Chat,
         contact: Option<&Contact>,
-    ) -> Self {
+    ) -> Result<Summary> {
+        if let Some((reaction_msg, reaction_contact_id, reaction)) = chat
+            .get_last_reaction_if_newer_than(context, msg.timestamp_sort)
+            .await?
+        {
+            // there is a reaction newer than the latest message, show that.
+            // sorting and therefore date is still the one of the last message,
+            // the reaction is is more sth. that overlays temporarily.
+            let summary = reaction_msg.get_summary_text_without_prefix(context).await;
+            return Ok(Summary {
+                prefix: None,
+                text: msg_reacted(context, reaction_contact_id, &reaction, &summary).await,
+                timestamp: msg.get_timestamp(), // message timestamp (not reaction) to make timestamps more consistent with chats ordering
+                state: msg.state, // message state (not reaction) - indicating if it was me sending the last message
+                thumbnail_path: None,
+            });
+        }
+
         let prefix = if msg.state == MessageState::OutDraft {
             Some(SummaryPrefix::Draft(stock_str::draft(context).await))
         } else if msg.from_id == ContactId::SELF {
@@ -102,13 +121,13 @@ impl Summary {
             None
         };
 
-        Self {
+        Ok(Summary {
             prefix,
             text,
             timestamp: msg.get_timestamp(),
             state: msg.state,
             thumbnail_path,
-        }
+        })
     }
 
     /// Returns the [`Summary::text`] attribute truncated to an approximate length.
@@ -120,6 +139,17 @@ impl Summary {
 impl Message {
     /// Returns a summary text.
     async fn get_summary_text(&self, context: &Context) -> String {
+        let summary = self.get_summary_text_without_prefix(context).await;
+
+        if self.is_forwarded() {
+            format!("{}: {}", stock_str::forwarded(context).await, summary)
+        } else {
+            summary
+        }
+    }
+
+    /// Returns a summary text without "Forwarded:" prefix.
+    async fn get_summary_text_without_prefix(&self, context: &Context) -> String {
         let (emoji, type_name, type_file, append_text);
         match self.viewtype {
             Viewtype::Image => {
@@ -230,12 +260,6 @@ impl Message {
             summary
         };
 
-        let summary = if self.is_forwarded() {
-            format!("{}: {}", stock_str::forwarded(context).await, summary)
-        } else {
-            summary
-        };
-
         summary.split_whitespace().collect::<Vec<&str>>().join(" ")
     }
 }
@@ -246,6 +270,11 @@ mod tests {
     use crate::param::Param;
     use crate::test_utils as test;
 
+    async fn assert_summary_texts(msg: &Message, ctx: &Context, expected: &str) {
+        assert_eq!(msg.get_summary_text(ctx).await, expected);
+        assert_eq!(msg.get_summary_text_without_prefix(ctx).await, expected);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_get_summary_text() {
         let d = test::TestContext::new().await;
@@ -255,131 +284,81 @@ mod tests {
 
         let mut msg = Message::new(Viewtype::Text);
         msg.set_text(some_text.to_string());
-        assert_eq!(
-            msg.get_summary_text(ctx).await,
-            "bla bla" // for simple text, the type is not added to the summary
-        );
+        assert_summary_texts(&msg, ctx, "bla bla").await; // for simple text, the type is not added to the summary
 
         let mut msg = Message::new(Viewtype::Image);
         msg.set_file("foo.jpg", None);
-        assert_eq!(
-            msg.get_summary_text(ctx).await,
-            "📷 Image" // file names are not added for images
-        );
+        assert_summary_texts(&msg, ctx, "📷 Image").await; // file names are not added for images
 
         let mut msg = Message::new(Viewtype::Image);
         msg.set_text(some_text.to_string());
         msg.set_file("foo.jpg", None);
-        assert_eq!(
-            msg.get_summary_text(ctx).await,
-            "📷 bla bla" // type is visible by emoji if text is set
-        );
+        assert_summary_texts(&msg, ctx, "📷 bla bla").await; // type is visible by emoji if text is set
 
         let mut msg = Message::new(Viewtype::Video);
         msg.set_file("foo.mp4", None);
-        assert_eq!(
-            msg.get_summary_text(ctx).await,
-            "🎥 Video" // file names are not added for videos
-        );
+        assert_summary_texts(&msg, ctx, "🎥 Video").await; // file names are not added for videos
 
         let mut msg = Message::new(Viewtype::Video);
         msg.set_text(some_text.to_string());
         msg.set_file("foo.mp4", None);
-        assert_eq!(
-            msg.get_summary_text(ctx).await,
-            "🎥 bla bla" // type is visible by emoji if text is set
-        );
+        assert_summary_texts(&msg, ctx, "🎥 bla bla").await; // type is visible by emoji if text is set
 
         let mut msg = Message::new(Viewtype::Gif);
         msg.set_file("foo.gif", None);
-        assert_eq!(
-            msg.get_summary_text(ctx).await,
-            "GIF" // file names are not added for GIFs
-        );
+        assert_summary_texts(&msg, ctx, "GIF").await; // file names are not added for GIFs
 
         let mut msg = Message::new(Viewtype::Gif);
         msg.set_text(some_text.to_string());
         msg.set_file("foo.gif", None);
-        assert_eq!(
-            msg.get_summary_text(ctx).await,
-            "GIF \u{2013} bla bla" // file names are not added for GIFs
-        );
+        assert_summary_texts(&msg, ctx, "GIF \u{2013} bla bla").await; // file names are not added for GIFs
 
         let mut msg = Message::new(Viewtype::Sticker);
         msg.set_file("foo.png", None);
-        assert_eq!(
-            msg.get_summary_text(ctx).await,
-            "Sticker" // file names are not added for stickers
-        );
+        assert_summary_texts(&msg, ctx, "Sticker").await; // file names are not added for stickers
 
         let mut msg = Message::new(Viewtype::Voice);
         msg.set_file("foo.mp3", None);
-        assert_eq!(
-            msg.get_summary_text(ctx).await,
-            "🎤 Voice message" // file names are not added for voice messages
-        );
+        assert_summary_texts(&msg, ctx, "🎤 Voice message").await; // file names are not added for voice messages
 
         let mut msg = Message::new(Viewtype::Voice);
         msg.set_text(some_text.clone());
         msg.set_file("foo.mp3", None);
-        assert_eq!(
-            msg.get_summary_text(ctx).await,
-            "🎤 bla bla" // `\u{2013}` explicitly checks for "EN DASH"
-        );
+        assert_summary_texts(&msg, ctx, "🎤 bla bla").await;
 
         let mut msg = Message::new(Viewtype::Audio);
         msg.set_file("foo.mp3", None);
-        assert_eq!(
-            msg.get_summary_text(ctx).await,
-            "🎵 foo.mp3" // file name is added for audio
-        );
+        assert_summary_texts(&msg, ctx, "🎵 foo.mp3").await; // file name is added for audio
 
         let mut msg = Message::new(Viewtype::Audio);
         msg.set_file("foo.mp3", None);
-        assert_eq!(
-            msg.get_summary_text(ctx).await,
-            "🎵 foo.mp3" // file name is added for audio, empty text is not added
-        );
+        assert_summary_texts(&msg, ctx, "🎵 foo.mp3").await; // file name is added for audio, empty text is not added
 
         let mut msg = Message::new(Viewtype::Audio);
         msg.set_text(some_text.clone());
         msg.set_file("foo.mp3", None);
-        assert_eq!(
-            msg.get_summary_text(ctx).await,
-            "🎵 foo.mp3 \u{2013} bla bla" // file name and text added for audio
-        );
+        assert_summary_texts(&msg, ctx, "🎵 foo.mp3 \u{2013} bla bla").await; // file name and text added for audio
 
         let mut msg = Message::new(Viewtype::File);
         msg.set_file("foo.bar", None);
-        assert_eq!(
-            msg.get_summary_text(ctx).await,
-            "📎 foo.bar" // file name is added for files
-        );
+        assert_summary_texts(&msg, ctx, "📎 foo.bar").await; // file name is added for files
 
         let mut msg = Message::new(Viewtype::File);
         msg.set_text(some_text.clone());
         msg.set_file("foo.bar", None);
-        assert_eq!(
-            msg.get_summary_text(ctx).await,
-            "📎 foo.bar \u{2013} bla bla" // file name is added for files
-        );
+        assert_summary_texts(&msg, ctx, "📎 foo.bar \u{2013} bla bla").await; // file name is added for files
 
         let mut msg = Message::new(Viewtype::VideochatInvitation);
         msg.set_text(some_text.clone());
         msg.set_file("foo.bar", None);
-        assert_eq!(
-            msg.get_summary_text(ctx).await,
-            "Video chat invitation" // text is not added for videochat invitations
-        );
+        assert_summary_texts(&msg, ctx, "Video chat invitation").await; // text is not added for videochat invitations
 
         // Forwarded
         let mut msg = Message::new(Viewtype::Text);
         msg.set_text(some_text.clone());
         msg.param.set_int(Param::Forwarded, 1);
-        assert_eq!(
-            msg.get_summary_text(ctx).await,
-            "Forwarded: bla bla" // for simple text, the type is not added to the summary
-        );
+        assert_eq!(msg.get_summary_text(ctx).await, "Forwarded: bla bla"); // for simple text, the type is not added to the summary
+        assert_eq!(msg.get_summary_text_without_prefix(ctx).await, "bla bla"); // skipping prefix used for reactions summaries
 
         let mut msg = Message::new(Viewtype::File);
         msg.set_text(some_text.clone());
@@ -389,14 +368,15 @@ mod tests {
             msg.get_summary_text(ctx).await,
             "Forwarded: 📎 foo.bar \u{2013} bla bla"
         );
+        assert_eq!(
+            msg.get_summary_text_without_prefix(ctx).await,
+            "📎 foo.bar \u{2013} bla bla"
+        ); // skipping prefix used for reactions summaries
 
         let mut msg = Message::new(Viewtype::File);
         msg.set_text(some_text.clone());
         msg.param.set(Param::File, "foo.bar");
         msg.param.set_cmd(SystemMessage::AutocryptSetupMessage);
-        assert_eq!(
-            msg.get_summary_text(ctx).await,
-            "Autocrypt Setup Message" // file name is not added for autocrypt setup messages
-        );
+        assert_summary_texts(&msg, ctx, "Autocrypt Setup Message").await; // file name is not added for autocrypt setup messages
     }
 }

@@ -1077,6 +1077,12 @@ async fn add_parts(
                     chat_id_blocked = chat.blocked;
                 }
             }
+            if chat_id.is_none() && is_dc_message == MessengerMessage::Yes {
+                if let Some(chat) = ChatIdBlocked::lookup_by_contact(context, to_id).await? {
+                    chat_id = Some(chat.id);
+                    chat_id_blocked = chat.blocked;
+                }
+            }
 
             // automatically unblock chat when the user sends a message
             if chat_id_blocked != Blocked::Not {
@@ -1374,6 +1380,7 @@ async fn add_parts(
                 &mime_in_reply_to,
                 orig_chat_id.unwrap_or_default(),
                 from_id,
+                sort_timestamp,
                 Reaction::from(reaction_str.as_str()),
             )
             .await?;

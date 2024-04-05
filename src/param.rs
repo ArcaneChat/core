@@ -9,7 +9,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::blob::BlobObject;
 use crate::context::Context;
-use crate::message::MsgId;
 use crate::mimeparser::SystemMessage;
 
 /// Available param keys.
@@ -18,7 +17,7 @@ use crate::mimeparser::SystemMessage;
 )]
 #[repr(u8)]
 pub enum Param {
-    /// For messages and jobs
+    /// For messages
     File = b'f',
 
     /// For messages: original filename (as shown in chat)
@@ -65,6 +64,15 @@ pub enum Param {
     /// For Messages: the message is a reaction.
     Reaction = b'x',
 
+    /// For Chats: the timestamp of the last reaction.
+    LastReactionTimestamp = b'y',
+
+    /// For Chats: Message ID of the last reaction.
+    LastReactionMsgId = b'Y',
+
+    /// For Chats: Contact ID of the last reaction.
+    LastReactionContactId = b'1',
+
     /// For Messages: a message with "Auto-Submitted: auto-generated" header ("bot").
     Bot = b'b',
 
@@ -107,17 +115,11 @@ pub enum Param {
     /// is used to also send all the forwarded messages.
     PrepForwards = b'P',
 
-    /// For Jobs
+    /// For Messages
     SetLatitude = b'l',
 
-    /// For Jobs
+    /// For Messages
     SetLongitude = b'n',
-
-    /// For Jobs
-    AlsoMove = b'M',
-
-    /// For MDN-sending job
-    MsgId = b'I',
 
     /// For Groups
     ///
@@ -173,9 +175,6 @@ pub enum Param {
     /// For Chats: timestamp of member list update.
     MemberListTimestamp = b'k',
 
-    /// For Chats: timestamp of protection settings update.
-    ProtectionSettingsTimestamp = b'L',
-
     /// For Webxdc Message Instances: Current document name
     WebxdcDocument = b'R',
 
@@ -190,6 +189,7 @@ pub enum Param {
 
     /// For messages: Whether [crate::message::Viewtype::Sticker] should be forced.
     ForceSticker = b'X',
+    // 'L' was defined as ProtectionSettingsTimestamp for Chats, however, never used in production.
 }
 
 /// An object for handling key=value parameter lists.
@@ -397,12 +397,6 @@ impl Params {
             ParamsFile::Blob(blob) => blob.to_abs_path(),
         };
         Ok(Some(path))
-    }
-
-    pub fn get_msg_id(&self) -> Option<MsgId> {
-        self.get(Param::MsgId)
-            .and_then(|x| x.parse().ok())
-            .map(MsgId::new)
     }
 
     /// Set the given parameter to the passed in `i32`.
