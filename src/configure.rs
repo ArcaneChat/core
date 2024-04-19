@@ -16,6 +16,7 @@ mod server_params;
 use anyhow::{bail, ensure, Context as _, Result};
 use auto_mozilla::moz_autoconfigure;
 use auto_outlook::outlk_autodiscover;
+use deltachat_contact_tools::EmailAddress;
 use futures::FutureExt;
 use futures_lite::FutureExt as _;
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
@@ -23,7 +24,6 @@ use server_params::{expand_param_vector, ServerParams};
 use tokio::task;
 
 use crate::config::{self, Config};
-use crate::contact::addr_cmp;
 use crate::context::Context;
 use crate::imap::{session::Session as ImapSession, Imap};
 use crate::log::LogExt;
@@ -35,8 +35,9 @@ use crate::smtp::Smtp;
 use crate::socks::Socks5Config;
 use crate::stock_str;
 use crate::sync::Sync::*;
-use crate::tools::{time, EmailAddress};
+use crate::tools::time;
 use crate::{chat, e2ee, provider};
+use deltachat_contact_tools::addr_cmp;
 
 macro_rules! progress {
     ($context:tt, $progress:expr, $comment:expr) => {
@@ -356,8 +357,8 @@ async fn configure(ctx: &Context, param: &mut LoginParam) -> Result<()> {
         let mut smtp_configured = false;
         let mut errors = Vec::new();
         for smtp_server in smtp_servers {
-            smtp_param.user = smtp_server.username.clone();
-            smtp_param.server = smtp_server.hostname.clone();
+            smtp_param.user.clone_from(&smtp_server.username);
+            smtp_param.server.clone_from(&smtp_server.hostname);
             smtp_param.port = smtp_server.port;
             smtp_param.security = smtp_server.socket;
             smtp_param.certificate_checks = match smtp_server.strict_tls {
@@ -403,8 +404,8 @@ async fn configure(ctx: &Context, param: &mut LoginParam) -> Result<()> {
     let imap_servers_count = imap_servers.len();
     let mut errors = Vec::new();
     for (imap_server_index, imap_server) in imap_servers.into_iter().enumerate() {
-        param.imap.user = imap_server.username.clone();
-        param.imap.server = imap_server.hostname.clone();
+        param.imap.user.clone_from(&imap_server.username);
+        param.imap.server.clone_from(&imap_server.hostname);
         param.imap.port = imap_server.port;
         param.imap.security = imap_server.socket;
         param.imap.certificate_checks = match imap_server.strict_tls {

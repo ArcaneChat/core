@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use ::pgp::types::KeyTrait;
 use anyhow::{bail, ensure, format_err, Context as _, Result};
+use deltachat_contact_tools::EmailAddress;
 use futures::StreamExt;
 use futures_lite::FutureExt;
 use rand::{thread_rng, Rng};
@@ -31,7 +32,6 @@ use crate::sql;
 use crate::stock_str;
 use crate::tools::{
     create_folder, delete_file, get_filesuffix_lc, open_file_std, read_file, time, write_file,
-    EmailAddress,
 };
 
 mod transfer;
@@ -1158,7 +1158,8 @@ mod tests {
         // Send a message that cannot be decrypted because the keys are
         // not synchronized yet.
         let sent = alice2.send_text(msg.chat_id, "Test").await;
-        alice.recv_msg(&sent).await;
+        let trashed_message = alice.recv_msg_opt(&sent).await;
+        assert!(trashed_message.is_none());
         assert_ne!(alice.get_last_msg().await.get_text(), "Test");
 
         // Transfer the key.

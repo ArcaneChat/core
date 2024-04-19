@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use ansi_term::Color;
 use async_channel::{self as channel, Receiver, Sender};
 use chat::ChatItem;
+use deltachat_contact_tools::{ContactAddress, EmailAddress};
 use once_cell::sync::Lazy;
 use pretty_assertions::assert_eq;
 use rand::Rng;
@@ -27,9 +28,10 @@ use crate::chat::{
 };
 use crate::chatlist::Chatlist;
 use crate::config::Config;
+use crate::constants::DC_CHAT_ID_TRASH;
 use crate::constants::DC_GCL_NO_SPECIALS;
 use crate::constants::{Blocked, Chattype};
-use crate::contact::{Contact, ContactAddress, ContactId, Modifier, Origin};
+use crate::contact::{Contact, ContactId, Modifier, Origin};
 use crate::context::Context;
 use crate::e2ee::EncryptHelper;
 use crate::events::{Event, EventType, Events};
@@ -41,7 +43,6 @@ use crate::pgp::KeyPair;
 use crate::receive_imf::receive_imf;
 use crate::securejoin::{get_securejoin_qr, join_securejoin};
 use crate::stock_str::StockStrings;
-use crate::tools::EmailAddress;
 
 #[allow(non_upper_case_globals)]
 pub const AVATAR_900x900_BYTES: &[u8] = include_bytes!("../test-data/image/avatar900x900.png");
@@ -179,9 +180,9 @@ impl TestContextManager {
 
         loop {
             if let Some(sent) = scanner.pop_sent_msg_opt(Duration::ZERO).await {
-                scanned.recv_msg(&sent).await;
+                scanned.recv_msg_opt(&sent).await;
             } else if let Some(sent) = scanned.pop_sent_msg_opt(Duration::ZERO).await {
-                scanner.recv_msg(&sent).await;
+                scanner.recv_msg_opt(&sent).await;
             } else {
                 break;
             }
@@ -537,6 +538,16 @@ impl TestContext {
         receive_imf(self, msg.payload().as_bytes(), false)
             .await
             .unwrap()
+            .filter(|msg| msg.chat_id != DC_CHAT_ID_TRASH)
+    }
+
+    /// Recevies a message and asserts that it goes to trash chat.
+    pub async fn recv_msg_trash(&self, msg: &SentMessage<'_>) {
+        let received = receive_imf(self, msg.payload().as_bytes(), false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received.chat_id, DC_CHAT_ID_TRASH);
     }
 
     /// Gets the most recent message of a chat.
@@ -1013,6 +1024,18 @@ impl EventTracker {
         self.get_matching(|evt| matches!(evt, EventType::IncomingMsg { .. }))
             .await;
     }
+
+    /// Clears event queue.
+    ///
+    /// This spends 1 second instead of using `try_recv`
+    /// to avoid accidentally leaving an event that
+    /// was emitted right before calling `clear_events()`.
+    ///
+    /// Avoid using this function if you can
+    /// by waiting for specific events you expect to receive.
+    pub async fn clear_events(&self) {
+        while let Ok(_ev) = tokio::time::timeout(Duration::from_secs(1), self.recv()).await {}
+    }
 }
 
 /// Gets a specific message from a chat and asserts that the chat has a specific length.
@@ -1056,8 +1079,10 @@ pub(crate) async fn mark_as_verified(this: &TestContext, other: &TestContext) {
         0,
     );
 
-    peerstate.verified_key = peerstate.public_key.clone();
-    peerstate.verified_key_fingerprint = peerstate.public_key_fingerprint.clone();
+    peerstate.verified_key.clone_from(&peerstate.public_key);
+    peerstate
+        .verified_key_fingerprint
+        .clone_from(&peerstate.public_key_fingerprint);
     peerstate.backward_verified_key_id = Some(this.get_config_i64(Config::KeyId).await.unwrap());
 
     peerstate.save_to_db(&this.sql).await.unwrap();
@@ -1067,7 +1092,8 @@ pub(crate) async fn mark_as_verified(this: &TestContext, other: &TestContext) {
 /// alice0's side that implies sending a sync message.
 pub(crate) async fn sync(alice0: &TestContext, alice1: &TestContext) {
     let sync_msg = alice0.pop_sent_msg().await;
-    alice1.recv_msg(&sync_msg).await;
+    let no_msg = alice1.recv_msg_opt(&sync_msg).await;
+    assert!(no_msg.is_none());
 }
 
 /// Pretty-print an event to stdout

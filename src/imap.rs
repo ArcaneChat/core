@@ -15,6 +15,7 @@ use std::{
 use anyhow::{bail, format_err, Context as _, Result};
 use async_channel::Receiver;
 use async_imap::types::{Fetch, Flag, Name, NameAttribute, UnsolicitedResponse};
+use deltachat_contact_tools::{normalize_name, ContactAddress};
 use futures::{FutureExt as _, StreamExt, TryStreamExt};
 use futures_lite::FutureExt;
 use num_traits::FromPrimitive;
@@ -22,9 +23,10 @@ use ratelimit::Ratelimit;
 use tokio::sync::RwLock;
 
 use crate::chat::{self, ChatId, ChatIdBlocked};
+use crate::chatlist_events;
 use crate::config::Config;
 use crate::constants::{self, Blocked, Chattype, ShowEmails};
-use crate::contact::{normalize_name, Contact, ContactAddress, ContactId, Modifier, Origin};
+use crate::contact::{Contact, ContactId, Modifier, Origin};
 use crate::context::Context;
 use crate::events::EventType;
 use crate::headerdef::{HeaderDef, HeaderDefMap};
@@ -388,7 +390,7 @@ impl Imap {
             Ok(session) => {
                 // Store server ID in the context to display in account info.
                 let mut lock = context.server_id.write().await;
-                *lock = session.capabilities.server_id.clone();
+                lock.clone_from(&session.capabilities.server_id);
 
                 self.login_failed_once = false;
                 context.emit_event(EventType::ImapConnected(format!(
@@ -420,7 +422,7 @@ impl Imap {
                     drop(lock);
 
                     let mut msg = Message::new(Viewtype::Text);
-                    msg.text = message.clone();
+                    msg.text.clone_from(&message);
                     if let Err(e) =
                         chat::add_device_msg_with_importance(context, None, Some(&mut msg), true)
                             .await
@@ -1170,6 +1172,7 @@ impl Session {
             .with_context(|| format!("failed to set MODSEQ for folder {folder}"))?;
         for updated_chat_id in updated_chat_ids {
             context.emit_event(EventType::MsgsNoticed(updated_chat_id));
+            chatlist_events::emit_chatlist_item_changed(context, updated_chat_id);
         }
 
         Ok(())

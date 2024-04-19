@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::blob::BlobObject;
 use crate::chat::{Chat, ChatId};
+use crate::chatlist_events;
 use crate::config::Config;
 use crate::constants::{
     Blocked, Chattype, VideochatType, DC_CHAT_ID_TRASH, DC_DESIRED_TEXT_LEN, DC_MSG_ID_LAST_SPECIAL,
@@ -138,6 +139,7 @@ WHERE id=?;
             chat_id,
             msg_id: self,
         });
+        chatlist_events::emit_chatlist_item_changed(context, chat_id);
         Ok(())
     }
 
@@ -362,7 +364,7 @@ impl rusqlite::types::FromSql for MsgId {
     fn column_result(value: rusqlite::types::ValueRef) -> rusqlite::types::FromSqlResult<Self> {
         // Would be nice if we could use match here, but alas.
         i64::column_result(value).and_then(|val| {
-            if 0 <= val && val <= i64::from(std::u32::MAX) {
+            if 0 <= val && val <= i64::from(u32::MAX) {
                 Ok(MsgId::new(val as u32))
             } else {
                 Err(rusqlite::types::FromSqlError::OutOfRange(val))
@@ -464,7 +466,7 @@ impl Message {
     pub async fn load_from_db(context: &Context, id: MsgId) -> Result<Message> {
         let message = Self::load_from_db_optional(context, id)
             .await?
-            .context("Message {id} does not exist")?;
+            .with_context(|| format!("Message {id} does not exist"))?;
         Ok(message)
     }
 
@@ -506,7 +508,7 @@ impl Message {
                     "    m.location_id AS location,",
                     "    c.blocked AS blocked",
                     " FROM msgs m LEFT JOIN chats c ON c.id=m.chat_id",
-                    " WHERE m.id=?;"
+                    " WHERE m.id=? AND chat_id!=3;"
                 ),
                 (id,),
                 |row| {
@@ -1145,13 +1147,8 @@ impl Message {
     pub async fn parent(&self, context: &Context) -> Result<Option<Message>> {
         if let Some(in_reply_to) = &self.in_reply_to {
             if let Some((msg_id, _ts_sent)) = rfc724_mid_exists(context, in_reply_to).await? {
-                let msg = Message::load_from_db(context, msg_id).await?;
-                return if msg.chat_id.is_trash() {
-                    // If message is already moved to trash chat, pretend it does not exist.
-                    Ok(None)
-                } else {
-                    Ok(Some(msg))
-                };
+                let msg = Message::load_from_db_optional(context, msg_id).await?;
+                return Ok(msg);
             }
         }
         Ok(None)
@@ -1532,9 +1529,12 @@ pub async fn delete_msgs(context: &Context, msg_ids: &[MsgId]) -> Result<()> {
 
     for modified_chat_id in modified_chat_ids {
         context.emit_msgs_changed(modified_chat_id, MsgId::new(0));
+        chatlist_events::emit_chatlist_item_changed(context, modified_chat_id);
     }
 
     if !msg_ids.is_empty() {
+        context.emit_msgs_changed_without_ids();
+        chatlist_events::emit_chatlist_changed(context);
         // Run housekeeping to delete unused blobs.
         context
             .set_config_internal(Config::LastHousekeeping, None)
@@ -1669,6 +1669,7 @@ pub async fn markseen_msgs(context: &Context, msg_ids: Vec<MsgId>) -> Result<()>
 
     for updated_chat_id in updated_chat_ids {
         context.emit_event(EventType::MsgsNoticed(updated_chat_id));
+        chatlist_events::emit_chatlist_item_changed(context, updated_chat_id);
     }
 
     Ok(())
@@ -1729,6 +1730,7 @@ pub(crate) async fn set_msg_failed(
         chat_id: msg.chat_id,
         msg_id: msg.id,
     });
+    chatlist_events::emit_chatlist_item_changed(context, msg.chat_id);
 
     Ok(())
 }
@@ -1881,8 +1883,7 @@ pub(crate) async fn get_latest_by_rfc724_mids(
 ) -> Result<Option<Message>> {
     for id in mids.iter().rev() {
         if let Some((msg_id, _)) = rfc724_mid_exists(context, id).await? {
-            let msg = Message::load_from_db(context, msg_id).await?;
-            if msg.chat_id != DC_CHAT_ID_TRASH {
+            if let Some(msg) = Message::load_from_db_optional(context, msg_id).await? {
                 return Ok(Some(msg));
             }
         }

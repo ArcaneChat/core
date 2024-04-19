@@ -6,6 +6,7 @@ use std::path::Path;
 use std::str;
 
 use anyhow::{bail, Context as _, Result};
+use deltachat_contact_tools::{addr_cmp, addr_normalize, strip_rtlo_characters};
 use deltachat_derive::{FromSql, ToSql};
 use format_flowed::unformat_flowed;
 use lettre_email::mime::Mime;
@@ -16,7 +17,7 @@ use crate::blob::BlobObject;
 use crate::chat::{add_info_msg, ChatId};
 use crate::config::Config;
 use crate::constants::{self, Chattype, DC_DESIRED_TEXT_LINES, DC_DESIRED_TEXT_LINE_LEN};
-use crate::contact::{addr_cmp, addr_normalize, Contact, ContactId, Origin};
+use crate::contact::{Contact, ContactId, Origin};
 use crate::context::Context;
 use crate::decrypt::{
     keyring_from_peerstate, prepare_decryption, try_decrypt, validate_detached_signature,
@@ -32,13 +33,11 @@ use crate::message::{
 use crate::param::{Param, Params};
 use crate::peerstate::Peerstate;
 use crate::simplify::{simplify, SimplifiedText};
-use crate::stock_str;
 use crate::sync::SyncItems;
 use crate::tools::{
-    create_smeared_timestamp, get_filemeta, parse_receive_headers, smeared_time,
-    strip_rtlo_characters, truncate_by_lines,
+    create_smeared_timestamp, get_filemeta, parse_receive_headers, smeared_time, truncate_by_lines,
 };
-use crate::{location, tools};
+use crate::{chatlist_events, location, stock_str, tools};
 
 /// A parsed MIME message.
 ///
@@ -495,7 +494,7 @@ impl MimeMessage {
             },
         };
 
-        if parser.mdn_reports.is_empty() {
+        if parser.mdn_reports.is_empty() && parser.webxdc_status_update.is_none() {
             // "Auto-Submitted" is also set by holiday-notices so we also check "chat-version".
             let is_bot = parser.headers.get("auto-submitted")
                 == Some(&"auto-generated".to_string())
@@ -604,7 +603,7 @@ impl MimeMessage {
                 let mut filepart = self.parts.swap_remove(1);
 
                 // insert new one
-                filepart.msg = self.parts[0].msg.clone();
+                filepart.msg.clone_from(&self.parts[0].msg);
                 if let Some(quote) = self.parts[0].param.get(Param::Quote) {
                     filepart.param.set(Param::Quote, quote);
                 }
@@ -2150,6 +2149,8 @@ async fn handle_mdn(
     {
         update_msg_state(context, msg_id, MessageState::OutMdnRcvd).await?;
         context.emit_event(EventType::MsgRead { chat_id, msg_id });
+        // note(treefit): only matters if it is the last message in chat (but probably too expensive to check, debounce also solves it)
+        chatlist_events::emit_chatlist_item_changed(context, chat_id);
     }
     Ok(())
 }

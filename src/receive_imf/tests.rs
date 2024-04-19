@@ -9,7 +9,7 @@ use crate::chat::{
     ChatVisibility,
 };
 use crate::chatlist::Chatlist;
-use crate::constants::{ShowEmails, DC_GCL_FOR_FORWARDING, DC_GCL_NO_SPECIALS};
+use crate::constants::{DC_GCL_FOR_FORWARDING, DC_GCL_NO_SPECIALS};
 use crate::download::MIN_DOWNLOAD_LIMIT;
 use crate::imap::prefetch_should_download;
 use crate::imex::{imex, ImexMode};
@@ -4014,8 +4014,7 @@ async fn test_member_left_does_not_create_chat() -> Result<()> {
     // which some members simply deleted and some members left,
     // recreating the chat for others.
     remove_contact_from_chat(&alice, alice_chat_id, ContactId::SELF).await?;
-    let bob_chat_id = bob.recv_msg(&alice.pop_sent_msg().await).await.chat_id;
-    assert!(bob_chat_id.is_trash());
+    bob.recv_msg_trash(&alice.pop_sent_msg().await).await;
 
     Ok(())
 }
@@ -4365,8 +4364,8 @@ async fn test_forged_from() -> Result<()> {
         .payload
         .replace("bob@example.net", "notbob@example.net");
 
-    let msg = alice.recv_msg(&sent_msg).await;
-    assert!(msg.chat_id.is_trash());
+    let msg = alice.recv_msg_opt(&sent_msg).await;
+    assert!(msg.is_none());
     Ok(())
 }
 

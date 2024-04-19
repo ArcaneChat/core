@@ -1577,18 +1577,18 @@ fn maybe_encode_words(words: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use deltachat_contact_tools::ContactAddress;
     use mailparse::{addrparse_header, MailHeaderMap};
     use std::str;
 
     use super::*;
-    use crate::chat::ChatId;
     use crate::chat::{
-        self, add_contact_to_chat, create_group_chat, remove_contact_from_chat, send_text_msg,
+        add_contact_to_chat, create_group_chat, remove_contact_from_chat, send_text_msg, ChatId,
         ProtectionStatus,
     };
     use crate::chatlist::Chatlist;
     use crate::constants;
-    use crate::contact::{ContactAddress, Origin};
+    use crate::contact::Origin;
     use crate::mimeparser::MimeMessage;
     use crate::receive_imf::receive_imf;
     use crate::test_utils::{get_chat_msg, TestContext, TestContextManager};
