@@ -2708,7 +2708,19 @@ Hi."#;
 
         bob.recv_msg(&sent_msg).await;
         let contact = Contact::get_by_id(&bob, *contacts.first().unwrap()).await?;
-        assert!(contact.was_seen_recently());
+
+        let green = ansi_term::Color::Green.normal();
+        assert!(
+            contact.was_seen_recently(),
+            "{}",
+            green.paint(
+                "\nNOTE: This test failure is probably a false-positive, caused by tests running in parallel.
+The issue is that `SystemTime::shift()` (a utility function for tests) changes the time for all threads doing tests, and not only for the running test.
+Until the false-positive is fixed:
+- Use `cargo test -- --test-threads 1` instead of `cargo test`
+- Or use `cargo nextest run` (install with `cargo install cargo-nextest --locked`)\n"
+            )
+        );
 
         let self_contact = Contact::get_by_id(&bob, ContactId::SELF).await?;
         assert!(!self_contact.was_seen_recently());
@@ -2730,7 +2742,7 @@ Hi."#;
             let sent_msg = alice.send_text(chat.id, "moin").await;
             let contact = Contact::get_by_id(&bob, *contacts.first().unwrap()).await?;
             assert!(!contact.was_seen_recently());
-            while bob.evtracker.try_recv().is_ok() {}
+            bob.evtracker.clear_events();
             bob.recv_msg(&sent_msg).await;
             let contact = Contact::get_by_id(&bob, *contacts.first().unwrap()).await?;
             assert!(contact.was_seen_recently());
@@ -2742,7 +2754,7 @@ Hi."#;
                 .await;
 
             // Wait for `was_seen_recently()` to turn off.
-            while bob.evtracker.try_recv().is_ok() {}
+            bob.evtracker.clear_events();
             SystemTime::shift(Duration::from_secs(SEEN_RECENTLY_SECONDS as u64 * 2));
             recently_seen_loop.interrupt(ContactId::UNDEFINED, 0).await;
             let contact = Contact::get_by_id(&bob, *contacts.first().unwrap()).await?;
