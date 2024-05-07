@@ -1,0 +1,42 @@
+name: JSON-RPC API Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_MIN_STACK: "8388608"
+
+jobs:
+  build_and_test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          show-progress: false
+      - name: Use Node.js 18.x
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18.x
+      - name: Add Rust cache
+        uses: Swatinem/rust-cache@v2
+      - name: npm install
+        working-directory: deltachat-jsonrpc/typescript
+        run: npm install
+      - name: Build TypeScript, run Rust tests, generate bindings
+        working-directory: deltachat-jsonrpc/typescript
+        run: npm run build
+      - name: Run integration tests
+        working-directory: deltachat-jsonrpc/typescript
+        run: npm run test
+        env:
+          CHATMAIL_DOMAIN: ${{ secrets.CHATMAIL_DOMAIN }}
+      - name: make sure websocket server version still builds
+        working-directory: deltachat-jsonrpc
+        run: cargo build --bin deltachat-jsonrpc-server --features webserver
+      - name: Run linter
+        working-directory: deltachat-jsonrpc/typescript
+        run: npm run prettier:check
