@@ -622,9 +622,11 @@ impl MimeMessage {
             {
                 part.typ = Viewtype::Voice;
             }
-            if let Some(value) = self.get_header(HeaderDef::ChatContent) {
-                if value == "sticker" {
-                    part.typ = Viewtype::Sticker;
+            if part.typ == Viewtype::Image || part.typ == Viewtype::Gif {
+                if let Some(value) = self.get_header(HeaderDef::ChatContent) {
+                    if value == "sticker" {
+                        part.typ = Viewtype::Sticker;
+                    }
                 }
             }
             if part.typ == Viewtype::Audio
