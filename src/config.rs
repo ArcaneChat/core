@@ -127,9 +127,6 @@ pub enum Config {
     #[strum(props(default = "1"))]
     MdnsEnabled,
 
-    #[strum(props(default = "1"))]
-    SubjectEnabled,
-
     /// True if "Sent" folder should be watched for changes.
     #[strum(props(default = "0"))]
     SentboxWatch,

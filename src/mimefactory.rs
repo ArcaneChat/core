@@ -563,11 +563,9 @@ impl<'a> MimeFactory<'a> {
         } else {
             encode_words(&subject_str)
         };
-        if context.get_config_bool(Config::SubjectEnabled).await? {
-            headers
-                .protected
-                .push(Header::new("Subject".into(), encoded_subject));
-        }
+        headers
+            .protected
+            .push(Header::new("Subject".into(), encoded_subject));
 
         let date = chrono::DateTime::<chrono::Utc>::from_timestamp(self.timestamp, 0)
             .unwrap()
