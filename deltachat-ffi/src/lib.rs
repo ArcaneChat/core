@@ -4105,6 +4105,17 @@ pub unsafe extern "C" fn dc_contact_get_color(contact: *mut dc_contact_t) -> u32
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn dc_get_color(context: *mut dc_context_t, name: *const libc::c_char) -> u32 {
+    if context.is_null() {
+        eprintln!("ignoring careless call to dc_is_configured()");
+        return 0;
+    }
+    let ctx = &*context;
+    let name = to_string_lossy(name);
+    ctx.get_color(name)
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn dc_contact_get_status(contact: *mut dc_contact_t) -> *mut libc::c_char {
     if contact.is_null() {
         eprintln!("ignoring careless call to dc_contact_get_status()");

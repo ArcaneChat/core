@@ -791,6 +791,12 @@ int             dc_is_configured   (const dc_context_t* context);
 
 
 /**
+ * Get a color for the contact name.
+ */
+uint32_t        dc_get_color            (const dc_context_t* context, const char *name);
+
+
+/**
  * Start job and IMAP/SMTP tasks.
  * If IO is already running, nothing happens.
  *
