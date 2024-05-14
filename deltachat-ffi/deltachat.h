@@ -791,12 +791,6 @@ int             dc_is_configured   (const dc_context_t* context);
 
 
 /**
- * Get a color for the contact name.
- */
-uint32_t        dc_get_color            (const dc_context_t* context, const char *name);
-
-
-/**
  * Start job and IMAP/SMTP tasks.
  * If IO is already running, nothing happens.
  *
@@ -4278,6 +4272,14 @@ int             dc_msg_get_showpadlock        (const dc_msg_t* msg);
  * @return 1=message is submitted automatically, 0=message is not automatically submitted.
  */
 int             dc_msg_is_bot                 (const dc_msg_t* msg); 
+
+int             dc_msg_is_outgoing            (const dc_msg_t* msg);
+
+
+/**
+ * Get a color for the overriden sender name.
+ */
+uint32_t        dc_msg_get_sender_color (const dc_msg_t* msg);
 
 /**
  * Get the ephemeral timer duration for a message.

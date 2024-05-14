@@ -4,6 +4,7 @@ use std::borrow::Cow;
 use std::fmt;
 
 use crate::chat::Chat;
+use crate::config::Config;
 use crate::constants::Chattype;
 use crate::contact::{Contact, ContactId};
 use crate::context::Context;
@@ -92,26 +93,26 @@ impl Summary {
         chat: &Chat,
         contact: Option<&Contact>,
     ) -> Result<Summary> {
+        let is_community = context.get_config_bool(Config::IsCommunity).await?;
         let prefix = if msg.state == MessageState::OutDraft {
             Some(SummaryPrefix::Draft(stock_str::draft(context).await))
         } else if msg.from_id == ContactId::SELF {
-            if msg.is_info() || chat.is_self_talk() {
+            if is_community && !msg.is_info() {
+              msg.get_override_sender_name()
+                 .or_else(|| contact.map(|contact| msg.get_sender_name(contact)))
+                 .map(SummaryPrefix::Username)
+            } else if msg.is_info() || chat.is_self_talk() {
                 None
             } else {
                 Some(SummaryPrefix::Me(stock_str::self_msg(context).await))
             }
         } else {
-            match chat.typ {
-                Chattype::Group | Chattype::Broadcast | Chattype::Mailinglist => {
-                    if msg.is_info() || contact.is_none() {
-                        None
-                    } else {
-                        msg.get_override_sender_name()
-                            .or_else(|| contact.map(|contact| msg.get_sender_name(contact)))
-                            .map(SummaryPrefix::Username)
-                    }
-                }
-                Chattype::Single => None,
+            if (chat.typ == Chattype::Single && !is_community) || msg.is_info() || contact.is_none() {
+               None
+            } else {
+               msg.get_override_sender_name()
+                 .or_else(|| contact.map(|contact| msg.get_sender_name(contact)))
+                 .map(SummaryPrefix::Username)
             }
         };
 

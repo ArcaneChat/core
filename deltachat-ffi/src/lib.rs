@@ -3369,6 +3369,50 @@ pub unsafe extern "C" fn dc_msg_get_file(msg: *mut dc_msg_t) -> *mut libc::c_cha
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn dc_msg_is_outgoing(msg: *mut dc_msg_t) -> libc::c_int {
+    if msg.is_null() {
+        eprintln!("ignoring careless call to dc_msg_is_outgoing()");
+        return 0;
+    }
+    let ffi_msg = &*msg;
+    let ctx = &*ffi_msg.context;
+
+    let is_community = block_on(async move {
+      ctx.get_config_bool(config::Config::IsCommunity)
+        .await
+        .context("Can't get config")
+        .log_err(ctx)
+    });
+
+    let is_community = match is_community {
+        Ok(is_community) => {
+          is_community
+        }
+        Err(_) => false,
+    };
+    if is_community {
+      let name = block_on(async move {
+         ctx.get_ui_config("ui.community.selfname")
+            .await
+            .context("Can't get ui-config")
+            .log_err(ctx)
+            .unwrap_or_default()
+            .unwrap_or_default()
+      });
+      if name != "" && name == ffi_msg.message.get_override_sender_name().unwrap_or_default() {
+        return 1;
+      } else {
+        return 0;
+      }
+    }
+    if ffi_msg.message.get_from_id().to_u32() == 1 {
+      return 1;
+    } else {
+      return 0;
+    }
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn dc_msg_save_file(
     msg: *mut dc_msg_t,
     path: *const libc::c_char,
@@ -4105,14 +4149,20 @@ pub unsafe extern "C" fn dc_contact_get_color(contact: *mut dc_contact_t) -> u32
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dc_get_color(context: *mut dc_context_t, name: *const libc::c_char) -> u32 {
-    if context.is_null() {
-        eprintln!("ignoring careless call to dc_is_configured()");
+pub unsafe extern "C" fn dc_msg_get_sender_color(msg: *mut dc_msg_t) -> u32 {
+    if msg.is_null() {
+        eprintln!("ignoring careless call to dc_msg_get_sender_color()");
         return 0;
     }
-    let ctx = &*context;
-    let name = to_string_lossy(name);
-    ctx.get_color(name)
+    let ffi_msg = &mut *msg;
+    let ctx = &*ffi_msg.context;
+
+    let name = ffi_msg.message.get_override_sender_name();
+    if let Some(name) = name {
+      return ctx.get_color(name);
+    } else {
+      return 0;
+    }
 }
 
 #[no_mangle]

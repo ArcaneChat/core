@@ -363,7 +363,14 @@ impl Contact {
             .await?
         {
             if contact_id == ContactId::SELF {
-                contact.name = stock_str::self_msg(context).await;
+                if !context.get_config_bool(Config::IsCommunity).await? {
+                  contact.name = stock_str::self_msg(context).await;
+                } else {
+                  contact.name = context
+                    .get_config(Config::Displayname)
+                    .await?
+                    .unwrap_or_default();
+                }
                 contact.addr = context
                     .get_config(Config::ConfiguredAddr)
                     .await?
