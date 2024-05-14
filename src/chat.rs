@@ -12,6 +12,7 @@ use deltachat_contact_tools::{strip_rtlo_characters, ContactAddress};
 use deltachat_derive::{FromSql, ToSql};
 use serde::{Deserialize, Serialize};
 use strum_macros::EnumIter;
+use tokio::task;
 
 use crate::aheader::EncryptPreference;
 use crate::blob::BlobObject;
@@ -38,6 +39,7 @@ use crate::mimeparser::SystemMessage;
 use crate::param::{Param, Params};
 use crate::peerstate::Peerstate;
 use crate::receive_imf::ReceivedMsg;
+use crate::securejoin::BobState;
 use crate::smtp::send_msg_to_smtp;
 use crate::sql;
 use crate::stock_str;
@@ -126,6 +128,10 @@ pub(crate) enum CantSendReason {
 
     /// Not a member of the chat.
     NotAMember,
+
+    /// Temporary state for 1:1 chats while SecureJoin is in progress, after a timeout sending
+    /// messages (incl. unencrypted if we don't yet know the contact's pubkey) is allowed.
+    SecurejoinWait,
 }
 
 impl fmt::Display for CantSendReason {
@@ -145,6 +151,7 @@ impl fmt::Display for CantSendReason {
                 write!(f, "mailing list does not have a know post address")
             }
             Self::NotAMember => write!(f, "not a member of the chat"),
+            Self::SecurejoinWait => write!(f, "awaiting SecureJoin for 1:1 chat"),
         }
     }
 }
@@ -630,7 +637,10 @@ impl ChatId {
         let sort_to_bottom = true;
         let ts = self
             .calc_sort_timestamp(context, timestamp_sent, sort_to_bottom, false)
-            .await?;
+            .await?
+            // Always sort protection messages below `SystemMessage::SecurejoinWait{,Timeout}` ones
+            // in case of race conditions.
+            .saturating_add(1);
         self.set_protection_for_timestamp_sort(context, protect, ts, contact_id)
             .await
     }
@@ -1427,6 +1437,18 @@ impl ChatId {
 
         Ok(sort_timestamp)
     }
+
+    /// Spawns a task checking after a timeout whether the SecureJoin has finished for the 1:1 chat
+    /// and otherwise notifying the user accordingly.
+    pub(crate) fn spawn_securejoin_wait(self, context: &Context, timeout: u64) {
+        let context = context.clone();
+        task::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(timeout)).await;
+            let chat = Chat::load_from_db(&context, self).await?;
+            chat.check_securejoin_wait(&context, 0).await?;
+            Result::<()>::Ok(())
+        });
+    }
 }
 
 impl std::fmt::Display for ChatId {
@@ -1606,6 +1628,12 @@ impl Chat {
             Some(ReadOnlyMailingList)
         } else if !self.is_self_in_chat(context).await? {
             Some(NotAMember)
+        } else if self
+            .check_securejoin_wait(context, constants::SECUREJOIN_WAIT_TIMEOUT)
+            .await?
+            > 0
+        {
+            Some(SecurejoinWait)
         } else {
             None
         };
@@ -1617,6 +1645,69 @@ impl Chat {
     /// This function can be used by the UI to decide whether to display the input box.
     pub async fn can_send(&self, context: &Context) -> Result<bool> {
         Ok(self.why_cant_send(context).await?.is_none())
+    }
+
+    /// Returns the remaining timeout for the 1:1 chat in-progress SecureJoin.
+    ///
+    /// If the timeout has expired, notifies the user that sending messages is possible. See also
+    /// [`CantSendReason::SecurejoinWait`].
+    pub(crate) async fn check_securejoin_wait(
+        &self,
+        context: &Context,
+        timeout: u64,
+    ) -> Result<u64> {
+        if self.typ != Chattype::Single || self.protected != ProtectionStatus::Unprotected {
+            return Ok(0);
+        }
+        let (mut param0, mut param1) = (Params::new(), Params::new());
+        param0.set_cmd(SystemMessage::SecurejoinWait);
+        param1.set_cmd(SystemMessage::SecurejoinWaitTimeout);
+        let (param0, param1) = (param0.to_string(), param1.to_string());
+        let Some((param, ts_sort, ts_start)) = context
+            .sql
+            .query_row_optional(
+                "SELECT param, timestamp, timestamp_sent FROM msgs WHERE id=\
+                 (SELECT MAX(id) FROM msgs WHERE chat_id=? AND param IN (?, ?))",
+                (self.id, &param0, &param1),
+                |row| {
+                    let param: String = row.get(0)?;
+                    let ts_sort: i64 = row.get(1)?;
+                    let ts_start: i64 = row.get(2)?;
+                    Ok((param, ts_sort, ts_start))
+                },
+            )
+            .await?
+        else {
+            return Ok(0);
+        };
+        if param == param1 {
+            return Ok(0);
+        }
+        let now = time();
+        // Don't await SecureJoin if the clock was set back.
+        if ts_start <= now {
+            let timeout = ts_start
+                .saturating_add(timeout.try_into()?)
+                .saturating_sub(now);
+            if timeout > 0 {
+                return Ok(timeout as u64);
+            }
+        }
+        add_info_msg_with_cmd(
+            context,
+            self.id,
+            &stock_str::securejoin_wait_timeout(context).await,
+            SystemMessage::SecurejoinWaitTimeout,
+            // Use the sort timestamp of the "please wait" message, this way the added message is
+            // never sorted below the protection message if the SecureJoin finishes in parallel.
+            ts_sort,
+            Some(now),
+            None,
+            None,
+        )
+        .await?;
+        context.emit_event(EventType::ChatModified(self.id));
+        Ok(0)
     }
 
     /// Checks if the user is part of a chat
@@ -2255,8 +2346,9 @@ pub struct ChatInfo {
 }
 
 pub(crate) async fn update_saved_messages_icon(context: &Context) -> Result<()> {
-    // if there is no saved-messages chat, there is nothing to update. this is no error.
-    if let Some(chat_id) = ChatId::lookup_by_contact(context, ContactId::SELF).await? {
+    if let Some(ChatIdBlocked { id: chat_id, .. }) =
+        ChatIdBlocked::lookup_by_contact(context, ContactId::SELF).await?
+    {
         let icon = include_bytes!("../assets/icon-saved-messages.png");
         let blob = BlobObject::create(context, "icon-saved-messages.png", icon).await?;
         let icon = blob.as_name().to_string();
@@ -2269,8 +2361,9 @@ pub(crate) async fn update_saved_messages_icon(context: &Context) -> Result<()> 
 }
 
 pub(crate) async fn update_device_icon(context: &Context) -> Result<()> {
-    // if there is no device-chat, there is nothing to update. this is no error.
-    if let Some(chat_id) = ChatId::lookup_by_contact(context, ContactId::DEVICE).await? {
+    if let Some(ChatIdBlocked { id: chat_id, .. }) =
+        ChatIdBlocked::lookup_by_contact(context, ContactId::DEVICE).await?
+    {
         let icon = include_bytes!("../assets/icon-device.png");
         let blob = BlobObject::create(context, "icon-device.png", icon).await?;
         let icon = blob.as_name().to_string();
@@ -2321,7 +2414,9 @@ async fn update_special_chat_name(
     contact_id: ContactId,
     name: String,
 ) -> Result<()> {
-    if let Some(chat_id) = ChatId::lookup_by_contact(context, contact_id).await? {
+    if let Some(ChatIdBlocked { id: chat_id, .. }) =
+        ChatIdBlocked::lookup_by_contact(context, contact_id).await?
+    {
         // the `!= name` condition avoids unneeded writes
         context
             .sql
@@ -2347,6 +2442,26 @@ pub(crate) async fn update_special_chat_names(context: &Context) -> Result<()> {
         stock_str::saved_messages(context).await,
     )
     .await?;
+    Ok(())
+}
+
+/// Checks if there is a 1:1 chat in-progress SecureJoin for Bob and, if necessary, schedules a task
+/// unblocking the chat and notifying the user accordingly.
+pub(crate) async fn resume_securejoin_wait(context: &Context) -> Result<()> {
+    let Some(bobstate) = BobState::from_db(&context.sql).await? else {
+        return Ok(());
+    };
+    if !bobstate.in_progress() {
+        return Ok(());
+    }
+    let chat_id = bobstate.alice_chat();
+    let chat = Chat::load_from_db(context, chat_id).await?;
+    let timeout = chat
+        .check_securejoin_wait(context, constants::SECUREJOIN_WAIT_TIMEOUT)
+        .await?;
+    if timeout > 0 {
+        chat_id.spawn_securejoin_wait(context, timeout);
+    }
     Ok(())
 }
 
@@ -2603,13 +2718,27 @@ async fn prepare_msg_common(
     if let Some(reason) = chat.why_cant_send(context).await? {
         if matches!(
             reason,
-            CantSendReason::ProtectionBroken | CantSendReason::ContactRequest
+            CantSendReason::ProtectionBroken
+                | CantSendReason::ContactRequest
+                | CantSendReason::SecurejoinWait
         ) && msg.param.get_cmd() == SystemMessage::SecurejoinMessage
         {
             // Send out the message, the securejoin message is supposed to repair the verification.
             // If the chat is a contact request, let the user accept it later.
         } else {
             bail!("cannot send to {chat_id}: {reason}");
+        }
+    }
+
+    // Check a quote reply is not leaking data from other chats.
+    // This is meant as a last line of defence, the UI should check that before as well.
+    // (We allow Chattype::Single in general for "Reply Privately";
+    // checking for exact contact_id will produce false positives when ppl just left the group)
+    if chat.typ != Chattype::Single && !context.get_config_bool(Config::Bot).await? {
+        if let Some(quoted_message) = msg.quoted_message(context).await? {
+            if quoted_message.chat_id != chat_id {
+                bail!("Bad quote reply");
+            }
         }
     }
 
@@ -2855,16 +2984,9 @@ pub(crate) async fn create_send_msg_jobs(context: &Context, msg: &mut Message) -
             .await?;
     }
 
-    if let Some(last_added_location_id) = rendered_msg.last_added_location_id {
+    if rendered_msg.last_added_location_id.is_some() {
         if let Err(err) = location::set_kml_sent_timestamp(context, msg.chat_id, now).await {
             error!(context, "Failed to set kml sent_timestamp: {err:#}.");
-        }
-        if !msg.hidden {
-            if let Err(err) =
-                location::set_msg_location_id(context, msg.id, last_added_location_id).await
-            {
-                error!(context, "Failed to set msg_location_id: {err:#}.");
-            }
         }
     }
 
@@ -4523,9 +4645,10 @@ impl Context {
                     }
                     _ => (),
                 }
-                ChatId::lookup_by_contact(self, contact_id)
+                ChatIdBlocked::lookup_by_contact(self, contact_id)
                     .await?
                     .with_context(|| format!("No chat for addr '{addr}'"))?
+                    .id
             }
             SyncId::Grpid(grpid) => {
                 if let SyncAction::CreateBroadcast(name) = action {
@@ -4768,6 +4891,59 @@ mod tests {
         assert_eq!(test.text, "another draft text".to_string());
         assert!(test.quoted_text().is_none());
         assert!(test.quoted_message(&t).await?.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_quote_replies() -> Result<()> {
+        let alice = TestContext::new_alice().await;
+        let bob = TestContext::new_bob().await;
+
+        let grp_chat_id = create_group_chat(&alice, ProtectionStatus::Unprotected, "grp").await?;
+        let grp_msg_id = send_text_msg(&alice, grp_chat_id, "bar".to_string()).await?;
+        let grp_msg = Message::load_from_db(&alice, grp_msg_id).await?;
+
+        let one2one_chat_id = alice.create_chat(&bob).await.id;
+        let one2one_msg_id = send_text_msg(&alice, one2one_chat_id, "foo".to_string()).await?;
+        let one2one_msg = Message::load_from_db(&alice, one2one_msg_id).await?;
+
+        // quoting messages in same chat is okay
+        let mut msg = Message::new(Viewtype::Text);
+        msg.set_text("baz".to_string());
+        msg.set_quote(&alice, Some(&grp_msg)).await?;
+        let result = send_msg(&alice, grp_chat_id, &mut msg).await;
+        assert!(result.is_ok());
+
+        let mut msg = Message::new(Viewtype::Text);
+        msg.set_text("baz".to_string());
+        msg.set_quote(&alice, Some(&one2one_msg)).await?;
+        let result = send_msg(&alice, one2one_chat_id, &mut msg).await;
+        assert!(result.is_ok());
+        let one2one_quote_reply_msg_id = result.unwrap();
+
+        // quoting messages from groups to one-to-ones is okay ("reply privately")
+        let mut msg = Message::new(Viewtype::Text);
+        msg.set_text("baz".to_string());
+        msg.set_quote(&alice, Some(&grp_msg)).await?;
+        let result = send_msg(&alice, one2one_chat_id, &mut msg).await;
+        assert!(result.is_ok());
+
+        // quoting messages from one-to-one chats in groups is an error; usually this is also not allowed by UI at all ...
+        let mut msg = Message::new(Viewtype::Text);
+        msg.set_text("baz".to_string());
+        msg.set_quote(&alice, Some(&one2one_msg)).await?;
+        let result = send_msg(&alice, grp_chat_id, &mut msg).await;
+        assert!(result.is_err());
+
+        // ... but forwarding messages with quotes is allowed
+        let result = forward_msgs(&alice, &[one2one_quote_reply_msg_id], grp_chat_id).await;
+        assert!(result.is_ok());
+
+        // ... and bots are not restricted
+        alice.set_config(Config::Bot, Some("1")).await?;
+        let result = send_msg(&alice, grp_chat_id, &mut msg).await;
+        assert!(result.is_ok());
 
         Ok(())
     }

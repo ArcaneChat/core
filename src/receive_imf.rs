@@ -37,7 +37,7 @@ use crate::simplify;
 use crate::sql;
 use crate::stock_str;
 use crate::sync::Sync::*;
-use crate::tools::{self, buf_compress, extract_grpid_from_rfc724_mid, validate_id};
+use crate::tools::{self, buf_compress, extract_grpid_from_rfc724_mid};
 use crate::{chatlist_events, location};
 use crate::{contact, imap};
 
@@ -703,7 +703,9 @@ async fn add_parts(
         better_msg = Some(stock_str::msg_location_enabled_by(context, from_id).await);
     }
 
-    let parent = get_parent_message(context, mime_parser).await?;
+    let parent = get_parent_message(context, mime_parser)
+        .await?
+        .filter(|p| Some(p.id) != replace_msg_id);
 
     let is_dc_message = if mime_parser.has_chat_version() {
         MessengerMessage::Yes
@@ -778,6 +780,18 @@ async fn add_parts(
         if chat_id.is_none() && is_mdn {
             chat_id = Some(DC_CHAT_ID_TRASH);
             info!(context, "Message is an MDN (TRASH).",);
+        }
+
+        // Try to assign to a chat based on Chat-Group-ID.
+        if chat_id.is_none() {
+            if let Some(grpid) = mime_parser.get_chat_group_id() {
+                if let Some((id, _protected, blocked)) =
+                    chat::get_chat_id_by_grpid(context, grpid).await?
+                {
+                    chat_id = Some(id);
+                    chat_id_blocked = blocked;
+                }
+            }
         }
 
         if chat_id.is_none() {
@@ -1034,6 +1048,18 @@ async fn add_parts(
             // Most mailboxes have a "Drafts" folder where constantly new emails appear but we don't actually want to show them
             info!(context, "Email is probably just a draft (TRASH).");
             chat_id = Some(DC_CHAT_ID_TRASH);
+        }
+
+        // Try to assign to a chat based on Chat-Group-ID.
+        if chat_id.is_none() {
+            if let Some(grpid) = mime_parser.get_chat_group_id() {
+                if let Some((id, _protected, blocked)) =
+                    chat::get_chat_id_by_grpid(context, grpid).await?
+                {
+                    chat_id = Some(id);
+                    chat_id_blocked = blocked;
+                }
+            }
         }
 
         if chat_id.is_none() {
@@ -1348,11 +1374,9 @@ async fn add_parts(
 
     let mime_in_reply_to = mime_parser
         .get_header(HeaderDef::InReplyTo)
-        .cloned()
         .unwrap_or_default();
     let mime_references = mime_parser
         .get_header(HeaderDef::References)
-        .cloned()
         .unwrap_or_default();
 
     // fine, so far.  now, split the message into simple parts usable as "short messages"
@@ -1412,7 +1436,7 @@ async fn add_parts(
             let reaction_str = simplify::remove_footers(part.msg.as_str());
             set_msg_reaction(
                 context,
-                &mime_in_reply_to,
+                mime_in_reply_to,
                 orig_chat_id.unwrap_or_default(),
                 from_id,
                 sort_timestamp,
@@ -1670,11 +1694,10 @@ async fn save_locations(
         if let Some(addr) = &location_kml.addr {
             let contact = Contact::get_by_id(context, from_id).await?;
             if contact.get_addr().to_lowercase() == addr.to_lowercase() {
-                if let Some(newest_location_id) =
-                    location::save(context, chat_id, from_id, &location_kml.locations, false)
-                        .await?
+                if location::save(context, chat_id, from_id, &location_kml.locations, false)
+                    .await?
+                    .is_some()
                 {
-                    location::set_msg_location_id(context, msg_id, newest_location_id).await?;
                     send_event = true;
                 }
             } else {
@@ -1753,6 +1776,11 @@ async fn is_probably_private_reply(
     let private_message =
         (to_ids == [ContactId::SELF]) || (from_id == ContactId::SELF && to_ids.len() == 1);
     if !private_message {
+        return Ok(false);
+    }
+
+    // Message cannot be a private reply if it has an explicit Chat-Group-ID header.
+    if mime_parser.get_chat_group_id().is_some() {
         return Ok(false);
     }
 
@@ -2433,11 +2461,8 @@ async fn apply_mailinglist_changes(
 }
 
 fn try_getting_grpid(mime_parser: &MimeMessage) -> Option<String> {
-    if let Some(optional_field) = mime_parser
-        .get_header(HeaderDef::ChatGroupId)
-        .filter(|s| validate_id(s))
-    {
-        return Some(optional_field.clone());
+    if let Some(optional_field) = mime_parser.get_chat_group_id() {
+        return Some(optional_field.to_string());
     }
 
     // Useful for undecipherable messages sent to known group.

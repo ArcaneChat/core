@@ -4396,9 +4396,9 @@ int             dc_msg_has_deviating_timestamp(const dc_msg_t* msg);
 
 
 /**
- * Check if a message has a location bound to it.
- * These messages are also returned by dc_get_locations()
- * and the UI may decide to display a special icon beside such messages,
+ * Check if a message has a POI location bound to it.
+ * These locations are also returned by dc_get_locations()
+ * The UI may decide to display a special icon beside such messages.
  *
  * @memberof dc_msg_t
  * @param msg The message object.
@@ -7332,6 +7332,16 @@ void dc_event_unref(dc_event_t* event);
 ///
 /// Used in summaries.
 #define DC_STR_REACTED_BY 177
+
+/// "Establishing guaranteed end-to-end encryption, please wait…"
+///
+/// Used as info message.
+#define DC_STR_SECUREJOIN_WAIT 190
+
+/// "Could not yet establish guaranteed end-to-end encryption, but you may already send a message."
+///
+/// Used as info message.
+#define DC_STR_SECUREJOIN_WAIT_TIMEOUT 191
 
 /**
  * @}

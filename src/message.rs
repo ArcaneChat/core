@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{fs, io};
 
 use crate::blob::BlobObject;
-use crate::chat::{Chat, ChatId};
+use crate::chat::{Chat, ChatId, ChatIdBlocked};
 use crate::chatlist_events;
 use crate::config::Config;
 use crate::constants::{
@@ -655,9 +655,11 @@ impl Message {
         Ok(())
     }
 
-    /// Check if a message has a location bound to it.
-    /// These messages are also returned by get_locations()
-    /// and the UI may decide to display a special icon beside such messages,
+    /// Check if a message has a POI location bound to it.
+    /// These locations are also returned by [`location::get_range()`].
+    /// The UI may decide to display a special icon beside such messages.
+    ///
+    /// [`location::get_range()`]: crate::location::get_range
     pub fn has_location(&self) -> bool {
         self.location_id != 0
     }
@@ -1811,8 +1813,9 @@ pub async fn estimate_deletion_cnt(
     from_server: bool,
     seconds: i64,
 ) -> Result<usize> {
-    let self_chat_id = ChatId::lookup_by_contact(context, ContactId::SELF)
+    let self_chat_id = ChatIdBlocked::lookup_by_contact(context, ContactId::SELF)
         .await?
+        .map(|c| c.id)
         .unwrap_or_default();
     let threshold_timestamp = time() - seconds;
 
