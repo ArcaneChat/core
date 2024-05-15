@@ -606,8 +606,9 @@ pub(crate) async fn receive_imf_inner(
         context.emit_msgs_changed(replace_chat_id, MsgId::new(0));
     } else if !chat_id.is_trash() {
         let fresh = received_msg.state == MessageState::InFresh;
+        let is_community = context.get_config_bool(Config::IsCommunity).await?;
         for msg_id in &received_msg.msg_ids {
-            chat_id.emit_msg_event(context, *msg_id, mime_parser.incoming && fresh);
+            chat_id.emit_msg_event(context, *msg_id, (mime_parser.incoming || is_community) && fresh);
         }
     }
     context.new_msgs_notify.notify_one();
@@ -761,6 +762,8 @@ async fn add_parts(
             }
         }
     }
+
+    let is_community = context.get_config_bool(Config::IsCommunity).await?;
 
     if mime_parser.incoming {
         to_id = ContactId::SELF;
@@ -1011,7 +1014,7 @@ async fn add_parts(
             }
         }
 
-        state = if seen
+        state = if (seen && !is_community)
             || fetching_existing_messages
             || is_mdn
             || is_reaction
@@ -1025,9 +1028,6 @@ async fn add_parts(
     } else {
         // Outgoing
 
-        // the mail is on the IMAP server, probably it is also delivered.
-        // We cannot recreate other states (read, error).
-        state = MessageState::OutDelivered;
         to_id = to_ids.first().copied().unwrap_or_default();
 
         let self_sent =
@@ -1188,19 +1188,63 @@ async fn add_parts(
         }
 
         if chat_id.is_none() {
-            // Check if the message belongs to a broadcast list.
-            if let Some(mailinglist_header) = mime_parser.get_mailinglist_header() {
-                let listid = mailinglist_header_listid(mailinglist_header)?;
-                chat_id = Some(
-                    if let Some((id, ..)) = chat::get_chat_id_by_grpid(context, &listid).await? {
-                        id
-                    } else {
-                        let name =
-                            compute_mailinglist_name(mailinglist_header, &listid, mime_parser);
-                        chat::create_broadcast_list_ex(context, Nosync, listid, name).await?
-                    },
-                );
+            if is_community {
+              // check if the message belongs to a mailing list
+              if let Some(mailinglist_header) = mime_parser.get_mailinglist_header() {
+                  if let Some((new_chat_id, new_chat_id_blocked)) = create_or_lookup_mailinglist(
+                      context,
+                      allow_creation,
+                      mailinglist_header,
+                      mime_parser,
+                  )
+                  .await?
+                  {
+                      chat_id = Some(new_chat_id);
+                      chat_id_blocked = new_chat_id_blocked;
+                  }
+              }
+            } else {
+              // Check if the message belongs to a broadcast list.
+              if let Some(mailinglist_header) = mime_parser.get_mailinglist_header() {
+                  let listid = mailinglist_header_listid(mailinglist_header)?;
+                  chat_id = Some(
+                      if let Some((id, ..)) = chat::get_chat_id_by_grpid(context, &listid).await? {
+                          id
+                      } else {
+                          let name =
+                              compute_mailinglist_name(mailinglist_header, &listid, mime_parser);
+                          chat::create_broadcast_list_ex(context, Nosync, listid, name).await?
+                      },
+                  );
+              }
             }
+        }
+
+        if is_community {
+          state = if fetching_existing_messages
+              || is_mdn
+              || is_reaction
+              || is_location_kml
+              || chat_id_blocked == Blocked::Yes
+          {
+            MessageState::OutDelivered
+          } else {
+            let selfname = context.get_ui_config("ui.community.selfname")
+              .await
+              .context("Can't get ui-config")
+              .unwrap_or_default()
+              .unwrap_or_default();
+            let overriden = if prevent_rename { if let Some(name) = &mime_parser.from.display_name { name} else {""} } else { "" };
+            if selfname != "" && overriden == selfname {
+              MessageState::OutDelivered
+            } else {
+              MessageState::InFresh
+            }
+          };
+        } else {
+          // the mail is on the IMAP server, probably it is also delivered.
+          // We cannot recreate other states (read, error).
+          state = MessageState::OutDelivered;
         }
     }
 
