@@ -1120,7 +1120,9 @@ impl Session {
 
     /// Synchronizes `\Seen` flags using `CONDSTORE` extension.
     pub(crate) async fn sync_seen_flags(&mut self, context: &Context, folder: &str) -> Result<()> {
-        return Ok(()); // disable syncing markseen
+        if self.get_config_bool(Config::IsCommunity).await? {
+          return Ok(()); // disable syncing markseen
+        }
         if !self.can_condstore() {
             info!(
                 context,
