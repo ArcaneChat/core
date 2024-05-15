@@ -2052,6 +2052,11 @@ async fn apply_group_changes(
                 .saturating_add(timestamp_sent_tolerance)
         })
         .is_some();
+    let allow_member_list_changes = if allow_member_list_changes {
+      if chat_contacts.len() == 1 && context.get_config_bool(Config::IsCommunity).await? { false } else { true }
+    } else {
+      false
+    };
     let sync_member_list = member_list_ts
         .filter(|t| *t <= mime_parser.timestamp_sent)
         .is_some();
