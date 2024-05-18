@@ -1,3 +1,4 @@
+use crate::api::VcardContact;
 use anyhow::{Context as _, Result};
 use deltachat::chat::Chat;
 use deltachat::chat::ChatItem;
@@ -87,6 +88,8 @@ pub struct MessageObject {
     download_state: DownloadState,
 
     reactions: Option<JSONRPCReactions>,
+
+    vcard_contact: Option<VcardContact>,
 }
 
 #[derive(Serialize, TypeDef, schemars::JsonSchema)]
@@ -173,6 +176,13 @@ impl MessageObject {
             Some(reactions.into())
         };
 
+        let vcard_contacts: Vec<VcardContact> = message
+            .vcard_contacts(context)
+            .await?
+            .into_iter()
+            .map(Into::into)
+            .collect();
+
         Ok(MessageObject {
             id: msg_id.to_u32(),
             chat_id: message.get_chat_id().to_u32(),
@@ -232,6 +242,8 @@ impl MessageObject {
             download_state,
 
             reactions,
+
+            vcard_contact: vcard_contacts.first().cloned(),
         })
     }
 }
@@ -274,6 +286,11 @@ pub enum MessageViewtype {
 
     /// Message is an webxdc instance.
     Webxdc,
+
+    /// Message containing shared contacts represented as a vCard (virtual contact file)
+    /// with email addresses and possibly other fields.
+    /// Use `parse_vcard()` to retrieve them.
+    Vcard,
 }
 
 impl From<Viewtype> for MessageViewtype {
@@ -290,6 +307,7 @@ impl From<Viewtype> for MessageViewtype {
             Viewtype::File => MessageViewtype::File,
             Viewtype::VideochatInvitation => MessageViewtype::VideochatInvitation,
             Viewtype::Webxdc => MessageViewtype::Webxdc,
+            Viewtype::Vcard => MessageViewtype::Vcard,
         }
     }
 }
@@ -308,6 +326,7 @@ impl From<MessageViewtype> for Viewtype {
             MessageViewtype::File => Viewtype::File,
             MessageViewtype::VideochatInvitation => Viewtype::VideochatInvitation,
             MessageViewtype::Webxdc => Viewtype::Webxdc,
+            MessageViewtype::Vcard => Viewtype::Vcard,
         }
     }
 }
@@ -372,6 +391,9 @@ pub enum SystemMessageType {
 
     /// Webxdc info added with `info` set in `send_webxdc_status_update()`.
     WebxdcInfoMessage,
+
+    /// This message contains a users iroh node address.
+    IrohNodeAddr,
 }
 
 impl From<deltachat::mimeparser::SystemMessage> for SystemMessageType {
@@ -394,6 +416,7 @@ impl From<deltachat::mimeparser::SystemMessage> for SystemMessageType {
             SystemMessage::WebxdcStatusUpdate => SystemMessageType::WebxdcStatusUpdate,
             SystemMessage::WebxdcInfoMessage => SystemMessageType::WebxdcInfoMessage,
             SystemMessage::InvalidUnencryptedMail => SystemMessageType::InvalidUnencryptedMail,
+            SystemMessage::IrohNodeAddr => SystemMessageType::IrohNodeAddr,
             SystemMessage::SecurejoinWait => SystemMessageType::SecurejoinWait,
             SystemMessage::SecurejoinWaitTimeout => SystemMessageType::SecurejoinWaitTimeout,
         }

@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::str;
 use std::sync::Arc;
 use std::time::Duration;
 use std::{collections::HashMap, str::FromStr};
@@ -17,11 +18,13 @@ use deltachat::constants::DC_MSG_ID_DAYMARKER;
 use deltachat::contact::{may_be_valid_addr, Contact, ContactId, Origin};
 use deltachat::context::get_info;
 use deltachat::ephemeral::Timer;
-use deltachat::imex;
 use deltachat::location;
 use deltachat::message::get_msg_read_receipts;
 use deltachat::message::{
     self, delete_msgs, markseen_msgs, Message, MessageState, MsgId, Viewtype,
+};
+use deltachat::peer_channels::{
+    leave_webxdc_realtime, send_webxdc_realtime_advertisement, send_webxdc_realtime_data,
 };
 use deltachat::provider::get_provider_info;
 use deltachat::qr::{self, Qr};
@@ -31,6 +34,7 @@ use deltachat::securejoin;
 use deltachat::stock_str::StockMessage;
 use deltachat::webxdc::StatusUpdateSerial;
 use deltachat::EventEmitter;
+use deltachat::{imex, info};
 use sanitize_filename::is_sanitized;
 use tokio::fs;
 use tokio::sync::{watch, Mutex, RwLock};
@@ -42,7 +46,7 @@ pub mod types;
 use num_traits::FromPrimitive;
 use types::account::Account;
 use types::chat::FullChat;
-use types::contact::ContactObject;
+use types::contact::{ContactObject, VcardContact};
 use types::events::Event;
 use types::http::HttpResponse;
 use types::message::{MessageData, MessageObject, MessageReadReceipt};
@@ -182,6 +186,16 @@ impl CommandApi {
 
     async fn add_account(&self) -> Result<u32> {
         self.accounts.write().await.add_account().await
+    }
+
+    /// Imports/migrated an existing account from a database path into this account manager.
+    /// Returns the ID of new account.
+    async fn migrate_account(&self, path_to_db: String) -> Result<u32> {
+        self.accounts
+            .write()
+            .await
+            .migrate_account(std::path::PathBuf::from(path_to_db))
+            .await
     }
 
     async fn remove_account(&self, account_id: u32) -> Result<()> {
@@ -326,6 +340,11 @@ impl CommandApi {
     async fn get_info(&self, account_id: u32) -> Result<BTreeMap<&'static str, String>> {
         let ctx = self.get_context(account_id).await?;
         ctx.get_info().await
+    }
+
+    async fn get_blob_dir(&self, account_id: u32) -> Result<Option<String>> {
+        let ctx = self.get_context(account_id).await?;
+        Ok(ctx.get_blobdir().to_str().map(|s| s.to_owned()))
     }
 
     async fn draft_self_report(&self, account_id: u32) -> Result<u32> {
@@ -1426,6 +1445,23 @@ impl CommandApi {
         Ok(contact_id.map(|id| id.to_u32()))
     }
 
+    /// Parses a vCard file located at the given path. Returns contacts in their original order.
+    async fn parse_vcard(&self, path: String) -> Result<Vec<VcardContact>> {
+        let vcard = tokio::fs::read(Path::new(&path)).await?;
+        let vcard = str::from_utf8(&vcard)?;
+        Ok(deltachat_contact_tools::parse_vcard(vcard)
+            .into_iter()
+            .map(|c| c.into())
+            .collect())
+    }
+
+    /// Returns a vCard containing contacts with the given ids.
+    async fn make_vcard(&self, account_id: u32, contacts: Vec<u32>) -> Result<String> {
+        let ctx = self.get_context(account_id).await?;
+        let contacts: Vec<_> = contacts.iter().map(|&c| ContactId::new(c)).collect();
+        deltachat::contact::make_vcard(&ctx, &contacts).await
+    }
+
     // ---------------------------------------------
     //                   chat
     // ---------------------------------------------
@@ -1728,6 +1764,37 @@ impl CommandApi {
         let ctx = self.get_context(account_id).await?;
         ctx.send_webxdc_status_update(MsgId::new(instance_msg_id), &update_str, &description)
             .await
+    }
+
+    async fn send_webxdc_realtime_data(
+        &self,
+        account_id: u32,
+        instance_msg_id: u32,
+        data: Vec<u8>,
+    ) -> Result<()> {
+        let ctx = self.get_context(account_id).await?;
+        send_webxdc_realtime_data(&ctx, MsgId::new(instance_msg_id), data).await
+    }
+
+    async fn send_webxdc_realtime_advertisement(
+        &self,
+        account_id: u32,
+        instance_msg_id: u32,
+    ) -> Result<()> {
+        let ctx = self.get_context(account_id).await?;
+        let fut = send_webxdc_realtime_advertisement(&ctx, MsgId::new(instance_msg_id)).await?;
+        if let Some(fut) = fut {
+            tokio::spawn(async move {
+                fut.await.ok();
+                info!(ctx, "send_webxdc_realtime_advertisement done")
+            });
+        }
+        Ok(())
+    }
+
+    async fn leave_webxdc_realtime(&self, account_id: u32, instance_message_id: u32) -> Result<()> {
+        let ctx = self.get_context(account_id).await?;
+        leave_webxdc_realtime(&ctx, MsgId::new(instance_message_id)).await
     }
 
     async fn get_webxdc_status_updates(

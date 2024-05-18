@@ -22,10 +22,6 @@ import {
 import package_json from "./package.json" with { type: "json" };
 import { createRequire } from "node:module";
 
-// exports
-// - [ ] a raw starter that has a stdin/out handle thingie like desktop uses
-// - [X] a function that already wraps the stdio handle from above into the deltachat jsonrpc bindings
-
 function findRPCServerInNodeModules() {
   const arch = os.arch();
   const operating_system = process.platform;
@@ -40,6 +36,32 @@ function findRPCServerInNodeModules() {
     } else {
       throw new Error(NPM_NOT_FOUND_UNSUPPORTED_PLATFORM_ERROR());
     }
+  }
+}
+
+/**
+ * @returns {Promise<string>}
+ */
+async function getLocationInPath() {
+  const exec = promisify(execFile);
+
+  if (os.platform() === "win32") {
+    const { stdout: executable } = await exec("where", [PATH_EXECUTABLE_NAME], {
+      shell: true,
+    });
+    return executable;
+  }
+
+  try {
+    const { stdout: executable } = await exec(
+      "command",
+      ["-v", PATH_EXECUTABLE_NAME],
+      { shell: true }
+    );
+    return executable;
+  } catch (error) {
+    if (error.code > 0) return "";
+    else throw error;
   }
 }
 
@@ -65,19 +87,18 @@ export async function getRPCServerPath(
 
   // 2. check if it can be found in PATH
   if (!process.env[SKIP_SEARCH_IN_PATH] && !skipSearchInPath) {
-    const exec = promisify(execFile);
-
-    const { stdout: executable } =
-      os.platform() !== "win32"
-        ? await exec("command", ["-v", PATH_EXECUTABLE_NAME])
-        : await exec("where", [PATH_EXECUTABLE_NAME]);
+    const executable = await getLocationInPath();
 
     // by just trying to execute it and then use "command -v deltachat-rpc-server" (unix) or "where deltachat-rpc-server" (windows) to get the path to the executable
     if (executable.length > 1) {
       // test if it is the right version
       try {
         // for some unknown reason it is in stderr and not in stdout
-        const { stderr } = await promisify(execFile)(executable, ["--version"]);
+        const { stderr } = await promisify(execFile)(
+          executable,
+          ["--version"],
+          { shell: true }
+        );
         const version = stderr.slice(0, stderr.indexOf("\n"));
         if (package_json.version !== version) {
           throw new Error(
@@ -109,6 +130,7 @@ export async function startDeltaChat(directory, options) {
       RUST_LOG: process.env.RUST_LOG || "info",
       DC_ACCOUNTS_PATH: directory,
     },
+    stdio: ["pipe", "pipe", options.muteStdErr ? "ignore" : "inherit"],
   });
 
   server.on("error", (err) => {
@@ -123,13 +145,11 @@ export async function startDeltaChat(directory, options) {
     throw new Error("Server quit");
   });
 
-  server.stderr.pipe(process.stderr);
-
   /** @type {import('./index').DeltaChatOverJsonRpcServer} */
   //@ts-expect-error
   const dc = new StdioDeltaChat(server.stdin, server.stdout, true);
 
-  dc.shutdown = async () => {
+  dc.close = () => {
     shouldClose = true;
     if (!server.kill()) {
       console.log("server termination failed");

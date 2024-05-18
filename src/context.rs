@@ -12,7 +12,7 @@ use anyhow::{bail, ensure, Context as _, Result};
 use async_channel::{self as channel, Receiver, Sender};
 use pgp::SignedPublicKey;
 use ratelimit::Ratelimit;
-use tokio::sync::{Mutex, Notify, RwLock};
+use tokio::sync::{Mutex, Notify, OnceCell, RwLock};
 
 use crate::aheader::EncryptPreference;
 use crate::chat::{get_chat_cnt, ChatId, ProtectionStatus};
@@ -31,6 +31,7 @@ use crate::key::{load_self_public_key, load_self_secret_key, DcKey as _};
 use crate::login_param::LoginParam;
 use crate::message::{self, Message, MessageState, MsgId, Viewtype};
 use crate::param::{Param, Params};
+use crate::peer_channels::Iroh;
 use crate::peerstate::Peerstate;
 use crate::push::PushSubscriber;
 use crate::quota::QuotaInfo;
@@ -289,6 +290,9 @@ pub struct InnerContext {
 
     /// True if account has subscribed to push notifications via IMAP.
     pub(crate) push_subscribed: AtomicBool,
+
+    /// Iroh for realtime peer channels.
+    pub(crate) iroh: OnceCell<Iroh>,
 }
 
 /// The state of ongoing process.
@@ -451,6 +455,7 @@ impl Context {
             debug_logging: std::sync::RwLock::new(None),
             push_subscriber,
             push_subscribed: AtomicBool::new(false),
+            iroh: OnceCell::new(),
         };
 
         let ctx = Context {
@@ -488,6 +493,9 @@ impl Context {
 
     /// Indicate that the network likely has come back.
     pub async fn maybe_network(&self) {
+        if let Some(iroh) = self.iroh.get() {
+            iroh.network_change().await;
+        }
         self.scheduler.maybe_network().await;
     }
 
@@ -1654,6 +1662,7 @@ mod tests {
             "socks5_password",
             "key_id",
             "webxdc_integration",
+            "iroh_secret_key",
         ];
         let t = TestContext::new().await;
         let info = t.get_info().await.unwrap();
