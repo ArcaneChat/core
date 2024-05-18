@@ -38,6 +38,9 @@ pub struct WebxdcMessageInfo {
 
     /// prefered screen orientation (landscape or portrait).
     orientation: Option<String>,
+
+    /// If the webxdc is a community backup
+    pub community: bool,
 }
 
 impl WebxdcMessageInfo {
@@ -54,6 +57,7 @@ impl WebxdcMessageInfo {
             source_code_url,
             internet_access,
             orientation,
+            community,
         } = message.get_webxdc_info(context).await?;
 
         Ok(Self {
@@ -64,6 +68,7 @@ impl WebxdcMessageInfo {
             source_code_url: maybe_empty_string_to_option(source_code_url),
             internet_access,
             orientation: maybe_empty_string_to_option(orientation),
+            community: community,
         })
     }
 }

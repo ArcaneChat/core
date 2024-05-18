@@ -71,6 +71,9 @@ pub struct WebxdcManifest {
 
     /// prefered screen orientation (landscape or portrait).
     pub orientation: Option<String>,
+
+    /// If the webxdc is a community backup
+    pub community: Option<bool>,
 }
 
 /// Parsed information from WebxdcManifest and fallbacks.
@@ -102,6 +105,9 @@ pub struct WebxdcInfo {
 
     /// prefered screen orientation (landscape or portrait).
     pub orientation: String,
+
+    /// If the webxdc is a community backup
+    pub community: bool,
 }
 
 /// Status Update ID.
@@ -864,6 +870,11 @@ impl Message {
                 orientation
             } else {
                 "".to_string()
+            },
+            community: if let Some(community) = manifest.community {
+                community
+            } else {
+                false
             },
         })
     }
