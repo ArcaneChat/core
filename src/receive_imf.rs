@@ -40,7 +40,7 @@ use crate::simplify;
 use crate::sql;
 use crate::stock_str;
 use crate::sync::Sync::*;
-use crate::tools::{self, buf_compress, extract_grpid_from_rfc724_mid};
+use crate::tools::{self, buf_compress};
 use crate::{chatlist_events, location};
 use crate::{contact, imap};
 use iroh_net::NodeAddr;
@@ -772,11 +772,7 @@ async fn add_parts(
     if mime_parser.incoming {
         to_id = ContactId::SELF;
 
-        let test_normal_chat = if from_id == ContactId::UNDEFINED {
-            None
-        } else {
-            ChatIdBlocked::lookup_by_contact(context, from_id).await?
-        };
+        let test_normal_chat = ChatIdBlocked::lookup_by_contact(context, from_id).await?;
 
         if chat_id.is_none() && mime_parser.delivery_report.is_some() {
             chat_id = Some(DC_CHAT_ID_TRASH);
@@ -841,18 +837,13 @@ async fn add_parts(
             create_blocked_default
         };
 
-        if chat_id.is_none() && !is_mdn {
+        if chat_id.is_none() && (allow_creation || test_normal_chat.is_some()) {
             // try to create a group
 
-            if let Some((new_chat_id, new_chat_id_blocked)) = create_or_lookup_group(
+            if let Some((new_chat_id, new_chat_id_blocked)) = create_group(
                 context,
                 mime_parser,
                 is_partial_download.is_some(),
-                if test_normal_chat.is_none() {
-                    allow_creation
-                } else {
-                    true
-                },
                 create_blocked,
                 from_id,
                 to_ids,
@@ -874,7 +865,7 @@ async fn add_parts(
             }
         }
 
-        // In lookup_chat_by_reply() and create_or_lookup_group(), it can happen that the message is put into a chat
+        // In lookup_chat_by_reply() and create_group(), it can happen that the message is put into a chat
         // but the From-address is not a member of this chat.
         if let Some(group_chat_id) = chat_id {
             if !chat::is_contact_in_chat(context, group_chat_id, from_id).await? {
@@ -1108,12 +1099,11 @@ async fn add_parts(
         }
 
         if !to_ids.is_empty() {
-            if chat_id.is_none() {
-                if let Some((new_chat_id, new_chat_id_blocked)) = create_or_lookup_group(
+            if chat_id.is_none() && allow_creation {
+                if let Some((new_chat_id, new_chat_id_blocked)) = create_group(
                     context,
                     mime_parser,
                     is_partial_download.is_some(),
-                    allow_creation,
                     Blocked::Not,
                     from_id,
                     to_ids,
@@ -1869,37 +1859,32 @@ async fn is_probably_private_reply(
     Ok(true)
 }
 
-/// This function tries to extract the group-id from the message and returns the corresponding
-/// chat_id. If the chat does not exist, it is created. If there is no group-id and there are more
+/// This function tries to extract the group-id from the message and create a new group
+/// chat with this ID. If there is no group-id and there are more
 /// than two members, a new ad hoc group is created.
 ///
 /// On success the function returns the found/created (chat_id, chat_blocked) tuple.
-#[allow(clippy::too_many_arguments)]
-async fn create_or_lookup_group(
+async fn create_group(
     context: &Context,
     mime_parser: &mut MimeMessage,
     is_partial_download: bool,
-    allow_creation: bool,
     create_blocked: Blocked,
     from_id: ContactId,
     to_ids: &[ContactId],
     verified_encryption: &VerifiedEncryption,
 ) -> Result<Option<(ChatId, Blocked)>> {
-    let grpid = if let Some(grpid) = try_getting_grpid(mime_parser) {
-        grpid
-    } else if !allow_creation {
-        info!(context, "Creating ad-hoc group prevented from caller.");
-        return Ok(None);
-    } else if is_partial_download {
-        // Partial download may be an encrypted message with protected Subject header.
-        //
-        // We do not want to create a group with "..." or "Encrypted message" as a subject.
-        info!(
-            context,
-            "Ad-hoc group cannot be created from partial download."
-        );
-        return Ok(None);
-    } else {
+    let Some(grpid) = mime_parser.get_chat_group_id().map(|s| s.to_string()) else {
+        if is_partial_download {
+            // Partial download may be an encrypted message with protected Subject header.
+            //
+            // We do not want to create a group with "..." or "Encrypted message" as a subject.
+            info!(
+                context,
+                "Ad-hoc group cannot be created from partial download."
+            );
+            return Ok(None);
+        }
+
         let mut member_ids: Vec<ContactId> = to_ids.to_vec();
         if !member_ids.contains(&(from_id)) {
             member_ids.push(from_id);
@@ -1915,15 +1900,8 @@ async fn create_or_lookup_group(
         return Ok(res);
     };
 
-    let mut chat_id;
-    let mut chat_id_blocked;
-    if let Some((id, _protected, blocked)) = chat::get_chat_id_by_grpid(context, &grpid).await? {
-        chat_id = Some(id);
-        chat_id_blocked = blocked;
-    } else {
-        chat_id = None;
-        chat_id_blocked = Default::default();
-    }
+    let mut chat_id = None;
+    let mut chat_id_blocked = Default::default();
 
     // For chat messages, we don't have to guess (is_*probably*_private_reply()) but we know for sure that
     // they belong to the group because of the Chat-Group-Id or Message-Id header
@@ -1968,11 +1946,6 @@ async fn create_or_lookup_group(
                 || self_explicitly_added(context, &mime_parser).await?)
     {
         // Group does not exist but should be created.
-        if !allow_creation {
-            info!(context, "Creating group forbidden by caller.");
-            return Ok(None);
-        }
-
         let grpname = mime_parser
             .get_header(HeaderDef::ChatGroupName)
             .context("Chat-Group-Name vanished")?
@@ -2538,37 +2511,6 @@ async fn apply_mailinglist_changes(
     }
 
     Ok(())
-}
-
-fn try_getting_grpid(mime_parser: &MimeMessage) -> Option<String> {
-    if let Some(optional_field) = mime_parser.get_chat_group_id() {
-        return Some(optional_field.to_string());
-    }
-
-    // Useful for undecipherable messages sent to known group.
-    if let Some(extracted_grpid) = extract_grpid(mime_parser, HeaderDef::MessageId) {
-        return Some(extracted_grpid.to_string());
-    }
-
-    if !mime_parser.has_chat_version() {
-        if let Some(extracted_grpid) = extract_grpid(mime_parser, HeaderDef::InReplyTo) {
-            return Some(extracted_grpid.to_string());
-        } else if let Some(extracted_grpid) = extract_grpid(mime_parser, HeaderDef::References) {
-            return Some(extracted_grpid.to_string());
-        }
-    }
-
-    None
-}
-
-/// try extract a grpid from a message-id list header value
-fn extract_grpid(mime_parser: &MimeMessage, headerdef: HeaderDef) -> Option<&str> {
-    let header = mime_parser.get_header(headerdef)?;
-    let parts = header
-        .split(',')
-        .map(str::trim)
-        .filter(|part| !part.is_empty());
-    parts.filter_map(extract_grpid_from_rfc724_mid).next()
 }
 
 /// Creates ad-hoc group and returns chat ID on success.
