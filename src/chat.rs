@@ -2901,13 +2901,16 @@ async fn prepare_send_msg(
 /// The caller has to interrupt SMTP loop or otherwise process new rows.
 pub(crate) async fn create_send_msg_jobs(context: &Context, msg: &mut Message) -> Result<Vec<i64>> {
     if context.get_config_bool(Config::IsCommunity).await? {
-      let selfname = context.get_ui_config("ui.community.selfname")
-        .await
-        .context("Can't get ui-config")
-        .unwrap_or_default()
-        .unwrap_or_default();
-      if selfname != "" {
-        msg.param.set(Param::OverrideSenderDisplayname, selfname);
+      if let Some(_) = msg.param.get(Param::OverrideSenderDisplayname) {
+      } else {
+        let selfname = context.get_ui_config("ui.community.selfname")
+          .await
+          .context("Can't get ui-config")
+          .unwrap_or_default()
+          .unwrap_or_default();
+        if selfname != "" {
+          msg.param.set(Param::OverrideSenderDisplayname, selfname);
+        }
       }
     }
     let needs_encryption = msg.param.get_bool(Param::GuaranteeE2ee).unwrap_or_default();
