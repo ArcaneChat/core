@@ -311,4 +311,14 @@ pub enum EventType {
         /// ID of the changed chat
         chat_id: Option<ChatId>,
     },
+
+    /// Event for using in tests, e.g. as a fence between normally generated events.
+    #[cfg(test)]
+    Test,
+
+    /// Inform than some events have been skipped due to event channel overflow.
+    EventChannelOverflow {
+        /// Number of events skipped.
+        n: u64,
+    },
 }

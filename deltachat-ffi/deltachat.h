@@ -6293,6 +6293,18 @@ void dc_event_unref(dc_event_t* event);
 #define DC_EVENT_WEBXDC_INSTANCE_DELETED          2121
 
 /**
+ * Data received over an ephemeral peer channel.
+ *
+ * @param data1 (int) msg_id
+ * @param data2 (int) + (char*) binary data.
+ *     length is returned as integer with dc_event_get_data2_int()
+ *     and binary data is returned as dc_event_get_data2_str().
+ *     Binary data must be passed to dc_str_unref() afterwards.
+ */
+
+#define DC_EVENT_WEBXDC_REALTIME_DATA             2150
+
+/**
  * Tells that the Background fetch was completed (or timed out).
  *
  * This event acts as a marker, when you reach this event you can be sure
@@ -6319,6 +6331,14 @@ void dc_event_unref(dc_event_t* event);
  */
 
 #define DC_EVENT_CHATLIST_ITEM_CHANGED         2301
+
+
+/**
+ * Inform that some events have been skipped due to event channel overflow.
+ *
+ * @param data1 (int) number of events that have been skipped
+ */
+#define DC_EVENT_CHANNEL_OVERFLOW              2400
 
 /**
  * @}

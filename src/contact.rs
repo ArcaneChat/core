@@ -1,6 +1,6 @@
 //! Contacts module
 
-use std::cmp::Reverse;
+use std::cmp::{min, Reverse};
 use std::collections::BinaryHeap;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -11,8 +11,8 @@ use async_channel::{self as channel, Receiver, Sender};
 use base64::Engine as _;
 pub use deltachat_contact_tools::may_be_valid_addr;
 use deltachat_contact_tools::{
-    self as contact_tools, addr_cmp, addr_normalize, normalize_name, sanitize_name_and_addr,
-    strip_rtlo_characters, ContactAddress, VcardContact,
+    self as contact_tools, addr_cmp, addr_normalize, sanitize_name_and_addr, strip_rtlo_characters,
+    ContactAddress, VcardContact,
 };
 use deltachat_derive::{FromSql, ToSql};
 use rusqlite::OptionalExtension;
@@ -20,14 +20,15 @@ use serde::{Deserialize, Serialize};
 use tokio::task;
 use tokio::time::{timeout, Duration};
 
-use crate::aheader::EncryptPreference;
+use crate::aheader::{Aheader, EncryptPreference};
+use crate::blob::BlobObject;
 use crate::chat::{ChatId, ChatIdBlocked, ProtectionStatus};
 use crate::color::str_to_color;
 use crate::config::Config;
 use crate::constants::{Blocked, Chattype, DC_GCL_ADD_SELF, DC_GCL_VERIFIED_ONLY};
 use crate::context::Context;
 use crate::events::EventType;
-use crate::key::{load_self_public_key, DcKey};
+use crate::key::{load_self_public_key, DcKey, SignedPublicKey};
 use crate::log::LogExt;
 use crate::login_param::LoginParam;
 use crate::message::MessageState;
@@ -36,7 +37,9 @@ use crate::param::{Param, Params};
 use crate::peerstate::Peerstate;
 use crate::sql::{self, params_iter};
 use crate::sync::{self, Sync::*};
-use crate::tools::{duration_to_str, get_abs_path, improve_single_line_input, time, SystemTime};
+use crate::tools::{
+    duration_to_str, get_abs_path, improve_single_line_input, smeared_time, time, SystemTime,
+};
 use crate::{chat, chatlist_events, stock_str};
 
 /// Time during which a contact is considered as seen recently.
@@ -120,6 +123,29 @@ impl ContactId {
             .await?;
         Ok(())
     }
+
+    /// Updates the origin of the contacts, but only if `origin` is higher than the current one.
+    pub(crate) async fn scaleup_origin(
+        context: &Context,
+        ids: &[Self],
+        origin: Origin,
+    ) -> Result<()> {
+        context
+            .sql
+            .execute(
+                &format!(
+                    "UPDATE contacts SET origin=? WHERE id IN ({}) AND origin<?",
+                    sql::repeat_vars(ids.len())
+                ),
+                rusqlite::params_from_iter(
+                    params_iter(&[origin])
+                        .chain(params_iter(ids))
+                        .chain(params_iter(&[origin])),
+                ),
+            )
+            .await?;
+        Ok(())
+    }
 }
 
 impl fmt::Display for ContactId {
@@ -166,9 +192,13 @@ pub async fn make_vcard(context: &Context, contacts: &[ContactId]) -> Result<Str
     let mut vcard_contacts = Vec::with_capacity(contacts.len());
     for id in contacts {
         let c = Contact::get_by_id(context, *id).await?;
-        let key = Peerstate::from_addr(context, &c.addr)
-            .await?
-            .and_then(|peerstate| peerstate.peek_key(false).map(|k| k.to_base64()));
+        let key = match *id {
+            ContactId::SELF => Some(load_self_public_key(context).await?),
+            _ => Peerstate::from_addr(context, &c.addr)
+                .await?
+                .and_then(|peerstate| peerstate.take_key(false)),
+        };
+        let key = key.map(|k| k.to_base64());
         let profile_image = match c.get_profile_image(context).await? {
             None => None,
             Some(path) => tokio::fs::read(path)
@@ -187,6 +217,129 @@ pub async fn make_vcard(context: &Context, contacts: &[ContactId]) -> Result<Str
         });
     }
     Ok(contact_tools::make_vcard(&vcard_contacts))
+}
+
+/// Imports contacts from the given vCard.
+///
+/// Returns the ids of successfully processed contacts in the order they appear in `vcard`,
+/// regardless of whether they are just created, modified or left untouched.
+pub async fn import_vcard(context: &Context, vcard: &str) -> Result<Vec<ContactId>> {
+    let contacts = contact_tools::parse_vcard(vcard);
+    let mut contact_ids = Vec::with_capacity(contacts.len());
+    for c in &contacts {
+        let Ok(id) = import_vcard_contact(context, c)
+            .await
+            .with_context(|| format!("import_vcard_contact() failed for {}", c.addr))
+            .log_err(context)
+        else {
+            continue;
+        };
+        contact_ids.push(id);
+    }
+    Ok(contact_ids)
+}
+
+async fn import_vcard_contact(context: &Context, contact: &VcardContact) -> Result<ContactId> {
+    let addr = ContactAddress::new(&contact.addr).context("Invalid address")?;
+    // Importing a vCard is also an explicit user action like creating a chat with the contact. We
+    // mustn't use `Origin::AddressBook` here because the vCard may be created not by us, also we
+    // want `contact.authname` to be saved as the authname and not a locally given name.
+    let origin = Origin::CreateChat;
+    let (id, modified) =
+        match Contact::add_or_lookup(context, &contact.authname, &addr, origin).await {
+            Err(e) => return Err(e).context("Contact::add_or_lookup() failed"),
+            Ok((ContactId::SELF, _)) => return Ok(ContactId::SELF),
+            Ok(val) => val,
+        };
+    if modified != Modifier::None {
+        context.emit_event(EventType::ContactsChanged(Some(id)));
+    }
+    let key = contact.key.as_ref().and_then(|k| {
+        SignedPublicKey::from_base64(k)
+            .with_context(|| {
+                format!(
+                    "import_vcard_contact: Cannot decode key for {}",
+                    contact.addr
+                )
+            })
+            .log_err(context)
+            .ok()
+    });
+    if let Some(public_key) = key {
+        let timestamp = contact
+            .timestamp
+            .as_ref()
+            .map_or(0, |&t| min(t, smeared_time(context)));
+        let aheader = Aheader {
+            addr: contact.addr.clone(),
+            public_key,
+            prefer_encrypt: EncryptPreference::Mutual,
+        };
+        let peerstate = match Peerstate::from_addr(context, &aheader.addr).await {
+            Err(e) => {
+                warn!(
+                    context,
+                    "import_vcard_contact: Cannot create peerstate from {}: {e:#}.", contact.addr
+                );
+                return Ok(id);
+            }
+            Ok(p) => p,
+        };
+        let peerstate = if let Some(mut p) = peerstate {
+            p.apply_gossip(&aheader, timestamp);
+            p
+        } else {
+            Peerstate::from_gossip(&aheader, timestamp)
+        };
+        if let Err(e) = peerstate.save_to_db(&context.sql).await {
+            warn!(
+                context,
+                "import_vcard_contact: Could not save peerstate for {}: {e:#}.", contact.addr
+            );
+            return Ok(id);
+        }
+        if let Err(e) = peerstate
+            .handle_fingerprint_change(context, timestamp)
+            .await
+        {
+            warn!(
+                context,
+                "import_vcard_contact: handle_fingerprint_change() failed for {}: {e:#}.",
+                contact.addr
+            );
+            return Ok(id);
+        }
+    }
+    if modified != Modifier::Created {
+        return Ok(id);
+    }
+    let path = match &contact.profile_image {
+        Some(image) => match BlobObject::store_from_base64(context, image, "avatar").await {
+            Err(e) => {
+                warn!(
+                    context,
+                    "import_vcard_contact: Could not decode and save avatar for {}: {e:#}.",
+                    contact.addr
+                );
+                None
+            }
+            Ok(path) => Some(path),
+        },
+        None => None,
+    };
+    if let Some(path) = path {
+        // Currently this value doesn't matter as we don't import the contact of self.
+        let was_encrypted = false;
+        if let Err(e) =
+            set_profile_image(context, id, &AvatarAction::Change(path), was_encrypted).await
+        {
+            warn!(
+                context,
+                "import_vcard_contact: Could not set avatar for {}: {e:#}.", contact.addr
+            );
+        }
+    }
+    Ok(id)
 }
 
 /// An object representing a single contact in memory.
@@ -393,14 +546,15 @@ impl Contact {
             .await?
         {
             if contact_id == ContactId::SELF {
-                if !context.get_config_bool(Config::IsCommunity).await? {
-                  contact.name = stock_str::self_msg(context).await;
-                } else {
-                  contact.name = context
+                contact.authname = context
                     .get_config(Config::Displayname)
                     .await?
                     .unwrap_or_default();
-                }
+                contact.name = if context.get_config_bool(Config::IsCommunity).await? {
+                  contact.authname.clone()
+                } else {
+                  stock_str::self_msg(context).await
+                };
                 contact.addr = context
                     .get_config(Config::ConfiguredAddr)
                     .await?
@@ -815,7 +969,6 @@ impl Contact {
 
         for (name, addr) in split_address_book(addr_book) {
             let (name, addr) = sanitize_name_and_addr(name, addr);
-            let name = normalize_name(&name);
             match ContactAddress::new(&addr) {
                 Ok(addr) => {
                     match Contact::add_or_lookup(context, &name, &addr, Origin::AddressBook).await {
@@ -1390,22 +1543,6 @@ impl Contact {
             .await?;
         Ok(exists)
     }
-
-    /// Updates the origin of the contact, but only if new origin is higher than the current one.
-    pub async fn scaleup_origin_by_id(
-        context: &Context,
-        contact_id: ContactId,
-        origin: Origin,
-    ) -> Result<()> {
-        context
-            .sql
-            .execute(
-                "UPDATE contacts SET origin=? WHERE id=? AND origin<?;",
-                (origin, contact_id, origin),
-            )
-            .await?;
-        Ok(())
-    }
 }
 
 pub(crate) async fn set_blocked(
@@ -1791,7 +1928,7 @@ impl RecentlySeenLoop {
 
 #[cfg(test)]
 mod tests {
-    use deltachat_contact_tools::may_be_valid_addr;
+    use deltachat_contact_tools::{may_be_valid_addr, normalize_name};
 
     use super::*;
     use crate::chat::{get_chat_contacts, send_text_msg, Chat};
@@ -2856,7 +2993,7 @@ Until the false-positive is fixed:
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_make_vcard() -> Result<()> {
+    async fn test_make_n_import_vcard() -> Result<()> {
         let alice = &TestContext::new_alice().await;
         let bob = &TestContext::new_bob().await;
         bob.set_config(Config::Displayname, Some("Bob")).await?;
@@ -2890,8 +3027,8 @@ Until the false-positive is fixed:
         assert_eq!(contacts.len(), 2);
         assert_eq!(contacts[0].addr, bob_addr);
         assert_eq!(contacts[0].authname, "Bob".to_string());
-        assert_eq!(contacts[0].key, Some(key_base64));
-        assert_eq!(contacts[0].profile_image, Some(avatar_base64));
+        assert_eq!(*contacts[0].key.as_ref().unwrap(), key_base64);
+        assert_eq!(*contacts[0].profile_image.as_ref().unwrap(), avatar_base64);
         let timestamp = *contacts[0].timestamp.as_ref().unwrap();
         assert!(t0 <= timestamp && timestamp <= t1);
         assert_eq!(contacts[1].addr, "fiona@example.net".to_string());
@@ -2900,6 +3037,110 @@ Until the false-positive is fixed:
         assert_eq!(contacts[1].profile_image, None);
         let timestamp = *contacts[1].timestamp.as_ref().unwrap();
         assert!(t0 <= timestamp && timestamp <= t1);
+
+        let alice = &TestContext::new_alice().await;
+        alice.evtracker.clear_events();
+        let contact_ids = import_vcard(alice, &vcard).await?;
+        assert_eq!(contact_ids.len(), 2);
+        for _ in 0..contact_ids.len() {
+            alice
+                .evtracker
+                .get_matching(|evt| matches!(evt, EventType::ContactsChanged(Some(_))))
+                .await;
+        }
+
+        let vcard = make_vcard(alice, &[contact_ids[0], contact_ids[1]]).await?;
+        // This should be the same vCard except timestamps, check that roughly.
+        let contacts = contact_tools::parse_vcard(&vcard);
+        assert_eq!(contacts.len(), 2);
+        assert_eq!(contacts[0].addr, bob_addr);
+        assert_eq!(contacts[0].authname, "Bob".to_string());
+        assert_eq!(*contacts[0].key.as_ref().unwrap(), key_base64);
+        assert_eq!(*contacts[0].profile_image.as_ref().unwrap(), avatar_base64);
+        assert!(contacts[0].timestamp.is_ok());
+        assert_eq!(contacts[1].addr, "fiona@example.net".to_string());
+
+        let chat_id = ChatId::create_for_contact(alice, contact_ids[0]).await?;
+        let sent_msg = alice.send_text(chat_id, "moin").await;
+        let msg = bob.recv_msg(&sent_msg).await;
+        assert!(msg.get_showpadlock());
+
+        // Bob only actually imports Fiona, though `ContactId::SELF` is also returned.
+        bob.evtracker.clear_events();
+        let contact_ids = import_vcard(bob, &vcard).await?;
+        bob.emit_event(EventType::Test);
+        assert_eq!(contact_ids.len(), 2);
+        assert_eq!(contact_ids[0], ContactId::SELF);
+        let ev = bob
+            .evtracker
+            .get_matching(|evt| matches!(evt, EventType::ContactsChanged { .. }))
+            .await;
+        assert_eq!(ev, EventType::ContactsChanged(Some(contact_ids[1])));
+        let ev = bob
+            .evtracker
+            .get_matching(|evt| matches!(evt, EventType::ContactsChanged { .. } | EventType::Test))
+            .await;
+        assert_eq!(ev, EventType::Test);
+        let vcard = make_vcard(bob, &[contact_ids[1]]).await?;
+        let contacts = contact_tools::parse_vcard(&vcard);
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].addr, "fiona@example.net");
+        assert_eq!(contacts[0].authname, "".to_string());
+        assert_eq!(contacts[0].key, None);
+        assert_eq!(contacts[0].profile_image, None);
+        assert!(contacts[0].timestamp.is_ok());
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_import_vcard_updates_only_key() -> Result<()> {
+        let alice = &TestContext::new_alice().await;
+        let bob = &TestContext::new_bob().await;
+        let bob_addr = &bob.get_config(Config::Addr).await?.unwrap();
+        bob.set_config(Config::Displayname, Some("Bob")).await?;
+        let vcard = make_vcard(bob, &[ContactId::SELF]).await?;
+        alice.evtracker.clear_events();
+        let alice_bob_id = import_vcard(alice, &vcard).await?[0];
+        let ev = alice
+            .evtracker
+            .get_matching(|evt| matches!(evt, EventType::ContactsChanged { .. }))
+            .await;
+        assert_eq!(ev, EventType::ContactsChanged(Some(alice_bob_id)));
+        let chat_id = ChatId::create_for_contact(alice, alice_bob_id).await?;
+        let sent_msg = alice.send_text(chat_id, "moin").await;
+        let msg = bob.recv_msg(&sent_msg).await;
+        assert!(msg.get_showpadlock());
+
+        let bob = &TestContext::new().await;
+        bob.configure_addr(bob_addr).await;
+        bob.set_config(Config::Displayname, Some("Not Bob")).await?;
+        let avatar_path = bob.dir.path().join("avatar.png");
+        let avatar_bytes = include_bytes!("../test-data/image/avatar64x64.png");
+        tokio::fs::write(&avatar_path, avatar_bytes).await?;
+        bob.set_config(Config::Selfavatar, Some(avatar_path.to_str().unwrap()))
+            .await?;
+        SystemTime::shift(Duration::from_secs(1));
+        let vcard1 = make_vcard(bob, &[ContactId::SELF]).await?;
+        assert_eq!(import_vcard(alice, &vcard1).await?, vec![alice_bob_id]);
+        let alice_bob_contact = Contact::get_by_id(alice, alice_bob_id).await?;
+        assert_eq!(alice_bob_contact.get_authname(), "Bob");
+        assert_eq!(alice_bob_contact.get_profile_image(alice).await?, None);
+        let msg = alice.get_last_msg_in(chat_id).await;
+        assert!(msg.is_info());
+        assert_eq!(
+            msg.get_text(),
+            stock_str::contact_setup_changed(alice, bob_addr).await
+        );
+        let sent_msg = alice.send_text(chat_id, "moin").await;
+        let msg = bob.recv_msg(&sent_msg).await;
+        assert!(msg.get_showpadlock());
+
+        // The old vCard is imported, but doesn't change Bob's key for Alice.
+        import_vcard(alice, &vcard).await?.first().unwrap();
+        let sent_msg = alice.send_text(chat_id, "moin").await;
+        let msg = bob.recv_msg(&sent_msg).await;
+        assert!(msg.get_showpadlock());
 
         Ok(())
     }

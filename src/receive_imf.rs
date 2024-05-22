@@ -958,7 +958,7 @@ async fn add_parts(
                     if create_blocked == Blocked::Request && parent.is_some() {
                         // we do not want any chat to be created implicitly.  Because of the origin-scale-up,
                         // the contact requests will pop up and this should be just fine.
-                        Contact::scaleup_origin_by_id(context, from_id, Origin::IncomingReplyTo)
+                        ContactId::scaleup_origin(context, &[from_id], Origin::IncomingReplyTo)
                             .await?;
                         info!(
                             context,
@@ -1477,7 +1477,8 @@ async fn add_parts(
                 let relay_server = node_addr.relay_url().map(|relay| relay.as_str());
                 let topic = get_iroh_topic_for_msg(context, instance_id).await?;
                 iroh_add_peer_for_topic(context, instance_id, topic, node_id, relay_server).await?;
-
+                let iroh = context.get_or_try_init_peer_channel().await?;
+                iroh.maybe_add_gossip_peers(topic, vec![node_addr]).await?;
                 chat_id = DC_CHAT_ID_TRASH;
             }
             Err(err) => {
