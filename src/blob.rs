@@ -1191,6 +1191,21 @@ mod tests {
         .await
         .unwrap();
 
+        send_image_check_mediaquality(
+            Viewtype::File,
+            Some("1"),
+            bytes,
+            "png",
+            false, // no Exif
+            1920,
+            1080,
+            0,
+            1920,
+            1080,
+        )
+        .await
+        .unwrap();
+
         // This will be sent as Image, see [`BlobObject::maybe_sticker`] for explanation.
         send_image_check_mediaquality(
             Viewtype::Sticker,
@@ -1321,6 +1336,11 @@ mod tests {
             .get_blobdir()
             .join("saved-".to_string() + &bob_msg.get_filename().unwrap());
         bob_msg.save_file(&bob, &file_saved).await?;
+        if viewtype == Viewtype::File {
+            assert_eq!(file_saved.extension().unwrap(), extension);
+            let bytes1 = fs::read(&file_saved).await?;
+            assert_eq!(&bytes1, bytes);
+        }
 
         let blob = BlobObject::new_from_path(&bob, &file_saved).await?;
         let (_, exif) = blob.metadata()?;

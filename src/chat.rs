@@ -2639,6 +2639,7 @@ async fn prepare_msg_blob(context: &Context, msg: &mut Message) -> Result<()> {
             .get_blob(Param::File, context, !msg.is_increation())
             .await?
             .with_context(|| format!("attachment missing for message of type #{}", msg.viewtype))?;
+        let send_as_is = msg.viewtype == Viewtype::File;
 
         if msg.viewtype == Viewtype::File || msg.viewtype == Viewtype::Image {
             // Correct the type, take care not to correct already very special
@@ -2665,8 +2666,9 @@ async fn prepare_msg_blob(context: &Context, msg: &mut Message) -> Result<()> {
         }
 
         let mut maybe_sticker = msg.viewtype == Viewtype::Sticker;
-        if msg.viewtype == Viewtype::Image
-            || maybe_sticker && !msg.param.exists(Param::ForceSticker)
+        if !send_as_is
+            && (msg.viewtype == Viewtype::Image
+                || maybe_sticker && !msg.param.exists(Param::ForceSticker))
         {
             blob.recode_to_image_size(context, &mut maybe_sticker)
                 .await?;
