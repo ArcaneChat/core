@@ -1952,6 +1952,10 @@ impl Chat {
         // reset encrypt error state eg. for forwarding
         msg.param.remove(Param::ErroneousE2ee);
 
+        let is_bot = context.get_config_bool(Config::Bot).await?;
+        msg.param
+            .set_optional(Param::Bot, Some("1").filter(|_| is_bot));
+
         // Set "In-Reply-To:" to identify the message to which the composed message is a reply.
         // Set "References:" to identify the "thread" of the conversation.
         // Both according to [RFC 5322 3.6.4, page 25](https://www.rfc-editor.org/rfc/rfc5322#section-3.6.4).
@@ -3024,11 +3028,7 @@ pub(crate) async fn create_send_msg_jobs(context: &Context, msg: &mut Message) -
 
     msg.subject.clone_from(&rendered_msg.subject);
     msg.update_subject(context).await?;
-    let chunk_size = context
-        .get_configured_provider()
-        .await?
-        .and_then(|provider| provider.opt.max_smtp_rcpt_to)
-        .map_or(constants::DEFAULT_MAX_SMTP_RCPT_TO, usize::from);
+    let chunk_size = context.get_max_smtp_rcpt_to().await?;
     let trans_fn = |t: &mut rusqlite::Transaction| {
         let mut row_ids = Vec::<i64>::new();
         for recipients_chunk in recipients.chunks(chunk_size) {
