@@ -368,6 +368,7 @@ pub enum Config {
     IsCommunity,
 
     /// Enable webxdc realtime features.
+    #[strum(props(default = "1"))]
     WebxdcRealtimeEnabled,
 }
 
