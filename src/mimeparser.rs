@@ -28,7 +28,8 @@ use crate::events::EventType;
 use crate::headerdef::{HeaderDef, HeaderDefMap};
 use crate::key::{self, load_self_secret_keyring, DcKey, Fingerprint, SignedPublicKey};
 use crate::message::{
-    self, set_msg_failed, update_msg_state, Message, MessageState, MsgId, Viewtype,
+    self, get_vcard_summary, set_msg_failed, update_msg_state, Message, MessageState, MsgId,
+    Viewtype,
 };
 use crate::param::{Param, Params};
 use crate::peerstate::Peerstate;
@@ -302,7 +303,7 @@ impl MimeMessage {
         // them in signed-only emails, but has no value currently.
         Self::remove_secured_headers(&mut headers);
 
-        let from = from.context("No from in message")?;
+        let mut from = from.context("No from in message")?;
         let private_keyring = load_self_secret_keyring(context).await?;
 
         let mut decryption_info =
@@ -398,6 +399,7 @@ impl MimeMessage {
             if let (Some(inner_from), true) = (inner_from, !signatures.is_empty()) {
                 if addr_cmp(&inner_from.addr, &from.addr) {
                     from_is_signed = true;
+                    from = inner_from;
                 } else {
                     // There is a From: header in the encrypted &
                     // signed part, but it doesn't match the outer one.
@@ -1231,6 +1233,7 @@ impl MimeMessage {
                 return Ok(());
             }
         }
+        let mut part = Part::default();
         let msg_type = if context
             .is_webxdc_file(filename, decoded_data)
             .await
@@ -1274,6 +1277,13 @@ impl MimeMessage {
                 .unwrap_or_default();
             self.webxdc_status_update = Some(serialized);
             return Ok(());
+        } else if msg_type == Viewtype::Vcard {
+            if let Some(summary) = get_vcard_summary(decoded_data) {
+                part.param.set(Param::Summary1, summary);
+                msg_type
+            } else {
+                Viewtype::File
+            }
         } else {
             msg_type
         };
@@ -1293,8 +1303,6 @@ impl MimeMessage {
         };
         info!(context, "added blobfile: {:?}", blob.as_name());
 
-        /* create and register Mime part referencing the new Blob object */
-        let mut part = Part::default();
         if mime_type.type_() == mime::IMAGE {
             if let Ok((width, height)) = get_filemeta(decoded_data) {
                 part.param.set_int(Param::Width, width as i32);
@@ -1926,7 +1934,10 @@ pub struct Part {
     pub(crate) is_reaction: bool,
 }
 
-/// return mimetype and viewtype for a parsed mail
+/// Returns the mimetype and viewtype for a parsed mail.
+///
+/// This only looks at the metadata, not at the content;
+/// the viewtype may later be corrected in `do_add_single_file_part()`.
 fn get_mime_type(
     mail: &mailparse::ParsedMail<'_>,
     filename: &Option<String>,
@@ -1935,7 +1946,7 @@ fn get_mime_type(
 
     let viewtype = match mimetype.type_() {
         mime::TEXT => match mimetype.subtype() {
-            mime::VCARD if is_valid_deltachat_vcard(mail) => Viewtype::Vcard,
+            mime::VCARD => Viewtype::Vcard,
             mime::PLAIN | mime::HTML if !is_attachment_disposition(mail) => Viewtype::Text,
             _ => Viewtype::File,
         },
@@ -1983,17 +1994,6 @@ fn is_attachment_disposition(mail: &mailparse::ParsedMail<'_>) -> bool {
             .params
             .iter()
             .any(|(key, _value)| key.starts_with("filename"))
-}
-
-fn is_valid_deltachat_vcard(mail: &mailparse::ParsedMail) -> bool {
-    let Ok(body) = &mail.get_body() else {
-        return false;
-    };
-    let contacts = deltachat_contact_tools::parse_vcard(body);
-    if let [c] = &contacts[..] {
-        return deltachat_contact_tools::may_be_valid_addr(&c.addr);
-    }
-    false
 }
 
 /// Tries to get attachment filename.

@@ -367,8 +367,8 @@ pub enum Config {
     /// 1 if the current account is a community
     IsCommunity,
 
-    /// Iroh secret key.
-    IrohSecretKey,
+    /// Enable webxdc realtime features.
+    WebxdcRealtimeEnabled,
 }
 
 impl Config {

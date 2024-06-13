@@ -1,5 +1,96 @@
 # Changelog
 
+## [1.140.2] - 2024-06-07
+
+### API-Changes
+
+- jsonrpc: Add set_draft_vcard(.., msg_id, contacts).
+
+### Fixes
+
+- Allow fetch_existing_msgs for bots ([#4976](https://github.com/deltachat/deltachat-core-rust/pull/4976)).
+- Remove group member locally even if send_msg() fails ([#5508](https://github.com/deltachat/deltachat-core-rust/pull/5508)).
+- Revert member addition if the corresponding message couldn't be sent ([#5508](https://github.com/deltachat/deltachat-core-rust/pull/5508)).
+- @deltachat/stdio-rpc-server: Make local non-symlinked installation possible by using absolute paths for local dev version ([#5679](https://github.com/deltachat/deltachat-core-rust/pull/5679)).
+
+### Miscellaneous Tasks
+
+- cargo: Bump schemars from 0.8.19 to 0.8.21.
+- cargo: Bump backtrace from 0.3.71 to 0.3.72.
+
+### Refactor
+
+- @deltachat/stdio-rpc-server: Use old school require instead of the experimental json import ([#5628](https://github.com/deltachat/deltachat-core-rust/pull/5628)).
+
+### Tests
+
+- Set fetch_existing_msgs for bots ([#4976](https://github.com/deltachat/deltachat-core-rust/pull/4976)).
+- Don't leave protected group if some member's key is missing ([#5508](https://github.com/deltachat/deltachat-core-rust/pull/5508)).
+
+## [1.140.1] - 2024-06-05
+
+### Fixes
+
+- Retry sending MDNs on temporary error.
+- Set Config::IsChatmail in configure().
+- Do not miss new messages while expunging the folder.
+- Log messages with `info!` instead of `println!`.
+
+### Documentation
+
+- imap: Document why CLOSE is faster than EXPUNGE.
+
+### Refactor
+
+- imap: Make select_folder() accept non-optional folder.
+- Improve SMTP logs and errors.
+- Remove unused `select_folder::Error` variants.
+
+### Tests
+
+- deltachat-rpc-client: reenable `log_cli`.
+
+## [1.140.0] - 2024-06-04
+
+### Features / Changes
+
+- Remove limit on number of email recipients for chatmail clients ([#5598](https://github.com/deltachat/deltachat-core-rust/pull/5598)).
+- Add config option to enable iroh ([#5607](https://github.com/deltachat/deltachat-core-rust/pull/5607)).
+- Map `*.wav` to Viewtype::Audio ([#5633](https://github.com/deltachat/deltachat-core-rust/pull/5633)).
+- Add a db index for reactions by msg_id ([#5507](https://github.com/deltachat/deltachat-core-rust/pull/5507)).
+
+### Fixes
+
+- Set Param::Bot for messages on the sender side as well ([#5615](https://github.com/deltachat/deltachat-core-rust/pull/5615)).
+- AEAP: Remove old peerstate verified_key instead of removing the whole peerstate ([#5535](https://github.com/deltachat/deltachat-core-rust/pull/5535)).
+- Allow creation of groups by outgoing messages without recipients.
+- Prefer `Chat-Group-ID` over references for new groups.
+- Do not fail to send images with wrong extensions.
+
+### Build system
+
+- Unpin OpenSSL version and update to OpenSSL 3.3.0.
+
+### CI
+
+- Remove cargo-nextest bug workaround.
+
+### Documentation
+
+- Add vCard as supported standard.
+- Create_group() does not find chats, only creates them.
+- Fix a typo in test_partial_group_consistency().
+
+### Refactor
+
+- Factor create_adhoc_group() call out of create_group().
+- Put duplicate code into `lookup_chat_or_create_adhoc_group`.
+
+### Tests
+
+- Fix logging of TestContext created using TestContext::new_alice().
+- Refactor `test_alias_*` into 8 separate tests.
+
 ## [1.139.6] - 2024-05-25
 
 ### Build system
@@ -4329,3 +4420,6 @@ https://github.com/deltachat/deltachat-core-rust/pulls?q=is%3Apr+is%3Aclosed
 [1.139.4]: https://github.com/deltachat/deltachat-core-rust/compare/v1.139.3...v1.139.4
 [1.139.5]: https://github.com/deltachat/deltachat-core-rust/compare/v1.139.4...v1.139.5
 [1.139.6]: https://github.com/deltachat/deltachat-core-rust/compare/v1.139.5...v1.139.6
+[1.140.0]: https://github.com/deltachat/deltachat-core-rust/compare/v1.139.6...v1.140.0
+[1.140.1]: https://github.com/deltachat/deltachat-core-rust/compare/v1.140.0...v1.140.1
+[1.140.2]: https://github.com/deltachat/deltachat-core-rust/compare/v1.140.1...v1.140.2

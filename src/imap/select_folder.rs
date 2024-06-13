@@ -10,12 +10,6 @@ type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("IMAP Connection Lost or no connection established")]
-    ConnectionLost,
-
-    #[error("IMAP Folder name invalid: {0}")]
-    BadFolderName(String),
-
     #[error("Got a NO response when trying to select {0}, usually this means that it doesn't exist: {1}")]
     NoFolder(String, String),
 
@@ -33,7 +27,8 @@ impl ImapSession {
     /// Issues a CLOSE command if selected folder needs expunge,
     /// i.e. if Delta Chat marked a message there as deleted previously.
     ///
-    /// CLOSE is considerably faster than an EXPUNGE, see
+    /// CLOSE is considerably faster than an EXPUNGE
+    /// because no EXPUNGE responses are sent, see
     /// <https://tools.ietf.org/html/rfc3501#section-6.4.2>
     pub(super) async fn maybe_close_folder(&mut self, context: &Context) -> anyhow::Result<()> {
         if let Some(folder) = &self.selected_folder {
@@ -44,6 +39,7 @@ impl ImapSession {
                 info!(context, "close/expunge succeeded");
                 self.selected_folder = None;
                 self.selected_folder_needs_expunge = false;
+                self.new_mail = false;
             }
         }
         Ok(())
@@ -52,18 +48,12 @@ impl ImapSession {
     /// Selects a folder, possibly updating uid_validity and, if needed,
     /// expunging the folder to remove delete-marked messages.
     /// Returns whether a new folder was selected.
-    pub(crate) async fn select_folder(
-        &mut self,
-        context: &Context,
-        folder: Option<&str>,
-    ) -> Result<NewlySelected> {
+    async fn select_folder(&mut self, context: &Context, folder: &str) -> Result<NewlySelected> {
         // if there is a new folder and the new folder is equal to the selected one, there's nothing to do.
         // if there is _no_ new folder, we continue as we might want to expunge below.
-        if let Some(folder) = folder {
-            if let Some(selected_folder) = &self.selected_folder {
-                if folder == selected_folder {
-                    return Ok(NewlySelected::No);
-                }
+        if let Some(selected_folder) = &self.selected_folder {
+            if folder == selected_folder {
+                return Ok(NewlySelected::No);
             }
         }
 
@@ -71,34 +61,26 @@ impl ImapSession {
         self.maybe_close_folder(context).await?;
 
         // select new folder
-        if let Some(folder) = folder {
-            let res = if self.can_condstore() {
-                self.select_condstore(folder).await
-            } else {
-                self.select(folder).await
-            };
-
-            // <https://tools.ietf.org/html/rfc3501#section-6.3.1>
-            // says that if the server reports select failure we are in
-            // authenticated (not-select) state.
-
-            match res {
-                Ok(mailbox) => {
-                    self.selected_folder = Some(folder.to_string());
-                    self.selected_mailbox = Some(mailbox);
-                    Ok(NewlySelected::Yes)
-                }
-                Err(async_imap::error::Error::ConnectionLost) => Err(Error::ConnectionLost),
-                Err(async_imap::error::Error::Validate(_)) => {
-                    Err(Error::BadFolderName(folder.to_string()))
-                }
-                Err(async_imap::error::Error::No(response)) => {
-                    Err(Error::NoFolder(folder.to_string(), response))
-                }
-                Err(err) => Err(Error::Other(err.to_string())),
-            }
+        let res = if self.can_condstore() {
+            self.select_condstore(folder).await
         } else {
-            Ok(NewlySelected::No)
+            self.select(folder).await
+        };
+
+        // <https://tools.ietf.org/html/rfc3501#section-6.3.1>
+        // says that if the server reports select failure we are in
+        // authenticated (not-select) state.
+
+        match res {
+            Ok(mailbox) => {
+                self.selected_folder = Some(folder.to_string());
+                self.selected_mailbox = Some(mailbox);
+                Ok(NewlySelected::Yes)
+            }
+            Err(async_imap::error::Error::No(response)) => {
+                Err(Error::NoFolder(folder.to_string(), response))
+            }
+            Err(err) => Err(Error::Other(err.to_string())),
         }
     }
 
@@ -108,7 +90,7 @@ impl ImapSession {
         context: &Context,
         folder: &str,
     ) -> anyhow::Result<NewlySelected> {
-        match self.select_folder(context, Some(folder)).await {
+        match self.select_folder(context, folder).await {
             Ok(newly_selected) => Ok(newly_selected),
             Err(err) => match err {
                 Error::NoFolder(..) => {
@@ -118,7 +100,7 @@ impl ImapSession {
                         info!(context, "Couldn't select folder, then create() failed: {err:#}.");
                         // Need to recheck, could have been created in parallel.
                     }
-                    let select_res = self.select_folder(context, Some(folder)).await.with_context(|| format!("failed to select newely created folder {folder}"));
+                    let select_res = self.select_folder(context, folder).await.with_context(|| format!("failed to select newely created folder {folder}"));
                     if select_res.is_err() {
                         create_res?;
                     }
@@ -134,13 +116,14 @@ impl ImapSession {
     /// When selecting a folder for the first time, sets the uid_next to the current
     /// mailbox.uid_next so that no old emails are fetched.
     ///
-    /// Returns Result<new_emails> (i.e. whether new emails arrived),
-    /// if in doubt, returns new_emails=true so emails are fetched.
+    /// Updates `self.new_mail` if folder was previously unselected
+    /// and new mails are detected after selecting,
+    /// i.e. UIDNEXT advanced while the folder was closed.
     pub(crate) async fn select_with_uidvalidity(
         &mut self,
         context: &Context,
         folder: &str,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         let newly_selected = self
             .select_or_create_folder(context, folder)
             .await
@@ -197,28 +180,26 @@ impl ImapSession {
         mailbox.uid_next = new_uid_next;
 
         if new_uid_validity == old_uid_validity {
-            let new_emails = if newly_selected == NewlySelected::No {
-                // The folder was not newly selected i.e. no SELECT command was run. This means that mailbox.uid_next
-                // was not updated and may contain an incorrect value. So, just return true so that
-                // the caller tries to fetch new messages (we could of course run a SELECT command now, but trying to fetch
-                // new messages is only one command, just as a SELECT command)
-                true
-            } else if let Some(new_uid_next) = new_uid_next {
-                if new_uid_next < old_uid_next {
-                    warn!(
-                        context,
-                        "The server illegally decreased the uid_next of folder {folder:?} from {old_uid_next} to {new_uid_next} without changing validity ({new_uid_validity}), resyncing UIDs...",
-                    );
-                    set_uid_next(context, folder, new_uid_next).await?;
-                    context.schedule_resync().await?;
-                }
-                new_uid_next != old_uid_next // If UIDNEXT changed, there are new emails
-            } else {
-                // We have no UIDNEXT and if in doubt, return true.
-                true
-            };
+            if newly_selected == NewlySelected::Yes {
+                if let Some(new_uid_next) = new_uid_next {
+                    if new_uid_next < old_uid_next {
+                        warn!(
+                            context,
+                            "The server illegally decreased the uid_next of folder {folder:?} from {old_uid_next} to {new_uid_next} without changing validity ({new_uid_validity}), resyncing UIDs...",
+                        );
+                        set_uid_next(context, folder, new_uid_next).await?;
+                        context.schedule_resync().await?;
+                    }
 
-            return Ok(new_emails);
+                    // If UIDNEXT changed, there are new emails.
+                    self.new_mail |= new_uid_next != old_uid_next;
+                } else {
+                    warn!(context, "Folder {folder} was just selected but we failed to determine UIDNEXT, assume that it has new mail.");
+                    self.new_mail = true;
+                }
+            }
+
+            return Ok(());
         }
 
         // UIDVALIDITY is modified, reset highest seen MODSEQ.
@@ -229,6 +210,7 @@ impl ImapSession {
         let new_uid_next = new_uid_next.unwrap_or_default();
         set_uid_next(context, folder, new_uid_next).await?;
         set_uidvalidity(context, folder, new_uid_validity).await?;
+        self.new_mail = true;
 
         // Collect garbage entries in `imap` table.
         context
@@ -251,7 +233,7 @@ impl ImapSession {
             old_uid_next,
             old_uid_validity,
         );
-        Ok(false)
+        Ok(())
     }
 }
 

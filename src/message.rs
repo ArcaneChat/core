@@ -2,6 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::str;
 
 use anyhow::{ensure, format_err, Context as _, Result};
 use deltachat_contact_tools::{parse_vcard, VcardContact};
@@ -16,7 +17,7 @@ use crate::config::Config;
 use crate::constants::{
     Blocked, Chattype, VideochatType, DC_CHAT_ID_TRASH, DC_DESIRED_TEXT_LEN, DC_MSG_ID_LAST_SPECIAL,
 };
-use crate::contact::{Contact, ContactId};
+use crate::contact::{self, Contact, ContactId};
 use crate::context::Context;
 use crate::debug_logging::set_debug_logging_xdc;
 use crate::download::DownloadState;
@@ -1081,6 +1082,30 @@ impl Message {
         Ok(())
     }
 
+    /// Makes message a vCard-containing message using the specified contacts.
+    pub async fn make_vcard(&mut self, context: &Context, contacts: &[ContactId]) -> Result<()> {
+        ensure!(
+            matches!(self.viewtype, Viewtype::File | Viewtype::Vcard),
+            "Wrong viewtype for vCard: {}",
+            self.viewtype,
+        );
+        let vcard = contact::make_vcard(context, contacts).await?;
+        self.set_file_from_bytes(context, "vcard.vcf", vcard.as_bytes(), None)
+            .await
+    }
+
+    /// Updates message state from the vCard attachment.
+    pub(crate) async fn try_set_vcard(&mut self, context: &Context, path: &Path) -> Result<()> {
+        let vcard = fs::read(path).await.context("Could not read {path}")?;
+        if let Some(summary) = get_vcard_summary(&vcard) {
+            self.param.set(Param::Summary1, summary);
+        } else {
+            warn!(context, "try_set_vcard: Not a valid DeltaChat vCard.");
+            self.viewtype = Viewtype::File;
+        }
+        Ok(())
+    }
+
     /// Set different sender name for a message.
     /// This overrides the name set by the `set_config()`-option `displayname`.
     pub fn set_override_sender_name(&mut self, name: Option<String>) {
@@ -1909,21 +1934,43 @@ pub(crate) async fn rfc724_mid_exists_and(
     Ok(res)
 }
 
-/// Given a list of Message-IDs, returns the latest message found in the database.
+/// Given a list of Message-IDs, returns the most relevant message found in the database.
 ///
+/// Relevance here is `(download_state == Done, index)`, where `index` is an index of Message-ID in
+/// `mids`. This means Message-IDs should be ordered from the least late to the latest one (like in
+/// the References header).
 /// Only messages that are not in the trash chat are considered.
-pub(crate) async fn get_latest_by_rfc724_mids(
+pub(crate) async fn get_by_rfc724_mids(
     context: &Context,
     mids: &[String],
 ) -> Result<Option<Message>> {
+    let mut latest = None;
     for id in mids.iter().rev() {
-        if let Some((msg_id, _)) = rfc724_mid_exists(context, id).await? {
-            if let Some(msg) = Message::load_from_db_optional(context, msg_id).await? {
-                return Ok(Some(msg));
-            }
+        let Some((msg_id, _)) = rfc724_mid_exists(context, id).await? else {
+            continue;
+        };
+        let Some(msg) = Message::load_from_db_optional(context, msg_id).await? else {
+            continue;
+        };
+        if msg.download_state == DownloadState::Done {
+            return Ok(Some(msg));
         }
+        latest.get_or_insert(msg);
     }
-    Ok(None)
+    Ok(latest)
+}
+
+/// Returns the 1st part of summary text (i.e. before the dash if any) for a valid DeltaChat vCard.
+pub(crate) fn get_vcard_summary(vcard: &[u8]) -> Option<String> {
+    let vcard = str::from_utf8(vcard).ok()?;
+    let contacts = deltachat_contact_tools::parse_vcard(vcard);
+    let [c] = &contacts[..] else {
+        return None;
+    };
+    if !deltachat_contact_tools::may_be_valid_addr(&c.addr) {
+        return None;
+    }
+    Some(c.display_name().to_string())
 }
 
 /// How a message is primarily displayed.

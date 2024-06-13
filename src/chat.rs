@@ -49,7 +49,6 @@ use crate::tools::{
     create_smeared_timestamps, get_abs_path, gm2local_offset, improve_single_line_input,
     smeared_time, time, IsNoneOrEmpty, SystemTime,
 };
-use crate::webxdc::WEBXDC_SUFFIX;
 
 /// An chat item, such as a message or a marker.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -914,8 +913,20 @@ impl ChatId {
                     .await?
                     .context("no file stored in params")?;
                 msg.param.set(Param::File, blob.as_name());
-                if blob.suffix() == Some(WEBXDC_SUFFIX) {
-                    msg.viewtype = Viewtype::Webxdc;
+                if msg.viewtype == Viewtype::File {
+                    if let Some((better_type, _)) =
+                        message::guess_msgtype_from_suffix(&blob.to_abs_path())
+                            // We do not do an automatic conversion to other viewtypes here so that
+                            // users can send images as "files" to preserve the original quality
+                            // (usually we compress images). The remaining conversions are done by
+                            // `prepare_msg_blob()` later.
+                            .filter(|&(vt, _)| vt == Viewtype::Webxdc || vt == Viewtype::Vcard)
+                    {
+                        msg.viewtype = better_type;
+                    }
+                }
+                if msg.viewtype == Viewtype::Vcard {
+                    msg.try_set_vcard(context, &blob.to_abs_path()).await?;
                 }
             }
         }
@@ -2669,6 +2680,10 @@ async fn prepare_msg_blob(context: &Context, msg: &mut Message) -> Result<()> {
                 .await?;
         }
 
+        if msg.viewtype == Viewtype::Vcard {
+            msg.try_set_vcard(context, &blob.to_abs_path()).await?;
+        }
+
         let mut maybe_sticker = msg.viewtype == Viewtype::Sticker;
         if !send_as_is
             && (msg.viewtype == Viewtype::Image
@@ -3787,7 +3802,10 @@ pub(crate) async fn add_contact_to_chat_ex(
         msg.param.set_cmd(SystemMessage::MemberAddedToGroup);
         msg.param.set(Param::Arg, contact_addr);
         msg.param.set_int(Param::Arg2, from_handshake.into());
-        msg.id = send_msg(context, chat_id, &mut msg).await?;
+        if let Err(e) = send_msg(context, chat_id, &mut msg).await {
+            remove_from_chat_contacts_table(context, chat_id, contact_id).await?;
+            return Err(e);
+        }
         sync = Nosync;
     }
     context.emit_event(EventType::ChatModified(chat_id));
@@ -3975,8 +3993,7 @@ pub async fn remove_contact_from_chat(
             if let Some(contact) = Contact::get_by_id_optional(context, contact_id).await? {
                 if chat.typ == Chattype::Group && chat.is_promoted() {
                     msg.viewtype = Viewtype::Text;
-                    if contact.id == ContactId::SELF {
-                        set_group_explicitly_left(context, &chat.grpid).await?;
+                    if contact_id == ContactId::SELF {
                         msg.text = stock_str::msg_group_left_local(context, ContactId::SELF).await;
                     } else {
                         msg.text = stock_str::msg_del_member_local(
@@ -3988,17 +4005,24 @@ pub async fn remove_contact_from_chat(
                     }
                     msg.param.set_cmd(SystemMessage::MemberRemovedFromGroup);
                     msg.param.set(Param::Arg, contact.get_addr().to_lowercase());
-                    msg.id = send_msg(context, chat_id, &mut msg).await?;
+                    let res = send_msg(context, chat_id, &mut msg).await;
+                    if contact_id == ContactId::SELF {
+                        res?;
+                        set_group_explicitly_left(context, &chat.grpid).await?;
+                    } else if let Err(e) = res {
+                        warn!(context, "remove_contact_from_chat({chat_id}, {contact_id}): send_msg() failed: {e:#}.");
+                    }
                 } else {
                     sync = Sync;
                 }
             }
             // we remove the member from the chat after constructing the
             // to-be-send message. If between send_msg() and here the
-            // process dies the user will have to re-do the action.  It's
-            // better than the other way round: you removed
-            // someone from DB but no peer or device gets to know about it and
-            // group membership is thus different on different devices.
+            // process dies, the user will be able to redo the action. It's better than the other
+            // way round: you removed someone from DB but no peer or device gets to know about it
+            // and group membership is thus different on different devices. But if send_msg()
+            // failed, we still remove the member locally, otherwise it would be impossible to
+            // remove a member with missing key from a protected group.
             // Note also that sending a message needs all recipients
             // in order to correctly determine encryption so if we
             // removed it first, it would complicate the
@@ -4673,7 +4697,7 @@ impl Context {
                     .0
             }
             SyncId::Msgids(msgids) => {
-                let msg = message::get_latest_by_rfc724_mids(self, msgids)
+                let msg = message::get_by_rfc724_mids(self, msgids)
                     .await?
                     .with_context(|| format!("No message found for Message-IDs {msgids:?}"))?;
                 ChatId::lookup_by_message(&msg)
@@ -5085,6 +5109,7 @@ mod tests {
 
         // Bob leaves the chat.
         remove_contact_from_chat(&bob, bob_chat_id, ContactId::SELF).await?;
+        bob.pop_sent_msg().await;
 
         // Bob receives a msg about Alice adding Claire to the group.
         bob.recv_msg(&alice_sent_add_msg).await;
@@ -5137,6 +5162,7 @@ mod tests {
         let sent_msg = alice.pop_sent_msg().await;
         bob.recv_msg(&sent_msg).await;
         remove_contact_from_chat(&bob, bob_chat_id, bob_fiona_contact_id).await?;
+        bob.pop_sent_msg().await;
 
         // This doesn't add Fiona back because Bob just removed them.
         let sent_msg = alice.send_text(alice_chat_id, "Welcome, Fiona!").await;

@@ -10,10 +10,11 @@ use crate::chat::{
 };
 use crate::chatlist::Chatlist;
 use crate::constants::{DC_GCL_FOR_FORWARDING, DC_GCL_NO_SPECIALS};
+use crate::contact;
 use crate::download::MIN_DOWNLOAD_LIMIT;
 use crate::imap::prefetch_should_download;
 use crate::imex::{imex, ImexMode};
-use crate::test_utils::{get_chat_msg, TestContext, TestContextManager};
+use crate::test_utils::{get_chat_msg, mark_as_verified, TestContext, TestContextManager};
 use crate::tools::SystemTime;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2886,6 +2887,18 @@ async fn test_incoming_contact_request() -> Result<()> {
     }
 }
 
+async fn get_parent_message(
+    context: &Context,
+    mime_parser: &MimeMessage,
+) -> Result<Option<Message>> {
+    super::get_parent_message(
+        context,
+        mime_parser.get_header(HeaderDef::References),
+        mime_parser.get_header(HeaderDef::InReplyTo),
+    )
+    .await
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_get_parent_message() -> Result<()> {
     let t = TestContext::new_alice().await;
@@ -3923,6 +3936,7 @@ async fn test_dont_readd_with_normal_msg() -> Result<()> {
     bob_chat_id.accept(&bob).await?;
 
     remove_contact_from_chat(&bob, bob_chat_id, ContactId::SELF).await?;
+    bob.pop_sent_msg().await;
     assert_eq!(get_chat_contacts(&bob, bob_chat_id).await?.len(), 1);
 
     SystemTime::shift(Duration::from_secs(3600));
@@ -4085,6 +4099,7 @@ async fn test_mua_can_readd() -> Result<()> {
 
     // And leaves it.
     remove_contact_from_chat(&alice, alice_chat.id, ContactId::SELF).await?;
+    alice.pop_sent_msg().await;
     assert!(!is_contact_in_chat(&alice, alice_chat.id, ContactId::SELF).await?);
 
     // Bob uses a classical MUA to answer, adding Alice back.
@@ -4159,6 +4174,7 @@ async fn test_recreate_member_list_on_missing_add_of_self() -> Result<()> {
     // But if Bob just left, they mustn't recreate the member list even after missing a message.
     bob_chat_id.accept(&bob).await?;
     remove_contact_from_chat(&bob, bob_chat_id, ContactId::SELF).await?;
+    bob.pop_sent_msg().await;
     send_text_msg(&alice, alice_chat_id, "3rd message".to_string()).await?;
     alice.pop_sent_msg().await;
     send_text_msg(&alice, alice_chat_id, "4th message".to_string()).await?;
@@ -4465,6 +4481,79 @@ Chat-Group-Member-Added: charlie@example.com",
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_leave_protected_group_missing_member_key() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+    mark_as_verified(alice, bob).await;
+    let alice_bob_id = alice.add_or_lookup_contact(bob).await.id;
+    let group_id = create_group_chat(alice, ProtectionStatus::Protected, "Group").await?;
+    add_contact_to_chat(alice, group_id, alice_bob_id).await?;
+    alice.send_text(group_id, "Hello!").await;
+    alice
+        .sql
+        .execute(
+            "UPDATE acpeerstates SET addr=? WHERE addr=?",
+            ("b@b", "bob@example.net"),
+        )
+        .await?;
+    assert!(remove_contact_from_chat(alice, group_id, ContactId::SELF)
+        .await
+        .is_err());
+    assert!(is_contact_in_chat(alice, group_id, ContactId::SELF).await?);
+    alice
+        .sql
+        .execute(
+            "UPDATE acpeerstates SET addr=? WHERE addr=?",
+            ("bob@example.net", "b@b"),
+        )
+        .await?;
+    remove_contact_from_chat(alice, group_id, ContactId::SELF).await?;
+    alice.pop_sent_msg().await;
+    assert!(!is_contact_in_chat(alice, group_id, ContactId::SELF).await?);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_protected_group_add_remove_member_missing_key() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+    let bob_addr = bob.get_config(Config::Addr).await?.unwrap();
+    mark_as_verified(alice, bob).await;
+    let group_id = create_group_chat(alice, ProtectionStatus::Protected, "Group").await?;
+    let alice_bob_id = alice.add_or_lookup_contact(bob).await.id;
+    add_contact_to_chat(alice, group_id, alice_bob_id).await?;
+    alice.send_text(group_id, "Hello!").await;
+    alice
+        .sql
+        .execute("DELETE FROM acpeerstates WHERE addr=?", (&bob_addr,))
+        .await?;
+
+    let fiona = &tcm.fiona().await;
+    mark_as_verified(alice, fiona).await;
+    let alice_fiona_id = alice.add_or_lookup_contact(fiona).await.id;
+    assert!(add_contact_to_chat(alice, group_id, alice_fiona_id)
+        .await
+        .is_err());
+    assert!(!is_contact_in_chat(alice, group_id, alice_fiona_id).await?);
+    // Now the chat has a message "You added member fiona@example.net. [INFO] !!" (with error) that
+    // may be confusing, but if the error is displayed in UIs, it's more or less ok. This is not a
+    // normal scenario anyway.
+
+    remove_contact_from_chat(alice, group_id, alice_bob_id).await?;
+    assert!(!is_contact_in_chat(alice, group_id, alice_bob_id).await?);
+    let msg = alice.get_last_msg_in(group_id).await;
+    assert!(msg.is_info());
+    assert_eq!(
+        msg.get_text(),
+        stock_str::msg_del_member_local(alice, &bob_addr, ContactId::SELF,).await
+    );
+    assert!(msg.error().is_some());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_forged_from() -> Result<()> {
     let mut tcm = TestContextManager::new();
     let alice = tcm.alice().await;
@@ -4548,6 +4637,50 @@ async fn test_references() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_prefer_references_to_downloaded_msgs() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+    bob.set_config(Config::DownloadLimit, Some("1")).await?;
+    let fiona = &tcm.fiona().await;
+    let alice_bob_id = tcm.send_recv(bob, alice, "hi").await.from_id;
+    let alice_fiona_id = tcm.send_recv(fiona, alice, "hi").await.from_id;
+    let alice_chat_id = create_group_chat(alice, ProtectionStatus::Unprotected, "Group").await?;
+    add_contact_to_chat(alice, alice_chat_id, alice_bob_id).await?;
+    // W/o fiona the test doesn't work -- the last message is assigned to the 1:1 chat due to
+    // `is_probably_private_reply()`.
+    add_contact_to_chat(alice, alice_chat_id, alice_fiona_id).await?;
+    let sent = alice.send_text(alice_chat_id, "Hi").await;
+    let received = bob.recv_msg(&sent).await;
+    assert_eq!(received.download_state, DownloadState::Done);
+    let bob_chat_id = received.chat_id;
+
+    let file_bytes = include_bytes!("../../test-data/image/screenshot.gif");
+    let mut msg = Message::new(Viewtype::File);
+    msg.set_file_from_bytes(alice, "file", file_bytes, None)
+        .await?;
+    let mut sent = alice.send_msg(alice_chat_id, &mut msg).await;
+    sent.payload = sent
+        .payload
+        .replace("References:", "X-Microsoft-Original-References:")
+        .replace("In-Reply-To:", "X-Microsoft-Original-In-Reply-To:");
+    let received = bob.recv_msg(&sent).await;
+    assert_eq!(received.download_state, DownloadState::Available);
+    assert_ne!(received.chat_id, bob_chat_id);
+    assert_eq!(received.chat_id, bob.get_chat(alice).await.id);
+
+    let mut msg = Message::new(Viewtype::File);
+    msg.set_file_from_bytes(alice, "file", file_bytes, None)
+        .await?;
+    let sent = alice.send_msg(alice_chat_id, &mut msg).await;
+    let received = bob.recv_msg(&sent).await;
+    assert_eq!(received.download_state, DownloadState::Available);
+    assert_eq!(received.chat_id, bob_chat_id);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_list_from() -> Result<()> {
     let t = &TestContext::new_alice().await;
 
@@ -4572,10 +4705,15 @@ async fn test_receive_vcard() -> Result<()> {
     let alice = tcm.alice().await;
     let bob = tcm.bob().await;
 
-    for vcard_contains_address in [true, false] {
-        let mut msg = Message::new(Viewtype::Vcard);
+    async fn test(
+        alice: &TestContext,
+        bob: &TestContext,
+        vcard_contains_address: bool,
+        viewtype: Viewtype,
+    ) -> Result<()> {
+        let mut msg = Message::new(viewtype);
         msg.set_file_from_bytes(
-            &alice,
+            alice,
             "claire.vcf",
             format!(
                 "BEGIN:VCARD\n\
@@ -4595,19 +4733,24 @@ async fn test_receive_vcard() -> Result<()> {
         .await
         .unwrap();
 
-        let alice_bob_chat = alice.create_chat(&bob).await;
+        let alice_bob_chat = alice.create_chat(bob).await;
         let sent = alice.send_msg(alice_bob_chat.id, &mut msg).await;
         let rcvd = bob.recv_msg(&sent).await;
+        let sent = Message::load_from_db(alice, sent.sender_msg_id).await?;
 
         if vcard_contains_address {
+            assert_eq!(sent.viewtype, Viewtype::Vcard);
+            assert_eq!(sent.get_summary_text(alice).await, "👤 Claire");
             assert_eq!(rcvd.viewtype, Viewtype::Vcard);
+            assert_eq!(rcvd.get_summary_text(bob).await, "👤 Claire");
         } else {
             // VCards without an email address are not "deltachat contacts",
             // so they are shown as files
+            assert_eq!(sent.viewtype, Viewtype::File);
             assert_eq!(rcvd.viewtype, Viewtype::File);
         }
 
-        let vcard = tokio::fs::read(rcvd.get_file(&bob).unwrap()).await?;
+        let vcard = tokio::fs::read(rcvd.get_file(bob).unwrap()).await?;
         let vcard = std::str::from_utf8(&vcard)?;
         let parsed = deltachat_contact_tools::parse_vcard(vcard);
         assert_eq!(parsed.len(), 1);
@@ -4616,7 +4759,49 @@ async fn test_receive_vcard() -> Result<()> {
         } else {
             assert_eq!(&parsed[0].addr, "");
         }
+        Ok(())
     }
+
+    for vcard_contains_address in [true, false] {
+        for viewtype in [Viewtype::File, Viewtype::Vcard] {
+            test(&alice, &bob, vcard_contains_address, viewtype).await?;
+        }
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_make_n_send_vcard() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+    let vcard = "BEGIN:VCARD\n\
+         VERSION:4.0\n\
+         FN:Claire\n\
+         EMAIL;TYPE=work:claire@example.org\n\
+         END:VCARD";
+    let contact_ids = contact::import_vcard(alice, vcard).await?;
+    assert_eq!(contact_ids.len(), 1);
+
+    let mut msg = Message::new(Viewtype::File);
+    msg.make_vcard(alice, &contact_ids).await?;
+
+    let alice_bob_chat = alice.create_chat(bob).await;
+    let sent = alice.send_msg(alice_bob_chat.id, &mut msg).await;
+    let rcvd = bob.recv_msg(&sent).await;
+    let sent = Message::load_from_db(alice, sent.sender_msg_id).await?;
+
+    assert_eq!(sent.viewtype, Viewtype::Vcard);
+    assert_eq!(sent.get_summary_text(alice).await, "👤 Claire");
+    assert_eq!(rcvd.viewtype, Viewtype::Vcard);
+    assert_eq!(rcvd.get_summary_text(bob).await, "👤 Claire");
+
+    let vcard = tokio::fs::read(rcvd.get_file(bob).unwrap()).await?;
+    let vcard = std::str::from_utf8(&vcard)?;
+    let parsed = deltachat_contact_tools::parse_vcard(vcard);
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(&parsed[0].addr, "claire@example.org");
 
     Ok(())
 }
