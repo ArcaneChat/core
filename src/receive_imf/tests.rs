@@ -15,7 +15,7 @@ use crate::download::MIN_DOWNLOAD_LIMIT;
 use crate::imap::prefetch_should_download;
 use crate::imex::{imex, ImexMode};
 use crate::test_utils::{get_chat_msg, mark_as_verified, TestContext, TestContextManager};
-use crate::tools::SystemTime;
+use crate::tools::{time, SystemTime};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_outgoing() -> Result<()> {
@@ -2043,7 +2043,7 @@ async fn test_dont_assign_to_trash_by_parent() {
     assert_eq!(msg.text, "Hi – hello");
 
     println!("\n========= Delete the message ==========");
-    msg.id.trash(&t).await.unwrap();
+    msg.id.trash(&t, false).await.unwrap();
 
     let msgs = chat::get_chat_msgs(&t.ctx, chat_id).await.unwrap();
     assert_eq!(msgs.len(), 0);
@@ -2800,8 +2800,13 @@ async fn test_read_receipts_dont_create_chats() -> Result<()> {
     assert_eq!(chats.len(), 0);
 
     // Bob sends a read receipt.
-    let mdn_mimefactory =
-        crate::mimefactory::MimeFactory::from_mdn(&bob, &received_msg, vec![]).await?;
+    let mdn_mimefactory = crate::mimefactory::MimeFactory::from_mdn(
+        &bob,
+        received_msg.from_id,
+        received_msg.rfc724_mid,
+        vec![],
+    )
+    .await?;
     let rendered_mdn = mdn_mimefactory.render(&bob).await?;
     let mdn_body = rendered_mdn.message;
 
@@ -2830,8 +2835,13 @@ async fn test_read_receipts_dont_unmark_bots() -> Result<()> {
     let received_msg = bob.get_last_msg().await;
 
     // Bob sends a read receipt.
-    let mdn_mimefactory =
-        crate::mimefactory::MimeFactory::from_mdn(bob, &received_msg, vec![]).await?;
+    let mdn_mimefactory = crate::mimefactory::MimeFactory::from_mdn(
+        bob,
+        received_msg.from_id,
+        received_msg.rfc724_mid,
+        vec![],
+    )
+    .await?;
     let rendered_mdn = mdn_mimefactory.render(bob).await?;
     let mdn_body = rendered_mdn.message;
 
@@ -3274,6 +3284,62 @@ async fn test_send_as_bot() -> Result<()> {
     assert!(msg.is_forwarded());
     assert!(!msg.is_bot());
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_bot_recv_existing_msg() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let bob = &tcm.bob().await;
+    bob.set_config(Config::Bot, Some("1")).await.unwrap();
+    bob.set_config(Config::FetchExistingMsgs, Some("1"))
+        .await
+        .unwrap();
+    let fetching_existing_messages = true;
+    let msg = receive_imf_from_inbox(
+        bob,
+        "first@example.org",
+        b"From: Alice <alice@example.org>\n\
+          To: Bob <bob@example.net>\n\
+          Chat-Version: 1.0\n\
+          Message-ID: <first@example.org>\n\
+          Date: Sun, 14 Nov 2021 00:10:00 +0000\n\
+          Content-Type: text/plain\n\
+          \n\
+          hello\n",
+        false,
+        None,
+        fetching_existing_messages,
+    )
+    .await?
+    .unwrap();
+    let msg = Message::load_from_db(bob, msg.msg_ids[0]).await?;
+    assert_eq!(msg.state, MessageState::InFresh);
+    let event = bob
+        .evtracker
+        .get_matching(|ev| matches!(ev, EventType::IncomingMsg { .. }))
+        .await;
+    let EventType::IncomingMsg { chat_id, msg_id } = event else {
+        unreachable!();
+    };
+    assert_eq!(chat_id, msg.chat_id);
+    assert_eq!(msg_id, msg.id);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_wrong_date_in_imf_section() {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+    let alice_chat_id = tcm.send_recv_accept(bob, alice, "hi").await.chat_id;
+    let time_before_sending = time();
+    let mut sent_msg = alice.send_text(alice_chat_id, "hi").await;
+    sent_msg.payload = sent_msg.payload.replace(
+        "Date:",
+        "Date: Tue, 29 Feb 1972 22:37:57 +0000\nX-Microsoft-Original-Date:",
+    );
+    let msg = bob.recv_msg(&sent_msg).await;
+    assert!(msg.timestamp_sent >= time_before_sending);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4229,6 +4295,33 @@ async fn test_keep_member_list_if_possibly_nomember() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_adhoc_grp_name_no_prefix() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let chat_id = receive_imf(
+        alice,
+        b"Subject: Re: Once upon a time this was with the only Re: here\n\
+          From: <bob@example.net>\n\
+          To: <claire@example.org>, <alice@example.org>\n\
+          Date: Mon, 12 Dec 3000 14:32:39 +0000\n\
+          Message-ID: <thisone@example.net>\n\
+          In-Reply-To: <previous@example.net>\n\
+          \n\
+          Adding Alice the Delta Chat lover",
+        false,
+    )
+    .await?
+    .unwrap()
+    .chat_id;
+    let chat = Chat::load_from_db(alice, chat_id).await.unwrap();
+    assert_eq!(
+        chat.get_name(),
+        "Once upon a time this was with the only Re: here"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_download_later() -> Result<()> {
     let mut tcm = TestContextManager::new();
     let alice = tcm.alice().await;
@@ -4809,18 +4902,62 @@ async fn test_make_n_send_vcard() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_group_no_recipients() -> Result<()> {
     let t = &TestContext::new_alice().await;
-    let raw = b"From: alice@example.org\n\
-                    Subject: Group\n\
-                    Chat-Version: 1.0\n\
-                    Chat-Group-Name: Group\n\
-                    Chat-Group-ID: GePFDkwEj2K\n\
-                    Message-ID: <foobar@localhost>\n\
-                    \n\
-                    Hello!";
+    let raw = "From: alice@example.org
+Subject: Group
+Chat-Version: 1.0
+Chat-Group-Name: Group
+ name\u{202B}
+Chat-Group-ID: GePFDkwEj2K
+Message-ID: <foobar@localhost>
+
+Hello!"
+        .as_bytes();
     let received = receive_imf(t, raw, false).await?.unwrap();
     let msg = Message::load_from_db(t, *received.msg_ids.last().unwrap()).await?;
     let chat = Chat::load_from_db(t, msg.chat_id).await?;
     assert_eq!(chat.typ, Chattype::Group);
+
+    // Check that the weird group name is sanitzied correctly:
+    let mail = mailparse::parse_mail(raw).unwrap();
+    assert_eq!(
+        mail.headers
+            .get_header(HeaderDef::ChatGroupName)
+            .unwrap()
+            .get_value_raw(),
+        "Group\n name\u{202B}".as_bytes()
+    );
+    assert_eq!(chat.name, "Group name");
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_group_name_with_newline() -> Result<()> {
+    let t = &TestContext::new_alice().await;
+    let raw = "From: alice@example.org
+Subject: Group
+Chat-Version: 1.0
+Chat-Group-Name: =?utf-8?q?Delta=0D=0AChat?=
+Chat-Group-ID: GePFDkwEj2K
+Message-ID: <foobar@localhost>
+
+Hello!"
+        .as_bytes();
+    let received = receive_imf(t, raw, false).await?.unwrap();
+    let msg = Message::load_from_db(t, *received.msg_ids.last().unwrap()).await?;
+    let chat = Chat::load_from_db(t, msg.chat_id).await?;
+    assert_eq!(chat.typ, Chattype::Group);
+
+    // Check that the weird group name is sanitzied correctly:
+    let mail = mailparse::parse_mail(raw).unwrap();
+    assert_eq!(
+        mail.headers
+            .get_header(HeaderDef::ChatGroupName)
+            .unwrap()
+            .get_value(),
+        "Delta\r\nChat"
+    );
+    assert_eq!(chat.name, "Delta  Chat");
 
     Ok(())
 }

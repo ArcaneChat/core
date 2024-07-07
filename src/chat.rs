@@ -8,7 +8,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, ensure, Context as _, Result};
-use deltachat_contact_tools::{strip_rtlo_characters, ContactAddress};
+use deltachat_contact_tools::{sanitize_bidi_characters, sanitize_single_line, ContactAddress};
 use deltachat_derive::{FromSql, ToSql};
 use serde::{Deserialize, Serialize};
 use strum_macros::EnumIter;
@@ -46,8 +46,8 @@ use crate::stock_str;
 use crate::sync::{self, Sync::*, SyncData};
 use crate::tools::{
     buf_compress, create_id, create_outgoing_rfc724_mid, create_smeared_timestamp,
-    create_smeared_timestamps, get_abs_path, gm2local_offset, improve_single_line_input,
-    smeared_time, time, IsNoneOrEmpty, SystemTime,
+    create_smeared_timestamps, get_abs_path, gm2local_offset, smeared_time, time, IsNoneOrEmpty,
+    SystemTime,
 };
 
 /// An chat item, such as a message or a marker.
@@ -321,7 +321,7 @@ impl ChatId {
         param: Option<String>,
         timestamp: i64,
     ) -> Result<Self> {
-        let grpname = strip_rtlo_characters(grpname);
+        let grpname = sanitize_single_line(grpname);
         let timestamp = cmp::min(timestamp, smeared_time(context));
         let row_id =
             context.sql.insert(
@@ -947,12 +947,13 @@ impl ChatId {
                         .sql
                         .execute(
                             "UPDATE msgs
-                            SET timestamp=?,type=?,txt=?, param=?,mime_in_reply_to=?
+                            SET timestamp=?,type=?,txt=?,txt_normalized=?,param=?,mime_in_reply_to=?
                             WHERE id=?;",
                             (
                                 time(),
                                 msg.viewtype,
                                 &msg.text,
+                                message::normalize_text(&msg.text),
                                 msg.param.to_string(),
                                 msg.in_reply_to.as_deref().unwrap_or_default(),
                                 msg.id,
@@ -976,10 +977,11 @@ impl ChatId {
                  type,
                  state,
                  txt,
+                 txt_normalized,
                  param,
                  hidden,
                  mime_in_reply_to)
-         VALUES (?,?,?, ?,?,?,?,?,?);",
+         VALUES (?,?,?,?,?,?,?,?,?,?);",
                 (
                     self,
                     ContactId::SELF,
@@ -987,6 +989,7 @@ impl ChatId {
                     msg.viewtype,
                     MessageState::OutDraft,
                     &msg.text,
+                    message::normalize_text(&msg.text),
                     msg.param.to_string(),
                     1,
                     msg.in_reply_to.as_deref().unwrap_or_default(),
@@ -2095,7 +2098,7 @@ impl Chat {
                 .execute(
                     "UPDATE msgs
                      SET rfc724_mid=?, chat_id=?, from_id=?, to_id=?, timestamp=?, type=?,
-                         state=?, txt=?, subject=?, param=?,
+                         state=?, txt=?, txt_normalized=?, subject=?, param=?,
                          hidden=?, mime_in_reply_to=?, mime_references=?, mime_modified=?,
                          mime_headers=?, mime_compressed=1, location_id=?, ephemeral_timer=?,
                          ephemeral_timestamp=?
@@ -2109,6 +2112,7 @@ impl Chat {
                         msg.viewtype,
                         msg.state,
                         msg.text,
+                        message::normalize_text(&msg.text),
                         &msg.subject,
                         msg.param.to_string(),
                         msg.hidden,
@@ -2137,6 +2141,7 @@ impl Chat {
                         type,
                         state,
                         txt,
+                        txt_normalized,
                         subject,
                         param,
                         hidden,
@@ -2148,7 +2153,7 @@ impl Chat {
                         location_id,
                         ephemeral_timer,
                         ephemeral_timestamp)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?);",
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?);",
                     params_slice![
                         msg.rfc724_mid,
                         msg.chat_id,
@@ -2158,6 +2163,7 @@ impl Chat {
                         msg.viewtype,
                         msg.state,
                         msg.text,
+                        message::normalize_text(&msg.text),
                         &msg.subject,
                         msg.param.to_string(),
                         msg.hidden,
@@ -2872,7 +2878,7 @@ pub async fn send_msg_sync(context: &Context, chat_id: ChatId, msg: &mut Message
 async fn send_msg_inner(context: &Context, chat_id: ChatId, msg: &mut Message) -> Result<MsgId> {
     // protect all system messages against RTLO attacks
     if msg.is_system_message() {
-        msg.text = strip_rtlo_characters(&msg.text);
+        msg.text = sanitize_bidi_characters(&msg.text);
     }
 
     if !prepare_send_msg(context, chat_id, msg).await?.is_empty() {
@@ -2935,7 +2941,7 @@ pub(crate) async fn create_send_msg_jobs(context: &Context, msg: &mut Message) -
       }
     }
     let needs_encryption = msg.param.get_bool(Param::GuaranteeE2ee).unwrap_or_default();
-    let mimefactory = MimeFactory::from_msg(context, msg).await?;
+    let mimefactory = MimeFactory::from_msg(context, msg.clone()).await?;
     let attach_selfavatar = mimefactory.attach_selfavatar;
     let mut recipients = mimefactory.recipients();
 
@@ -3530,7 +3536,7 @@ pub async fn create_group_chat(
     protect: ProtectionStatus,
     chat_name: &str,
 ) -> Result<ChatId> {
-    let chat_name = improve_single_line_input(chat_name);
+    let chat_name = sanitize_single_line(chat_name);
     ensure!(!chat_name.is_empty(), "Invalid chat name");
 
     let grpid = create_id();
@@ -4070,7 +4076,7 @@ async fn rename_ex(
     chat_id: ChatId,
     new_name: &str,
 ) -> Result<()> {
-    let new_name = improve_single_line_input(new_name);
+    let new_name = sanitize_single_line(new_name);
     /* the function only sets the names of group chats; normal chats get their names from the contacts */
     let mut success = false;
 
@@ -4101,7 +4107,7 @@ async fn rename_ex(
             if chat.is_promoted()
                 && !chat.is_mailing_list()
                 && chat.typ != Chattype::Broadcast
-                && improve_single_line_input(&chat.name) != new_name
+                && sanitize_single_line(&chat.name) != new_name
             {
                 msg.viewtype = Viewtype::Text;
                 msg.text =
@@ -4429,9 +4435,10 @@ pub async fn add_device_msg_with_importance(
             timestamp_rcvd,
             type,state,
             txt,
+            txt_normalized,
             param,
             rfc724_mid)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?);",
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?);",
                 (
                     chat_id,
                     ContactId::DEVICE,
@@ -4442,6 +4449,7 @@ pub async fn add_device_msg_with_importance(
                     msg.viewtype,
                     state,
                     &msg.text,
+                    message::normalize_text(&msg.text),
                     msg.param.to_string(),
                     rfc724_mid,
                 ),
@@ -4545,8 +4553,8 @@ pub(crate) async fn add_info_msg_with_cmd(
 
     let row_id =
     context.sql.insert(
-        "INSERT INTO msgs (chat_id,from_id,to_id,timestamp,timestamp_sent,timestamp_rcvd,type,state,txt,rfc724_mid,ephemeral_timer, param,mime_in_reply_to)
-        VALUES (?,?,?, ?,?,?,?,?, ?,?,?, ?,?);",
+        "INSERT INTO msgs (chat_id,from_id,to_id,timestamp,timestamp_sent,timestamp_rcvd,type,state,txt,txt_normalized,rfc724_mid,ephemeral_timer,param,mime_in_reply_to)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?);",
         (
             chat_id,
             from_id.unwrap_or(ContactId::INFO),
@@ -4557,6 +4565,7 @@ pub(crate) async fn add_info_msg_with_cmd(
             Viewtype::Text,
             MessageState::InNoticed,
             text,
+            message::normalize_text(text),
             rfc724_mid,
             ephemeral_timer,
             param.to_string(),
@@ -4601,8 +4610,8 @@ pub(crate) async fn update_msg_text_and_timestamp(
     context
         .sql
         .execute(
-            "UPDATE msgs SET txt=?, timestamp=? WHERE id=?;",
-            (text, timestamp, msg_id),
+            "UPDATE msgs SET txt=?, txt_normalized=?, timestamp=? WHERE id=?;",
+            (text, message::normalize_text(text), timestamp, msg_id),
         )
         .await?;
     context.emit_msgs_changed(chat_id, msg_id);

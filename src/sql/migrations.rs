@@ -1,6 +1,6 @@
 //! Migrations module.
 
-use anyhow::{Context as _, Result};
+use anyhow::{ensure, Context as _, Result};
 use deltachat_contact_tools::EmailAddress;
 use rusqlite::OptionalExtension;
 
@@ -578,7 +578,7 @@ CREATE INDEX smtp_messageid ON imap(rfc724_mid);
     if dbversion < 90 {
         sql.execute_migration(
             r#"CREATE TABLE smtp_mdns (
-              msg_id INTEGER NOT NULL, -- id of the message in msgs table which requested MDN
+              msg_id INTEGER NOT NULL, -- id of the message in msgs table which requested MDN (DEPRECATED 2024-06-21)
               from_id INTEGER NOT NULL, -- id of the contact that sent the message, MDN destination
               rfc724_mid TEXT NOT NULL, -- Message-ID header
               retries INTEGER NOT NULL DEFAULT 0 -- Number of failed attempts to send MDN
@@ -937,6 +937,24 @@ CREATE INDEX msgs_status_updates_index2 ON msgs_status_updates (uid);
             .await?;
     }
 
+    if dbversion < 115 {
+        sql.execute_migration("ALTER TABLE msgs ADD COLUMN txt_normalized TEXT", 115)
+            .await?;
+    }
+    let migration_version: i32 = 115;
+
+    let migration_version: i32 = migration_version + 1;
+    ensure!(migration_version == 116, "Fix the number here");
+    if dbversion < migration_version {
+        // Whether the message part doesn't need to be stored on the server. If all parts are marked
+        // deleted, a server-side deletion is issued.
+        sql.execute_migration(
+            "ALTER TABLE msgs ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0",
+            migration_version,
+        )
+        .await?;
+    }
+
     let new_version = sql
         .get_raw_config_int(VERSION_CFG)
         .await?
@@ -945,13 +963,11 @@ CREATE INDEX msgs_status_updates_index2 ON msgs_status_updates (uid);
         let created_db = if exists_before_update {
             ""
         } else {
-            "Created new database; "
+            "Created new database. "
         };
-        info!(
-            context,
-            "{}[migration] v{}-v{}", created_db, dbversion, new_version
-        );
+        info!(context, "{}Migration done from v{}.", created_db, dbversion);
     }
+    info!(context, "Database version: v{new_version}.");
 
     Ok((
         recalc_fingerprints,
@@ -984,6 +1000,13 @@ impl Sql {
 
     async fn execute_migration(&self, query: &str, version: i32) -> Result<()> {
         self.transaction(move |transaction| {
+            let curr_version: String = transaction.query_row(
+                "SELECT IFNULL(value, ?) FROM config WHERE keyname=?;",
+                ("0", VERSION_CFG),
+                |row| row.get(0),
+            )?;
+            let curr_version: i32 = curr_version.parse()?;
+            ensure!(curr_version < version, "Db version must be increased");
             Self::set_db_version_trans(transaction, version)?;
             transaction.execute_batch(query)?;
 

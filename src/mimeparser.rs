@@ -6,7 +6,7 @@ use std::path::Path;
 use std::str;
 
 use anyhow::{bail, Context as _, Result};
-use deltachat_contact_tools::{addr_cmp, addr_normalize, strip_rtlo_characters};
+use deltachat_contact_tools::{addr_cmp, addr_normalize, sanitize_bidi_characters};
 use deltachat_derive::{FromSql, ToSql};
 use format_flowed::unformat_flowed;
 use lettre_email::mime::Mime;
@@ -220,13 +220,8 @@ impl MimeMessage {
         let mail = mailparse::parse_mail(body)?;
 
         let timestamp_rcvd = smeared_time(context);
-        let timestamp_sent = mail
-            .headers
-            .get_header_value(HeaderDef::Date)
-            .and_then(|v| mailparse::dateparse(&v).ok())
-            .map_or(timestamp_rcvd, |value| {
-                min(value, timestamp_rcvd + constants::TIMESTAMP_SENT_TOLERANCE)
-            });
+        let mut timestamp_sent =
+            Self::get_timestamp_sent(&mail.headers, timestamp_rcvd, timestamp_rcvd);
         let mut hop_info = parse_receive_headers(&mail.get_headers());
 
         let mut headers = Default::default();
@@ -254,6 +249,8 @@ impl MimeMessage {
                     // We don't remove "subject" from `headers` because currently just signed
                     // messages are shown as unencrypted anyway.
 
+                    timestamp_sent =
+                        Self::get_timestamp_sent(&mail.headers, timestamp_sent, timestamp_rcvd);
                     MimeMessage::merge_headers(
                         context,
                         &mut headers,
@@ -349,6 +346,8 @@ impl MimeMessage {
             content
         });
         if let (Ok(mail), true) = (mail, encrypted) {
+            timestamp_sent =
+                Self::get_timestamp_sent(&mail.headers, timestamp_sent, timestamp_rcvd);
             if !signatures.is_empty() {
                 // Handle any gossip headers if the mail was encrypted. See section
                 // "3.6 Key Gossip" of <https://autocrypt.org/autocrypt-spec-1.1.0.pdf>
@@ -523,6 +522,18 @@ impl MimeMessage {
         }
 
         Ok(parser)
+    }
+
+    fn get_timestamp_sent(
+        hdrs: &[mailparse::MailHeader<'_>],
+        default: i64,
+        timestamp_rcvd: i64,
+    ) -> i64 {
+        hdrs.get_header_value(HeaderDef::Date)
+            .and_then(|v| mailparse::dateparse(&v).ok())
+            .map_or(default, |value| {
+                min(value, timestamp_rcvd + constants::TIMESTAMP_SENT_TOLERANCE)
+            })
     }
 
     /// Parses system messages.
@@ -2045,7 +2056,7 @@ fn get_attachment_filename(
         };
     }
 
-    let desired_filename = desired_filename.map(|filename| strip_rtlo_characters(&filename));
+    let desired_filename = desired_filename.map(|filename| sanitize_bidi_characters(&filename));
 
     Ok(desired_filename)
 }

@@ -101,7 +101,7 @@ impl Context {
     /// Adds item and timestamp to the list of items that should be synchronized to other devices.
     /// If device synchronization is disabled, the function does nothing.
     async fn add_sync_item_with_timestamp(&self, data: SyncData, timestamp: i64) -> Result<()> {
-        if !self.get_config_bool(Config::SyncMsgs).await? {
+        if !self.should_send_sync_msgs().await? {
             return Ok(());
         }
 
@@ -121,7 +121,7 @@ impl Context {
     /// If device synchronization is disabled,
     /// no tokens exist or the chat is unpromoted, the function does nothing.
     pub(crate) async fn sync_qr_code_tokens(&self, chat_id: Option<ChatId>) -> Result<()> {
-        if !self.get_config_bool(Config::SyncMsgs).await? {
+        if !self.should_send_sync_msgs().await? {
             return Ok(());
         }
 
@@ -322,17 +322,30 @@ mod tests {
     use super::*;
     use crate::chatlist::Chatlist;
     use crate::contact::{Contact, Origin};
-    use crate::test_utils::TestContext;
+    use crate::test_utils::{TestContext, TestContextManager};
     use crate::tools::SystemTime;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_config_sync_msgs() -> Result<()> {
         let t = TestContext::new_alice().await;
-        assert!(!t.get_config_bool(Config::SyncMsgs).await?);
+        assert_eq!(t.get_config_bool(Config::SyncMsgs).await?, false);
+        assert_eq!(t.get_config_bool(Config::BccSelf).await?, true);
+        assert_eq!(t.should_send_sync_msgs().await?, false);
+
         t.set_config_bool(Config::SyncMsgs, true).await?;
-        assert!(t.get_config_bool(Config::SyncMsgs).await?);
+        assert_eq!(t.get_config_bool(Config::SyncMsgs).await?, true);
+        assert_eq!(t.get_config_bool(Config::BccSelf).await?, true);
+        assert_eq!(t.should_send_sync_msgs().await?, true);
+
+        t.set_config_bool(Config::BccSelf, false).await?;
+        assert_eq!(t.get_config_bool(Config::SyncMsgs).await?, true);
+        assert_eq!(t.get_config_bool(Config::BccSelf).await?, false);
+        assert_eq!(t.should_send_sync_msgs().await?, false);
+
         t.set_config_bool(Config::SyncMsgs, false).await?;
-        assert!(!t.get_config_bool(Config::SyncMsgs).await?);
+        assert_eq!(t.get_config_bool(Config::SyncMsgs).await?, false);
+        assert_eq!(t.get_config_bool(Config::BccSelf).await?, false);
+        assert_eq!(t.should_send_sync_msgs().await?, false);
         Ok(())
     }
 
@@ -580,6 +593,32 @@ mod tests {
         bob.recv_msg(&sent_msg).await;
         assert!(!token::exists(&bob, token::Namespace::Auth, "testtoken").await?);
 
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_bot_no_sync_msgs() -> Result<()> {
+        let mut tcm = TestContextManager::new();
+        let alice = &tcm.alice().await;
+        let bob = &tcm.bob().await;
+        alice.set_config_bool(Config::SyncMsgs, true).await?;
+        let chat_id = alice.create_chat(bob).await.id;
+
+        chat::send_text_msg(alice, chat_id, "hi".to_string()).await?;
+        alice
+            .set_config(Config::Displayname, Some("Alice Human"))
+            .await?;
+        alice.pop_sent_msg().await; // Sync message
+        let msg = bob.recv_msg(&alice.pop_sent_msg().await).await;
+        assert_eq!(msg.text, "hi");
+
+        alice.set_config_bool(Config::Bot, true).await?;
+        chat::send_text_msg(alice, chat_id, "hi".to_string()).await?;
+        alice
+            .set_config(Config::Displayname, Some("Alice Bot"))
+            .await?;
+        let msg = bob.recv_msg(&alice.pop_sent_msg().await).await;
+        assert_eq!(msg.text, "hi");
         Ok(())
     }
 }

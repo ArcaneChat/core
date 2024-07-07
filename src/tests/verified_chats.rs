@@ -180,6 +180,26 @@ async fn test_create_verified_oneonone_chat() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_missing_peerstate_reexecute_securejoin() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let alice_addr = alice.get_config(Config::Addr).await?.unwrap();
+    let bob = &tcm.bob().await;
+    enable_verified_oneonone_chats(&[alice, bob]).await;
+    tcm.execute_securejoin(bob, alice).await;
+    let chat = bob.get_chat(alice).await;
+    assert!(chat.is_protected());
+    bob.sql
+        .execute("DELETE FROM acpeerstates WHERE addr=?", (&alice_addr,))
+        .await?;
+    tcm.execute_securejoin(bob, alice).await;
+    let chat = bob.get_chat(alice).await;
+    assert!(chat.is_protected());
+    assert!(!chat.is_protection_broken());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_create_unverified_oneonone_chat() -> Result<()> {
     let mut tcm = TestContextManager::new();
     let alice = tcm.alice().await;
@@ -542,7 +562,7 @@ async fn test_mdn_doesnt_disable_verification() -> Result<()> {
     let rcvd = tcm.send_recv_accept(&alice, &bob, "Heyho").await;
     message::markseen_msgs(&bob, vec![rcvd.id]).await?;
 
-    let mimefactory = MimeFactory::from_mdn(&bob, &rcvd, vec![]).await?;
+    let mimefactory = MimeFactory::from_mdn(&bob, rcvd.from_id, rcvd.rfc724_mid, vec![]).await?;
     let rendered_msg = mimefactory.render(&bob).await?;
     let body = rendered_msg.message;
     receive_imf(&alice, body.as_bytes(), false).await.unwrap();

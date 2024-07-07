@@ -16,7 +16,7 @@ use std::{
 use anyhow::{bail, format_err, Context as _, Result};
 use async_channel::Receiver;
 use async_imap::types::{Fetch, Flag, Name, NameAttribute, UnsolicitedResponse};
-use deltachat_contact_tools::{normalize_name, ContactAddress};
+use deltachat_contact_tools::ContactAddress;
 use futures::{FutureExt as _, StreamExt, TryStreamExt};
 use futures_lite::FutureExt;
 use num_traits::FromPrimitive;
@@ -540,6 +540,7 @@ impl Imap {
     ) -> Result<bool> {
         if should_ignore_folder(context, folder, folder_meaning).await? {
             info!(context, "Not fetching from {folder:?}.");
+            session.new_mail = false;
             return Ok(false);
         }
 
@@ -599,20 +600,26 @@ impl Imap {
             // in the `INBOX.DeltaChat` folder again.
             let _target;
             let target = if let Some(message_id) = &message_id {
-                let is_dup = if let Some((_, ts_sent_old)) =
-                    message::rfc724_mid_exists(context, message_id).await?
-                {
+                let msg_info =
+                    message::rfc724_mid_exists_ex(context, message_id, "deleted=1").await?;
+                let delete = if let Some((_, _, true)) = msg_info {
+                    info!(context, "Deleting locally deleted message {message_id}.");
+                    true
+                } else if let Some((_, ts_sent_old, _)) = msg_info {
                     let is_chat_msg = headers.get_header_value(HeaderDef::ChatVersion).is_some();
                     let ts_sent = headers
                         .get_header_value(HeaderDef::Date)
                         .and_then(|v| mailparse::dateparse(&v).ok())
                         .unwrap_or_default();
-                    is_dup_msg(is_chat_msg, ts_sent, ts_sent_old)
+                    let is_dup = is_dup_msg(is_chat_msg, ts_sent, ts_sent_old);
+                    if is_dup {
+                        info!(context, "Deleting duplicate message {message_id}.");
+                    }
+                    is_dup
                 } else {
                     false
                 };
-                if is_dup {
-                    info!(context, "Deleting duplicate message {message_id}.");
+                if delete {
                     &delete_target
                 } else if context
                     .sql
@@ -2421,12 +2428,6 @@ async fn add_all_recipients_as_contacts(
 
     let mut any_modified = false;
     for recipient in recipients {
-        let display_name_normalized = recipient
-            .display_name
-            .as_ref()
-            .map(|s| normalize_name(s))
-            .unwrap_or_default();
-
         let recipient_addr = match ContactAddress::new(&recipient.addr) {
             Err(err) => {
                 warn!(
@@ -2442,7 +2443,7 @@ async fn add_all_recipients_as_contacts(
 
         let (_, modified) = Contact::add_or_lookup(
             context,
-            &display_name_normalized,
+            &recipient.display_name.unwrap_or_default(),
             &recipient_addr,
             Origin::OutgoingTo,
         )

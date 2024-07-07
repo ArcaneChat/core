@@ -6,7 +6,7 @@ use std::str::FromStr;
 
 use anyhow::{ensure, Context as _, Result};
 use base64::Engine as _;
-use deltachat_contact_tools::addr_cmp;
+use deltachat_contact_tools::{addr_cmp, sanitize_single_line};
 use serde::{Deserialize, Serialize};
 use strum::{EnumProperty, IntoEnumIterator};
 use strum_macros::{AsRefStr, Display, EnumIter, EnumString};
@@ -20,7 +20,7 @@ use crate::log::LogExt;
 use crate::mimefactory::RECOMMENDED_FILE_SIZE;
 use crate::provider::{get_provider_by_id, Provider};
 use crate::sync::{self, Sync::*, SyncData};
-use crate::tools::{get_abs_path, improve_single_line_input};
+use crate::tools::get_abs_path;
 
 /// The available configuration keys.
 #[derive(
@@ -315,7 +315,8 @@ pub enum Config {
     #[strum(props(default = "655360"))]
     DownloadLimit,
 
-    /// Enable sending and executing (applying) sync messages. Sending requires `BccSelf` to be set.
+    /// Enable sending and executing (applying) sync messages. Sending requires `BccSelf` to be set
+    /// and `Bot` unset.
     #[strum(props(default = "1"))]
     SyncMsgs,
 
@@ -383,14 +384,14 @@ impl Config {
     /// multiple users are sharing an account. Another example is `Self::SyncMsgs` itself which
     /// mustn't be controlled by other devices.
     pub(crate) fn is_synced(&self) -> bool {
-        // We don't restart IO from the synchronisation code, so this is to be on the safe side.
-        if self.needs_io_restart() {
-            return false;
-        }
+        // NB: We don't restart IO from the synchronisation code, so `MvboxMove` isn't effective
+        // immediately if `ConfiguredMvboxFolder` is unset, but only after a reconnect (see
+        // `Imap::prepare()`).
         matches!(
             self,
             Self::Displayname
                 | Self::MdnsEnabled
+                | Self::MvboxMove
                 | Self::ShowEmails
                 | Self::Selfavatar
                 | Self::Selfstatus,
@@ -496,6 +497,13 @@ impl Context {
                 .get_config(Config::ConfiguredSentboxFolder)
                 .await?
                 .is_some())
+    }
+
+    /// Returns true if sync messages should be sent.
+    pub(crate) async fn should_send_sync_msgs(&self) -> Result<bool> {
+        Ok(self.get_config_bool(Config::SyncMsgs).await?
+            && self.get_config_bool(Config::BccSelf).await?
+            && !self.get_config_bool(Config::Bot).await?)
     }
 
     /// Gets configured "delete_server_after" value.
@@ -605,7 +613,7 @@ impl Context {
         mut value: Option<&str>,
     ) -> Result<()> {
         Self::check_config(key, value)?;
-        let sync = sync == Sync && key.is_synced();
+        let sync = sync == Sync && key.is_synced() && self.is_configured().await?;
         let better_value;
 
         match key {
@@ -644,7 +652,7 @@ impl Context {
             }
             Config::Displayname => {
                 if let Some(v) = value {
-                    better_value = improve_single_line_input(v);
+                    better_value = sanitize_single_line(v);
                     value = Some(&better_value);
                 }
                 self.sql.set_raw_config(key.as_ref(), value).await?;
@@ -978,15 +986,12 @@ mod tests {
         sync(&alice0, &alice1).await;
         assert_eq!(alice1.get_config_bool(Config::MdnsEnabled).await?, false);
 
-        let show_emails = alice0.get_config_bool(Config::ShowEmails).await?;
-        alice0
-            .set_config_bool(Config::ShowEmails, !show_emails)
-            .await?;
-        sync(&alice0, &alice1).await;
-        assert_eq!(
-            alice1.get_config_bool(Config::ShowEmails).await?,
-            !show_emails
-        );
+        for key in [Config::ShowEmails, Config::MvboxMove] {
+            let val = alice0.get_config_bool(key).await?;
+            alice0.set_config_bool(key, !val).await?;
+            sync(&alice0, &alice1).await;
+            assert_eq!(alice1.get_config_bool(key).await?, !val);
+        }
 
         // `Config::SyncMsgs` mustn't be synced.
         alice0.set_config_bool(Config::SyncMsgs, false).await?;

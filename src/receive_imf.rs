@@ -4,9 +4,7 @@ use std::collections::HashSet;
 use std::str::FromStr;
 
 use anyhow::{Context as _, Result};
-use deltachat_contact_tools::{
-    addr_cmp, may_be_valid_addr, normalize_name, strip_rtlo_characters, ContactAddress,
-};
+use deltachat_contact_tools::{addr_cmp, may_be_valid_addr, sanitize_single_line, ContactAddress};
 use iroh_gossip::proto::TopicId;
 use mailparse::{parse_mail, SingleInfo};
 use num_traits::FromPrimitive;
@@ -27,7 +25,7 @@ use crate::headerdef::{HeaderDef, HeaderDefMap};
 use crate::imap::{markseen_on_imap_table, GENERATED_PREFIX};
 use crate::log::LogExt;
 use crate::message::{
-    self, rfc724_mid_exists, rfc724_mid_exists_and, Message, MessageState, MessengerMessage, MsgId,
+    self, rfc724_mid_exists, rfc724_mid_exists_ex, Message, MessageState, MessengerMessage, MsgId,
     Viewtype,
 };
 use crate::mimeparser::{parse_message_ids, AvatarAction, MimeMessage, SystemMessage};
@@ -40,7 +38,7 @@ use crate::simplify;
 use crate::sql;
 use crate::stock_str;
 use crate::sync::Sync::*;
-use crate::tools::{self, buf_compress};
+use crate::tools::{self, buf_compress, remove_subject_prefix};
 use crate::{chatlist_events, location};
 use crate::{contact, imap};
 use iroh_net::NodeAddr;
@@ -661,10 +659,10 @@ pub async fn from_field_to_contact_id(
         }
     };
 
-    let from_id = add_or_lookup_contact_by_addr(
+    let (from_id, _) = Contact::add_or_lookup(
         context,
-        display_name,
-        from_addr,
+        display_name.unwrap_or_default(),
+        &from_addr,
         Origin::IncomingUnknownFrom,
     )
     .await?;
@@ -697,6 +695,9 @@ async fn add_parts(
     prevent_rename: bool,
     verified_encryption: VerifiedEncryption,
 ) -> Result<ReceivedMsg> {
+    let is_bot = context.get_config_bool(Config::Bot).await?;
+    // Bots handle existing messages the same way as new ones.
+    let fetching_existing_messages = fetching_existing_messages && !is_bot;
     let rfc724_mid_orig = &mime_parser
         .get_rfc724_mid()
         .unwrap_or(rfc724_mid.to_string());
@@ -790,9 +791,6 @@ async fn add_parts(
             chat_id = Some(DC_CHAT_ID_TRASH);
             info!(context, "Message is an MDN (TRASH).",);
         }
-
-        // signals whether the current user is a bot
-        let is_bot = context.get_config_bool(Config::Bot).await?;
 
         let create_blocked_default = if is_bot {
             Blocked::Not
@@ -1584,7 +1582,7 @@ INSERT INTO msgs
     rfc724_mid, chat_id,
     from_id, to_id, timestamp, timestamp_sent, 
     timestamp_rcvd, type, state, msgrmsg, 
-    txt, subject, txt_raw, param, hidden,
+    txt, txt_normalized, subject, txt_raw, param, hidden,
     bytes, mime_headers, mime_compressed, mime_in_reply_to,
     mime_references, mime_modified, error, ephemeral_timer,
     ephemeral_timestamp, download_state, hop_info
@@ -1594,7 +1592,7 @@ INSERT INTO msgs
     ?, ?, ?, ?,
     ?, ?, ?, ?,
     ?, ?, ?, ?, ?,
-    ?, ?, ?, ?, 1,
+    ?, ?, ?, ?, ?, 1,
     ?, ?, ?, ?,
     ?, ?, ?, ?
   )
@@ -1602,7 +1600,8 @@ ON CONFLICT (id) DO UPDATE
 SET rfc724_mid=excluded.rfc724_mid, chat_id=excluded.chat_id,
     from_id=excluded.from_id, to_id=excluded.to_id, timestamp_sent=excluded.timestamp_sent,
     type=excluded.type, msgrmsg=excluded.msgrmsg,
-    txt=excluded.txt, subject=excluded.subject, txt_raw=excluded.txt_raw, param=excluded.param,
+    txt=excluded.txt, txt_normalized=excluded.txt_normalized, subject=excluded.subject,
+    txt_raw=excluded.txt_raw, param=excluded.param,
     hidden=excluded.hidden,bytes=excluded.bytes, mime_headers=excluded.mime_headers,
     mime_compressed=excluded.mime_compressed, mime_in_reply_to=excluded.mime_in_reply_to,
     mime_references=excluded.mime_references, mime_modified=excluded.mime_modified, error=excluded.error, ephemeral_timer=excluded.ephemeral_timer,
@@ -1622,6 +1621,7 @@ RETURNING id
                     state,
                     is_dc_message,
                     if trash { "" } else { msg },
+                    if trash { None } else { message::normalize_text(msg) },
                     if trash { "" } else { &subject },
                     // txt_raw might contain invalid utf8
                     if trash { "" } else { &txt_raw },
@@ -1694,8 +1694,11 @@ RETURNING id
     }
 
     if let Some(replace_msg_id) = replace_msg_id {
-        // "Replace" placeholder with a message that has no parts.
-        replace_msg_id.trash(context).await?;
+        // Trash the "replace" placeholder with a message that has no parts. If it has the original
+        // "Message-ID", mark the placeholder for server-side deletion so as if the user deletes the
+        // fully downloaded message later, the server-side deletion is issued.
+        let on_server = rfc724_mid == rfc724_mid_orig;
+        replace_msg_id.trash(context, on_server).await?;
     }
 
     chat_id.unarchive_if_not_muted(context, state).await?;
@@ -1980,8 +1983,9 @@ async fn create_group(
         let grpname = mime_parser
             .get_header(HeaderDef::ChatGroupName)
             .context("Chat-Group-Name vanished")?
-            // W/a for "Space added before long group names after MIME serialization/deserialization
-            // #3650" issue. DC itself never creates group names with leading/trailing whitespace.
+            // Workaround for the "Space added before long group names after MIME
+            // serialization/deserialization #3650" issue. DC itself never creates group names with
+            // leading/trailing whitespace.
             .trim();
         let new_chat_id = ChatId::create_multiuser_record(
             context,
@@ -2104,8 +2108,9 @@ async fn apply_group_changes(
             || match mime_parser.get_header(HeaderDef::InReplyTo) {
                 // If we don't know the referenced message, we missed some messages.
                 // Maybe they added/removed members, so we need to recreate our member list.
-                Some(reply_to) => rfc724_mid_exists_and(context, reply_to, "download_state=0")
+                Some(reply_to) => rfc724_mid_exists_ex(context, reply_to, "download_state=0")
                     .await?
+                    .filter(|(_, _, downloaded)| *downloaded)
                     .is_none(),
                 None => false,
             }
@@ -2176,15 +2181,15 @@ async fn apply_group_changes(
         }
     } else if let Some(old_name) = mime_parser
         .get_header(HeaderDef::ChatGroupNameChanged)
-        // See create_or_lookup_group() for explanation
         .map(|s| s.trim())
     {
         if let Some(grpname) = mime_parser
             .get_header(HeaderDef::ChatGroupName)
-            // See create_or_lookup_group() for explanation
             .map(|grpname| grpname.trim())
             .filter(|grpname| grpname.len() < 200)
         {
+            let grpname = &sanitize_single_line(grpname);
+            let old_name = &sanitize_single_line(old_name);
             if chat_id
                 .update_timestamp(
                     context,
@@ -2196,10 +2201,7 @@ async fn apply_group_changes(
                 info!(context, "Updating grpname for chat {chat_id}.");
                 context
                     .sql
-                    .execute(
-                        "UPDATE chats SET name=? WHERE id=?;",
-                        (strip_rtlo_characters(grpname), chat_id),
-                    )
+                    .execute("UPDATE chats SET name=? WHERE id=?;", (grpname, chat_id))
                     .await?;
                 send_event_chat_modified = true;
             }
@@ -2472,7 +2474,7 @@ fn compute_mailinglist_name(
         }
     }
 
-    strip_rtlo_characters(&name)
+    sanitize_single_line(&name)
 }
 
 /// Set ListId param on the contact and ListPost param the chat.
@@ -2596,10 +2598,10 @@ async fn create_adhoc_group(
         return Ok(None);
     }
 
-    // use subject as initial chat name
     let grpname = mime_parser
         .get_subject()
-        .unwrap_or_else(|| "Unnamed group".to_string());
+        .map(|s| remove_subject_prefix(&s))
+        .unwrap_or_else(|| "👥📧".to_string());
 
     let new_chat_id: ChatId = ChatId::create_multiuser_record(
         context,
@@ -2894,8 +2896,9 @@ async fn add_or_lookup_contacts_by_address_list(
         }
         let display_name = info.display_name.as_deref();
         if let Ok(addr) = ContactAddress::new(addr) {
-            let contact_id =
-                add_or_lookup_contact_by_addr(context, display_name, addr, origin).await?;
+            let (contact_id, _) =
+                Contact::add_or_lookup(context, display_name.unwrap_or_default(), &addr, origin)
+                    .await?;
             contact_ids.insert(contact_id);
         } else {
             warn!(context, "Contact with address {:?} cannot exist.", addr);
@@ -2903,23 +2906,6 @@ async fn add_or_lookup_contacts_by_address_list(
     }
 
     Ok(contact_ids.into_iter().collect::<Vec<ContactId>>())
-}
-
-/// Add contacts to database on receiving messages.
-async fn add_or_lookup_contact_by_addr(
-    context: &Context,
-    display_name: Option<&str>,
-    addr: ContactAddress,
-    origin: Origin,
-) -> Result<ContactId> {
-    if context.is_self_addr(&addr).await? {
-        return Ok(ContactId::SELF);
-    }
-    let display_name_normalized = display_name.map(normalize_name).unwrap_or_default();
-
-    let (contact_id, _modified) =
-        Contact::add_or_lookup(context, &display_name_normalized, &addr, origin).await?;
-    Ok(contact_id)
 }
 
 #[cfg(test)]
