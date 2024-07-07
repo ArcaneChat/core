@@ -9,7 +9,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::blob::BlobObject;
 use crate::context::Context;
-use crate::message::MsgId;
 use crate::mimeparser::SystemMessage;
 
 /// Available param keys.
@@ -18,7 +17,7 @@ use crate::mimeparser::SystemMessage;
 )]
 #[repr(u8)]
 pub enum Param {
-    /// For messages and jobs
+    /// For messages
     File = b'f',
 
     /// For messages: original filename (as shown in chat)
@@ -49,6 +48,11 @@ pub enum Param {
     /// For Messages: message is encrypted, outgoing: guarantee E2EE or the message is not send
     GuaranteeE2ee = b'c',
 
+    /// For Messages: quoted message is encrypted.
+    ///
+    /// If this message is sent unencrypted, quote text should be replaced.
+    ProtectQuote = b'0',
+
     /// For Messages: decrypted with validation errors or without mutual set, if neither
     /// 'c' nor 'e' are preset, the messages is only transport encrypted.
     ErroneousE2ee = b'e',
@@ -65,7 +69,16 @@ pub enum Param {
     /// For Messages: the message is a reaction.
     Reaction = b'x',
 
-    /// For Messages: a message with Auto-Submitted header ("bot").
+    /// For Chats: the timestamp of the last reaction.
+    LastReactionTimestamp = b'y',
+
+    /// For Chats: Message ID of the last reaction.
+    LastReactionMsgId = b'Y',
+
+    /// For Chats: Contact ID of the last reaction.
+    LastReactionContactId = b'1',
+
+    /// For Messages: a message with "Auto-Submitted: auto-generated" header ("bot").
     Bot = b'b',
 
     /// For Messages: unset or 0=not forwarded,
@@ -74,6 +87,9 @@ pub enum Param {
 
     /// For Messages: quoted text.
     Quote = b'q',
+
+    /// For Messages: the 1st part of summary text (i.e. before the dash if any).
+    Summary1 = b'4',
 
     /// For Messages
     Cmd = b'S',
@@ -84,10 +100,10 @@ pub enum Param {
     /// For Messages
     Arg2 = b'F',
 
-    /// For Messages
+    /// `Secure-Join-Fingerprint` header for `{vc,vg}-request-with-auth` messages.
     Arg3 = b'G',
 
-    /// For Messages
+    /// Deprecated `Secure-Join-Group` header for messages.
     Arg4 = b'H',
 
     /// For Messages
@@ -107,17 +123,11 @@ pub enum Param {
     /// is used to also send all the forwarded messages.
     PrepForwards = b'P',
 
-    /// For Jobs
+    /// For Messages
     SetLatitude = b'l',
 
-    /// For Jobs
+    /// For Messages
     SetLongitude = b'n',
-
-    /// For Jobs
-    AlsoMove = b'M',
-
-    /// For MDN-sending job
-    MsgId = b'I',
 
     /// For Groups
     ///
@@ -173,9 +183,6 @@ pub enum Param {
     /// For Chats: timestamp of member list update.
     MemberListTimestamp = b'k',
 
-    /// For Chats: timestamp of protection settings update.
-    ProtectionSettingsTimestamp = b'L',
-
     /// For Webxdc Message Instances: Current document name
     WebxdcDocument = b'R',
 
@@ -188,8 +195,15 @@ pub enum Param {
     /// For Webxdc Message Instances: timestamp of summary update.
     WebxdcSummaryTimestamp = b'Q',
 
+    /// For Webxdc Message Instances: Webxdc is an integration, see init_webxdc_integration()
+    WebxdcIntegration = b'3',
+
+    /// For Webxdc Message Instances: Chat to integrate the Webxdc for.
+    WebxdcIntegrateFor = b'2',
+
     /// For messages: Whether [crate::message::Viewtype::Sticker] should be forced.
     ForceSticker = b'X',
+    // 'L' was defined as ProtectionSettingsTimestamp for Chats, however, never used in production.
 }
 
 /// An object for handling key=value parameter lists.
@@ -399,12 +413,6 @@ impl Params {
         Ok(Some(path))
     }
 
-    pub fn get_msg_id(&self) -> Option<MsgId> {
-        self.get(Param::MsgId)
-            .and_then(|x| x.parse().ok())
-            .map(MsgId::new)
-    }
-
     /// Set the given parameter to the passed in `i32`.
     pub fn set_int(&mut self, key: Param, value: i32) -> &mut Self {
         self.set(key, format!("{value}"));
@@ -455,7 +463,6 @@ mod tests {
     use std::path::Path;
     use std::str::FromStr;
 
-    use anyhow::Result;
     use tokio::fs;
 
     use super::*;

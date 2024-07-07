@@ -4,10 +4,10 @@ For example, to release version 1.116.0 of the core, do the following steps.
 
 1. Resolve all [blocker issues](https://github.com/deltachat/deltachat-core-rust/labels/blocker).
 
-2. Run `npm run build:core:constants` in the root of the repository
-   and commit generated `node/constants.js`, `node/events.js` and `node/lib/constants.js`.
+2. Update the changelog: `git cliff --unreleased --tag 1.116.0 --prepend CHANGELOG.md` or `git cliff -u -t 1.116.0 -p CHANGELOG.md`.
 
-3. Update the changelog: `git cliff --unreleased --tag 1.116.0 --prepend CHANGELOG.md` or `git cliff -u -t 1.116.0 -p CHANGELOG.md`.
+3. add a link to compare previous with current version to the end of CHANGELOG.md:
+  `[1.116.0]: https://github.com/deltachat/deltachat-core-rust/compare/v1.115.2...v1.116.0`
 
 4. Update the version by running `scripts/set_core_version.py 1.116.0`.
 

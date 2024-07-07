@@ -1,10 +1,13 @@
+from __future__ import annotations
+
 import os
 import random
-from typing import AsyncGenerator, List, Optional
+from typing import AsyncGenerator, Optional
 
 import pytest
 
-from . import Account, AttrDict, Bot, Client, DeltaChat, EventType, Message
+from . import Account, AttrDict, Bot, Chat, Client, DeltaChat, EventType, Message
+from ._utils import futuremethod
 from .rpc import Rpc
 
 
@@ -37,9 +40,10 @@ class ACFactory:
         assert not account.is_configured()
         return account
 
-    def new_configured_account(self) -> Account:
+    @futuremethod
+    def new_configured_account(self):
         account = self.new_preconfigured_account()
-        account.configure()
+        yield account.configure.future()
         assert account.is_configured()
         return account
 
@@ -49,17 +53,15 @@ class ACFactory:
         bot.configure(credentials["email"], credentials["password"])
         return bot
 
-    def get_online_account(self) -> Account:
-        account = self.new_configured_account()
-        account.start_io()
-        while True:
-            event = account.wait_for_event()
-            if event.kind == EventType.IMAP_INBOX_IDLE:
-                break
+    @futuremethod
+    def get_online_account(self):
+        account = yield self.new_configured_account.future()
+        account.bring_online()
         return account
 
-    def get_online_accounts(self, num: int) -> List[Account]:
-        return [self.get_online_account() for _ in range(num)]
+    def get_online_accounts(self, num: int) -> list[Account]:
+        futures = [self.get_online_account.future() for _ in range(num)]
+        return [f() for f in futures]
 
     def resetup_account(self, ac: Account) -> Account:
         """Resetup account from scratch, losing the encryption key."""
@@ -70,6 +72,10 @@ class ACFactory:
         ac.remove()
         ac_clone.configure()
         return ac_clone
+
+    def get_accepted_chat(self, ac1: Account, ac2: Account) -> Chat:
+        ac2.create_chat(ac1)
+        return ac1.create_chat(ac2)
 
     def send_message(
         self,

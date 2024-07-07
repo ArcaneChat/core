@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 
 use anyhow::{anyhow, bail, ensure, Context as _, Result};
 pub use dclogin_scheme::LoginOptions;
+use deltachat_contact_tools::{addr_normalize, may_be_valid_addr, ContactAddress};
 use once_cell::sync::Lazy;
 use percent_encoding::percent_decode_str;
 use serde::Deserialize;
@@ -13,9 +14,7 @@ use self::dclogin_scheme::configure_from_login_qr;
 use crate::chat::{get_chat_id_by_grpid, ChatIdBlocked};
 use crate::config::Config;
 use crate::constants::Blocked;
-use crate::contact::{
-    addr_normalize, may_be_valid_addr, Contact, ContactAddress, ContactId, Origin,
-};
+use crate::contact::{Contact, ContactId, Origin};
 use crate::context::Context;
 use crate::events::EventType;
 use crate::key::Fingerprint;
@@ -23,8 +22,12 @@ use crate::message::Message;
 use crate::peerstate::Peerstate;
 use crate::socks::Socks5Config;
 use crate::token;
+use crate::tools::validate_id;
+use iroh_old as iroh;
 
 const OPENPGP4FPR_SCHEME: &str = "OPENPGP4FPR:"; // yes: uppercase
+const IDELTACHAT_SCHEME: &str = "https://i.delta.chat/#";
+const IDELTACHAT_NOSLASH_SCHEME: &str = "https://i.delta.chat#";
 const DCACCOUNT_SCHEME: &str = "DCACCOUNT:";
 pub(super) const DCLOGIN_SCHEME: &str = "DCLOGIN:";
 const DCWEBRTC_SCHEME: &str = "DCWEBRTC:";
@@ -247,12 +250,14 @@ fn starts_with_ignore_case(string: &str, pattern: &str) -> bool {
 /// The function should be called after a QR code is scanned.
 /// The function takes the raw text scanned and checks what can be done with it.
 pub async fn check_qr(context: &Context, qr: &str) -> Result<Qr> {
-    info!(context, "Scanned QR code: {}", qr);
-
     let qrcode = if starts_with_ignore_case(qr, OPENPGP4FPR_SCHEME) {
         decode_openpgp(context, qr)
             .await
             .context("failed to decode OPENPGP4FPR QR code")?
+    } else if qr.starts_with(IDELTACHAT_SCHEME) {
+        decode_ideltachat(context, IDELTACHAT_SCHEME, qr).await?
+    } else if qr.starts_with(IDELTACHAT_NOSLASH_SCHEME) {
+        decode_ideltachat(context, IDELTACHAT_NOSLASH_SCHEME, qr).await?
     } else if starts_with_ignore_case(qr, DCACCOUNT_SCHEME) {
         decode_account(qr)?
     } else if starts_with_ignore_case(qr, DCLOGIN_SCHEME) {
@@ -301,11 +306,12 @@ pub fn format_backup(qr: &Qr) -> Result<String> {
 async fn decode_openpgp(context: &Context, qr: &str) -> Result<Qr> {
     let payload = &qr[OPENPGP4FPR_SCHEME.len()..];
 
-    let (fingerprint, fragment) = match payload.find('#').map(|offset| {
-        let (fp, rest) = payload.split_at(offset);
-        // need to remove the # from the fragment
-        (fp, &rest[1..])
-    }) {
+    // macOS and iOS sometimes replace the # with %23 (uri encode it), we should be able to parse this wrong format too.
+    // see issue https://github.com/deltachat/deltachat-core-rust/issues/1969 for more info
+    let (fingerprint, fragment) = match payload
+        .split_once('#')
+        .or_else(|| payload.split_once("%23"))
+    {
         Some(pair) => pair,
         None => (payload, ""),
     };
@@ -340,9 +346,18 @@ async fn decode_openpgp(context: &Context, qr: &str) -> Result<Qr> {
         "".to_string()
     };
 
-    let invitenumber = param.get("i").map(|s| s.to_string());
-    let authcode = param.get("s").map(|s| s.to_string());
-    let grpid = param.get("x").map(|s| s.to_string());
+    let invitenumber = param
+        .get("i")
+        .filter(|&s| validate_id(s))
+        .map(|s| s.to_string());
+    let authcode = param
+        .get("s")
+        .filter(|&s| validate_id(s))
+        .map(|s| s.to_string());
+    let grpid = param
+        .get("x")
+        .filter(|&s| validate_id(s))
+        .map(|s| s.to_string());
 
     let grpname = if grpid.is_some() {
         if let Some(encoded_name) = param.get("g") {
@@ -365,9 +380,10 @@ async fn decode_openpgp(context: &Context, qr: &str) -> Result<Qr> {
 
     if let (Some(addr), Some(invitenumber), Some(authcode)) = (&addr, invitenumber, authcode) {
         let addr = ContactAddress::new(addr)?;
-        let (contact_id, _) = Contact::add_or_lookup(context, &name, addr, Origin::UnhandledQrScan)
-            .await
-            .with_context(|| format!("failed to add or lookup contact for address {addr:?}"))?;
+        let (contact_id, _) =
+            Contact::add_or_lookup(context, &name, &addr, Origin::UnhandledQrScan)
+                .await
+                .with_context(|| format!("failed to add or lookup contact for address {addr:?}"))?;
 
         if let (Some(grpid), Some(grpname)) = (grpid, grpname) {
             if context
@@ -375,7 +391,7 @@ async fn decode_openpgp(context: &Context, qr: &str) -> Result<Qr> {
                 .await
                 .with_context(|| format!("can't check if address {addr:?} is our address"))?
             {
-                if token::exists(context, token::Namespace::InviteNumber, &invitenumber).await {
+                if token::exists(context, token::Namespace::InviteNumber, &invitenumber).await? {
                     Ok(Qr::WithdrawVerifyGroup {
                         grpname,
                         grpid,
@@ -405,7 +421,7 @@ async fn decode_openpgp(context: &Context, qr: &str) -> Result<Qr> {
                 })
             }
         } else if context.is_self_addr(&addr).await? {
-            if token::exists(context, token::Namespace::InviteNumber, &invitenumber).await {
+            if token::exists(context, token::Namespace::InviteNumber, &invitenumber).await? {
                 Ok(Qr::WithdrawVerifyContact {
                     contact_id,
                     fingerprint,
@@ -432,7 +448,7 @@ async fn decode_openpgp(context: &Context, qr: &str) -> Result<Qr> {
         if let Some(peerstate) = peerstate {
             let peerstate_addr = ContactAddress::new(&peerstate.addr)?;
             let (contact_id, _) =
-                Contact::add_or_lookup(context, &name, peerstate_addr, Origin::UnhandledQrScan)
+                Contact::add_or_lookup(context, &name, &peerstate_addr, Origin::UnhandledQrScan)
                     .await
                     .context("add_or_lookup")?;
             ChatIdBlocked::get_for_contact(context, contact_id, Blocked::Request)
@@ -452,13 +468,21 @@ async fn decode_openpgp(context: &Context, qr: &str) -> Result<Qr> {
     }
 }
 
+/// scheme: `https://i.delta.chat[/]#FINGERPRINT&a=ADDR[&OPTIONAL_PARAMS]`
+async fn decode_ideltachat(context: &Context, prefix: &str, qr: &str) -> Result<Qr> {
+    let qr = qr.replacen(prefix, OPENPGP4FPR_SCHEME, 1);
+    let qr = qr.replacen('&', "#", 1);
+    decode_openpgp(context, &qr)
+        .await
+        .context("failed to decode {prefix} QR code")
+}
+
 /// scheme: `DCACCOUNT:https://example.org/new_email?t=1w_7wDjgjelxeX884x96v3`
 fn decode_account(qr: &str) -> Result<Qr> {
     let payload = qr
         .get(DCACCOUNT_SCHEME.len()..)
         .context("invalid DCACCOUNT payload")?;
-    let url =
-        url::Url::parse(payload).with_context(|| format!("Invalid account URL: {payload:?}"))?;
+    let url = url::Url::parse(payload).context("Invalid account URL")?;
     if url.scheme() == "http" || url.scheme() == "https" {
         Ok(Qr::Account {
             domain: url
@@ -467,7 +491,7 @@ fn decode_account(qr: &str) -> Result<Qr> {
                 .to_string(),
         })
     } else {
-        bail!("Bad scheme for account URL: {:?}.", payload);
+        bail!("Bad scheme for account URL: {:?}.", url.scheme());
     }
 }
 
@@ -478,8 +502,7 @@ fn decode_webrtc_instance(_context: &Context, qr: &str) -> Result<Qr> {
         .context("invalid DCWEBRTC payload")?;
 
     let (_type, url) = Message::parse_webrtc_instance(payload);
-    let url =
-        url::Url::parse(&url).with_context(|| format!("Invalid WebRTC instance: {payload:?}"))?;
+    let url = url::Url::parse(&url).context("Invalid WebRTC instance")?;
 
     if url.scheme() == "http" || url.scheme() == "https" {
         Ok(Qr::WebrtcInstance {
@@ -490,7 +513,7 @@ fn decode_webrtc_instance(_context: &Context, qr: &str) -> Result<Qr> {
             instance_pattern: payload.to_string(),
         })
     } else {
-        bail!("Bad URL scheme for WebRTC instance: {:?}", payload);
+        bail!("Bad URL scheme for WebRTC instance: {:?}", url.scheme());
     }
 }
 
@@ -532,19 +555,22 @@ async fn set_account_from_qr(context: &Context, qr: &str) -> Result<()> {
         .send()
         .await?;
     let response_status = response.status();
-    let response_text = response.text().await.with_context(|| {
-        format!("Cannot create account, request to {url_str:?} failed: empty response")
-    })?;
+    let response_text = response
+        .text()
+        .await
+        .context("Cannot create account, request failed: empty response")?;
 
     if response_status.is_success() {
         let CreateAccountSuccessResponse { password, email } = serde_json::from_str(&response_text)
             .with_context(|| {
-                format!(
-                    "Cannot create account, response from {url_str:?} is malformed:\n{response_text:?}"
-                )
+                format!("Cannot create account, response is malformed:\n{response_text:?}")
             })?;
-        context.set_config(Config::Addr, Some(&email)).await?;
-        context.set_config(Config::MailPw, Some(&password)).await?;
+        context
+            .set_config_internal(Config::Addr, Some(&email))
+            .await?;
+        context
+            .set_config_internal(Config::MailPw, Some(&password))
+            .await?;
 
         Ok(())
     } else {
@@ -572,7 +598,7 @@ pub async fn set_config_from_qr(context: &Context, qr: &str) -> Result<()> {
             instance_pattern,
         } => {
             context
-                .set_config(Config::WebrtcInstance, Some(&instance_pattern))
+                .set_config_internal(Config::WebrtcInstance, Some(&instance_pattern))
                 .await?;
         }
         Qr::WithdrawVerifyContact {
@@ -632,7 +658,7 @@ pub async fn set_config_from_qr(context: &Context, qr: &str) -> Result<()> {
         Qr::Login { address, options } => {
             configure_from_login_qr(context, &address, options).await?
         }
-        _ => bail!("qr code {:?} does not contain config", qr),
+        _ => bail!("QR code does not contain config"),
     }
 
     Ok(())
@@ -777,7 +803,7 @@ impl Qr {
     ) -> Result<Self> {
         let addr = ContactAddress::new(addr)?;
         let (contact_id, _) =
-            Contact::add_or_lookup(context, name, addr, Origin::UnhandledQrScan).await?;
+            Contact::add_or_lookup(context, name, &addr, Origin::UnhandledQrScan).await?;
         Ok(Qr::Addr { contact_id, draft })
     }
 }
@@ -788,15 +814,13 @@ fn normalize_address(addr: &str) -> Result<String> {
     let new_addr = percent_decode_str(addr).decode_utf8()?;
     let new_addr = addr_normalize(&new_addr);
 
-    ensure!(may_be_valid_addr(new_addr), "Bad e-mail address");
+    ensure!(may_be_valid_addr(&new_addr), "Bad e-mail address");
 
     Ok(new_addr.to_string())
 }
 
 #[cfg(test)]
 mod tests {
-    use anyhow::Result;
-
     use super::*;
     use crate::aheader::EncryptPreference;
     use crate::chat::{create_group_chat, ProtectionStatus};
@@ -943,6 +967,40 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_decode_ideltachat_link() -> Result<()> {
+        let ctx = TestContext::new().await;
+
+        let qr = check_qr(
+            &ctx.ctx,
+            "https://i.delta.chat/#79252762C34C5096AF57958F4FC3D21A81B0F0A7&a=cli%40deltachat.de&g=test%20%3F+test%20%21&x=h-0oKQf2CDK&i=9JEXlxAqGM0&s=0V7LzL9cxRL"
+        ).await?;
+        assert!(matches!(qr, Qr::AskVerifyGroup { .. }));
+
+        let qr = check_qr(
+            &ctx.ctx,
+            "https://i.delta.chat#79252762C34C5096AF57958F4FC3D21A81B0F0A7&a=cli%40deltachat.de&g=test%20%3F+test%20%21&x=h-0oKQf2CDK&i=9JEXlxAqGM0&s=0V7LzL9cxRL"
+        ).await?;
+        assert!(matches!(qr, Qr::AskVerifyGroup { .. }));
+
+        Ok(())
+    }
+
+    // macOS and iOS sometimes replace the # with %23 (uri encode it), we should be able to parse this wrong format too.
+    // see issue https://github.com/deltachat/deltachat-core-rust/issues/1969 for more info
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_decode_openpgp_tolerance_for_issue_1969() -> Result<()> {
+        let ctx = TestContext::new().await;
+
+        let qr = check_qr(
+            &ctx.ctx,
+            "OPENPGP4FPR:79252762C34C5096AF57958F4FC3D21A81B0F0A7%23a=cli%40deltachat.de&g=test%20%3F+test%20%21&x=h-0oKQf2CDK&i=9JEXlxAqGM0&s=0V7LzL9cxRL"
+        ).await?;
+
+        assert!(matches!(qr, Qr::AskVerifyGroup { .. }));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_decode_openpgp_group() -> Result<()> {
         let ctx = TestContext::new().await;
         let qr = check_qr(
@@ -981,6 +1039,21 @@ mod tests {
         } else {
             bail!("Wrong QR code type");
         }
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_decode_openpgp_invalid_token() -> Result<()> {
+        let ctx = TestContext::new().await;
+
+        // Token cannot contain "/"
+        let qr = check_qr(
+            &ctx.ctx,
+            "OPENPGP4FPR:79252762C34C5096AF57958F4FC3D21A81B0F0A7#a=cli%40deltachat.de&g=test%20%3F+test%20%21&x=h-0oKQf2CDK&i=9JEXlxAqGM0&s=0V7LzL/cxRL"
+        ).await?;
+
+        assert!(matches!(qr, Qr::FprMismatch { .. }));
 
         Ok(())
     }
@@ -1056,6 +1129,7 @@ mod tests {
             secondary_verified_key: None,
             secondary_verified_key_fingerprint: None,
             secondary_verifier: None,
+            backward_verified_key_id: None,
             fingerprint_changed: false,
         };
         assert!(

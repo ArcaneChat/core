@@ -2,7 +2,7 @@
 //!
 //! Functions to read/write token from/to the database. A token is any string associated with a key.
 //!
-//! Tokens are used in countermitm verification protocols.
+//! Tokens are used in SecureJoin verification protocols.
 
 use anyhow::Result;
 use deltachat_derive::{FromSql, ToSql};
@@ -93,25 +93,44 @@ pub async fn lookup_or_new(
     context: &Context,
     namespace: Namespace,
     foreign_id: Option<ChatId>,
-) -> String {
-    if let Ok(Some(token)) = lookup(context, namespace, foreign_id).await {
-        return token;
+) -> Result<String> {
+    if let Some(token) = lookup(context, namespace, foreign_id).await? {
+        return Ok(token);
     }
 
     let token = create_id();
-    save(context, namespace, foreign_id, &token).await.ok();
-    token
+    save(context, namespace, foreign_id, &token).await?;
+    Ok(token)
 }
 
-pub async fn exists(context: &Context, namespace: Namespace, token: &str) -> bool {
-    context
+pub async fn exists(context: &Context, namespace: Namespace, token: &str) -> Result<bool> {
+    let exists = context
         .sql
         .exists(
             "SELECT COUNT(*) FROM tokens WHERE namespc=? AND token=?;",
             (namespace, token),
         )
-        .await
-        .unwrap_or_default()
+        .await?;
+    Ok(exists)
+}
+
+/// Looks up ChatId by auth token.
+///
+/// Returns None if auth token is not valid.
+/// Returns zero/unset ChatId if the token corresponds to "setup contact" rather than group join.
+pub async fn auth_chat_id(context: &Context, token: &str) -> Result<Option<ChatId>> {
+    let chat_id: Option<ChatId> = context
+        .sql
+        .query_row_optional(
+            "SELECT foreign_id FROM tokens WHERE namespc=? AND token=?",
+            (Namespace::Auth, token),
+            |row| {
+                let chat_id: ChatId = row.get(0)?;
+                Ok(chat_id)
+            },
+        )
+        .await?;
+    Ok(chat_id)
 }
 
 pub async fn delete(context: &Context, namespace: Namespace, token: &str) -> Result<()> {

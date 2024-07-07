@@ -14,9 +14,10 @@ jobs:
       matrix:
         os: [macos-latest, windows-latest]
     steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-      - uses: actions/setup-node@v3
+      - uses: actions/checkout@v4
+        with:
+          show-progress: false
+      - uses: actions/setup-node@v4
         with:
           node-version: "18"
       - name: System info
@@ -28,7 +29,7 @@ jobs:
           node --version
 
       - name: Cache node modules
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: |
             ${{ env.APPDATA }}/npm-cache
@@ -36,7 +37,7 @@ jobs:
           key: ${{ matrix.os }}-node-${{ hashFiles('**/package.json') }}
 
       - name: Cache cargo index
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry/
@@ -56,7 +57,7 @@ jobs:
           tar -zcvf "${{ matrix.os }}.tar.gz" -C prebuilds .
 
       - name: Upload Prebuild
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.os }}
           path: node/${{ matrix.os }}.tar.gz
@@ -74,9 +75,10 @@ jobs:
       - name: Change working directory owner
         run: chown root:root .
 
-      - name: Checkout
-        uses: actions/checkout@v3
-      - uses: actions/setup-node@v3
+      - uses: actions/checkout@v4
+        with:
+          show-progress: false
+      - uses: actions/setup-node@v4
         with:
           node-version: "18"
       - run: apt-get update
@@ -97,7 +99,7 @@ jobs:
           node --version
 
       - name: Cache node modules
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: |
             ${{ env.APPDATA }}/npm-cache
@@ -105,7 +107,7 @@ jobs:
           key: ${{ matrix.os }}-node-${{ hashFiles('**/package.json') }}
 
       - name: Cache cargo index
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry/
@@ -125,7 +127,7 @@ jobs:
           tar -zcvf "linux.tar.gz" -C prebuilds .
 
       - name: Upload Prebuild
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: linux
           path: node/linux.tar.gz
@@ -137,9 +139,10 @@ jobs:
     steps:
       - name: Install tree
         run: sudo apt install tree
-      - name: Checkout
-        uses: actions/checkout@v3
-      - uses: actions/setup-node@v2
+      - uses: actions/checkout@v4
+        with:
+          show-progress: false
+      - uses: actions/setup-node@v4
         with:
           node-version: "18"
       - name: Get tag
@@ -165,25 +168,25 @@ jobs:
           node --version
           echo $DELTACHAT_NODE_TAR_GZ
       - name: Download Linux prebuild
-        uses: actions/download-artifact@v1
+        uses: actions/download-artifact@v4
         with:
           name: linux
       - name: Download macOS prebuild
-        uses: actions/download-artifact@v1
+        uses: actions/download-artifact@v4
         with:
           name: macos-latest
       - name: Download Windows prebuild
-        uses: actions/download-artifact@v1
+        uses: actions/download-artifact@v4
         with:
           name: windows-latest
       - shell: bash
         run: |
           mkdir node/prebuilds
-          tar -xvzf linux/linux.tar.gz -C node/prebuilds
-          tar -xvzf macos-latest/macos-latest.tar.gz -C node/prebuilds
-          tar -xvzf windows-latest/windows-latest.tar.gz -C node/prebuilds
+          tar -xvzf linux.tar.gz -C node/prebuilds
+          tar -xvzf macos-latest.tar.gz -C node/prebuilds
+          tar -xvzf windows-latest.tar.gz -C node/prebuilds
           tree node/prebuilds
-          rm -rf linux macos-latest windows-latest
+          rm -f linux.tar.gz macos-latest.tar.gz windows-latest.tar.gz
       - name: Install dependencies without running scripts
         run: |
           npm install --ignore-scripts
@@ -201,7 +204,7 @@ jobs:
           ls -lah
           mv $(find deltachat-node-*) $DELTACHAT_NODE_TAR_GZ
       - name: Upload prebuild
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: deltachat-node.tgz
           path: ${{ env.DELTACHAT_NODE_TAR_GZ }}

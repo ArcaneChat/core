@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 //! Delta Chat core RPC server.
 //!
 //! It speaks JSON Lines over stdio.
@@ -10,6 +11,7 @@ use deltachat::constants::DC_VERSION_STR;
 use deltachat_jsonrpc::api::{Accounts, CommandApi};
 use futures_lite::stream::StreamExt;
 use tokio::io::{self, AsyncBufReadExt, BufReader};
+use tracing_subscriber::EnvFilter;
 use yerpc::RpcServer as _;
 
 #[cfg(target_family = "unix")]
@@ -27,6 +29,9 @@ async fn main() {
     // "For technical reasons, stdin is implemented by using an ordinary blocking read on a separate
     // thread, and it is impossible to cancel that read. This can make shutdown of the runtime hang
     // until the user presses enter."
+    if let Err(error) = &r {
+        log::error!("Fatal error: {error:#}.")
+    }
     std::process::exit(if r.is_ok() { 0 } else { 1 });
 }
 
@@ -59,7 +64,13 @@ async fn main_impl() -> Result<()> {
     #[cfg(target_family = "unix")]
     let mut sigterm = signal_unix::signal(signal_unix::SignalKind::terminate())?;
 
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // Logs from `log` crate and traces from `tracing` crate
+    // are configurable with `RUST_LOG` environment variable
+    // and go to stderr to avoid interferring with JSON-RPC using stdout.
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .init();
 
     let path = std::env::var("DC_ACCOUNTS_PATH").unwrap_or_else(|_| "accounts".to_string());
     log::info!("Starting with accounts directory `{}`.", path);
@@ -68,7 +79,7 @@ async fn main_impl() -> Result<()> {
 
     log::info!("Creating JSON-RPC API.");
     let accounts = Arc::new(RwLock::new(accounts));
-    let state = CommandApi::from_arc(accounts.clone());
+    let state = CommandApi::from_arc(accounts.clone()).await;
 
     let (client, mut out_receiver) = RpcClient::new();
     let session = RpcSession::new(client.clone(), state.clone());

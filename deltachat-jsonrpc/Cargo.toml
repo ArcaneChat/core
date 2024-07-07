@@ -1,10 +1,11 @@
 [package]
 name = "deltachat-jsonrpc"
-version = "1.131.4"
+version = "1.141.1"
 description = "DeltaChat JSON-RPC API"
 edition = "2021"
 default-run = "deltachat-jsonrpc-server"
 license = "MPL-2.0"
+repository = "https://github.com/deltachat/deltachat-core-rust"
 
 [[bin]]
 name = "deltachat-jsonrpc-server"
@@ -12,29 +13,30 @@ path = "src/webserver.rs"
 required-features = ["webserver"]
 
 [dependencies]
-anyhow = "1"
+anyhow = { workspace = true }
 deltachat = { path = ".." }
-num-traits = "0.2"
-schemars = "0.8.13"
-serde = { version = "1.0", features = ["derive"] }
-tempfile = "3.8.0"
-log = "0.4"
-async-channel = { version = "2.0.0" }
-futures = { version = "0.3.28" }
-serde_json = "1.0.105"
-yerpc = { version = "0.5.2", features = ["anyhow_expose", "openrpc"] }
+deltachat-contact-tools = { path = "../deltachat-contact-tools" }
+num-traits = { workspace = true }
+schemars = "0.8.21"
+serde = { workspace = true, features = ["derive"] }
+tempfile = { workspace = true }
+log = { workspace = true }
+async-channel = { workspace = true }
+futures = { workspace = true }
+serde_json = { workspace = true }
+yerpc = { workspace = true, features = ["anyhow_expose", "openrpc"] }
 typescript-type-def = { version = "0.5.8", features = ["json_value"] }
-tokio = { version = "1.33.0" }
-sanitize-filename = "0.5"
-walkdir = "2.3.3"
-base64 = "0.21"
+tokio = { workspace = true }
+sanitize-filename = { workspace = true }
+walkdir = "2.5.0"
+base64 = { workspace = true }
 
 # optional dependencies
-axum = { version = "0.6.20", optional = true, features = ["ws"] }
-env_logger = { version = "0.10.0", optional = true }
+axum = { version = "0.7", optional = true, features = ["ws"] }
+env_logger = { version = "0.11.3", optional = true }
 
 [dev-dependencies]
-tokio = { version = "1.33.0", features = ["full", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["full", "rt-multi-thread"] }
 
 
 [features]

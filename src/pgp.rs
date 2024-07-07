@@ -4,7 +4,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::io;
 use std::io::Cursor;
 
-use anyhow::{bail, format_err, Context as _, Result};
+use anyhow::{bail, Context as _, Result};
+use deltachat_contact_tools::EmailAddress;
 use pgp::armor::BlockType;
 use pgp::composed::{
     Deserializable, KeyType as PgpKeyType, Message, SecretKeyParamsBuilder, SignedPublicKey,
@@ -20,7 +21,6 @@ use tokio::runtime::Handle;
 
 use crate::constants::KeyGenType;
 use crate::key::{DcKey, Fingerprint};
-use crate::tools::EmailAddress;
 
 #[allow(missing_docs)]
 #[cfg(test)]
@@ -138,8 +138,11 @@ pub struct KeyPair {
 }
 
 /// Create a new key pair.
+///
+/// Both secret and public key consist of signing primary key and encryption subkey
+/// as [described in the Autocrypt standard](https://autocrypt.org/level1.html#openpgp-based-key-data).
 pub(crate) fn create_keypair(addr: EmailAddress, keygen_type: KeyGenType) -> Result<KeyPair> {
-    let (secret_key_type, public_key_type) = match keygen_type {
+    let (signing_key_type, encryption_key_type) = match keygen_type {
         KeyGenType::Rsa2048 => (PgpKeyType::Rsa(2048), PgpKeyType::Rsa(2048)),
         KeyGenType::Rsa4096 => (PgpKeyType::Rsa(4096), PgpKeyType::Rsa(4096)),
         KeyGenType::Ed25519 | KeyGenType::Default => (PgpKeyType::EdDSA, PgpKeyType::ECDH),
@@ -147,8 +150,8 @@ pub(crate) fn create_keypair(addr: EmailAddress, keygen_type: KeyGenType) -> Res
 
     let user_id = format!("<{addr}>");
     let key_params = SecretKeyParamsBuilder::default()
-        .key_type(secret_key_type)
-        .can_create_certificates(true)
+        .key_type(signing_key_type)
+        .can_certify(true)
         .can_sign(true)
         .primary_user_id(user_id)
         .passphrase(None)
@@ -170,41 +173,36 @@ pub(crate) fn create_keypair(addr: EmailAddress, keygen_type: KeyGenType) -> Res
         ])
         .subkey(
             SubkeyParamsBuilder::default()
-                .key_type(public_key_type)
+                .key_type(encryption_key_type)
                 .can_encrypt(true)
                 .passphrase(None)
                 .build()
-                .map_err(|e| format_err!("{}", e))
                 .context("failed to build subkey parameters")?,
         )
         .build()
-        .map_err(|e| format_err!("{}", e))
-        .context("invalid key params")?;
-    let key = key_params.generate().context("invalid params")?;
-    let private_key = key
+        .context("failed to build key parameters")?;
+
+    let secret_key = key_params
+        .generate()
+        .context("failed to generate the key")?
         .sign(|| "".into())
-        .map_err(|e| format_err!("{}", e))
         .context("failed to sign secret key")?;
-
-    let public_key = private_key.public_key();
-    let public_key = public_key
-        .sign(&private_key, || "".into())
-        .map_err(|e| format_err!("{}", e))
-        .context("failed to sign public key")?;
-
-    private_key
+    secret_key
         .verify()
-        .map_err(|e| format_err!("{}", e))
-        .context("invalid private key generated")?;
+        .context("invalid secret key generated")?;
+
+    let public_key = secret_key
+        .public_key()
+        .sign(&secret_key, || "".into())
+        .context("failed to sign public key")?;
     public_key
         .verify()
-        .map_err(|e| format_err!("{}", e))
         .context("invalid public key generated")?;
 
     Ok(KeyPair {
         addr,
         public: public_key,
-        secret: private_key,
+        secret: secret_key,
     })
 }
 
@@ -238,6 +236,7 @@ pub async fn pk_encrypt(
     plain: &[u8],
     public_keys_for_encryption: Vec<SignedPublicKey>,
     private_key_for_signing: Option<SignedSecretKey>,
+    compress: bool,
 ) -> Result<String> {
     let lit_msg = Message::new_literal_bytes("", plain);
 
@@ -251,20 +250,19 @@ pub async fn pk_encrypt(
 
             let mut rng = thread_rng();
 
-            // TODO: measure time
             let encrypted_msg = if let Some(ref skey) = private_key_for_signing {
-                lit_msg
-                    .sign(skey, || "".into(), HASH_ALGORITHM)
-                    .and_then(|msg| msg.compress(CompressionAlgorithm::ZLIB))
-                    .and_then(|msg| {
-                        msg.encrypt_to_keys(&mut rng, SYMMETRIC_KEY_ALGORITHM, &pkeys_refs)
-                    })
+                let signed_msg = lit_msg.sign(skey, || "".into(), HASH_ALGORITHM)?;
+                let compressed_msg = if compress {
+                    signed_msg.compress(CompressionAlgorithm::ZLIB)?
+                } else {
+                    signed_msg
+                };
+                compressed_msg.encrypt_to_keys(&mut rng, SYMMETRIC_KEY_ALGORITHM, &pkeys_refs)?
             } else {
-                lit_msg.encrypt_to_keys(&mut rng, SYMMETRIC_KEY_ALGORITHM, &pkeys_refs)
+                lit_msg.encrypt_to_keys(&mut rng, SYMMETRIC_KEY_ALGORITHM, &pkeys_refs)?
             };
 
-            let msg = encrypted_msg?;
-            let encoded_msg = msg.to_armored_string(None)?;
+            let encoded_msg = encrypted_msg.to_armored_string(None)?;
 
             Ok(encoded_msg)
         })
@@ -451,7 +449,8 @@ mod tests {
         assert_ne!(keypair0.public, keypair1.public);
     }
 
-    /// [Key] objects to use in tests.
+    /// [SignedSecretKey] and [SignedPublicKey] objects
+    /// to use in tests.
     struct TestKeys {
         alice_secret: SignedSecretKey,
         alice_public: SignedPublicKey,
@@ -486,10 +485,16 @@ mod tests {
         CTEXT_SIGNED
             .get_or_init(|| async {
                 let keyring = vec![KEYS.alice_public.clone(), KEYS.bob_public.clone()];
+                let compress = true;
 
-                pk_encrypt(CLEARTEXT, keyring, Some(KEYS.alice_secret.clone()))
-                    .await
-                    .unwrap()
+                pk_encrypt(
+                    CLEARTEXT,
+                    keyring,
+                    Some(KEYS.alice_secret.clone()),
+                    compress,
+                )
+                .await
+                .unwrap()
             })
             .await
     }
@@ -499,7 +504,11 @@ mod tests {
         CTEXT_UNSIGNED
             .get_or_init(|| async {
                 let keyring = vec![KEYS.alice_public.clone(), KEYS.bob_public.clone()];
-                pk_encrypt(CLEARTEXT, keyring, None).await.unwrap()
+                let compress = true;
+
+                pk_encrypt(CLEARTEXT, keyring, None, compress)
+                    .await
+                    .unwrap()
             })
             .await
     }

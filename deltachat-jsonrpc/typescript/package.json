@@ -3,7 +3,7 @@
   "dependencies": {
     "@deltachat/tiny-emitter": "3.0.0",
     "isomorphic-ws": "^4.0.1",
-    "yerpc": "^0.4.3"
+    "yerpc": "^0.6.2"
   },
   "devDependencies": {
     "@types/chai": "^4.2.21",
@@ -25,12 +25,17 @@
   "exports": {
     ".": {
       "import": "./dist/deltachat.js",
-      "require": "./dist/deltachat.cjs"
+      "require": "./dist/deltachat.cjs",
+      "types": "./dist/deltachat.d.ts"
     }
   },
   "license": "MPL-2.0",
   "main": "dist/deltachat.js",
   "name": "@deltachat/jsonrpc-client",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/deltachat/deltachat-core-rust.git"
+  },
   "scripts": {
     "build": "run-s generate-bindings extract-constants build:tsc build:bundle build:cjs",
     "build:bundle": "esbuild --format=esm --bundle dist/deltachat.js --outfile=dist/deltachat.bundle.js",
@@ -53,5 +58,5 @@
   },
   "type": "module",
   "types": "dist/deltachat.d.ts",
-  "version": "1.131.4"
+  "version": "1.141.1"
 }

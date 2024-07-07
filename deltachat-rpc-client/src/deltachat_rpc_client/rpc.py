@@ -1,16 +1,60 @@
+from __future__ import annotations
+
 import itertools
 import json
 import logging
 import os
 import subprocess
 import sys
-from queue import Queue
+from queue import Empty, Queue
 from threading import Event, Thread
-from typing import Any, Dict, Iterator, Optional
+from typing import Any, Iterator, Optional
 
 
 class JsonRpcError(Exception):
     pass
+
+
+class RpcFuture:
+    def __init__(self, rpc: "Rpc", request_id: int, event: Event):
+        self.rpc = rpc
+        self.request_id = request_id
+        self.event = event
+
+    def __call__(self):
+        self.event.wait()
+        response = self.rpc.request_results.pop(self.request_id)
+        if "error" in response:
+            raise JsonRpcError(response["error"])
+        if "result" in response:
+            return response["result"]
+        return None
+
+
+class RpcMethod:
+    def __init__(self, rpc: "Rpc", name: str):
+        self.rpc = rpc
+        self.name = name
+
+    def __call__(self, *args) -> Any:
+        """Synchronously calls JSON-RPC method."""
+        future = self.future(*args)
+        return future()
+
+    def future(self, *args) -> Any:
+        """Asynchronously calls JSON-RPC method."""
+        request_id = next(self.rpc.id_iterator)
+        request = {
+            "jsonrpc": "2.0",
+            "method": self.name,
+            "params": args,
+            "id": request_id,
+        }
+        event = Event()
+        self.rpc.request_events[request_id] = event
+        self.rpc.request_queue.put(request)
+
+        return RpcFuture(self.rpc, request_id, event)
 
 
 class Rpc:
@@ -25,11 +69,11 @@ class Rpc:
         self._kwargs = kwargs
         self.process: subprocess.Popen
         self.id_iterator: Iterator[int]
-        self.event_queues: Dict[int, Queue]
+        self.event_queues: dict[int, Queue]
         # Map from request ID to `threading.Event`.
-        self.request_events: Dict[int, Event]
+        self.request_events: dict[int, Event]
         # Map from request ID to the result.
-        self.request_results: Dict[int, Any]
+        self.request_results: dict[int, Any]
         self.request_queue: Queue[Any]
         self.closing: bool
         self.reader_thread: Thread
@@ -144,25 +188,14 @@ class Rpc:
         queue = self.get_queue(account_id)
         return queue.get()
 
+    def clear_all_events(self, account_id: int):
+        """Removes all queued-up events for a given account. Useful for tests."""
+        queue = self.get_queue(account_id)
+        try:
+            while True:
+                queue.get_nowait()
+        except Empty:
+            pass
+
     def __getattr__(self, attr: str):
-        def method(*args) -> Any:
-            request_id = next(self.id_iterator)
-            request = {
-                "jsonrpc": "2.0",
-                "method": attr,
-                "params": args,
-                "id": request_id,
-            }
-            event = Event()
-            self.request_events[request_id] = event
-            self.request_queue.put(request)
-            event.wait()
-
-            response = self.request_results.pop(request_id)
-            if "error" in response:
-                raise JsonRpcError(response["error"])
-            if "result" in response:
-                return response["result"]
-            return None
-
-        return method
+        return RpcMethod(self, attr)

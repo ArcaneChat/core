@@ -1,8 +1,10 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Optional, Union
 from warnings import warn
 
-from ._utils import AttrDict
+from ._utils import AttrDict, futuremethod
 from .chat import Chat
 from .const import ChatlistFlag, ContactFlag, EventType, SpecialContactId
 from .contact import Contact
@@ -27,6 +29,10 @@ class Account:
     def wait_for_event(self) -> AttrDict:
         """Wait until the next event and return it."""
         return AttrDict(self._rpc.wait_for_event(self.id))
+
+    def clear_all_events(self):
+        """Removes all queued-up events for a given account. Useful for tests."""
+        self._rpc.clear_all_events(self.id)
 
     def remove(self) -> None:
         """Remove the account."""
@@ -76,9 +82,24 @@ class Account:
         """Get self avatar."""
         return self.get_config("selfavatar")
 
-    def configure(self) -> None:
+    def check_qr(self, qr):
+        return self._rpc.check_qr(self.id, qr)
+
+    def set_config_from_qr(self, qr: str):
+        self._rpc.set_config_from_qr(self.id, qr)
+
+    @futuremethod
+    def configure(self):
         """Configure an account."""
-        self._rpc.configure(self.id)
+        yield self._rpc.configure.future(self.id)
+
+    def bring_online(self):
+        """Start I/O and wait until IMAP becomes IDLE."""
+        self.start_io()
+        while True:
+            event = self.wait_for_event()
+            if event.kind == EventType.IMAP_INBOX_IDLE:
+                break
 
     def create_contact(self, obj: Union[int, str, Contact], name: Optional[str] = None) -> Contact:
         """Create a new Contact or return an existing one.
@@ -97,6 +118,11 @@ class Account:
             obj = obj.get_snapshot().address
         return Contact(self, self._rpc.create_contact(self.id, obj, name))
 
+    def create_chat(self, account: "Account") -> Chat:
+        addr = account.get_config("addr")
+        contact = self.create_contact(addr)
+        return contact.create_chat()
+
     def get_contact_by_id(self, contact_id: int) -> Contact:
         """Return Contact instance for the given contact ID."""
         return Contact(self, contact_id)
@@ -106,7 +132,7 @@ class Account:
         contact_id = self._rpc.lookup_contact_id_by_addr(self.id, address)
         return contact_id and Contact(self, contact_id)
 
-    def get_blocked_contacts(self) -> List[AttrDict]:
+    def get_blocked_contacts(self) -> list[AttrDict]:
         """Return a list with snapshots of all blocked contacts."""
         contacts = self._rpc.get_blocked_contacts(self.id)
         return [AttrDict(contact=Contact(self, contact["id"]), **contact) for contact in contacts]
@@ -131,7 +157,7 @@ class Account:
         with_self: bool = False,
         verified_only: bool = False,
         snapshot: bool = False,
-    ) -> Union[List[Contact], List[AttrDict]]:
+    ) -> Union[list[Contact], list[AttrDict]]:
         """Get a filtered list of contacts.
 
         :param query: if a string is specified, only return contacts
@@ -166,7 +192,7 @@ class Account:
         no_specials: bool = False,
         alldone_hint: bool = False,
         snapshot: bool = False,
-    ) -> Union[List[Chat], List[AttrDict]]:
+    ) -> Union[list[Chat], list[AttrDict]]:
         """Return list of chats.
 
         :param query: if a string is specified only chats matching this query are returned.
@@ -218,33 +244,37 @@ class Account:
         The function returns immediately and the handshake runs in background, sending
         and receiving several messages.
         Subsequent calls of `secure_join()` will abort previous, unfinished handshakes.
-        See https://securejoin.readthedocs.io/en/latest/new.html for protocol details.
+        See https://securejoin.delta.chat/ for protocol details.
 
         :param qrdata: The text of the scanned QR code.
         """
         return Chat(self, self._rpc.secure_join(self.id, qrdata))
 
-    def get_qr_code(self) -> Tuple[str, str]:
-        """Get Setup-Contact QR Code text and SVG data.
+    def get_qr_code(self) -> str:
+        """Get Setup-Contact QR Code text.
 
-        this data needs to be transferred to another Delta Chat account
+        This data needs to be transferred to another Delta Chat account
         in a second channel, typically used by mobiles with QRcode-show + scan UX.
         """
+        return self._rpc.get_chat_securejoin_qr_code(self.id, None)
+
+    def get_qr_code_svg(self) -> tuple[str, str]:
+        """Get Setup-Contact QR code text and SVG."""
         return self._rpc.get_chat_securejoin_qr_code_svg(self.id, None)
 
     def get_message_by_id(self, msg_id: int) -> Message:
         """Return the Message instance with the given ID."""
         return Message(self, msg_id)
 
-    def mark_seen_messages(self, messages: List[Message]) -> None:
+    def mark_seen_messages(self, messages: list[Message]) -> None:
         """Mark the given set of messages as seen."""
         self._rpc.markseen_msgs(self.id, [msg.id for msg in messages])
 
-    def delete_messages(self, messages: List[Message]) -> None:
+    def delete_messages(self, messages: list[Message]) -> None:
         """Delete messages (local and remote)."""
         self._rpc.delete_messages(self.id, [msg.id for msg in messages])
 
-    def get_fresh_messages(self) -> List[Message]:
+    def get_fresh_messages(self) -> list[Message]:
         """Return the list of fresh messages, newest messages first.
 
         This call is intended for displaying notifications.
@@ -254,12 +284,12 @@ class Account:
         fresh_msg_ids = self._rpc.get_fresh_msgs(self.id)
         return [Message(self, msg_id) for msg_id in fresh_msg_ids]
 
-    def get_next_messages(self) -> List[Message]:
+    def get_next_messages(self) -> list[Message]:
         """Return a list of next messages."""
         next_msg_ids = self._rpc.get_next_msgs(self.id)
         return [Message(self, msg_id) for msg_id in next_msg_ids]
 
-    def wait_next_messages(self) -> List[Message]:
+    def wait_next_messages(self) -> list[Message]:
         """Wait for new messages and return a list of them."""
         next_msg_ids = self._rpc.wait_next_msgs(self.id)
         return [Message(self, msg_id) for msg_id in next_msg_ids]
@@ -270,6 +300,12 @@ class Account:
             event = self.wait_for_event()
             if event.kind == EventType.INCOMING_MSG:
                 return event
+
+    def wait_for_incoming_msg(self):
+        """Wait for incoming message and return it.
+
+        Consumes all events before the next incoming message event."""
+        return self.get_message_by_id(self.wait_for_incoming_msg_event().msg_id)
 
     def wait_for_securejoin_inviter_success(self):
         while True:
@@ -283,7 +319,13 @@ class Account:
             if event["kind"] == "SecurejoinJoinerProgress" and event["progress"] == 1000:
                 break
 
-    def get_fresh_messages_in_arrival_order(self) -> List[Message]:
+    def wait_for_reactions_changed(self):
+        while True:
+            event = self.wait_for_event()
+            if event.kind == EventType.REACTIONS_CHANGED:
+                return event
+
+    def get_fresh_messages_in_arrival_order(self) -> list[Message]:
         """Return fresh messages list sorted in the order of their arrival, with ascending IDs."""
         warn(
             "get_fresh_messages_in_arrival_order is deprecated, use get_next_messages instead.",
@@ -300,3 +342,13 @@ class Account:
     def import_backup(self, path, passphrase: str = "") -> None:
         """Import backup."""
         self._rpc.import_backup(self.id, str(path), passphrase)
+
+    def export_self_keys(self, path) -> None:
+        """Export keys."""
+        passphrase = ""  # Setting passphrase is currently not supported.
+        self._rpc.export_self_keys(self.id, str(path), passphrase)
+
+    def import_self_keys(self, path) -> None:
+        """Import keys."""
+        passphrase = ""  # Importing passphrase-protected keys is currently not supported.
+        self._rpc.import_self_keys(self.id, str(path), passphrase)

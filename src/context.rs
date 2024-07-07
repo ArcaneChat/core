@@ -6,28 +6,39 @@ use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::Duration;
 
 use anyhow::{bail, ensure, Context as _, Result};
 use async_channel::{self as channel, Receiver, Sender};
+use pgp::SignedPublicKey;
 use ratelimit::Ratelimit;
-use tokio::sync::{Mutex, Notify, RwLock};
+use tokio::sync::{Mutex, Notify, OnceCell, RwLock};
 
-use crate::chat::{get_chat_cnt, ChatId};
+use crate::aheader::EncryptPreference;
+use crate::chat::{get_chat_cnt, ChatId, ProtectionStatus};
+use crate::chatlist_events;
 use crate::config::Config;
-use crate::constants::DC_VERSION_STR;
-use crate::contact::Contact;
+use crate::constants::{
+    self, DC_BACKGROUND_FETCH_QUOTA_CHECK_RATELIMIT, DC_CHAT_ID_TRASH, DC_VERSION_STR,
+};
+use crate::contact::{Contact, ContactId};
 use crate::debug_logging::DebugLogging;
+use crate::download::DownloadState;
 use crate::events::{Event, EventEmitter, EventType, Events};
-use crate::key::{load_self_public_key, DcKey as _};
+use crate::imap::{FolderMeaning, Imap, ServerMetadata};
+use crate::key::{load_self_public_key, load_self_secret_key, DcKey as _};
 use crate::login_param::LoginParam;
-use crate::message::{self, MessageState, MsgId};
+use crate::message::{self, Message, MessageState, MsgId, Viewtype};
+use crate::param::{Param, Params};
+use crate::peer_channels::Iroh;
+use crate::peerstate::Peerstate;
+use crate::push::PushSubscriber;
 use crate::quota::QuotaInfo;
-use crate::scheduler::SchedulerState;
+use crate::scheduler::{convert_folder_meaning, SchedulerState};
 use crate::sql::Sql;
 use crate::stock_str::StockStrings;
 use crate::timesmearing::SmearedTimestamp;
-use crate::tools::{duration_to_str, time};
+use crate::tools::{self, create_id, duration_to_str, time, time_elapsed};
 
 /// Builder for the [`Context`].
 ///
@@ -78,6 +89,8 @@ pub struct ContextBuilder {
     events: Events,
     stock_strings: StockStrings,
     password: Option<String>,
+
+    push_subscriber: Option<PushSubscriber>,
 }
 
 impl ContextBuilder {
@@ -93,6 +106,7 @@ impl ContextBuilder {
             events: Events::new(),
             stock_strings: StockStrings::new(),
             password: None,
+            push_subscriber: None,
         }
     }
 
@@ -147,11 +161,32 @@ impl ContextBuilder {
         self
     }
 
-    /// Opens the [`Context`].
+    /// Sets push subscriber.
+    pub(crate) fn with_push_subscriber(mut self, push_subscriber: PushSubscriber) -> Self {
+        self.push_subscriber = Some(push_subscriber);
+        self
+    }
+
+    /// Builds the [`Context`] without opening it.
+    pub async fn build(self) -> Result<Context> {
+        let push_subscriber = self.push_subscriber.unwrap_or_default();
+        let context = Context::new_closed(
+            &self.dbfile,
+            self.id,
+            self.events,
+            self.stock_strings,
+            push_subscriber,
+        )
+        .await?;
+        Ok(context)
+    }
+
+    /// Builds the [`Context`] and opens it.
+    ///
+    /// Returns error if context cannot be opened with the given passphrase.
     pub async fn open(self) -> Result<Context> {
-        let context =
-            Context::new_closed(&self.dbfile, self.id, self.events, self.stock_strings).await?;
-        let password = self.password.unwrap_or_default();
+        let password = self.password.clone().unwrap_or_default();
+        let context = self.build().await?;
         match context.open(password).await? {
             true => Ok(context),
             false => bail!("database could not be decrypted, incorrect or missing password"),
@@ -224,7 +259,10 @@ pub struct InnerContext {
     /// <https://datatracker.ietf.org/doc/html/rfc2971>
     pub(crate) server_id: RwLock<Option<HashMap<String, String>>>,
 
-    pub(crate) last_full_folder_scan: Mutex<Option<Instant>>,
+    /// IMAP METADATA.
+    pub(crate) metadata: RwLock<Option<ServerMetadata>>,
+
+    pub(crate) last_full_folder_scan: Mutex<Option<tools::Time>>,
 
     /// ID for this `Context` in the current process.
     ///
@@ -232,7 +270,7 @@ pub struct InnerContext {
     /// be identified by this ID.
     pub(crate) id: u32,
 
-    creation_time: SystemTime,
+    creation_time: tools::Time,
 
     /// The text of the last error logged and emitted as an event.
     /// If the ui wants to display an error after a failure,
@@ -244,6 +282,16 @@ pub struct InnerContext {
     /// Standard RwLock instead of [`tokio::sync::RwLock`] is used
     /// because the lock is used from synchronous [`Context::emit_event`].
     pub(crate) debug_logging: std::sync::RwLock<Option<DebugLogging>>,
+
+    /// Push subscriber to store device token
+    /// and register for heartbeat notifications.
+    pub(crate) push_subscriber: PushSubscriber,
+
+    /// True if account has subscribed to push notifications via IMAP.
+    pub(crate) push_subscribed: AtomicBool,
+
+    /// Iroh for realtime peer channels.
+    pub(crate) iroh: OnceCell<Iroh>,
 }
 
 /// The state of ongoing process.
@@ -253,7 +301,7 @@ enum RunningState {
     Running { cancel_sender: Sender<()> },
 
     /// Cancel signal has been sent, waiting for ongoing process to be freed.
-    ShallStop { request: Instant },
+    ShallStop { request: tools::Time },
 
     /// There is no ongoing process, a new one can be allocated.
     Stopped,
@@ -289,7 +337,8 @@ impl Context {
         events: Events,
         stock_strings: StockStrings,
     ) -> Result<Context> {
-        let context = Self::new_closed(dbfile, id, events, stock_strings).await?;
+        let context =
+            Self::new_closed(dbfile, id, events, stock_strings, Default::default()).await?;
 
         // Open the database if is not encrypted.
         if context.check_passphrase("".to_string()).await? {
@@ -304,6 +353,7 @@ impl Context {
         id: u32,
         events: Events,
         stockstrings: StockStrings,
+        push_subscriber: PushSubscriber,
     ) -> Result<Context> {
         let mut blob_fname = OsString::new();
         blob_fname.push(dbfile.file_name().unwrap_or_default());
@@ -312,7 +362,14 @@ impl Context {
         if !blobdir.exists() {
             tokio::fs::create_dir_all(&blobdir).await?;
         }
-        let context = Context::with_blobdir(dbfile.into(), blobdir, id, events, stockstrings)?;
+        let context = Context::with_blobdir(
+            dbfile.into(),
+            blobdir,
+            id,
+            events,
+            stockstrings,
+            push_subscriber,
+        )?;
         Ok(context)
     }
 
@@ -355,6 +412,7 @@ impl Context {
         id: u32,
         events: Events,
         stockstrings: StockStrings,
+        push_subscriber: PushSubscriber,
     ) -> Result<Context> {
         ensure!(
             blobdir.is_dir(),
@@ -384,10 +442,14 @@ impl Context {
             resync_request: AtomicBool::new(false),
             new_msgs_notify,
             server_id: RwLock::new(None),
-            creation_time: std::time::SystemTime::now(),
+            metadata: RwLock::new(None),
+            creation_time: tools::Time::now(),
             last_full_folder_scan: Mutex::new(None),
             last_error: std::sync::RwLock::new("".to_string()),
             debug_logging: std::sync::RwLock::new(None),
+            push_subscriber,
+            push_subscribed: AtomicBool::new(false),
+            iroh: OnceCell::new(),
         };
 
         let ctx = Context {
@@ -398,24 +460,16 @@ impl Context {
     }
 
     /// Starts the IO scheduler.
-    pub async fn start_io(&mut self) {
+    pub async fn start_io(&self) {
         if !self.is_configured().await.unwrap_or_default() {
             warn!(self, "can not start io on a context that is not configured");
             return;
         }
 
-        {
-            if self
-                .get_config(Config::ConfiguredAddr)
-                .await
-                .unwrap_or_default()
-                .filter(|s| s.ends_with(".testrun.org"))
-                .is_some()
-            {
-                let mut lock = self.ratelimit.write().await;
-                // Allow at least 1 message every second + a burst of 3.
-                *lock = Ratelimit::new(Duration::new(3, 0), 3.0);
-            }
+        if self.is_chatmail().await.unwrap_or_default() {
+            let mut lock = self.ratelimit.write().await;
+            // Allow at least 1 message every second + a burst of 3.
+            *lock = Ratelimit::new(Duration::new(3, 0), 3.0);
         }
         self.scheduler.start(self.clone()).await;
     }
@@ -433,7 +487,76 @@ impl Context {
 
     /// Indicate that the network likely has come back.
     pub async fn maybe_network(&self) {
+        if let Some(iroh) = self.iroh.get() {
+            iroh.network_change().await;
+        }
         self.scheduler.maybe_network().await;
+    }
+
+    /// Returns true if an account is on a chatmail server.
+    pub async fn is_chatmail(&self) -> Result<bool> {
+        self.get_config_bool(Config::IsChatmail).await
+    }
+
+    /// Returns maximum number of recipients the provider allows to send a single email to.
+    pub(crate) async fn get_max_smtp_rcpt_to(&self) -> Result<usize> {
+        let is_chatmail = self.is_chatmail().await?;
+        let val = self
+            .get_configured_provider()
+            .await?
+            .and_then(|provider| provider.opt.max_smtp_rcpt_to)
+            .map_or_else(
+                || match is_chatmail {
+                    true => usize::MAX,
+                    false => constants::DEFAULT_MAX_SMTP_RCPT_TO,
+                },
+                usize::from,
+            );
+        Ok(val)
+    }
+
+    /// Does a background fetch
+    /// pauses the scheduler and does one imap fetch, then unpauses and returns
+    pub async fn background_fetch(&self) -> Result<()> {
+        if !(self.is_configured().await?) {
+            return Ok(());
+        }
+
+        let address = self.get_primary_self_addr().await?;
+        let time_start = tools::Time::now();
+        info!(self, "background_fetch started fetching {address}");
+
+        let _pause_guard = self.scheduler.pause(self.clone()).await?;
+
+        // connection
+        let mut connection = Imap::new_configured(self, channel::bounded(1).1).await?;
+        let mut session = connection.prepare(self).await?;
+
+        // fetch imap folders
+        for folder_meaning in [FolderMeaning::Inbox, FolderMeaning::Mvbox] {
+            let (_, watch_folder) = convert_folder_meaning(self, folder_meaning).await?;
+            connection
+                .fetch_move_delete(self, &mut session, &watch_folder, folder_meaning)
+                .await?;
+        }
+
+        // update quota (to send warning if full) - but only check it once in a while
+        if self
+            .quota_needs_update(DC_BACKGROUND_FETCH_QUOTA_CHECK_RATELIMIT)
+            .await
+        {
+            if let Err(err) = self.update_recent_quota(&mut session).await {
+                warn!(self, "Failed to update quota: {err:#}.");
+            }
+        }
+
+        info!(
+            self,
+            "background_fetch done for {address} took {:?}",
+            time_elapsed(&time_start),
+        );
+
+        Ok(())
     }
 
     pub(crate) async fn schedule_resync(&self) -> Result<()> {
@@ -485,11 +608,32 @@ impl Context {
     /// Emits a MsgsChanged event with specified chat and message ids
     pub fn emit_msgs_changed(&self, chat_id: ChatId, msg_id: MsgId) {
         self.emit_event(EventType::MsgsChanged { chat_id, msg_id });
+        chatlist_events::emit_chatlist_changed(self);
+        chatlist_events::emit_chatlist_item_changed(self, chat_id);
     }
 
     /// Emits an IncomingMsg event with specified chat and message ids
     pub fn emit_incoming_msg(&self, chat_id: ChatId, msg_id: MsgId) {
         self.emit_event(EventType::IncomingMsg { chat_id, msg_id });
+        chatlist_events::emit_chatlist_changed(self);
+        chatlist_events::emit_chatlist_item_changed(self, chat_id);
+    }
+
+    /// Emits an LocationChanged event and a WebxdcStatusUpdate in case there is a maps integration
+    pub async fn emit_location_changed(&self, contact_id: Option<ContactId>) -> Result<()> {
+        self.emit_event(EventType::LocationChanged(contact_id));
+
+        if let Some(msg_id) = self
+            .get_config_parsed::<u32>(Config::WebxdcIntegration)
+            .await?
+        {
+            self.emit_event(EventType::WebxdcStatusUpdate {
+                msg_id: MsgId::new(msg_id),
+                status_update_serial: Default::default(),
+            })
+        }
+
+        Ok(())
     }
 
     /// Returns a receiver for emitted events.
@@ -532,7 +676,7 @@ impl Context {
     pub(crate) async fn free_ongoing(&self) {
         let mut s = self.running_state.write().await;
         if let RunningState::ShallStop { request } = *s {
-            info!(self, "Ongoing stopped in {:?}", request.elapsed());
+            info!(self, "Ongoing stopped in {:?}", time_elapsed(&request));
         }
         *s = RunningState::Stopped;
     }
@@ -547,7 +691,7 @@ impl Context {
                 }
                 info!(self, "Signaling the ongoing process to stop ASAP.",);
                 *s = RunningState::ShallStop {
-                    request: Instant::now(),
+                    request: tools::Time::now(),
                 };
             }
             RunningState::ShallStop { .. } | RunningState::Stopped => {
@@ -613,7 +757,7 @@ impl Context {
         let only_fetch_mvbox = self.get_config_int(Config::OnlyFetchMvbox).await?;
         let folders_configured = self
             .sql
-            .get_raw_config_int("folders_configured")
+            .get_raw_config_int(constants::DC_FOLDERS_CONFIGURED_KEY)
             .await?
             .unwrap_or_default();
 
@@ -653,7 +797,7 @@ impl Context {
         );
         res.insert("journal_mode", journal_mode);
         res.insert("blobdir", self.get_blobdir().display().to_string());
-        res.insert("display_name", displayname.unwrap_or_else(|| unset.into()));
+        res.insert("displayname", displayname.unwrap_or_else(|| unset.into()));
         res.insert(
             "selfavatar",
             self.get_config(Config::Selfavatar)
@@ -667,6 +811,18 @@ impl Context {
 
         if let Some(server_id) = &*self.server_id.read().await {
             res.insert("imap_server_id", format!("{server_id:?}"));
+        }
+
+        res.insert("is_chatmail", self.is_chatmail().await?.to_string());
+
+        if let Some(metadata) = &*self.metadata.read().await {
+            if let Some(comment) = &metadata.comment {
+                res.insert("imap_server_comment", format!("{comment:?}"));
+            }
+
+            if let Some(admin) = &metadata.admin {
+                res.insert("imap_server_admin", format!("{admin:?}"));
+            }
         }
 
         res.insert("secondary_addrs", secondary_addrs);
@@ -687,6 +843,12 @@ impl Context {
             self.get_config_int(Config::ShowEmails).await?.to_string(),
         );
         res.insert(
+            "save_mime_headers",
+            self.get_config_bool(Config::SaveMimeHeaders)
+                .await?
+                .to_string(),
+        );
+        res.insert(
             "download_limit",
             self.get_config_int(Config::DownloadLimit)
                 .await?
@@ -695,7 +857,10 @@ impl Context {
         res.insert("sentbox_watch", sentbox_watch.to_string());
         res.insert("mvbox_move", mvbox_move.to_string());
         res.insert("only_fetch_mvbox", only_fetch_mvbox.to_string());
-        res.insert("folders_configured", folders_configured.to_string());
+        res.insert(
+            constants::DC_FOLDERS_CONFIGURED_KEY,
+            folders_configured.to_string(),
+        );
         res.insert("configured_inbox_folder", configured_inbox_folder);
         res.insert("configured_sentbox_folder", configured_sentbox_folder);
         res.insert("configured_mvbox_folder", configured_mvbox_folder);
@@ -747,6 +912,12 @@ impl Context {
                 .to_string(),
         );
         res.insert(
+            "last_cant_decrypt_outgoing_msgs",
+            self.get_config_int(Config::LastCantDecryptOutgoingMsgs)
+                .await?
+                .to_string(),
+        );
+        res.insert(
             "scan_all_folders_debounce_secs",
             self.get_config_int(Config::ScanAllFoldersDebounceSecs)
                 .await?
@@ -788,11 +959,182 @@ impl Context {
                 .await?
                 .to_string(),
         );
+        res.insert(
+            "webxdc_realtime_enabled",
+            self.get_config_bool(Config::WebxdcRealtimeEnabled)
+                .await?
+                .to_string(),
+        );
 
-        let elapsed = self.creation_time.elapsed();
-        res.insert("uptime", duration_to_str(elapsed.unwrap_or_default()));
+        let elapsed = time_elapsed(&self.creation_time);
+        res.insert("uptime", duration_to_str(elapsed));
 
         Ok(res)
+    }
+
+    async fn get_self_report(&self) -> Result<String> {
+        #[derive(Default)]
+        struct ChatNumbers {
+            protected: u32,
+            protection_broken: u32,
+            opportunistic_dc: u32,
+            opportunistic_mua: u32,
+            unencrypted_dc: u32,
+            unencrypted_mua: u32,
+        }
+
+        let mut res = String::new();
+        res += &format!("core_version {}\n", get_version_str());
+
+        let num_msgs: u32 = self
+            .sql
+            .query_get_value(
+                "SELECT COUNT(*) FROM msgs WHERE hidden=0 AND chat_id!=?",
+                (DC_CHAT_ID_TRASH,),
+            )
+            .await?
+            .unwrap_or_default();
+        res += &format!("num_msgs {}\n", num_msgs);
+
+        let num_chats: u32 = self
+            .sql
+            .query_get_value("SELECT COUNT(*) FROM chats WHERE id>9 AND blocked!=1", ())
+            .await?
+            .unwrap_or_default();
+        res += &format!("num_chats {}\n", num_chats);
+
+        let db_size = tokio::fs::metadata(&self.sql.dbfile).await?.len();
+        res += &format!("db_size_bytes {}\n", db_size);
+
+        let secret_key = &load_self_secret_key(self).await?.primary_key;
+        let key_created = secret_key.created_at().timestamp();
+        res += &format!("key_created {}\n", key_created);
+
+        // how many of the chats active in the last months are:
+        // - protected
+        // - protection-broken
+        // - opportunistic-encrypted and the contact uses Delta Chat
+        // - opportunistic-encrypted and the contact uses a classical MUA
+        // - unencrypted and the contact uses Delta Chat
+        // - unencrypted and the contact uses a classical MUA
+        let three_months_ago = time().saturating_sub(3600 * 24 * 30 * 3);
+        let chats = self
+            .sql
+            .query_map(
+                "SELECT c.protected, m.param, m.msgrmsg
+                    FROM chats c
+                    JOIN msgs m
+                        ON c.id=m.chat_id
+                        AND m.id=(
+                                SELECT id
+                                FROM msgs
+                                WHERE chat_id=c.id
+                                AND hidden=0
+                                AND download_state=?
+                                AND to_id!=?
+                                ORDER BY timestamp DESC, id DESC LIMIT 1)
+                    WHERE c.id>9
+                    AND (c.blocked=0 OR c.blocked=2)
+                    AND IFNULL(m.timestamp,c.created_timestamp) > ?
+                    GROUP BY c.id",
+                (DownloadState::Done, ContactId::INFO, three_months_ago),
+                |row| {
+                    let protected: ProtectionStatus = row.get(0)?;
+                    let message_param: Params =
+                        row.get::<_, String>(1)?.parse().unwrap_or_default();
+                    let is_dc_message: bool = row.get(2)?;
+                    Ok((protected, message_param, is_dc_message))
+                },
+                |rows| {
+                    let mut chats = ChatNumbers::default();
+                    for row in rows {
+                        let (protected, message_param, is_dc_message) = row?;
+                        let encrypted = message_param
+                            .get_bool(Param::GuaranteeE2ee)
+                            .unwrap_or(false);
+
+                        if protected == ProtectionStatus::Protected {
+                            chats.protected += 1;
+                        } else if protected == ProtectionStatus::ProtectionBroken {
+                            chats.protection_broken += 1;
+                        } else if encrypted {
+                            if is_dc_message {
+                                chats.opportunistic_dc += 1;
+                            } else {
+                                chats.opportunistic_mua += 1;
+                            }
+                        } else if is_dc_message {
+                            chats.unencrypted_dc += 1;
+                        } else {
+                            chats.unencrypted_mua += 1;
+                        }
+                    }
+                    Ok(chats)
+                },
+            )
+            .await?;
+        res += &format!("chats_protected {}\n", chats.protected);
+        res += &format!("chats_protection_broken {}\n", chats.protection_broken);
+        res += &format!("chats_opportunistic_dc {}\n", chats.opportunistic_dc);
+        res += &format!("chats_opportunistic_mua {}\n", chats.opportunistic_mua);
+        res += &format!("chats_unencrypted_dc {}\n", chats.unencrypted_dc);
+        res += &format!("chats_unencrypted_mua {}\n", chats.unencrypted_mua);
+
+        let self_reporting_id = match self.get_config(Config::SelfReportingId).await? {
+            Some(id) => id,
+            None => {
+                let id = create_id();
+                self.set_config(Config::SelfReportingId, Some(&id)).await?;
+                id
+            }
+        };
+        res += &format!("self_reporting_id {}", self_reporting_id);
+
+        Ok(res)
+    }
+
+    /// Drafts a message with statistics about the usage of Delta Chat.
+    /// The user can inspect the message if they want, and then hit "Send".
+    ///
+    /// On the other end, a bot will receive the message and make it available
+    /// to Delta Chat's developers.
+    pub async fn draft_self_report(&self) -> Result<ChatId> {
+        const SELF_REPORTING_BOT: &str = "self_reporting@testrun.org";
+
+        let contact_id = Contact::create(self, "Statistics bot", SELF_REPORTING_BOT).await?;
+        let chat_id = ChatId::create_for_contact(self, contact_id).await?;
+
+        // We're including the bot's public key in Delta Chat
+        // so that the first message to the bot can directly be encrypted:
+        let public_key = SignedPublicKey::from_base64(
+            "xjMEZbfBlBYJKwYBBAHaRw8BAQdABpLWS2PUIGGo4pslVt4R8sylP5wZihmhf1DTDr3oCM\
+	        PNHDxzZWxmX3JlcG9ydGluZ0B0ZXN0cnVuLm9yZz7CiwQQFggAMwIZAQUCZbfBlAIbAwQLCQgHBhUI\
+	        CQoLAgMWAgEWIQTS2i16sHeYTckGn284K3M5Z4oohAAKCRA4K3M5Z4oohD8dAQCQV7CoH6UP4PD+Nq\
+	        I4kW5tbbqdh2AnDROg60qotmLExAEAxDfd3QHAK9f8b9qQUbLmHIztCLxhEuVbWPBEYeVW0gvOOARl\
+	        t8GUEgorBgEEAZdVAQUBAQdAMBUhYoAAcI625vGZqnM5maPX4sGJ7qvJxPAFILPy6AcDAQgHwngEGB\
+	        YIACAFAmW3wZQCGwwWIQTS2i16sHeYTckGn284K3M5Z4oohAAKCRA4K3M5Z4oohPwCAQCvzk1ObIkj\
+	        2GqsuIfaULlgdnfdZY8LNary425CEfHZDQD5AblXVrlMO1frdlc/Vo9z3pEeCrfYdD7ITD3/OeVoiQ\
+	        4=",
+        )?;
+        let mut peerstate = Peerstate::from_public_key(
+            SELF_REPORTING_BOT,
+            0,
+            EncryptPreference::Mutual,
+            &public_key,
+        );
+        let fingerprint = public_key.fingerprint();
+        peerstate.set_verified(public_key, fingerprint, "".to_string())?;
+        peerstate.save_to_db(&self.sql).await?;
+        chat_id
+            .set_protection(self, ProtectionStatus::Protected, time(), Some(contact_id))
+            .await?;
+
+        let mut msg = Message::new(Viewtype::Text);
+        msg.text = self.get_self_report().await?;
+
+        chat_id.set_draft(self, Some(&mut msg)).await?;
+
+        Ok(chat_id)
     }
 
     /// Get a list of fresh, unmuted messages in unblocked chats.
@@ -909,12 +1251,12 @@ impl Context {
         Ok(list)
     }
 
-    /// Searches for messages containing the query string.
+    /// Searches for messages containing the query string case-insensitively.
     ///
     /// If `chat_id` is provided this searches only for messages in this chat, if `chat_id`
     /// is `None` this searches messages from all chats.
     pub async fn search_msgs(&self, chat_id: Option<ChatId>, query: &str) -> Result<Vec<MsgId>> {
-        let real_query = query.trim();
+        let real_query = query.trim().to_lowercase();
         if real_query.is_empty() {
             return Ok(Vec::new());
         }
@@ -930,7 +1272,7 @@ impl Context {
                  WHERE m.chat_id=?
                    AND m.hidden=0
                    AND ct.blocked=0
-                   AND txt LIKE ?
+                   AND IFNULL(txt_normalized, txt) LIKE ?
                  ORDER BY m.timestamp,m.id;",
                     (chat_id, str_like_in_text),
                     |row| row.get::<_, MsgId>("id"),
@@ -966,7 +1308,7 @@ impl Context {
                    AND m.hidden=0
                    AND c.blocked!=1
                    AND ct.blocked=0
-                   AND m.txt LIKE ?
+                   AND IFNULL(txt_normalized, txt) LIKE ?
                  ORDER BY m.id DESC LIMIT 1000",
                     (str_like_in_text,),
                     |row| row.get::<_, MsgId>("id"),
@@ -996,7 +1338,7 @@ impl Context {
         Ok(sentbox.as_deref() == Some(folder_name))
     }
 
-    /// Returns true if given folder name is the name of the "Delta Chat" folder.
+    /// Returns true if given folder name is the name of the "DeltaChat" folder.
     pub async fn is_mvbox(&self, folder_name: &str) -> Result<bool> {
         let mvbox = self.get_config(Config::ConfiguredMvboxFolder).await?;
         Ok(mvbox.as_deref() == Some(folder_name))
@@ -1051,23 +1393,18 @@ pub fn get_version_str() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use anyhow::Context as _;
     use strum::IntoEnumIterator;
     use tempfile::tempdir;
 
     use super::*;
-    use crate::chat::{
-        get_chat_contacts, get_chat_msgs, send_msg, set_muted, Chat, ChatId, MuteDuration,
-    };
+    use crate::chat::{get_chat_contacts, get_chat_msgs, send_msg, set_muted, Chat, MuteDuration};
     use crate::chatlist::Chatlist;
     use crate::constants::Chattype;
-    use crate::contact::ContactId;
-    use crate::message::{Message, Viewtype};
+    use crate::mimeparser::SystemMessage;
     use crate::receive_imf::receive_imf;
-    use crate::test_utils::TestContext;
-    use crate::tools::create_outgoing_rfc724_mid;
+    use crate::test_utils::{get_chat_msg, TestContext};
+    use crate::tools::{create_outgoing_rfc724_mid, SystemTime};
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_wrong_db() -> Result<()> {
@@ -1102,7 +1439,7 @@ mod tests {
              \n\
              hello\n",
             contact.get_addr(),
-            create_outgoing_rfc724_mid(None, contact.get_addr())
+            create_outgoing_rfc724_mid()
         );
         println!("{msg}");
         receive_imf(t, msg.as_bytes(), false).await.unwrap();
@@ -1252,7 +1589,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dbfile = tmp.path().join("db.sqlite");
         let blobdir = PathBuf::new();
-        let res = Context::with_blobdir(dbfile, blobdir, 1, Events::new(), StockStrings::new());
+        let res = Context::with_blobdir(
+            dbfile,
+            blobdir,
+            1,
+            Events::new(),
+            StockStrings::new(),
+            Default::default(),
+        );
         assert!(res.is_err());
     }
 
@@ -1261,7 +1605,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dbfile = tmp.path().join("db.sqlite");
         let blobdir = tmp.path().join("blobs");
-        let res = Context::with_blobdir(dbfile, blobdir, 1, Events::new(), StockStrings::new());
+        let res = Context::with_blobdir(
+            dbfile,
+            blobdir,
+            1,
+            Events::new(),
+            StockStrings::new(),
+            Default::default(),
+        );
         assert!(res.is_err());
     }
 
@@ -1276,14 +1627,14 @@ mod tests {
         let t = TestContext::new().await;
 
         let info = t.get_info().await.unwrap();
-        assert!(info.get("database_dir").is_some());
+        assert!(info.contains_key("database_dir"));
     }
 
     #[test]
     fn test_get_info_no_context() {
         let info = get_info();
-        assert!(info.get("deltachat_core_version").is_some());
-        assert!(info.get("database_dir").is_none());
+        assert!(info.contains_key("deltachat_core_version"));
+        assert!(!info.contains_key("database_dir"));
         assert_eq!(info.get("level").unwrap(), "awesome");
     }
 
@@ -1304,7 +1655,7 @@ mod tests {
             "mail_port",
             "mail_security",
             "notify_about_wrong_pw",
-            "save_mime_headers",
+            "self_reporting_id",
             "selfstatus",
             "send_server",
             "send_user",
@@ -1318,6 +1669,8 @@ mod tests {
             "socks5_port",
             "socks5_user",
             "socks5_password",
+            "key_id",
+            "webxdc_integration",
         ];
         let t = TestContext::new().await;
         let info = t.get_info().await.unwrap();
@@ -1360,6 +1713,8 @@ mod tests {
         msg2.set_text("barbaz".to_string());
         send_msg(&alice, chat.id, &mut msg2).await?;
 
+        alice.send_text(chat.id, "Δ-Chat").await;
+
         // Global search with a part of text finds the message.
         let res = alice.search_msgs(None, "ob").await?;
         assert_eq!(res.len(), 1);
@@ -1369,8 +1724,14 @@ mod tests {
         assert_eq!(res.len(), 2);
 
         // Message added later is returned first.
-        assert_eq!(res.get(0), Some(&msg2.id));
+        assert_eq!(res.first(), Some(&msg2.id));
         assert_eq!(res.get(1), Some(&msg1.id));
+
+        // Search is case-insensitive.
+        for chat_id in [None, Some(chat.id)] {
+            let res = alice.search_msgs(chat_id, "δ-chat").await?;
+            assert_eq!(res.len(), 1);
+        }
 
         // Global search with longer text does not find any message.
         let res = alice.search_msgs(None, "foobarbaz").await?;
@@ -1482,16 +1843,18 @@ mod tests {
         let dir = tempdir()?;
         let dbfile = dir.path().join("db.sqlite");
 
-        let id = 1;
-        let context = Context::new_closed(&dbfile, id, Events::new(), StockStrings::new())
+        let context = ContextBuilder::new(dbfile.clone())
+            .with_id(1)
+            .build()
             .await
             .context("failed to create context")?;
         assert_eq!(context.open("foo".to_string()).await?, true);
         assert_eq!(context.is_open().await, true);
         drop(context);
 
-        let id = 2;
-        let context = Context::new(&dbfile, id, Events::new(), StockStrings::new())
+        let context = ContextBuilder::new(dbfile)
+            .with_id(2)
+            .build()
             .await
             .context("failed to create context")?;
         assert_eq!(context.is_open().await, false);
@@ -1507,8 +1870,9 @@ mod tests {
         let dir = tempdir()?;
         let dbfile = dir.path().join("db.sqlite");
 
-        let id = 1;
-        let context = Context::new_closed(&dbfile, id, Events::new(), StockStrings::new())
+        let context = ContextBuilder::new(dbfile)
+            .with_id(1)
+            .build()
             .await
             .context("failed to create context")?;
         assert_eq!(context.open("foo".to_string()).await?, true);
@@ -1586,7 +1950,7 @@ mod tests {
 
         let bob_next_msg_ids = bob.get_next_msgs().await?;
         assert_eq!(bob_next_msg_ids.len(), 1);
-        assert_eq!(bob_next_msg_ids.get(0), Some(&received_msg.id));
+        assert_eq!(bob_next_msg_ids.first(), Some(&received_msg.id));
 
         bob.set_config_u32(Config::LastMsgId, received_msg.id.to_u32())
             .await?;
@@ -1595,12 +1959,32 @@ mod tests {
         // Next messages include self-sent messages.
         let alice_next_msg_ids = alice.get_next_msgs().await?;
         assert_eq!(alice_next_msg_ids.len(), 1);
-        assert_eq!(alice_next_msg_ids.get(0), Some(&sent_msg.sender_msg_id));
+        assert_eq!(alice_next_msg_ids.first(), Some(&sent_msg.sender_msg_id));
 
         alice
             .set_config_u32(Config::LastMsgId, sent_msg.sender_msg_id.to_u32())
             .await?;
         assert!(alice.get_next_msgs().await?.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_draft_self_report() -> Result<()> {
+        let alice = TestContext::new_alice().await;
+
+        let chat_id = alice.draft_self_report().await?;
+        let msg = get_chat_msg(&alice, chat_id, 0, 1).await;
+        assert_eq!(msg.get_info_type(), SystemMessage::ChatProtectionEnabled);
+
+        let chat = Chat::load_from_db(&alice, chat_id).await?;
+        assert!(chat.is_protected());
+
+        let mut draft = chat_id.get_draft(&alice).await?.unwrap();
+        assert!(draft.text.starts_with("core_version"));
+
+        // Test that sending into the protected chat works:
+        let _sent = alice.send_msg(chat_id, &mut draft).await;
 
         Ok(())
     }

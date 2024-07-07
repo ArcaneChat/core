@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use crate::chat::ChatId;
+use crate::config::Config;
 use crate::contact::ContactId;
 use crate::ephemeral::Timer as EphemeralTimer;
 use crate::message::MsgId;
@@ -106,10 +107,7 @@ pub enum EventType {
     },
 
     /// Downloading a bunch of messages just finished.
-    IncomingMsgBunch {
-        /// List of incoming message IDs.
-        msg_ids: Vec<MsgId>,
-    },
+    IncomingMsgBunch,
 
     /// Messages were seen or noticed.
     /// chat id is always set.
@@ -184,7 +182,7 @@ pub enum EventType {
         timer: EphemeralTimer,
     },
 
-    /// Contact(s) created, renamed, blocked or deleted.
+    /// Contact(s) created, renamed, blocked, deleted or changed their "recently seen" status.
     ///
     /// @param data1 (int) If set, this is the contact_id of an added contact that should be selected.
     ContactsChanged(Option<ContactId>),
@@ -261,7 +259,16 @@ pub enum EventType {
     ConnectivityChanged,
 
     /// The user's avatar changed.
+    /// Deprecated by `ConfigSynced`.
     SelfavatarChanged,
+
+    /// A multi-device synced config value changed. Maybe the app needs to refresh smth. For
+    /// uniformity this is emitted on the source device too. The value isn't here, otherwise it
+    /// would be logged which might not be good for privacy.
+    ConfigSynced {
+        /// Configuration key.
+        key: Config,
+    },
 
     /// Webxdc status update received.
     WebxdcStatusUpdate {
@@ -272,9 +279,46 @@ pub enum EventType {
         status_update_serial: StatusUpdateSerial,
     },
 
+    /// Data received over an ephemeral peer channel.
+    WebxdcRealtimeData {
+        /// Message ID.
+        msg_id: MsgId,
+
+        /// Realtime data.
+        data: Vec<u8>,
+    },
+
     /// Inform that a message containing a webxdc instance has been deleted.
     WebxdcInstanceDeleted {
         /// ID of the deleted message.
         msg_id: MsgId,
+    },
+
+    /// Tells that the Background fetch was completed (or timed out).
+    /// This event acts as a marker, when you reach this event you can be sure
+    /// that all events emitted during the background fetch were processed.
+    ///
+    /// This event is only emitted by the account manager
+    AccountsBackgroundFetchDone,
+    /// Inform that set of chats or the order of the chats in the chatlist has changed.
+    ///
+    /// Sometimes this is emitted together with `UIChatlistItemChanged`.
+    ChatlistChanged,
+
+    /// Inform that a single chat list item changed and needs to be rerendered.
+    /// If `chat_id` is set to None, then all currently visible chats need to be rerendered, and all not-visible items need to be cleared from cache if the UI has a cache.
+    ChatlistItemChanged {
+        /// ID of the changed chat
+        chat_id: Option<ChatId>,
+    },
+
+    /// Event for using in tests, e.g. as a fence between normally generated events.
+    #[cfg(test)]
+    Test,
+
+    /// Inform than some events have been skipped due to event channel overflow.
+    EventChannelOverflow {
+        /// Number of events skipped.
+        n: u64,
     },
 }

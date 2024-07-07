@@ -1,5 +1,4 @@
 #define NAPI_VERSION 4
-#define NAPI_EXPERIMENTAL
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -3048,14 +3047,6 @@ NAPI_METHOD(dcn_accounts_select_account) {
   NAPI_RETURN_UINT32(result);
 }
 
-NAPI_METHOD(dcn_accounts_all_work_done) {
-  NAPI_ARGV(1);
-  NAPI_DCN_ACCOUNTS();
-
-  int result = dc_accounts_all_work_done(dcn_accounts->dc_accounts);
-  NAPI_RETURN_INT32(result);
-}
-
 NAPI_METHOD(dcn_accounts_start_io) {
   NAPI_ARGV(1);
   NAPI_DCN_ACCOUNTS();
@@ -3382,7 +3373,6 @@ NAPI_INIT() {
   NAPI_EXPORT_FUNCTION(dcn_accounts_get_account);
   NAPI_EXPORT_FUNCTION(dcn_accounts_get_selected_account);
   NAPI_EXPORT_FUNCTION(dcn_accounts_select_account);
-  NAPI_EXPORT_FUNCTION(dcn_accounts_all_work_done);
   NAPI_EXPORT_FUNCTION(dcn_accounts_start_io);
   NAPI_EXPORT_FUNCTION(dcn_accounts_stop_io);
   NAPI_EXPORT_FUNCTION(dcn_accounts_maybe_network);

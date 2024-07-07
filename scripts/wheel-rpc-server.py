@@ -1,24 +1,26 @@
 #!/usr/bin/env python3
-"""Build Python wheels for deltachat-rpc-server.
-Run scripts/zig-rpc-server.sh first."""
+"""Build Python wheels for deltachat-rpc-server."""
 from pathlib import Path
 from wheel.wheelfile import WheelFile
 import tomllib
 import tarfile
+import sys
 from io import BytesIO
 
 
 def metadata_contents(version):
+    readme_text = (Path("deltachat-rpc-server") / "README.md").read_text()
     return f"""Metadata-Version: 2.1
 Name: deltachat-rpc-server
 Version: {version}
 Summary: Delta Chat JSON-RPC server
+Description-Content-Type: text/markdown
+
+{readme_text}
 """
 
 
-def build_source_package(version):
-    filename = f"dist/deltachat-rpc-server-{version}.tar.gz"
-
+def build_source_package(version, filename):
     with tarfile.open(filename, "w:gz") as pkg:
 
         def pack(name, contents):
@@ -99,7 +101,7 @@ setup(
 
 
 def build_wheel(version, binary, tag, windows=False):
-    filename = f"dist/deltachat_rpc_server-{version}-{tag}.whl"
+    filename = f"deltachat_rpc_server-{version}-{tag}.whl"
 
     with WheelFile(filename, "w") as wheel:
         wheel.write("LICENSE", "deltachat_rpc_server/LICENSE")
@@ -126,9 +128,11 @@ def main():
         Path(binary).chmod(0o755)
         wheel.write(
             binary,
-            "deltachat_rpc_server/deltachat-rpc-server.exe"
-            if windows
-            else "deltachat_rpc_server/deltachat-rpc-server",
+            (
+                "deltachat_rpc_server/deltachat-rpc-server.exe"
+                if windows
+                else "deltachat_rpc_server/deltachat-rpc-server"
+            ),
         )
         wheel.writestr(
             f"deltachat_rpc_server-{version}.dist-info/METADATA",
@@ -144,54 +148,41 @@ def main():
         )
 
 
-def main():
-    with open("deltachat-rpc-server/Cargo.toml", "rb") as f:
-        cargo_toml = tomllib.load(f)
-        version = cargo_toml["package"]["version"]
-    Path("dist").mkdir(exist_ok=True)
-    build_source_package(version)
-    build_wheel(
-        version,
-        "dist/deltachat-rpc-server-x86_64-linux",
-        "py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.musllinux_1_1_x86_64",
-    )
-    build_wheel(
-        version,
-        "dist/deltachat-rpc-server-armv7-linux",
-        "py3-none-manylinux_2_17_armv7l.manylinux2014_armv7l.musllinux_1_1_armv7l",
-    )
-    build_wheel(
-        version,
-        "dist/deltachat-rpc-server-aarch64-linux",
-        "py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.musllinux_1_1_aarch64",
-    )
-    build_wheel(
-        version,
-        "dist/deltachat-rpc-server-i686-linux",
-        "py3-none-manylinux_2_12_i686.manylinux2010_i686.musllinux_1_1_i686",
-    )
-
+arch2tags = {
+    "x86_64-linux": "manylinux_2_17_x86_64.manylinux2014_x86_64.musllinux_1_1_x86_64",
+    "armv7l-linux": "linux_armv7l.manylinux_2_17_armv7l.manylinux2014_armv7l.musllinux_1_1_armv7l",
+    "armv6l-linux": "linux_armv6l",
+    "aarch64-linux": "manylinux_2_17_aarch64.manylinux2014_aarch64.musllinux_1_1_aarch64",
+    "i686-linux": "manylinux_2_12_i686.manylinux2010_i686.musllinux_1_1_i686",
+    "win64": "win_amd64",
+    "win32": "win32",
     # macOS versions for platform compatibility tags are taken from https://doc.rust-lang.org/rustc/platform-support.html
-    build_wheel(
-        version,
-        "dist/deltachat-rpc-server-x86_64-macos",
-        "py3-none-macosx_10_7_x86_64",
-    )
-    build_wheel(
-        version,
-        "dist/deltachat-rpc-server-aarch64-macos",
-        "py3-none-macosx_11_0_arm64",
-    )
+    "x86_64-darwin": "macosx_10_7_x86_64",
+    "aarch64-darwin": "macosx_11_0_arm64",
+}
 
-    build_wheel(
-        version, "dist/deltachat-rpc-server-win32.exe", "py3-none-win32", windows=True
-    )
-    build_wheel(
-        version,
-        "dist/deltachat-rpc-server-win64.exe",
-        "py3-none-win_amd64",
-        windows=True,
-    )
+
+def main():
+    with Path("Cargo.toml").open("rb") as fp:
+        cargo_manifest = tomllib.load(fp)
+    version = cargo_manifest["package"]["version"]
+    if sys.argv[1] == "source":
+        filename = f"deltachat-rpc-server-{version}.tar.gz"
+        build_source_package(version, filename)
+    else:
+        arch = sys.argv[1]
+        executable = sys.argv[2]
+        tags = arch2tags[arch]
+
+        if arch in ["win32", "win64"]:
+            build_wheel(
+                version,
+                executable,
+                f"py3-none-{tags}",
+                windows=True,
+            )
+        else:
+            build_wheel(version, executable, f"py3-none-{tags}")
 
 
 main()

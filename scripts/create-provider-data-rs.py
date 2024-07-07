@@ -149,7 +149,7 @@ def process_data(data, file):
     oauth2 = "Some(Oauth2Authorizer::" + camel(oauth2) + ")" if oauth2 != "" else "None"
 
     provider = ""
-    before_login_hint = cleanstr(data.get("before_login_hint", ""))
+    before_login_hint = cleanstr(data.get("before_login_hint", "") or "")
     after_login_hint = cleanstr(data.get("after_login_hint", ""))
     if (not has_imap and not has_smtp) or (has_imap and has_smtp):
         provider += (
@@ -220,9 +220,9 @@ if __name__ == "__main__":
 
     process_dir(Path(sys.argv[1]))
 
-    out_all += "pub(crate) static PROVIDER_DATA: Lazy<HashMap<&'static str, &'static Provider>> = Lazy::new(|| HashMap::from([\n"
+    out_all += "pub(crate) static PROVIDER_DATA: [(&str, &Provider); " + str(len(domains_set)) + "] = [\n";
     out_all += out_domains
-    out_all += "]));\n\n"
+    out_all += "];\n\n"
 
     out_all += "pub(crate) static PROVIDER_IDS: Lazy<HashMap<&'static str, &'static Provider>> = Lazy::new(|| HashMap::from([\n"
     out_all += out_ids

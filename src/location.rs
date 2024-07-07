@@ -1,6 +1,15 @@
 //! Location handling.
+//!
+//! Delta Chat handles two kind of locations.
+//!
+//! There are two kinds of locations:
+//! - Independent locations, also known as Points of Interest (POI).
+//! - Path locations.
+//!
+//! Locations are sent as KML attachments.
+//! Independent locations are sent in `message.kml` attachments
+//! and path locations are sent in `location.kml` attachments.
 
-use std::convert::TryFrom;
 use std::time::Duration;
 
 use anyhow::{ensure, Context as _, Result};
@@ -9,13 +18,14 @@ use quick_xml::events::{BytesEnd, BytesStart, BytesText};
 use tokio::time::timeout;
 
 use crate::chat::{self, ChatId};
+use crate::constants::DC_CHAT_ID_TRASH;
 use crate::contact::ContactId;
 use crate::context::Context;
 use crate::events::EventType;
 use crate::message::{Message, MsgId, Viewtype};
 use crate::mimeparser::SystemMessage;
-use crate::stock_str;
 use crate::tools::{duration_to_str, time};
+use crate::{chatlist_events, stock_str};
 
 /// Location record.
 #[derive(Debug, Clone, Default)]
@@ -99,7 +109,7 @@ impl Kml {
         ensure!(to_parse.len() <= 1024 * 1024, "kml-file is too large");
 
         let mut reader = quick_xml::Reader::from_reader(to_parse);
-        reader.trim_text(true);
+        reader.config_mut().trim_text(true);
 
         let mut kml = Kml::new();
         kml.locations = Vec::with_capacity(100);
@@ -138,9 +148,10 @@ impl Kml {
                 // 0   4  7  10 13 16 19
                 match chrono::NaiveDateTime::parse_from_str(&val, "%Y-%m-%dT%H:%M:%SZ") {
                     Ok(res) => {
-                        self.curr.timestamp = res.timestamp();
-                        if self.curr.timestamp > time() {
-                            self.curr.timestamp = time();
+                        self.curr.timestamp = res.and_utc().timestamp();
+                        let now = time();
+                        if self.curr.timestamp > now {
+                            self.curr.timestamp = now;
                         }
                     }
                     Err(_err) => {
@@ -215,7 +226,7 @@ impl Kml {
                     == "addr"
             }) {
                 self.addr = addr
-                    .decode_and_unescape_value(reader)
+                    .decode_and_unescape_value(reader.decoder())
                     .ok()
                     .map(|a| a.into_owned());
             }
@@ -245,7 +256,7 @@ impl Kml {
             }) {
                 let v = acc
                     .unwrap()
-                    .decode_and_unescape_value(reader)
+                    .decode_and_unescape_value(reader.decoder())
                     .unwrap_or_default();
 
                 self.curr.accuracy = v.trim().parse().unwrap_or_default();
@@ -290,6 +301,7 @@ pub async fn send_locations_to_chat(
         chat::add_info_msg(context, chat_id, &stock_str, now).await?;
     }
     context.emit_event(EventType::ChatModified(chat_id));
+    chatlist_events::emit_chatlist_item_changed(context, chat_id);
     if 0 != seconds {
         context.scheduler.interrupt_location().await;
     }
@@ -333,12 +345,13 @@ pub async fn set(context: &Context, latitude: f64, longitude: f64, accuracy: f64
         return Ok(true);
     }
     let mut continue_streaming = false;
+    let now = time();
 
     let chats = context
         .sql
         .query_map(
             "SELECT id FROM chats WHERE locations_send_until>?;",
-            (time(),),
+            (now,),
             |row| row.get::<_, i32>(0),
             |chats| {
                 chats
@@ -348,6 +361,7 @@ pub async fn set(context: &Context, latitude: f64, longitude: f64, accuracy: f64
         )
         .await?;
 
+    let mut stored_location = false;
     for chat_id in chats {
         context.sql.execute(
                 "INSERT INTO locations  \
@@ -356,17 +370,22 @@ pub async fn set(context: &Context, latitude: f64, longitude: f64, accuracy: f64
                     latitude,
                     longitude,
                     accuracy,
-                    time(),
+                    now,
                     chat_id,
                     ContactId::SELF,
                 )).await.context("Failed to store location")?;
+        stored_location = true;
 
         info!(context, "Stored location for chat {chat_id}.");
         continue_streaming = true;
     }
     if continue_streaming {
-        context.emit_event(EventType::LocationChanged(Some(ContactId::SELF)));
+        context.emit_location_changed(Some(ContactId::SELF)).await?;
     };
+    if stored_location {
+        // Interrupt location loop so it may send a location-only message.
+        context.scheduler.interrupt_location().await;
+    }
 
     Ok(continue_streaming)
 }
@@ -455,7 +474,59 @@ fn is_marker(txt: &str) -> bool {
 /// Deletes all locations from the database.
 pub async fn delete_all(context: &Context) -> Result<()> {
     context.sql.execute("DELETE FROM locations;", ()).await?;
-    context.emit_event(EventType::LocationChanged(None));
+    context.emit_location_changed(None).await?;
+    Ok(())
+}
+
+/// Deletes expired locations.
+///
+/// Only path locations are deleted.
+/// POIs should be deleted when corresponding message is deleted.
+pub(crate) async fn delete_expired(context: &Context, now: i64) -> Result<()> {
+    let Some(delete_device_after) = context.get_config_delete_device_after().await? else {
+        return Ok(());
+    };
+
+    let threshold_timestamp = now.saturating_sub(delete_device_after);
+    let deleted = context
+        .sql
+        .execute(
+            "DELETE FROM locations WHERE independent=0 AND timestamp < ?",
+            (threshold_timestamp,),
+        )
+        .await?
+        > 0;
+    if deleted {
+        info!(context, "Deleted {deleted} expired locations.");
+        context.emit_location_changed(None).await?;
+    }
+    Ok(())
+}
+
+/// Deletes location if it is an independent location.
+///
+/// This function is used when a message is deleted
+/// that has a corresponding `location_id`.
+pub(crate) async fn delete_poi_location(context: &Context, location_id: u32) -> Result<()> {
+    context
+        .sql
+        .execute(
+            "DELETE FROM locations WHERE independent = 1 AND id=?",
+            (location_id as i32,),
+        )
+        .await?;
+    Ok(())
+}
+
+/// Deletes POI locations that don't have corresponding message anymore.
+pub(crate) async fn delete_orphaned_poi_locations(context: &Context) -> Result<()> {
+    context.sql.execute("
+    DELETE FROM locations
+    WHERE independent=1 AND id NOT IN
+    (SELECT location_id from MSGS LEFT JOIN locations
+     ON locations.id=location_id
+     WHERE location_id>0 -- This check makes the query faster by not looking for locations with ID 0 that don't exist.
+     AND msgs.chat_id != ?)", (DC_CHAT_ID_TRASH,)).await?;
     Ok(())
 }
 
@@ -539,7 +610,7 @@ pub async fn get_kml(context: &Context, chat_id: ChatId) -> Result<Option<(Strin
 
 fn get_kml_timestamp(utc: i64) -> String {
     // Returns a string formatted as YYYY-MM-DDTHH:MM:SSZ. The trailing `Z` indicates UTC.
-    chrono::NaiveDateTime::from_timestamp_opt(utc, 0)
+    chrono::DateTime::<chrono::Utc>::from_timestamp(utc, 0)
         .unwrap()
         .format("%Y-%m-%dT%H:%M:%SZ")
         .to_string()
@@ -678,7 +749,21 @@ pub(crate) async fn location_loop(context: &Context, interrupt_receiver: Receive
             "Location loop is waiting for {} or interrupt",
             duration_to_str(duration)
         );
-        timeout(duration, interrupt_receiver.recv()).await.ok();
+        match timeout(duration, interrupt_receiver.recv()).await {
+            Err(_err) => {
+                info!(context, "Location loop timeout.");
+            }
+            Ok(Err(err)) => {
+                warn!(
+                    context,
+                    "Interrupt channel closed, location loop exits now: {err:#}."
+                );
+                return;
+            }
+            Ok(Ok(())) => {
+                info!(context, "Location loop received interrupt.");
+            }
+        }
     }
 }
 
@@ -787,6 +872,7 @@ async fn maybe_send_locations(context: &Context) -> Result<Option<u64>> {
             let stock_str = stock_str::msg_location_disabled(context).await;
             chat::add_info_msg(context, chat_id, &stock_str, now).await?;
             context.emit_event(EventType::ChatModified(chat_id));
+            chatlist_events::emit_chatlist_item_changed(context, chat_id);
         }
     }
 
@@ -798,8 +884,11 @@ mod tests {
     #![allow(clippy::indexing_slicing)]
 
     use super::*;
+    use crate::config::Config;
+    use crate::message::MessageState;
     use crate::receive_imf::receive_imf;
-    use crate::test_utils::TestContext;
+    use crate::test_utils::{TestContext, TestContextManager};
+    use crate::tools::SystemTime;
 
     #[test]
     fn test_kml_parse() {
@@ -927,6 +1016,54 @@ Content-Disposition: attachment; filename="location.kml"
         Ok(())
     }
 
+    /// Tests that `location.kml` is not hidden and not seen if it contains a message.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn receive_visible_location_kml() -> Result<()> {
+        let alice = TestContext::new_alice().await;
+
+        receive_imf(
+            &alice,
+            br#"Subject: locations
+MIME-Version: 1.0
+To: <alice@example.org>
+From: <bob@example.net>
+Date: Tue, 21 Dec 2021 00:00:00 +0000
+Chat-Version: 1.0
+Message-ID: <foobar@localhost>
+Content-Type: multipart/mixed; boundary="U8BOG8qNXfB0GgLiQ3PKUjlvdIuLRF"
+
+
+--U8BOG8qNXfB0GgLiQ3PKUjlvdIuLRF
+Content-Type: text/plain; charset=utf-8; format=flowed; delsp=no
+
+Text message.
+
+
+--U8BOG8qNXfB0GgLiQ3PKUjlvdIuLRF
+Content-Type: application/vnd.google-earth.kml+xml
+Content-Disposition: attachment; filename="location.kml"
+
+<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+<Document addr="bob@example.net">
+<Placemark><Timestamp><when>2021-11-21T00:00:00Z</when></Timestamp><Point><coordinates accuracy="1.0000000000000000">10.00000000000000,20.00000000000000</coordinates></Point></Placemark>
+</Document>
+</kml>
+
+--U8BOG8qNXfB0GgLiQ3PKUjlvdIuLRF--"#,
+            false,
+        )
+        .await?;
+
+        let received_msg = alice.get_last_msg().await;
+        assert_eq!(received_msg.text, "Text message.");
+        assert_eq!(received_msg.state, MessageState::InFresh);
+
+        let locations = get_range(&alice, None, None, 0, 0).await?;
+        assert_eq!(locations.len(), 1);
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_send_locations_to_chat() -> Result<()> {
         let alice = TestContext::new_alice().await;
@@ -949,14 +1086,70 @@ Content-Disposition: attachment; filename="location.kml"
         let mut msg = Message::new(Viewtype::Image);
         msg.set_file(file.to_str().unwrap(), None);
         let sent = alice.send_msg(alice_chat.id, &mut msg).await;
+        let alice_msg = Message::load_from_db(&alice, sent.sender_msg_id).await?;
+        assert_eq!(alice_msg.has_location(), false);
 
         let msg = bob.recv_msg_opt(&sent).await.unwrap();
         assert!(msg.chat_id == bob_chat_id);
         assert_eq!(msg.msg_ids.len(), 1);
 
-        let bob_msg = Message::load_from_db(&bob, *msg.msg_ids.get(0).unwrap()).await?;
+        let bob_msg = Message::load_from_db(&bob, *msg.msg_ids.first().unwrap()).await?;
         assert_eq!(bob_msg.chat_id, bob_chat_id);
         assert_eq!(bob_msg.viewtype, Viewtype::Image);
+        assert_eq!(bob_msg.has_location(), false);
+
+        let bob_locations = get_range(&bob, None, None, 0, 0).await?;
+        assert_eq!(bob_locations.len(), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_delete_expired_locations() -> Result<()> {
+        let mut tcm = TestContextManager::new();
+        let alice = &tcm.alice().await;
+        let bob = &tcm.bob().await;
+
+        // Alice enables deletion of messages from device after 1 week.
+        alice
+            .set_config(Config::DeleteDeviceAfter, Some("604800"))
+            .await?;
+        // Bob enables deletion of messages from device after 1 day.
+        bob.set_config(Config::DeleteDeviceAfter, Some("86400"))
+            .await?;
+
+        let alice_chat = alice.create_chat(bob).await;
+
+        // Alice enables location streaming.
+        // Bob receives a message saying that Alice enabled location streaming.
+        send_locations_to_chat(alice, alice_chat.id, 60).await?;
+        bob.recv_msg(&alice.pop_sent_msg().await).await;
+
+        // Alice gets new location from GPS.
+        assert_eq!(set(alice, 10.0, 20.0, 1.0).await?, true);
+        assert_eq!(get_range(alice, None, None, 0, 0).await?.len(), 1);
+
+        // 10 seconds later location sending stream manages to send location.
+        SystemTime::shift(Duration::from_secs(10));
+        delete_expired(alice, time()).await?;
+        maybe_send_locations(alice).await?;
+        bob.recv_msg_opt(&alice.pop_sent_msg().await).await;
+        assert_eq!(get_range(alice, None, None, 0, 0).await?.len(), 1);
+        assert_eq!(get_range(bob, None, None, 0, 0).await?.len(), 1);
+
+        // Day later Bob removes location.
+        SystemTime::shift(Duration::from_secs(86400));
+        delete_expired(alice, time()).await?;
+        delete_expired(bob, time()).await?;
+        assert_eq!(get_range(alice, None, None, 0, 0).await?.len(), 1);
+        assert_eq!(get_range(bob, None, None, 0, 0).await?.len(), 0);
+
+        // Week late Alice removes location.
+        SystemTime::shift(Duration::from_secs(604800));
+        delete_expired(alice, time()).await?;
+        delete_expired(bob, time()).await?;
+        assert_eq!(get_range(alice, None, None, 0, 0).await?.len(), 0);
+        assert_eq!(get_range(bob, None, None, 0, 0).await?.len(), 0);
 
         Ok(())
     }

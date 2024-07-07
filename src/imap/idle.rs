@@ -1,18 +1,24 @@
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use anyhow::{bail, Context as _, Result};
 use async_channel::Receiver;
 use async_imap::extensions::idle::IdleResponse;
 use futures_lite::FutureExt;
+use tokio::time::timeout;
 
 use super::session::Session;
 use super::Imap;
-use crate::config::Config;
 use crate::context::Context;
-use crate::imap::{client::IMAP_TIMEOUT, get_uid_next, FolderMeaning};
-use crate::log::LogExt;
+use crate::imap::{client::IMAP_TIMEOUT, FolderMeaning};
+use crate::tools::{self, time_elapsed};
 
-const IDLE_TIMEOUT: Duration = Duration::from_secs(23 * 60);
+/// Timeout after which IDLE is finished
+/// if there are no responses from the server.
+///
+/// If `* OK Still here` keepalives are sent more frequently
+/// than this duration, timeout should never be triggered.
+/// For example, Dovecot sends keepalives every 2 minutes by default.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 impl Session {
     pub async fn idle(
@@ -23,33 +29,14 @@ impl Session {
     ) -> Result<Self> {
         use futures::future::FutureExt;
 
-        self.select_folder(context, Some(folder)).await?;
+        self.select_with_uidvalidity(context, folder).await?;
 
         if self.server_sent_unsolicited_exists(context)? {
-            return Ok(self);
+            self.new_mail = true;
         }
 
-        // Despite checking for unsolicited EXISTS above,
-        // we may have missed EXISTS if the message was
-        // received when the folder was not selected.
-        let status = self
-            .status(folder, "(UIDNEXT)")
-            .await
-            .with_context(|| format!("STATUS (UIDNEXT) error for {folder:?}"))?;
-        if let Some(uid_next) = status.uid_next {
-            let expected_uid_next = get_uid_next(context, folder)
-                .await
-                .with_context(|| format!("failed to get old UID NEXT for folder {folder}"))?;
-            if uid_next > expected_uid_next {
-                info!(
-                    context,
-                    "Skipping IDLE on {folder:?} because UIDNEXT {uid_next}>{expected_uid_next} indicates there are new messages."
-                );
-                return Ok(self);
-            }
-        } else {
-            warn!(context, "STATUS {folder} (UIDNEXT) did not return UIDNEXT");
-            // Go to IDLE anyway if STATUS is broken.
+        if self.new_mail {
+            return Ok(self);
         }
 
         if let Ok(()) = idle_interrupt_receiver.try_recv() {
@@ -109,102 +96,46 @@ impl Session {
         session.as_mut().set_read_timeout(Some(IMAP_TIMEOUT));
         self.inner = session;
 
+        // Fetch mail once we exit IDLE.
+        self.new_mail = true;
+
         Ok(self)
     }
 }
 
 impl Imap {
+    /// Idle using polling.
     pub(crate) async fn fake_idle(
         &mut self,
         context: &Context,
-        watch_folder: Option<String>,
+        session: &mut Session,
+        watch_folder: String,
         folder_meaning: FolderMeaning,
-    ) {
-        // Idle using polling. This is also needed if we're not yet configured -
-        // in this case, we're waiting for a configure job (and an interrupt).
+    ) -> Result<()> {
+        let fake_idle_start_time = tools::Time::now();
 
-        let fake_idle_start_time = SystemTime::now();
-
-        // Do not poll, just wait for an interrupt when no folder is passed in.
-        let watch_folder = if let Some(watch_folder) = watch_folder {
-            watch_folder
-        } else {
-            info!(context, "IMAP-fake-IDLE: no folder, waiting for interrupt");
-            self.idle_interrupt_receiver.recv().await.ok();
-            return;
-        };
         info!(context, "IMAP-fake-IDLEing folder={:?}", watch_folder);
 
-        const TIMEOUT_INIT_MS: u64 = 60_000;
-        let mut timeout_ms: u64 = TIMEOUT_INIT_MS;
-        enum Event {
-            Tick,
-            Interrupt,
-        }
-        // loop until we are interrupted or if we fetched something
+        // Loop until we are interrupted or until we fetch something.
         loop {
-            use futures::future::FutureExt;
-            use rand::Rng;
-
-            let mut interval = tokio::time::interval(Duration::from_millis(timeout_ms));
-            timeout_ms = timeout_ms
-                .saturating_add(rand::thread_rng().gen_range((timeout_ms / 2)..=timeout_ms));
-            interval.tick().await; // The first tick completes immediately.
-            match interval
-                .tick()
-                .map(|_| Event::Tick)
-                .race(
-                    self.idle_interrupt_receiver
-                        .recv()
-                        .map(|_| Event::Interrupt),
-                )
-                .await
-            {
-                Event::Tick => {
-                    // try to connect with proper login params
-                    // (setup_handle_if_needed might not know about them if we
-                    // never successfully connected)
-                    if let Err(err) = self.prepare(context).await {
-                        warn!(context, "fake_idle: could not connect: {}", err);
-                        continue;
-                    }
-                    if let Some(session) = &self.session {
-                        if session.can_idle()
-                            && !context
-                                .get_config_bool(Config::DisableIdle)
-                                .await
-                                .context("Failed to get disable_idle config")
-                                .log_err(context)
-                                .unwrap_or_default()
-                        {
-                            // we only fake-idled because network was gone during IDLE, probably
-                            break;
-                        }
-                    }
-                    info!(context, "fake_idle is connected");
-                    // we are connected, let's see if fetching messages results
+            match timeout(Duration::from_secs(60), self.idle_interrupt_receiver.recv()).await {
+                Err(_) => {
+                    // Let's see if fetching messages results
                     // in anything.  If so, we behave as if IDLE had data but
                     // will have already fetched the messages so perform_*_fetch
                     // will not find any new.
-                    match self
-                        .fetch_new_messages(context, &watch_folder, folder_meaning, false)
-                        .await
-                    {
-                        Ok(res) => {
-                            info!(context, "fetch_new_messages returned {:?}", res);
-                            timeout_ms = TIMEOUT_INIT_MS;
-                            if res {
-                                break;
-                            }
-                        }
-                        Err(err) => {
-                            error!(context, "could not fetch from folder: {:#}", err);
-                            self.trigger_reconnect(context);
-                        }
+                    let res = self
+                        .fetch_new_messages(context, session, &watch_folder, folder_meaning, false)
+                        .await?;
+
+                    info!(context, "fetch_new_messages returned {:?}", res);
+
+                    if res {
+                        break;
                     }
                 }
-                Event::Interrupt => {
-                    info!(context, "Fake IDLE interrupted");
+                Ok(_) => {
+                    info!(context, "Fake IDLE interrupted.");
                     break;
                 }
             }
@@ -213,11 +144,8 @@ impl Imap {
         info!(
             context,
             "IMAP-fake-IDLE done after {:.4}s",
-            SystemTime::now()
-                .duration_since(fake_idle_start_time)
-                .unwrap_or_default()
-                .as_millis() as f64
-                / 1000.,
+            time_elapsed(&fake_idle_start_time).as_millis() as f64 / 1000.,
         );
+        Ok(())
     }
 }

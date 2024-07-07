@@ -129,7 +129,7 @@ fn dehtml_quick_xml(buf: &str) -> (String, String) {
     };
 
     let mut reader = quick_xml::Reader::from_str(buf);
-    reader.check_end_names(false);
+    reader.config_mut().check_end_names = false;
 
     let mut buf = Vec::new();
 
@@ -181,7 +181,12 @@ fn dehtml_text_cb(event: &BytesText, dehtml: &mut Dehtml) {
     if dehtml.get_add_text() == AddText::YesPreserveLineEnds
         || dehtml.get_add_text() == AddText::YesRemoveLineEnds
     {
-        let last_added = escaper::decode_html_buf_sloppy(event as &[_]).unwrap_or_default();
+        let event = event as &[_];
+        let event_str = std::str::from_utf8(event).unwrap_or_default();
+        let mut last_added = escaper::decode_html_buf_sloppy(event).unwrap_or_default();
+        if event_str.starts_with(&last_added) {
+            last_added = event_str.to_string();
+        }
 
         if dehtml.get_add_text() == AddText::YesRemoveLineEnds {
             // Replace all line ends with spaces.
@@ -294,9 +299,9 @@ fn dehtml_starttag_cb<B: std::io::BufRead>(
                 })
             {
                 let href = href
-                    .decode_and_unescape_value(reader)
+                    .decode_and_unescape_value(reader.decoder())
                     .unwrap_or_default()
-                    .to_lowercase();
+                    .to_string();
 
                 if !href.is_empty() {
                     dehtml.last_href = Some(href);
@@ -343,7 +348,7 @@ fn maybe_push_tag(
 fn tag_contains_attr(event: &BytesStart, reader: &Reader<impl BufRead>, name: &str) -> bool {
     event.attributes().any(|r| {
         r.map(|a| {
-            a.decode_and_unescape_value(reader)
+            a.decode_and_unescape_value(reader.decoder())
                 .map(|v| v == name)
                 .unwrap_or(false)
         })
@@ -452,10 +457,17 @@ mod tests {
 
     #[test]
     fn test_dehtml_parse_href() {
-        let html = "<a href=url>text</a";
+        let html = "<a href=url>text</a>";
         let plain = dehtml(html).unwrap().text;
 
         assert_eq!(plain, "[text](url)");
+    }
+
+    #[test]
+    fn test_dehtml_case_sensitive_link() {
+        let html = "<html><A HrEf=\"https://foo.bar/Data\">case in URLs matter</A></html>";
+        let plain = dehtml(html).unwrap().text;
+        assert_eq!(plain, "[case in URLs matter](https://foo.bar/Data)");
     }
 
     #[test]
@@ -527,6 +539,6 @@ mod tests {
     fn test_spaces() {
         let input = include_str!("../test-data/spaces.html");
         let txt = dehtml(input).unwrap();
-        assert_eq!(txt.text, "Welcome back to Strolling!\n\nHey there,\n\nWelcome back! Use this link to securely sign in to your Strolling account:\n\nSign in to Strolling\n\nFor your security, the link will expire in 24 hours time.\n\nSee you soon!\n\nYou can also copy\n\nhttps://strolling.rosano.ca/members/?token=XXX\n\nIf you did not make this request, you can safely ignore this email.\n\nThis message was sent from [strolling.rosano.ca](https://strolling.rosano.ca/) to [alice@example.org](mailto:alice@example.org)");
+        assert_eq!(txt.text, "Welcome back to Strolling!\n\nHey there,\n\nWelcome back! Use this link to securely sign in to your Strolling account:\n\nSign in to Strolling\n\nFor your security, the link will expire in 24 hours time.\n\nSee you soon!\n\nYou can also copy & paste this URL into your browser:\n\nhttps://strolling.rosano.ca/members/?token=XXX&action=signin&r=https%3A%2F%2Fstrolling.rosano.ca%2F\n\nIf you did not make this request, you can safely ignore this email.\n\nThis message was sent from [strolling.rosano.ca](https://strolling.rosano.ca/) to [alice@example.org](mailto:alice@example.org)");
     }
 }

@@ -3,7 +3,7 @@ extern crate dirs;
 
 use std::path::Path;
 use std::str::FromStr;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use anyhow::{bail, ensure, Result};
 use deltachat::chat::{
@@ -19,6 +19,7 @@ use deltachat::location;
 use deltachat::log::LogExt;
 use deltachat::message::{self, Message, MessageState, MsgId, Viewtype};
 use deltachat::mimeparser::SystemMessage;
+use deltachat::peer_channels::{send_webxdc_realtime_advertisement, send_webxdc_realtime_data};
 use deltachat::peerstate::*;
 use deltachat::qr::*;
 use deltachat::reaction::send_reaction;
@@ -33,14 +34,6 @@ use tokio::fs;
 /// e.g. bitmask 7 triggers actions defined with bits 1, 2 and 4.
 async fn reset_tables(context: &Context, bits: i32) {
     println!("Resetting tables ({bits})...");
-    if 0 != bits & 1 {
-        context
-            .sql()
-            .execute("DELETE FROM jobs;", ())
-            .await
-            .unwrap();
-        println!("(1) Jobs reset.");
-    }
     if 0 != bits & 2 {
         context
             .sql()
@@ -284,13 +277,8 @@ async fn log_contactlist(context: &Context, contacts: &[ContactId]) -> Result<()
         let contact = Contact::get_by_id(context, *contact_id).await?;
         let name = contact.get_display_name();
         let addr = contact.get_addr();
-        let verified_state = contact.is_verified(context).await?;
-        let verified_str = if VerifiedStatus::Unverified != verified_state {
-            if verified_state == VerifiedStatus::BidirectVerified {
-                " √√"
-            } else {
-                " √"
-            }
+        let verified_str = if contact.is_verified(context).await? {
+            " √"
         } else {
             ""
         };
@@ -654,6 +642,30 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             }
             println!("{cnt} chats");
             println!("{time_needed:?} to create this list");
+        }
+        "start-realtime" => {
+            if arg1.is_empty() {
+                bail!("missing msgid");
+            }
+            let msg_id = MsgId::new(arg1.parse()?);
+            let res = send_webxdc_realtime_advertisement(&context, msg_id).await?;
+
+            if let Some(res) = res {
+                println!("waiting for peer channel join");
+                res.await?;
+            }
+            println!("joined peer channel");
+        }
+        "send-realtime" => {
+            if arg1.is_empty() {
+                bail!("missing msgid");
+            }
+            if arg2.is_empty() {
+                bail!("no message");
+            }
+            let msg_id = MsgId::new(arg1.parse()?);
+            send_webxdc_realtime_data(&context, msg_id, arg2.as_bytes().to_vec()).await?;
+            println!("sent realtime message");
         }
         "chat" => {
             if sel_chat.is_none() && arg1.is_empty() {

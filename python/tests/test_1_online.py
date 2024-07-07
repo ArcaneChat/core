@@ -1,7 +1,6 @@
 import os
 import queue
 import sys
-import time
 import base64
 from datetime import datetime, timezone
 
@@ -44,21 +43,21 @@ def test_configure_generate_key(acfactory, lp):
     lp.sec("ac1: send unencrypted message to ac2")
     chat.send_text("message1")
     lp.sec("ac2: waiting for message from ac1")
-    msg_in = ac2.wait_next_incoming_message()
+    msg_in = ac2._evtracker.wait_next_incoming_message()
     assert msg_in.text == "message1"
     assert not msg_in.is_encrypted()
 
     lp.sec("ac2: send encrypted message to ac1")
     msg_in.chat.send_text("message2")
     lp.sec("ac1: waiting for message from ac2")
-    msg2_in = ac1.wait_next_incoming_message()
+    msg2_in = ac1._evtracker.wait_next_incoming_message()
     assert msg2_in.text == "message2"
     assert msg2_in.is_encrypted()
 
     lp.sec("ac1: send encrypted message to ac2")
     msg2_in.chat.send_text("message3")
     lp.sec("ac2: waiting for message from ac1")
-    msg3_in = ac2.wait_next_incoming_message()
+    msg3_in = ac2._evtracker.wait_next_incoming_message()
     assert msg3_in.text == "message3"
     assert msg3_in.is_encrypted()
 
@@ -382,9 +381,24 @@ def test_webxdc_download_on_demand(acfactory, data, lp):
     assert msgs_changed_event.data2 == 0
 
 
+def test_enable_mvbox_move(acfactory, lp):
+    (ac1,) = acfactory.get_online_accounts(1)
+
+    lp.sec("ac2: start without mvbox thread")
+    ac2 = acfactory.new_online_configuring_account(mvbox_move=False)
+    acfactory.bring_accounts_online()
+
+    lp.sec("ac2: configuring mvbox")
+    ac2.set_config("mvbox_move", "1")
+
+    lp.sec("ac1: send message and wait for ac2 to receive it")
+    acfactory.get_accepted_chat(ac1, ac2).send_text("message1")
+    assert ac2._evtracker.wait_next_incoming_message().text == "message1"
+
+
 def test_mvbox_sentbox_threads(acfactory, lp):
     lp.sec("ac1: start with mvbox thread")
-    ac1 = acfactory.new_online_configuring_account(mvbox_move=True, sentbox_watch=True)
+    ac1 = acfactory.new_online_configuring_account(mvbox_move=True, sentbox_watch=False)
 
     lp.sec("ac2: start without mvbox/sentbox threads")
     ac2 = acfactory.new_online_configuring_account(mvbox_move=False, sentbox_watch=False)
@@ -392,9 +406,17 @@ def test_mvbox_sentbox_threads(acfactory, lp):
     lp.sec("ac2 and ac1: waiting for configuration")
     acfactory.bring_accounts_online()
 
+    lp.sec("ac1: create and configure sentbox")
+    ac1.direct_imap.create_folder("Sent")
+    ac1.set_config("sentbox_watch", "1")
+
     lp.sec("ac1: send message and wait for ac2 to receive it")
     acfactory.get_accepted_chat(ac1, ac2).send_text("message1")
     assert ac2._evtracker.wait_next_incoming_message().text == "message1"
+
+    assert ac1.get_config("configured_mvbox_folder") == "DeltaChat"
+    while ac1.get_config("configured_sentbox_folder") != "Sent":
+        ac1._evtracker.get_matching("DC_EVENT_CONNECTIVITY_CHANGED")
 
 
 def test_move_works(acfactory):
@@ -498,6 +520,26 @@ def test_forward_messages(acfactory, lp):
     assert not chat3.get_messages()
 
 
+def test_forward_encrypted_to_unencrypted(acfactory, lp):
+    ac1, ac2, ac3 = acfactory.get_online_accounts(3)
+    chat = acfactory.get_protected_chat(ac1, ac2)
+
+    lp.sec("ac1: send encrypted message to ac2")
+    txt = "This should be encrypted"
+    chat.send_text(txt)
+    msg = ac2._evtracker.wait_next_incoming_message()
+    assert msg.text == txt
+    assert msg.is_encrypted()
+
+    lp.sec("ac2: forward message to ac3 unencrypted")
+    unencrypted_chat = ac2.create_chat(ac3)
+    msg_id = msg.id
+    msg2 = unencrypted_chat.send_msg(msg)
+    assert msg2 == msg
+    assert msg.id != msg_id
+    assert not msg.is_encrypted()
+
+
 def test_forward_own_message(acfactory, lp):
     ac1, ac2 = acfactory.get_online_accounts(2)
     chat = acfactory.get_accepted_chat(ac1, ac2)
@@ -521,6 +563,27 @@ def test_forward_own_message(acfactory, lp):
     msg_in = ac2.get_message_by_id(ev.data2)
     assert msg_in.text == "message2"
     assert msg_in.is_forwarded()
+
+
+def test_resend_message(acfactory, lp):
+    ac1, ac2 = acfactory.get_online_accounts(2)
+    chat1 = ac1.create_chat(ac2)
+
+    lp.sec("ac1: send message to ac2")
+    chat1.send_text("message")
+
+    lp.sec("ac2: receive message")
+    msg_in = ac2._evtracker.wait_next_incoming_message()
+    assert msg_in.text == "message"
+    chat2 = msg_in.chat
+    chat2_msg_cnt = len(chat2.get_messages())
+
+    lp.sec("ac1: resend message")
+    ac1.resend_messages([msg_in])
+
+    lp.sec("ac2: check that message is deleted")
+    ac2._evtracker.get_matching("DC_EVENT_IMAP_MESSAGE_DELETED")
+    assert len(chat2.get_messages()) == chat2_msg_cnt
 
 
 def test_long_group_name(acfactory, lp):
@@ -1280,7 +1343,6 @@ def test_quote_encrypted(acfactory, lp):
 
     for quoted_msg in msg1, msg3:
         # Save the draft with a quote.
-        # It should be encrypted if quoted message is encrypted.
         msg_draft = Message.new_empty(ac1, "text")
         msg_draft.set_text("message reply")
         msg_draft.quote = quoted_msg
@@ -1294,10 +1356,14 @@ def test_quote_encrypted(acfactory, lp):
         chat.set_draft(None)
         assert chat.get_draft() is None
 
+        # Quote should be replaced with "..." if quoted message is encrypted.
         msg_in = ac2._evtracker.wait_next_incoming_message()
         assert msg_in.text == "message reply"
-        assert msg_in.quoted_text == quoted_msg.text
-        assert msg_in.is_encrypted() == quoted_msg.is_encrypted()
+        assert not msg_in.is_encrypted()
+        if quoted_msg.is_encrypted():
+            assert msg_in.quoted_text == "..."
+        else:
+            assert msg_in.quoted_text == quoted_msg.text
 
 
 def test_quote_attachment(tmp_path, acfactory, lp):
@@ -1429,112 +1495,12 @@ def test_send_and_receive_image(acfactory, lp, data):
     assert m == msg_in
 
 
-def test_reaction_to_partially_fetched_msg(acfactory, lp, tmp_path):
-    """See https://github.com/deltachat/deltachat-core-rust/issues/3688 "Partially downloaded
-    messages are received out of order".
-
-    If the Inbox contains X small messages followed by Y large messages followed by Z small
-    messages, Delta Chat first downloaded a batch of X+Z messages, and then a batch of Y messages.
-
-    This bug was discovered by @Simon-Laux while testing reactions PR #3644 and can be reproduced
-    with online test as follows:
-    - Bob enables download limit and goes offline.
-    - Alice sends a large message to Bob and reacts to this message with a thumbs-up.
-    - Bob goes online
-    - Bob first processes a reaction message and throws it away because there is no corresponding
-      message, then processes a partially downloaded message.
-    - As a result, Bob does not see a reaction
-    """
-    download_limit = 300000
-    ac1, ac2 = acfactory.get_online_accounts(2)
-    ac1_addr = ac1.get_config("addr")
-    chat = ac1.create_chat(ac2)
-    ac2.set_config("download_limit", str(download_limit))
-    ac2.stop_io()
-
-    reactions_queue = queue.Queue()
-
-    class InPlugin:
-        @account_hookimpl
-        def ac_reactions_changed(self, message):
-            reactions_queue.put(message)
-
-    ac2.add_account_plugin(InPlugin())
-
-    lp.sec("sending small+large messages from ac1 to ac2")
-    msgs = []
-    msgs.append(chat.send_text("hi"))
-    path = tmp_path / "large"
-    path.write_bytes(os.urandom(download_limit + 1))
-    msgs.append(chat.send_file(str(path)))
-    for m in msgs:
-        ac1._evtracker.wait_msg_delivered(m)
-
-    lp.sec("sending a reaction to the large message from ac1 to ac2")
-    # TODO: Find the reason of an occasional message reordering on the server (so that the reaction
-    # has a lower UID than the previous message). W/a is to sleep for some time to let the reaction
-    # have a later INTERNALDATE.
-    time.sleep(1.1)
-    react_str = "\N{THUMBS UP SIGN}"
-    msgs.append(msgs[-1].send_reaction(react_str))
-    ac1._evtracker.wait_msg_delivered(msgs[-1])
-
-    ac2.start_io()
-
-    lp.sec("wait for ac2 to receive a reaction")
-    msg2 = ac2._evtracker.wait_next_reactions_changed()
-    assert msg2.get_sender_contact().addr == ac1_addr
-    assert msg2.download_state == dc.const.DC_DOWNLOAD_AVAILABLE
-    assert reactions_queue.get() == msg2
-    reactions = msg2.get_reactions()
-    contacts = reactions.get_contacts()
-    assert len(contacts) == 1
-    assert contacts[0].addr == ac1_addr
-    assert reactions.get_by_contact(contacts[0]) == react_str
-
-
-def test_reactions_for_a_reordering_move(acfactory, lp):
-    """When a batch of messages is moved from Inbox to DeltaChat folder with a single MOVE command,
-    their UIDs may be reordered (e.g. Gmail is known for that) which led to that messages were
-    processed by receive_imf in the wrong order, and, particularly, reactions were processed before
-    messages they refer to and thus dropped.
-    """
-    (ac1,) = acfactory.get_online_accounts(1)
-    ac2 = acfactory.new_online_configuring_account(mvbox_move=True)
-    acfactory.bring_accounts_online()
-    chat1 = acfactory.get_accepted_chat(ac1, ac2)
-    ac2.stop_io()
-
-    lp.sec("sending message + reaction from ac1 to ac2")
-    msg1 = chat1.send_text("hi")
-    ac1._evtracker.wait_msg_delivered(msg1)
-    # It's is sad, but messages must differ in their INTERNALDATEs to be processed in the correct
-    # order by DC, and most (if not all) mail servers provide only seconds precision.
-    time.sleep(1.1)
-    react_str = "\N{THUMBS UP SIGN}"
-    ac1._evtracker.wait_msg_delivered(msg1.send_reaction(react_str))
-
-    lp.sec("moving messages to ac2's DeltaChat folder in the reverse order")
-    ac2.direct_imap.connect()
-    for uid in sorted([m.uid for m in ac2.direct_imap.get_all_messages()], reverse=True):
-        ac2.direct_imap.conn.move(uid, "DeltaChat")
-
-    lp.sec("receiving messages by ac2")
-    ac2.start_io()
-    msg2 = ac2._evtracker.wait_next_reactions_changed()
-    assert msg2.text == msg1.text
-    reactions = msg2.get_reactions()
-    contacts = reactions.get_contacts()
-    assert len(contacts) == 1
-    assert contacts[0].addr == ac1.get_config("addr")
-    assert reactions.get_by_contact(contacts[0]) == react_str
-
-
 def test_import_export_online_all(acfactory, tmp_path, data, lp):
-    (ac1,) = acfactory.get_online_accounts(1)
+    (ac1, some1) = acfactory.get_online_accounts(2)
 
     lp.sec("create some chat content")
-    chat1 = ac1.create_contact("some1@example.org", name="some1").create_chat()
+    some1_addr = some1.get_config("addr")
+    chat1 = ac1.create_contact(some1_addr, name="some1").create_chat()
     chat1.send_text("msg1")
     assert len(ac1.get_contacts(query="some1")) == 1
 
@@ -1551,7 +1517,7 @@ def test_import_export_online_all(acfactory, tmp_path, data, lp):
         contacts = ac.get_contacts(query="some1")
         assert len(contacts) == 1
         contact2 = contacts[0]
-        assert contact2.addr == "some1@example.org"
+        assert contact2.addr == some1_addr
         chat2 = contact2.create_chat()
         messages = chat2.get_messages()
         assert len(messages) == 3
@@ -1979,6 +1945,32 @@ def test_connectivity(acfactory, lp):
     ac1._evtracker.wait_for_connectivity(dc.const.DC_CONNECTIVITY_NOT_CONNECTED)
 
 
+def test_all_work_done(acfactory, lp):
+    """
+    Tests that calling start_io() immediately followed by maybe_network()
+    and then waiting for all_work_done() reliably fetches the messages
+    delivered while account was offline.
+    In other words, connectivity should not change to a state
+    where all_work_done() returns true until IMAP connection goes idle.
+    """
+    ac1, ac2 = acfactory.get_online_accounts(2)
+
+    ac1.stop_io()
+    ac1._evtracker.wait_for_connectivity(dc.const.DC_CONNECTIVITY_NOT_CONNECTED)
+
+    ac1.direct_imap.select_config_folder("inbox")
+    with ac1.direct_imap.idle() as idle1:
+        ac2.create_chat(ac1).send_text("Hi")
+        idle1.wait_for_new_message()
+
+    ac1.start_io()
+    ac1.maybe_network()
+    ac1._evtracker.wait_for_all_work_done()
+    msgs = ac1.create_chat(ac2).get_messages()
+    assert len(msgs) == 1
+    assert msgs[0].text == "Hi"
+
+
 def test_fetch_deleted_msg(acfactory, lp):
     """This is a regression test: Messages with \\Deleted flag were downloaded again and again,
     hundreds of times, because uid_next was not updated.
@@ -2044,14 +2036,15 @@ def test_send_receive_locations(acfactory, lp):
     assert chat1.is_sending_locations()
     ac1._evtracker.get_matching("DC_EVENT_SMTP_MESSAGE_SENT")
 
+    # Wait for "enabled location streaming" message.
+    ac2._evtracker.wait_next_incoming_message()
+
+    # First location is sent immediately as a location-only message.
     ac1.set_location(latitude=2.0, longitude=3.0, accuracy=0.5)
     ac1._evtracker.get_matching("DC_EVENT_LOCATION_CHANGED")
-    chat1.send_text("🍞")
     ac1._evtracker.get_matching("DC_EVENT_SMTP_MESSAGE_SENT")
 
     lp.sec("ac2: wait for incoming location message")
-
-    # currently core emits location changed before event_incoming message
     ac2._evtracker.get_matching("DC_EVENT_LOCATION_CHANGED")
 
     locations = chat2.get_locations()
@@ -2060,7 +2053,7 @@ def test_send_receive_locations(acfactory, lp):
     assert locations[0].longitude == 3.0
     assert locations[0].accuracy == 0.5
     assert locations[0].timestamp > now
-    assert locations[0].marker == "🍞"
+    assert locations[0].marker is None
 
     contact = ac2.create_contact(ac1)
     locations2 = chat2.get_locations(contact=contact)
@@ -2139,17 +2132,21 @@ def test_delete_multiple_messages(acfactory, lp):
 
 def test_trash_multiple_messages(acfactory, lp):
     ac1, ac2 = acfactory.get_online_accounts(2)
+    ac2.stop_io()
 
-    # Create the Trash folder on IMAP server
-    # and recreate the account so Trash folder is configured.
+    # Create the Trash folder on IMAP server and configure deletion to it. There was a bug that if
+    # Trash wasn't configured initially, it can't be configured later, let's check this.
     lp.sec("Creating trash folder")
     ac2.direct_imap.create_folder("Trash")
-    lp.sec("Creating new accounts")
-    ac2 = acfactory.new_online_configuring_account(cloned_from=ac2)
-    acfactory.bring_accounts_online()
-
     ac2.set_config("delete_to_trash", "1")
-    assert ac2.get_config("configured_trash_folder")
+
+    lp.sec("Check that Trash can be configured initially as well")
+    ac3 = acfactory.new_online_configuring_account(cloned_from=ac2)
+    acfactory.bring_accounts_online()
+    assert ac3.get_config("configured_trash_folder")
+    ac3.stop_io()
+
+    ac2.start_io()
     chat12 = acfactory.get_accepted_chat(ac1, ac2)
 
     lp.sec("ac1: sending 3 messages")
@@ -2164,6 +2161,9 @@ def test_trash_multiple_messages(acfactory, lp):
         assert msg.text in texts
         if text != "second":
             to_delete.append(msg)
+    # ac2 has received some messages, this is impossible w/o the trash folder configured, let's
+    # check the configuration.
+    assert ac2.get_config("configured_trash_folder") == "Trash"
 
     lp.sec("ac2: deleting all messages except second")
     assert len(to_delete) == len(texts) - 1

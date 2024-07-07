@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 //! This is a CLI program and a little testing frame.  This file must not be
 //! included when using Delta Chat Core as a library.
 //!
@@ -9,7 +10,6 @@ extern crate deltachat;
 
 use std::borrow::Cow::{self, Borrowed, Owned};
 use std::io::{self, Write};
-use std::path::Path;
 use std::process::Command;
 
 use ansi_term::Color;
@@ -20,8 +20,7 @@ use deltachat::context::*;
 use deltachat::oauth2::*;
 use deltachat::qr_code_generator::get_securejoin_qr_svg;
 use deltachat::securejoin::*;
-use deltachat::stock_str::StockStrings;
-use deltachat::{EventType, Events};
+use deltachat::EventType;
 use log::{error, info, warn};
 use rustyline::completion::{Completer, FilenameCompleter, Pair};
 use rustyline::error::ReadlineError;
@@ -33,6 +32,7 @@ use rustyline::{
 };
 use tokio::fs;
 use tokio::runtime::Handle;
+use tracing_subscriber::EnvFilter;
 
 mod cmdline;
 use self::cmdline::*;
@@ -299,8 +299,8 @@ impl Highlighter for DcHelper {
         self.highlighter.highlight(line, pos)
     }
 
-    fn highlight_char(&self, line: &str, pos: usize) -> bool {
-        self.highlighter.highlight_char(line, pos)
+    fn highlight_char(&self, line: &str, pos: usize, forced: bool) -> bool {
+        self.highlighter.highlight_char(line, pos, forced)
     }
 }
 
@@ -312,7 +312,10 @@ async fn start(args: Vec<String>) -> Result<(), Error> {
         println!("Error: Bad arguments, expected [db-name].");
         bail!("No db-name specified");
     }
-    let context = Context::new(Path::new(&args[1]), 0, Events::new(), StockStrings::new()).await?;
+    let context = ContextBuilder::new(args[1].clone().into())
+        .with_id(1)
+        .open()
+        .await?;
 
     let events = context.get_event_emitter();
     tokio::task::spawn(async move {
@@ -401,7 +404,7 @@ enum ExitResult {
 
 async fn handle_cmd(
     line: &str,
-    mut ctx: Context,
+    ctx: Context,
     selected_chat: &mut ChatId,
 ) -> Result<ExitResult, Error> {
     let mut args = line.splitn(2, ' ');
@@ -481,7 +484,11 @@ async fn handle_cmd(
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    let _ = pretty_env_logger::try_init();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::from_default_env().add_directive("deltachat_repl=info".parse()?),
+        )
+        .init();
 
     let args = std::env::args().collect();
     start(args).await?;

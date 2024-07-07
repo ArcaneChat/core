@@ -12,19 +12,19 @@ use tokio::sync::{oneshot, RwLock, RwLockWriteGuard};
 use tokio::task;
 
 use self::connectivity::ConnectivityStore;
-use crate::config::Config;
+use crate::config::{self, Config};
 use crate::contact::{ContactId, RecentlySeenLoop};
 use crate::context::Context;
-use crate::download::download_msg;
+use crate::download::{download_msg, DownloadState};
 use crate::ephemeral::{self, delete_expired_imap_messages};
 use crate::events::EventType;
-use crate::imap::{FolderMeaning, Imap};
+use crate::imap::{session::Session, FolderMeaning, Imap};
 use crate::location;
 use crate::log::LogExt;
 use crate::message::MsgId;
 use crate::smtp::{send_smtp_messages, Smtp};
 use crate::sql;
-use crate::tools::{duration_to_str, maybe_add_time_based_warnings, time};
+use crate::tools::{self, duration_to_str, maybe_add_time_based_warnings, time, time_elapsed};
 
 pub(crate) mod connectivity;
 
@@ -70,8 +70,11 @@ impl SchedulerState {
         context.new_msgs_notify.notify_one();
 
         let ctx = context.clone();
-        match Scheduler::start(context).await {
-            Ok(scheduler) => *inner = InnerSchedulerState::Started(scheduler),
+        match Scheduler::start(&context).await {
+            Ok(scheduler) => {
+                *inner = InnerSchedulerState::Started(scheduler);
+                context.emit_event(EventType::ConnectivityChanged);
+            }
             Err(err) => error!(&ctx, "Failed to start IO: {:#}", err),
         }
     }
@@ -116,6 +119,7 @@ impl SchedulerState {
             debug_logging.loop_handle.abort();
         }
         let prev_state = std::mem::replace(&mut *inner, new_state);
+        context.emit_event(EventType::ConnectivityChanged);
         match prev_state {
             InnerSchedulerState::Started(scheduler) => scheduler.stop(context).await,
             InnerSchedulerState::Stopped | InnerSchedulerState::Paused { .. } => (),
@@ -242,6 +246,14 @@ impl SchedulerState {
         }
     }
 
+    /// Interrupt optional boxes (mvbox, sentbox) loops.
+    pub(crate) async fn interrupt_oboxes(&self) {
+        let inner = self.inner.read().await;
+        if let InnerSchedulerState::Started(ref scheduler) = *inner {
+            scheduler.interrupt_oboxes();
+        }
+    }
+
     pub(crate) async fn interrupt_smtp(&self) {
         let inner = self.inner.read().await;
         if let InnerSchedulerState::Started(ref scheduler) = *inner {
@@ -286,7 +298,7 @@ enum InnerSchedulerState {
 ///
 /// Returned by [`SchedulerState::pause`].  To resume the IO scheduler simply drop this
 /// guard.
-#[derive(Debug)]
+#[derive(Default, Debug)]
 pub(crate) struct IoPausedGuard {
     sender: Option<oneshot::Sender<()>>,
 }
@@ -325,7 +337,7 @@ pub(crate) struct Scheduler {
     recently_seen_loop: RecentlySeenLoop,
 }
 
-async fn download_msgs(context: &Context, imap: &mut Imap) -> Result<()> {
+async fn download_msgs(context: &Context, session: &mut Session) -> Result<()> {
     let msg_ids = context
         .sql
         .query_map(
@@ -344,8 +356,18 @@ async fn download_msgs(context: &Context, imap: &mut Imap) -> Result<()> {
         .await?;
 
     for msg_id in msg_ids {
-        if let Err(err) = download_msg(context, msg_id, imap).await {
+        if let Err(err) = download_msg(context, msg_id, session).await {
             warn!(context, "Failed to download message {msg_id}: {:#}.", err);
+
+            // Update download state to failure
+            // so it can be retried.
+            //
+            // On success update_download_state() is not needed
+            // as receive_imf() already
+            // set the state and emitted the event.
+            msg_id
+                .update_download_state(context, DownloadState::Failure)
+                .await?;
         }
         context
             .sql
@@ -377,76 +399,26 @@ async fn inbox_loop(
             return;
         };
 
+        let mut old_session: Option<Session> = None;
         loop {
-            {
-                // Update quota no more than once a minute.
-                let quota_needs_update = {
-                    let quota = ctx.quota.read().await;
-                    quota
-                        .as_ref()
-                        .filter(|quota| quota.modified + 60 > time())
-                        .is_none()
-                };
-
-                if quota_needs_update {
-                    if let Err(err) = ctx.update_recent_quota(&mut connection).await {
-                        warn!(ctx, "Failed to update quota: {:#}.", err);
+            let session = if let Some(session) = old_session.take() {
+                session
+            } else {
+                match connection.prepare(&ctx).await {
+                    Err(err) => {
+                        warn!(ctx, "Failed to prepare INBOX connection: {:#}.", err);
+                        continue;
                     }
-                }
-            }
-
-            let resync_requested = ctx.resync_request.swap(false, Ordering::Relaxed);
-            if resync_requested {
-                if let Err(err) = connection.resync_folders(&ctx).await {
-                    warn!(ctx, "Failed to resync folders: {:#}.", err);
-                    ctx.resync_request.store(true, Ordering::Relaxed);
-                }
-            }
-
-            maybe_add_time_based_warnings(&ctx).await;
-
-            match ctx.get_config_i64(Config::LastHousekeeping).await {
-                Ok(last_housekeeping_time) => {
-                    let next_housekeeping_time =
-                        last_housekeeping_time.saturating_add(60 * 60 * 24);
-                    if next_housekeeping_time <= time() {
-                        sql::housekeeping(&ctx).await.log_err(&ctx).ok();
-                    }
-                }
-                Err(err) => {
-                    warn!(ctx, "Failed to get last housekeeping time: {}", err);
+                    Ok(session) => session,
                 }
             };
 
-            match ctx.get_config_bool(Config::FetchedExistingMsgs).await {
-                Ok(fetched_existing_msgs) => {
-                    if !fetched_existing_msgs {
-                        // Consider it done even if we fail.
-                        //
-                        // This operation is not critical enough to retry,
-                        // especially if the error is persistent.
-                        if let Err(err) =
-                            ctx.set_config_bool(Config::FetchedExistingMsgs, true).await
-                        {
-                            warn!(ctx, "Can't set Config::FetchedExistingMsgs: {:#}", err);
-                        }
-
-                        if let Err(err) = connection.fetch_existing_msgs(&ctx).await {
-                            warn!(ctx, "Failed to fetch existing messages: {:#}", err);
-                            connection.trigger_reconnect(&ctx);
-                        }
-                    }
-                }
-                Err(err) => {
-                    warn!(ctx, "Can't get Config::FetchedExistingMsgs: {:#}", err);
+            match inbox_fetch_idle(&ctx, &mut connection, session).await {
+                Err(err) => warn!(ctx, "Failed fetch_idle: {err:#}"),
+                Ok(session) => {
+                    old_session = Some(session);
                 }
             }
-
-            if let Err(err) = download_msgs(&ctx, &mut connection).await {
-                warn!(ctx, "Failed to download messages: {:#}", err);
-            }
-
-            fetch_idle(&ctx, &mut connection, FolderMeaning::Inbox).await;
         }
     };
 
@@ -459,95 +431,168 @@ async fn inbox_loop(
         .await;
 }
 
-/// Implement a single iteration of IMAP loop.
-///
-/// This function performs all IMAP operations on a single folder, selecting it if necessary and
-/// handling all the errors. In case of an error, it is logged, but not propagated upwards. If
-/// critical operation fails such as fetching new messages fails, connection is reset via
-/// `trigger_reconnect`, so a fresh one can be opened.
-async fn fetch_idle(ctx: &Context, connection: &mut Imap, folder_meaning: FolderMeaning) {
+/// Convert folder meaning
+/// used internally by [fetch_idle] and [Context::background_fetch]
+pub async fn convert_folder_meaning(
+    ctx: &Context,
+    folder_meaning: FolderMeaning,
+) -> Result<(Config, String)> {
     let folder_config = match folder_meaning.to_config() {
         Some(c) => c,
         None => {
-            error!(ctx, "Bad folder meaning: {}", folder_meaning);
-            connection
-                .fake_idle(ctx, None, FolderMeaning::Unknown)
-                .await;
-            return;
+            bail!("Bad folder meaning: {}", folder_meaning);
         }
     };
+
     let folder = match ctx.get_config(folder_config).await {
         Ok(folder) => folder,
         Err(err) => {
-            warn!(
-                ctx,
-                "Can not watch {} folder, failed to retrieve config: {:#}", folder_config, err
+            bail!(
+                "Can not watch {} folder, failed to retrieve config: {:#}",
+                folder_config,
+                err
             );
-            connection
-                .fake_idle(ctx, None, FolderMeaning::Unknown)
-                .await;
-            return;
         }
     };
 
     let watch_folder = if let Some(watch_folder) = folder {
         watch_folder
     } else {
-        connection.connectivity.set_not_configured(ctx).await;
-        info!(ctx, "Can not watch {} folder, not set", folder_config);
-        connection
-            .fake_idle(ctx, None, FolderMeaning::Unknown)
-            .await;
-        return;
+        bail!("Can not watch {} folder, not set", folder_config);
     };
 
-    // connect and fake idle if unable to connect
-    if let Err(err) = connection
-        .prepare(ctx)
-        .await
-        .context("prepare IMAP connection")
-    {
-        warn!(ctx, "{:#}", err);
-        connection.trigger_reconnect(ctx);
-        connection
-            .fake_idle(ctx, Some(watch_folder), folder_meaning)
-            .await;
-        return;
-    }
+    Ok((folder_config, watch_folder))
+}
 
-    if folder_config == Config::ConfiguredInboxFolder {
-        if let Some(session) = connection.session.as_mut() {
-            session
-                .store_seen_flags_on_imap(ctx)
-                .await
-                .context("store_seen_flags_on_imap")
-                .log_err(ctx)
-                .ok();
-        } else {
-            warn!(ctx, "No session even though we just prepared it");
+async fn inbox_fetch_idle(ctx: &Context, imap: &mut Imap, mut session: Session) -> Result<Session> {
+    ctx.set_config_internal(
+        Config::IsChatmail,
+        crate::config::from_bool(session.is_chatmail()),
+    )
+    .await?;
+
+    // Update quota no more than once a minute.
+    if ctx.quota_needs_update(60).await {
+        if let Err(err) = ctx.update_recent_quota(&mut session).await {
+            warn!(ctx, "Failed to update quota: {:#}.", err);
         }
     }
 
-    // Fetch the watched folder.
-    if let Err(err) = connection
-        .fetch_move_delete(ctx, &watch_folder, folder_meaning)
-        .await
-        .context("fetch_move_delete")
-    {
-        connection.trigger_reconnect(ctx);
-        warn!(ctx, "{:#}", err);
-        return;
+    let resync_requested = ctx.resync_request.swap(false, Ordering::Relaxed);
+    if resync_requested {
+        if let Err(err) = session.resync_folders(ctx).await {
+            warn!(ctx, "Failed to resync folders: {:#}.", err);
+            ctx.resync_request.store(true, Ordering::Relaxed);
+        }
     }
 
-    // Mark expired messages for deletion. Marked messages will be deleted from the server
-    // on the next iteration of `fetch_move_delete`. `delete_expired_imap_messages` is not
-    // called right before `fetch_move_delete` because it is not well optimized and would
-    // otherwise slow down message fetching.
-    delete_expired_imap_messages(ctx)
+    maybe_add_time_based_warnings(ctx).await;
+
+    match ctx.get_config_i64(Config::LastHousekeeping).await {
+        Ok(last_housekeeping_time) => {
+            let next_housekeeping_time = last_housekeeping_time.saturating_add(60 * 60 * 24);
+            if next_housekeeping_time <= time() {
+                sql::housekeeping(ctx).await.log_err(ctx).ok();
+            }
+        }
+        Err(err) => {
+            warn!(ctx, "Failed to get last housekeeping time: {}", err);
+        }
+    };
+
+    match ctx.get_config_bool(Config::FetchedExistingMsgs).await {
+        Ok(fetched_existing_msgs) => {
+            if !fetched_existing_msgs {
+                // Consider it done even if we fail.
+                //
+                // This operation is not critical enough to retry,
+                // especially if the error is persistent.
+                if let Err(err) = ctx
+                    .set_config_internal(Config::FetchedExistingMsgs, config::from_bool(true))
+                    .await
+                {
+                    warn!(ctx, "Can't set Config::FetchedExistingMsgs: {:#}", err);
+                }
+
+                if let Err(err) = imap.fetch_existing_msgs(ctx, &mut session).await {
+                    warn!(ctx, "Failed to fetch existing messages: {:#}", err);
+                }
+            }
+        }
+        Err(err) => {
+            warn!(ctx, "Can't get Config::FetchedExistingMsgs: {:#}", err);
+        }
+    }
+
+    download_msgs(ctx, &mut session)
         .await
-        .context("delete_expired_imap_messages")
-        .log_err(ctx)
-        .ok();
+        .context("Failed to download messages")?;
+    session
+        .fetch_metadata(ctx)
+        .await
+        .context("Failed to fetch metadata")?;
+    session
+        .register_token(ctx)
+        .await
+        .context("Failed to register push token")?;
+
+    let session = fetch_idle(ctx, imap, session, FolderMeaning::Inbox).await?;
+    Ok(session)
+}
+
+/// Implement a single iteration of IMAP loop.
+///
+/// This function performs all IMAP operations on a single folder, selecting it if necessary and
+/// handling all the errors. In case of an error, an error is returned and connection is dropped,
+/// otherwise connection is returned.
+async fn fetch_idle(
+    ctx: &Context,
+    connection: &mut Imap,
+    mut session: Session,
+    folder_meaning: FolderMeaning,
+) -> Result<Session> {
+    let (folder_config, watch_folder) = match convert_folder_meaning(ctx, folder_meaning).await {
+        Ok(meaning) => meaning,
+        Err(err) => {
+            // Warning instead of error because the folder may not be configured.
+            // For example, this happens if the server does not have Sent folder
+            // but watching Sent folder is enabled.
+            warn!(ctx, "Error converting IMAP Folder name: {err:#}.");
+            connection.connectivity.set_not_configured(ctx).await;
+            connection.idle_interrupt_receiver.recv().await.ok();
+            return Err(err);
+        }
+    };
+
+    if folder_config == Config::ConfiguredInboxFolder {
+        session
+            .store_seen_flags_on_imap(ctx)
+            .await
+            .context("store_seen_flags_on_imap")?;
+    }
+
+    if !ctx.should_delete_to_trash().await?
+        || ctx
+            .get_config(Config::ConfiguredTrashFolder)
+            .await?
+            .is_some()
+    {
+        // Fetch the watched folder.
+        connection
+            .fetch_move_delete(ctx, &mut session, &watch_folder, folder_meaning)
+            .await
+            .context("fetch_move_delete")?;
+
+        // Mark expired messages for deletion. Marked messages will be deleted from the server
+        // on the next iteration of `fetch_move_delete`. `delete_expired_imap_messages` is not
+        // called right before `fetch_move_delete` because it is not well optimized and would
+        // otherwise slow down message fetching.
+        delete_expired_imap_messages(ctx)
+            .await
+            .context("delete_expired_imap_messages")?;
+    } else if folder_config == Config::ConfiguredInboxFolder {
+        ctx.last_full_folder_scan.lock().await.take();
+    }
 
     // Scan additional folders only after finishing fetching the watched folder.
     //
@@ -555,7 +600,11 @@ async fn fetch_idle(ctx: &Context, connection: &mut Imap, folder_meaning: Folder
     // be able to scan all folders before time is up if there are many of them.
     if folder_config == Config::ConfiguredInboxFolder {
         // Only scan on the Inbox thread in order to prevent parallel scans, which might lead to duplicate messages
-        match connection.scan_folders(ctx).await.context("scan_folders") {
+        match connection
+            .scan_folders(ctx, &mut session)
+            .await
+            .context("scan_folders")
+        {
             Err(err) => {
                 // Don't reconnect, if there is a problem with the connection we will realize this when IDLEing
                 // but maybe just one folder can't be selected or something
@@ -568,38 +617,26 @@ async fn fetch_idle(ctx: &Context, connection: &mut Imap, folder_meaning: Folder
                 // In most cases this will select the watched folder and return because there are
                 // no new messages. We want to select the watched folder anyway before going IDLE
                 // there, so this does not take additional protocol round-trip.
-                if let Err(err) = connection
-                    .fetch_move_delete(ctx, &watch_folder, folder_meaning)
+                connection
+                    .fetch_move_delete(ctx, &mut session, &watch_folder, folder_meaning)
                     .await
-                    .context("fetch_move_delete after scan_folders")
-                {
-                    connection.trigger_reconnect(ctx);
-                    warn!(ctx, "{:#}", err);
-                    return;
-                }
+                    .context("fetch_move_delete after scan_folders")?;
             }
             Ok(false) => {}
         }
     }
 
     // Synchronize Seen flags.
-    connection
+    session
         .sync_seen_flags(ctx, &watch_folder)
         .await
         .context("sync_seen_flags")
         .log_err(ctx)
         .ok();
 
-    connection.connectivity.set_connected(ctx).await;
+    connection.connectivity.set_idle(ctx).await;
 
     ctx.emit_event(EventType::ImapInboxIdle);
-    let Some(session) = connection.session.take() else {
-        warn!(ctx, "No IMAP session, going to fake idle.");
-        connection
-            .fake_idle(ctx, Some(watch_folder), folder_meaning)
-            .await;
-        return;
-    };
 
     if !session.can_idle() {
         info!(
@@ -607,9 +644,9 @@ async fn fetch_idle(ctx: &Context, connection: &mut Imap, folder_meaning: Folder
             "IMAP session does not support IDLE, going to fake idle."
         );
         connection
-            .fake_idle(ctx, Some(watch_folder), folder_meaning)
-            .await;
-        return;
+            .fake_idle(ctx, &mut session, watch_folder, folder_meaning)
+            .await?;
+        return Ok(session);
     }
 
     if ctx
@@ -621,29 +658,22 @@ async fn fetch_idle(ctx: &Context, connection: &mut Imap, folder_meaning: Folder
     {
         info!(ctx, "IMAP IDLE is disabled, going to fake idle.");
         connection
-            .fake_idle(ctx, Some(watch_folder), folder_meaning)
-            .await;
-        return;
+            .fake_idle(ctx, &mut session, watch_folder, folder_meaning)
+            .await?;
+        return Ok(session);
     }
 
     info!(ctx, "IMAP session supports IDLE, using it.");
-    match session
+    let session = session
         .idle(
             ctx,
             connection.idle_interrupt_receiver.clone(),
             &watch_folder,
         )
         .await
-        .context("idle")
-    {
-        Ok(session) => {
-            connection.session = Some(session);
-        }
-        Err(err) => {
-            connection.trigger_reconnect(ctx);
-            warn!(ctx, "{:#}", err);
-        }
-    }
+        .context("idle")?;
+
+    Ok(session)
 }
 
 async fn simple_imap_loop(
@@ -669,8 +699,29 @@ async fn simple_imap_loop(
             return;
         }
 
+        let mut old_session: Option<Session> = None;
         loop {
-            fetch_idle(&ctx, &mut connection, folder_meaning).await;
+            let session = if let Some(session) = old_session.take() {
+                session
+            } else {
+                match connection.prepare(&ctx).await {
+                    Err(err) => {
+                        warn!(
+                            ctx,
+                            "Failed to prepare {folder_meaning} connection: {err:#}."
+                        );
+                        continue;
+                    }
+                    Ok(session) => session,
+                }
+            };
+
+            match fetch_idle(&ctx, &mut connection, session, folder_meaning).await {
+                Err(err) => warn!(ctx, "Failed fetch_idle: {err:#}"),
+                Ok(session) => {
+                    old_session = Some(session);
+                }
+            }
         }
     };
 
@@ -690,7 +741,7 @@ async fn smtp_loop(
 ) {
     use futures::future::FutureExt;
 
-    info!(ctx, "starting smtp loop");
+    info!(ctx, "Starting SMTP loop.");
     let SmtpConnectionHandlers {
         mut connection,
         stop_receiver,
@@ -701,14 +752,14 @@ async fn smtp_loop(
     let fut = async move {
         let ctx = ctx1;
         if let Err(()) = started.send(()) {
-            warn!(&ctx, "smtp loop, missing started receiver");
+            warn!(&ctx, "SMTP loop, missing started receiver.");
             return;
         }
 
         let mut timeout = None;
         loop {
             if let Err(err) = send_smtp_messages(&ctx, &mut connection).await {
-                warn!(ctx, "send_smtp_messages failed: {:#}", err);
+                warn!(ctx, "send_smtp_messages failed: {:#}.", err);
                 timeout = Some(timeout.unwrap_or(30));
             } else {
                 timeout = None;
@@ -725,9 +776,9 @@ async fn smtp_loop(
             }
 
             // Fake Idle
-            info!(ctx, "smtp fake idle - started");
+            info!(ctx, "SMTP fake idle started.");
             match &connection.last_send_error {
-                None => connection.connectivity.set_connected(&ctx).await,
+                None => connection.connectivity.set_idle(&ctx).await,
                 Some(err) => connection.connectivity.set_err(&ctx, err).await,
             }
 
@@ -736,10 +787,10 @@ async fn smtp_loop(
             // again, we increase the timeout exponentially, in order not to do lots of
             // unnecessary retries.
             if let Some(t) = timeout {
-                let now = tokio::time::Instant::now();
+                let now = tools::Time::now();
                 info!(
                     ctx,
-                    "smtp has messages to retry, planning to retry {} seconds later", t,
+                    "SMTP has messages to retry, planning to retry {t} seconds later."
                 );
                 let duration = std::time::Duration::from_secs(t);
                 tokio::time::timeout(duration, async {
@@ -747,24 +798,24 @@ async fn smtp_loop(
                 })
                 .await
                 .unwrap_or_default();
-                let slept = (tokio::time::Instant::now() - now).as_secs();
+                let slept = time_elapsed(&now).as_secs();
                 timeout = Some(cmp::max(
                     t,
                     slept.saturating_add(rand::thread_rng().gen_range((slept / 2)..=slept)),
                 ));
             } else {
-                info!(ctx, "smtp has no messages to retry, waiting for interrupt");
+                info!(ctx, "SMTP has no messages to retry, waiting for interrupt.");
                 idle_interrupt_receiver.recv().await.unwrap_or_default();
             };
 
-            info!(ctx, "smtp fake idle - interrupted")
+            info!(ctx, "SMTP fake idle interrupted.")
         }
     };
 
     stop_receiver
         .recv()
         .map(|_| {
-            info!(ctx, "shutting down smtp loop");
+            info!(ctx, "Shutting down SMTP loop.");
         })
         .race(fut)
         .await;
@@ -772,7 +823,7 @@ async fn smtp_loop(
 
 impl Scheduler {
     /// Start the scheduler.
-    pub async fn start(ctx: Context) -> Result<Self> {
+    pub async fn start(ctx: &Context) -> Result<Self> {
         let (smtp, smtp_handlers) = SmtpConnectionState::new();
 
         let (smtp_start_send, smtp_start_recv) = oneshot::channel();
@@ -782,7 +833,7 @@ impl Scheduler {
         let mut oboxes = Vec::new();
         let mut start_recvs = Vec::new();
 
-        let (conn_state, inbox_handlers) = ImapConnectionState::new(&ctx).await?;
+        let (conn_state, inbox_handlers) = ImapConnectionState::new(ctx).await?;
         let (inbox_start_send, inbox_start_recv) = oneshot::channel();
         let handle = {
             let ctx = ctx.clone();
@@ -797,13 +848,10 @@ impl Scheduler {
 
         for (meaning, should_watch) in [
             (FolderMeaning::Mvbox, ctx.should_watch_mvbox().await),
-            (
-                FolderMeaning::Sent,
-                ctx.get_config_bool(Config::SentboxWatch).await,
-            ),
+            (FolderMeaning::Sent, ctx.should_watch_sentbox().await),
         ] {
             if should_watch? {
-                let (conn_state, handlers) = ImapConnectionState::new(&ctx).await?;
+                let (conn_state, handlers) = ImapConnectionState::new(ctx).await?;
                 let (start_send, start_recv) = oneshot::channel();
                 let ctx = ctx.clone();
                 let handle = task::spawn(simple_imap_loop(ctx, start_send, handlers, meaning));
@@ -881,6 +929,12 @@ impl Scheduler {
         self.inbox.conn_state.interrupt();
     }
 
+    fn interrupt_oboxes(&self) {
+        for b in &self.oboxes {
+            b.conn_state.interrupt();
+        }
+    }
+
     fn interrupt_smtp(&self) {
         self.smtp.interrupt();
     }
@@ -894,7 +948,7 @@ impl Scheduler {
     }
 
     fn interrupt_recently_seen(&self, contact_id: ContactId, timestamp: i64) {
-        self.recently_seen_loop.interrupt(contact_id, timestamp);
+        self.recently_seen_loop.try_interrupt(contact_id, timestamp);
     }
 
     /// Halt the scheduler.

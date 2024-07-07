@@ -1,10 +1,9 @@
+#![recursion_limit = "256"]
 #![warn(unused, clippy::all)]
 #![allow(
     non_camel_case_types,
     non_snake_case,
     non_upper_case_globals,
-    non_upper_case_globals,
-    non_camel_case_types,
     clippy::missing_safety_doc,
     clippy::expect_fun_call
 )]
@@ -26,16 +25,13 @@ use anyhow::Context as _;
 use deltachat::chat::{ChatId, ChatVisibility, MessageListOptions, MuteDuration, ProtectionStatus};
 use deltachat::constants::DC_MSG_ID_LAST_SPECIAL;
 use deltachat::contact::{Contact, ContactId, Origin};
-use deltachat::context::Context;
+use deltachat::context::{Context, ContextBuilder};
 use deltachat::ephemeral::Timer as EphemeralTimer;
 use deltachat::imex::BackupProvider;
 use deltachat::key::preconfigure_keypair;
 use deltachat::message::MsgId;
-use deltachat::net::read_url_blob;
 use deltachat::qr_code_generator::{generate_backup_qr, get_securejoin_qr_svg};
-use deltachat::reaction::{get_msg_reactions, send_reaction, Reactions};
 use deltachat::stock_str::StockMessage;
-use deltachat::stock_str::StockStrings;
 use deltachat::webxdc::StatusUpdateSerial;
 use deltachat::*;
 use deltachat::{accounts::Accounts, log::LogExt};
@@ -70,8 +66,6 @@ const DC_GCM_INFO_ONLY: u32 = 0x02;
 /// Struct representing the deltachat context.
 pub type dc_context_t = Context;
 
-pub type dc_reactions_t = Reactions;
-
 static RT: Lazy<Runtime> = Lazy::new(|| Runtime::new().expect("unable to create tokio runtime"));
 
 fn block_on<T>(fut: T) -> T::Output
@@ -105,12 +99,11 @@ pub unsafe extern "C" fn dc_context_new(
     let ctx = if blobdir.is_null() || *blobdir == 0 {
         // generate random ID as this functionality is not yet available on the C-api.
         let id = rand::thread_rng().gen();
-        block_on(Context::new(
-            as_path(dbfile),
-            id,
-            Events::new(),
-            StockStrings::new(),
-        ))
+        block_on(
+            ContextBuilder::new(as_path(dbfile).to_path_buf())
+                .with_id(id)
+                .open(),
+        )
     } else {
         eprintln!("blobdir can not be defined explicitly anymore");
         return ptr::null_mut();
@@ -134,12 +127,11 @@ pub unsafe extern "C" fn dc_context_new_closed(dbfile: *const libc::c_char) -> *
     }
 
     let id = rand::thread_rng().gen();
-    match block_on(Context::new_closed(
-        as_path(dbfile),
-        id,
-        Events::new(),
-        StockStrings::new(),
-    )) {
+    match block_on(
+        ContextBuilder::new(as_path(dbfile).to_path_buf())
+            .with_id(id)
+            .build(),
+    ) {
         Ok(context) => Box::into_raw(Box::new(context)),
         Err(err) => {
             eprintln!("failed to create context: {err:#}");
@@ -388,7 +380,7 @@ pub unsafe extern "C" fn dc_get_connectivity(context: *const dc_context_t) -> li
         return 0;
     }
     let ctx = &*context;
-    block_on(async move { ctx.get_connectivity().await as u32 as libc::c_int })
+    block_on(ctx.get_connectivity()) as u32 as libc::c_int
 }
 
 #[no_mangle]
@@ -409,6 +401,16 @@ pub unsafe extern "C" fn dc_get_connectivity_html(
             }
         }
     })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_get_push_state(context: *const dc_context_t) -> libc::c_int {
+    if context.is_null() {
+        eprintln!("ignoring careless call to dc_get_push_state()");
+        return 0;
+    }
+    let ctx = &*context;
+    block_on(ctx.push_state()) as libc::c_int
 }
 
 #[no_mangle]
@@ -557,8 +559,14 @@ pub unsafe extern "C" fn dc_event_get_id(event: *mut dc_event_t) -> libc::c_int 
         EventType::SecurejoinJoinerProgress { .. } => 2061,
         EventType::ConnectivityChanged => 2100,
         EventType::SelfavatarChanged => 2110,
+        EventType::ConfigSynced { .. } => 2111,
         EventType::WebxdcStatusUpdate { .. } => 2120,
         EventType::WebxdcInstanceDeleted { .. } => 2121,
+        EventType::WebxdcRealtimeData { .. } => 2150,
+        EventType::AccountsBackgroundFetchDone => 2200,
+        EventType::ChatlistChanged => 2300,
+        EventType::ChatlistItemChanged { .. } => 2301,
+        EventType::EventChannelOverflow { .. } => 2400,
     }
 }
 
@@ -584,8 +592,11 @@ pub unsafe extern "C" fn dc_event_get_data1_int(event: *mut dc_event_t) -> libc:
         | EventType::Error(_)
         | EventType::ConnectivityChanged
         | EventType::SelfavatarChanged
+        | EventType::ConfigSynced { .. }
         | EventType::IncomingMsgBunch { .. }
-        | EventType::ErrorSelfNotInGroup(_) => 0,
+        | EventType::ErrorSelfNotInGroup(_)
+        | EventType::AccountsBackgroundFetchDone => 0,
+        EventType::ChatlistChanged => 0,
         EventType::MsgsChanged { chat_id, .. }
         | EventType::ReactionsChanged { chat_id, .. }
         | EventType::IncomingMsg { chat_id, .. }
@@ -608,8 +619,13 @@ pub unsafe extern "C" fn dc_event_get_data1_int(event: *mut dc_event_t) -> libc:
         | EventType::SecurejoinJoinerProgress { contact_id, .. } => {
             contact_id.to_u32() as libc::c_int
         }
-        EventType::WebxdcStatusUpdate { msg_id, .. } => msg_id.to_u32() as libc::c_int,
-        EventType::WebxdcInstanceDeleted { msg_id, .. } => msg_id.to_u32() as libc::c_int,
+        EventType::WebxdcRealtimeData { msg_id, .. }
+        | EventType::WebxdcStatusUpdate { msg_id, .. }
+        | EventType::WebxdcInstanceDeleted { msg_id, .. } => msg_id.to_u32() as libc::c_int,
+        EventType::ChatlistItemChanged { chat_id } => {
+            chat_id.unwrap_or_default().to_u32() as libc::c_int
+        }
+        EventType::EventChannelOverflow { n } => *n as libc::c_int,
     }
 }
 
@@ -644,8 +660,13 @@ pub unsafe extern "C" fn dc_event_get_data2_int(event: *mut dc_event_t) -> libc:
         | EventType::ConnectivityChanged
         | EventType::WebxdcInstanceDeleted { .. }
         | EventType::IncomingMsgBunch { .. }
-        | EventType::SelfavatarChanged => 0,
-        EventType::ChatModified(_) => 0,
+        | EventType::SelfavatarChanged
+        | EventType::AccountsBackgroundFetchDone
+        | EventType::ChatlistChanged
+        | EventType::ChatlistItemChanged { .. }
+        | EventType::ConfigSynced { .. }
+        | EventType::ChatModified(_)
+        | EventType::EventChannelOverflow { .. } => 0,
         EventType::MsgsChanged { msg_id, .. }
         | EventType::ReactionsChanged { msg_id, .. }
         | EventType::IncomingMsg { msg_id, .. }
@@ -660,6 +681,7 @@ pub unsafe extern "C" fn dc_event_get_data2_int(event: *mut dc_event_t) -> libc:
             status_update_serial,
             ..
         } => status_update_serial.to_u32() as libc::c_int,
+        EventType::WebxdcRealtimeData { data, .. } => data.len() as libc::c_int,
     }
 }
 
@@ -706,7 +728,12 @@ pub unsafe extern "C" fn dc_event_get_data2_str(event: *mut dc_event_t) -> *mut 
         | EventType::SelfavatarChanged
         | EventType::WebxdcStatusUpdate { .. }
         | EventType::WebxdcInstanceDeleted { .. }
-        | EventType::ChatEphemeralTimerModified { .. } => ptr::null_mut(),
+        | EventType::AccountsBackgroundFetchDone
+        | EventType::ChatEphemeralTimerModified { .. }
+        | EventType::IncomingMsgBunch { .. }
+        | EventType::ChatlistItemChanged { .. }
+        | EventType::ChatlistChanged
+        | EventType::EventChannelOverflow { .. } => ptr::null_mut(),
         EventType::ConfigureProgress { comment, .. } => {
             if let Some(comment) = comment {
                 comment.to_c_string().unwrap_or_default().into_raw()
@@ -718,11 +745,15 @@ pub unsafe extern "C" fn dc_event_get_data2_str(event: *mut dc_event_t) -> *mut 
             let data2 = file.to_c_string().unwrap_or_default();
             data2.into_raw()
         }
-        EventType::IncomingMsgBunch { msg_ids } => serde_json::to_string(msg_ids)
-            .unwrap_or_default()
-            .to_c_string()
-            .unwrap_or_default()
-            .into_raw(),
+        EventType::ConfigSynced { key } => {
+            let data2 = key.to_string().to_c_string().unwrap_or_default();
+            data2.into_raw()
+        }
+        EventType::WebxdcRealtimeData { data, .. } => {
+            let ptr = libc::malloc(data.len());
+            libc::memcpy(ptr, data.as_ptr() as *mut libc::c_void, data.len());
+            ptr as *mut libc::c_char
+        }
     }
 }
 
@@ -1003,49 +1034,6 @@ pub unsafe extern "C" fn dc_send_videochat_invitation(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dc_send_reaction(
-    context: *mut dc_context_t,
-    msg_id: u32,
-    reaction: *const libc::c_char,
-) -> u32 {
-    if context.is_null() {
-        eprintln!("ignoring careless call to dc_send_reaction()");
-        return 0;
-    }
-    let ctx = &*context;
-
-    block_on(async move {
-        send_reaction(ctx, MsgId::new(msg_id), &to_string_lossy(reaction))
-            .await
-            .map(|msg_id| msg_id.to_u32())
-            .unwrap_or_log_default(ctx, "Failed to send reaction")
-    })
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn dc_get_msg_reactions(
-    context: *mut dc_context_t,
-    msg_id: u32,
-) -> *mut dc_reactions_t {
-    if context.is_null() {
-        eprintln!("ignoring careless call to dc_get_msg_reactions()");
-        return ptr::null_mut();
-    }
-    let ctx = &*context;
-
-    let reactions = if let Ok(reactions) = block_on(get_msg_reactions(ctx, MsgId::new(msg_id)))
-        .context("failed dc_get_msg_reactions() call")
-        .log_err(ctx)
-    {
-        reactions
-    } else {
-        return ptr::null_mut();
-    };
-
-    Box::into_raw(Box::new(reactions))
-}
-
-#[no_mangle]
 pub unsafe extern "C" fn dc_send_webxdc_status_update(
     context: *mut dc_context_t,
     msg_id: u32,
@@ -1086,6 +1074,43 @@ pub unsafe extern "C" fn dc_get_webxdc_status_updates(
     ))
     .unwrap_or_else(|_| "".to_string())
     .strdup()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_set_webxdc_integration(
+    context: *mut dc_context_t,
+    file: *const libc::c_char,
+) {
+    if context.is_null() || file.is_null() {
+        eprintln!("ignoring careless call to dc_set_webxdc_integration()");
+        return;
+    }
+    let ctx = &*context;
+    block_on(ctx.set_webxdc_integration(&to_string_lossy(file)))
+        .log_err(ctx)
+        .unwrap_or_default();
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_init_webxdc_integration(
+    context: *mut dc_context_t,
+    chat_id: u32,
+) -> u32 {
+    if context.is_null() {
+        eprintln!("ignoring careless call to dc_init_webxdc_integration()");
+        return 0;
+    }
+    let ctx = &*context;
+    let chat_id = if chat_id == 0 {
+        None
+    } else {
+        Some(ChatId::new(chat_id))
+    };
+
+    block_on(ctx.init_webxdc_integration(chat_id))
+        .log_err(ctx)
+        .map(|msg_id| msg_id.map(|id| id.to_u32()).unwrap_or_default())
+        .unwrap_or(0)
 }
 
 #[no_mangle]
@@ -2033,7 +2058,7 @@ pub unsafe extern "C" fn dc_get_msg(context: *mut dc_context_t, msg_id: u32) -> 
                     );
                     message::Message::default()
                 } else {
-                    error!(ctx, "dc_get_msg could not retrieve msg_id {msg_id}: {e:#}");
+                    warn!(ctx, "dc_get_msg could not retrieve msg_id {msg_id}: {e:#}");
                     return ptr::null_mut();
                 }
             }
@@ -3357,6 +3382,34 @@ pub unsafe extern "C" fn dc_msg_get_file(msg: *mut dc_msg_t) -> *mut libc::c_cha
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn dc_msg_save_file(
+    msg: *mut dc_msg_t,
+    path: *const libc::c_char,
+) -> libc::c_int {
+    if msg.is_null() || path.is_null() {
+        eprintln!("ignoring careless call to dc_msg_save_file()");
+        return 0;
+    }
+    let ffi_msg = &*msg;
+    let ctx = &*ffi_msg.context;
+    let path = to_string_lossy(path);
+    let r = block_on(
+        ffi_msg
+            .message
+            .save_file(ctx, &std::path::PathBuf::from(path)),
+    );
+    match r {
+        Ok(()) => 1,
+        Err(_) => {
+            r.context("Failed to save file from message")
+                .log_err(ctx)
+                .unwrap_or_default();
+            0
+        }
+    }
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn dc_msg_get_filename(msg: *mut dc_msg_t) -> *mut libc::c_char {
     if msg.is_null() {
         eprintln!("ignoring careless call to dc_msg_get_filename()");
@@ -4113,10 +4166,26 @@ pub unsafe extern "C" fn dc_contact_is_verified(contact: *mut dc_contact_t) -> l
     let ffi_contact = &*contact;
     let ctx = &*ffi_contact.context;
 
-    block_on(ffi_contact.contact.is_verified(ctx))
+    if block_on(ffi_contact.contact.is_verified(ctx))
         .context("is_verified failed")
         .log_err(ctx)
-        .unwrap_or_default() as libc::c_int
+        .unwrap_or_default()
+    {
+        // Return value is essentially a boolean,
+        // but we return 2 for true for backwards compatibility.
+        2
+    } else {
+        0
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_contact_is_bot(contact: *mut dc_contact_t) -> libc::c_int {
+    if contact.is_null() {
+        eprintln!("ignoring careless call to dc_contact_is_bot()");
+        return 0;
+    }
+    (*contact).contact.is_bot() as libc::c_int
 }
 
 #[no_mangle]
@@ -4213,45 +4282,6 @@ pub unsafe extern "C" fn dc_lot_get_timestamp(lot: *mut dc_lot_t) -> i64 {
 
     let lot = &*lot;
     lot.get_timestamp()
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn dc_reactions_get_contacts(
-    reactions: *mut dc_reactions_t,
-) -> *mut dc_array::dc_array_t {
-    if reactions.is_null() {
-        eprintln!("ignoring careless call to dc_reactions_get_contacts()");
-        return ptr::null_mut();
-    }
-
-    let reactions = &*reactions;
-    let array: dc_array_t = reactions.contacts().into();
-
-    Box::into_raw(Box::new(array))
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn dc_reactions_get_by_contact_id(
-    reactions: *mut dc_reactions_t,
-    contact_id: u32,
-) -> *mut libc::c_char {
-    if reactions.is_null() {
-        eprintln!("ignoring careless call to dc_reactions_get_by_contact_id()");
-        return ptr::null_mut();
-    }
-
-    let reactions = &*reactions;
-    reactions.get(ContactId::new(contact_id)).as_str().strdup()
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn dc_reactions_unref(reactions: *mut dc_reactions_t) {
-    if reactions.is_null() {
-        eprintln!("ignoring careless call to dc_reactions_unref()");
-        return;
-    }
-
-    drop(Box::from_raw(reactions));
 }
 
 #[no_mangle]
@@ -4454,19 +4484,6 @@ where
     }
 }
 
-trait ResultNullableExt<T> {
-    fn into_raw(self) -> *mut T;
-}
-
-impl<T, E> ResultNullableExt<T> for Result<T, E> {
-    fn into_raw(self) -> *mut T {
-        match self {
-            Ok(t) => Box::into_raw(Box::new(t)),
-            Err(_) => ptr::null_mut(),
-        }
-    }
-}
-
 fn convert_and_prune_message_ids(msg_ids: *const u32, msg_cnt: libc::c_int) -> Vec<MsgId> {
     let ids = unsafe { std::slice::from_raw_parts(msg_ids, msg_cnt as usize) };
     let msg_ids: Vec<MsgId> = ids
@@ -4588,96 +4605,6 @@ pub unsafe extern "C" fn dc_provider_unref(provider: *mut dc_provider_t) {
     }
     // currently, there is nothing to free, the provider info is a static object.
     // this may change once we start localizing string.
-}
-
-// dc_http_response_t
-
-pub type dc_http_response_t = net::HttpResponse;
-
-#[no_mangle]
-pub unsafe extern "C" fn dc_get_http_response(
-    context: *const dc_context_t,
-    url: *const libc::c_char,
-) -> *mut dc_http_response_t {
-    if context.is_null() || url.is_null() {
-        eprintln!("ignoring careless call to dc_get_http_response()");
-        return ptr::null_mut();
-    }
-
-    let context = &*context;
-    let url = to_string_lossy(url);
-    if let Ok(response) = block_on(read_url_blob(context, &url))
-        .context("read_url_blob")
-        .log_err(context)
-    {
-        Box::into_raw(Box::new(response))
-    } else {
-        ptr::null_mut()
-    }
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn dc_http_response_get_mimetype(
-    response: *const dc_http_response_t,
-) -> *mut libc::c_char {
-    if response.is_null() {
-        eprintln!("ignoring careless call to dc_http_response_get_mimetype()");
-        return ptr::null_mut();
-    }
-
-    let response = &*response;
-    response.mimetype.strdup()
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn dc_http_response_get_encoding(
-    response: *const dc_http_response_t,
-) -> *mut libc::c_char {
-    if response.is_null() {
-        eprintln!("ignoring careless call to dc_http_response_get_encoding()");
-        return ptr::null_mut();
-    }
-
-    let response = &*response;
-    response.encoding.strdup()
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn dc_http_response_get_blob(
-    response: *const dc_http_response_t,
-) -> *mut libc::c_char {
-    if response.is_null() {
-        eprintln!("ignoring careless call to dc_http_response_get_blob()");
-        return ptr::null_mut();
-    }
-
-    let response = &*response;
-    let blob_len = response.blob.len();
-    let ptr = libc::malloc(blob_len);
-    libc::memcpy(ptr, response.blob.as_ptr() as *mut libc::c_void, blob_len);
-    ptr as *mut libc::c_char
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn dc_http_response_get_size(
-    response: *const dc_http_response_t,
-) -> libc::size_t {
-    if response.is_null() {
-        eprintln!("ignoring careless call to dc_http_response_get_size()");
-        return 0;
-    }
-
-    let response = &*response;
-    response.blob.len()
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn dc_http_response_unref(response: *mut dc_http_response_t) {
-    if response.is_null() {
-        eprintln!("ignoring careless call to dc_http_response_unref()");
-        return;
-    }
-    drop(Box::from_raw(response));
 }
 
 // -- Accounts
@@ -4913,16 +4840,6 @@ pub unsafe extern "C" fn dc_accounts_get_all(accounts: *mut dc_accounts_t) -> *m
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dc_accounts_all_work_done(accounts: *mut dc_accounts_t) -> libc::c_int {
-    if accounts.is_null() {
-        eprintln!("ignoring careless call to dc_accounts_all_work_done()");
-        return 0;
-    }
-    let accounts = &*accounts;
-    block_on(async move { accounts.read().await.all_work_done().await as libc::c_int })
-}
-
-#[no_mangle]
 pub unsafe extern "C" fn dc_accounts_start_io(accounts: *mut dc_accounts_t) {
     if accounts.is_null() {
         eprintln!("ignoring careless call to dc_accounts_start_io()");
@@ -4967,6 +4884,49 @@ pub unsafe extern "C" fn dc_accounts_maybe_network_lost(accounts: *mut dc_accoun
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn dc_accounts_background_fetch(
+    accounts: *mut dc_accounts_t,
+    timeout_in_seconds: u64,
+) -> libc::c_int {
+    if accounts.is_null() || timeout_in_seconds <= 2 {
+        eprintln!("ignoring careless call to dc_accounts_background_fetch()");
+        return 0;
+    }
+
+    let accounts = &*accounts;
+    block_on(async move {
+        let accounts = accounts.read().await;
+        accounts
+            .background_fetch(Duration::from_secs(timeout_in_seconds))
+            .await;
+    });
+    1
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_accounts_set_push_device_token(
+    accounts: *mut dc_accounts_t,
+    token: *const libc::c_char,
+) {
+    if accounts.is_null() {
+        eprintln!("ignoring careless call to dc_accounts_set_push_device_token()");
+        return;
+    }
+
+    let accounts = &*accounts;
+    let token = to_string_lossy(token);
+
+    block_on(async move {
+        let mut accounts = accounts.write().await;
+        if let Err(err) = accounts.set_push_device_token(&token).await {
+            accounts.emit_event(EventType::Error(format!(
+                "Failed to set notify token: {err:#}."
+            )));
+        }
+    })
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn dc_accounts_get_event_emitter(
     accounts: *mut dc_accounts_t,
 ) -> *mut dc_event_emitter_t {
@@ -5003,7 +4963,9 @@ mod jsonrpc {
         }
 
         let account_manager = &*account_manager;
-        let cmd_api = deltachat_jsonrpc::api::CommandApi::from_arc(account_manager.inner.clone());
+        let cmd_api = block_on(deltachat_jsonrpc::api::CommandApi::from_arc(
+            account_manager.inner.clone(),
+        ));
 
         let (request_handle, receiver) = RpcClient::new();
         let handle = RpcSession::new(request_handle, cmd_api);

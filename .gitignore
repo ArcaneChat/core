@@ -33,7 +33,7 @@ deltachat-ffi/xml
 
 coverage/
 .DS_Store
-.vscode/launch.json
+.vscode
 python/accounts.txt
 python/all-testaccounts.txt
 tmp/
@@ -44,3 +44,10 @@ node/build/
 node/dist/
 node/prebuilds/
 node/.nyc_output/
+
+# Nix symlink.
+result
+
+# direnv
+.envrc
+.direnv

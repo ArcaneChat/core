@@ -182,6 +182,12 @@ class FFIEventTracker:
                 print(f"** SECUREJOINT-INVITER PROGRESS {target}", self.account)
                 break
 
+    def wait_securejoin_joiner_progress(self, target):
+        while True:
+            event = self.get_matching("DC_EVENT_SECUREJOIN_JOINER_PROGRESS")
+            if event.data2 >= target:
+                break
+
     def wait_idle_inbox_ready(self):
         """Has to be called after start_io() to wait for fetch_existing_msgs to run
         so that new messages are not mistaken for old ones:
@@ -322,10 +328,12 @@ class EventThread(threading.Thread):
         elif name == "DC_EVENT_REACTIONS_CHANGED":
             assert ffi_event.data1 > 0
             msg = account.get_message_by_id(ffi_event.data2)
-            yield "ac_reactions_changed", {"message": msg}
+            if msg is not None:
+                yield "ac_reactions_changed", {"message": msg}
         elif name == "DC_EVENT_MSG_DELIVERED":
             msg = account.get_message_by_id(ffi_event.data2)
-            yield "ac_message_delivered", {"message": msg}
+            if msg is not None:
+                yield "ac_message_delivered", {"message": msg}
         elif name == "DC_EVENT_CHAT_MODIFIED":
             chat = account.get_chat_by_id(ffi_event.data1)
             yield "ac_chat_modified", {"chat": chat}

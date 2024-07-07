@@ -83,16 +83,13 @@ pub enum StockMessage {
     #[strum(props(fallback = "Return receipt"))]
     ReadRcpt = 31,
 
-    #[strum(props(fallback = "This is a return receipt for the message \"%1$s\"."))]
-    ReadRcptMailBody = 32,
-
     #[strum(props(fallback = "End-to-end encryption preferred"))]
     E2ePreferred = 34,
 
     #[strum(props(fallback = "%1$s verified."))]
     ContactVerified = 35,
 
-    #[strum(props(fallback = "Cannot verify %1$s"))]
+    #[strum(props(fallback = "Cannot establish guaranteed end-to-end encryption with %1$s"))]
     ContactNotVerified = 36,
 
     #[strum(props(fallback = "Changed setup for %1$s"))]
@@ -419,6 +416,33 @@ pub enum StockMessage {
 
     #[strum(props(fallback = "Member %1$s added."))]
     MsgAddMember = 173,
+
+    #[strum(props(
+        fallback = "⚠️ Your email provider %1$s requires end-to-end encryption which is not setup yet."
+    ))]
+    InvalidUnencryptedMail = 174,
+
+    #[strum(props(
+        fallback = "⚠️ It seems you are using Delta Chat on multiple devices that cannot decrypt each other's outgoing messages. To fix this, on the older device use \"Settings / Add Second Device\" and follow the instructions."
+    ))]
+    CantDecryptOutgoingMsgs = 175,
+
+    #[strum(props(fallback = "You reacted %1$s to \"%2$s\""))]
+    MsgYouReacted = 176,
+
+    #[strum(props(fallback = "%1$s reacted %2$s to \"%3$s\""))]
+    MsgReactedBy = 177,
+
+    #[strum(props(fallback = "Establishing guaranteed end-to-end encryption, please wait…"))]
+    SecurejoinWait = 190,
+
+    #[strum(props(
+        fallback = "Could not yet establish guaranteed end-to-end encryption, but you may already send a message."
+    ))]
+    SecurejoinWaitTimeout = 191,
+
+    #[strum(props(fallback = "This message is a receipt notification."))]
+    ReadRcptMailBody = 192,
 }
 
 impl StockMessage {
@@ -720,14 +744,30 @@ pub(crate) async fn msg_group_left_local(context: &Context, by_contact: ContactI
     }
 }
 
+/// Stock string: `You reacted %1$s to "%2$s"` or `%1$s reacted %2$s to "%3$s"`.
+pub(crate) async fn msg_reacted(
+    context: &Context,
+    by_contact: ContactId,
+    reaction: &str,
+    summary: &str,
+) -> String {
+    if by_contact == ContactId::SELF {
+        translated(context, StockMessage::MsgYouReacted)
+            .await
+            .replace1(reaction)
+            .replace2(summary)
+    } else {
+        translated(context, StockMessage::MsgReactedBy)
+            .await
+            .replace1(&by_contact.get_stock_name(context).await)
+            .replace2(reaction)
+            .replace3(summary)
+    }
+}
+
 /// Stock string: `GIF`.
 pub(crate) async fn gif(context: &Context) -> String {
     translated(context, StockMessage::Gif).await
-}
-
-/// Stock string: `Encrypted message`.
-pub(crate) async fn encrypted_msg(context: &Context) -> String {
-    translated(context, StockMessage::EncryptedMsg).await
 }
 
 /// Stock string: `End-to-end encryption available.`.
@@ -745,6 +785,11 @@ pub(crate) async fn cant_decrypt_msg_body(context: &Context) -> String {
     translated(context, StockMessage::CantDecryptMsgBody).await
 }
 
+/// Stock string:`Got outgoing message(s) encrypted for another setup...`.
+pub(crate) async fn cant_decrypt_outgoing_msgs(context: &Context) -> String {
+    translated(context, StockMessage::CantDecryptOutgoingMsgs).await
+}
+
 /// Stock string: `Fingerprints`.
 pub(crate) async fn finger_prints(context: &Context) -> String {
     translated(context, StockMessage::FingerPrints).await
@@ -755,11 +800,9 @@ pub(crate) async fn read_rcpt(context: &Context) -> String {
     translated(context, StockMessage::ReadRcpt).await
 }
 
-/// Stock string: `This is a return receipt for the message "%1$s".`.
-pub(crate) async fn read_rcpt_mail_body(context: &Context, message: &str) -> String {
-    translated(context, StockMessage::ReadRcptMailBody)
-        .await
-        .replace1(message)
+/// Stock string: `This message is a receipt notification.`.
+pub(crate) async fn read_rcpt_mail_body(context: &Context) -> String {
+    translated(context, StockMessage::ReadRcptMailBody).await
 }
 
 /// Stock string: `Group image deleted.`.
@@ -800,6 +843,16 @@ pub(crate) async fn secure_join_replies(context: &Context, contact_id: ContactId
         .replace1(&contact_id.get_stock_name(context).await)
 }
 
+/// Stock string: `Establishing guaranteed end-to-end encryption, please wait…`.
+pub(crate) async fn securejoin_wait(context: &Context) -> String {
+    translated(context, StockMessage::SecurejoinWait).await
+}
+
+/// Stock string: `Could not yet establish guaranteed end-to-end encryption, but you may already send a message.`.
+pub(crate) async fn securejoin_wait_timeout(context: &Context) -> String {
+    translated(context, StockMessage::SecurejoinWaitTimeout).await
+}
+
 /// Stock string: `Scan to chat with %1$s`.
 pub(crate) async fn setup_contact_qr_description(
     context: &Context,
@@ -832,7 +885,7 @@ pub(crate) async fn contact_verified(context: &Context, contact: &Contact) -> St
         .replace1(addr)
 }
 
-/// Stock string: `Cannot verify %1$s`.
+/// Stock string: `Cannot establish guaranteed end-to-end encryption with %1$s`.
 pub(crate) async fn contact_not_verified(context: &Context, contact: &Contact) -> String {
     let addr = &contact.get_name_n_addr();
     translated(context, StockMessage::ContactNotVerified)
@@ -1285,6 +1338,13 @@ pub(crate) async fn aeap_addr_changed(
         .replace3(new_addr)
 }
 
+/// Stock string: `⚠️ Your email provider %1$s requires end-to-end encryption which is not setup yet. Tap to learn more.`.
+pub(crate) async fn unencrypted_email(context: &Context, provider: &str) -> String {
+    translated(context, StockMessage::InvalidUnencryptedMail)
+        .await
+        .replace1(provider)
+}
+
 pub(crate) async fn aeap_explanation_and_link(
     context: &Context,
     old_addr: &str,
@@ -1399,7 +1459,6 @@ mod tests {
 
     use super::*;
     use crate::chat::delete_and_reset_all_device_msgs;
-    use crate::chat::Chat;
     use crate::chatlist::Chatlist;
     use crate::test_utils::TestContext;
 

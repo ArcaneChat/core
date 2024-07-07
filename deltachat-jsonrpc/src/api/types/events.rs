@@ -28,55 +28,37 @@ pub enum EventType {
     ///
     /// This event should *not* be reported to the end-user using a popup or something like
     /// that.
-    Info {
-        msg: String,
-    },
+    Info { msg: String },
 
     /// Emitted when SMTP connection is established and login was successful.
-    SmtpConnected {
-        msg: String,
-    },
+    SmtpConnected { msg: String },
 
     /// Emitted when IMAP connection is established and login was successful.
-    ImapConnected {
-        msg: String,
-    },
+    ImapConnected { msg: String },
 
     /// Emitted when a message was successfully sent to the SMTP server.
-    SmtpMessageSent {
-        msg: String,
-    },
+    SmtpMessageSent { msg: String },
 
     /// Emitted when an IMAP message has been marked as deleted
-    ImapMessageDeleted {
-        msg: String,
-    },
+    ImapMessageDeleted { msg: String },
 
     /// Emitted when an IMAP message has been moved
-    ImapMessageMoved {
-        msg: String,
-    },
+    ImapMessageMoved { msg: String },
 
     /// Emitted before going into IDLE on the Inbox folder.
     ImapInboxIdle,
 
     /// Emitted when an new file in the $BLOBDIR was created
-    NewBlobFile {
-        file: String,
-    },
+    NewBlobFile { file: String },
 
     /// Emitted when an file in the $BLOBDIR was deleted
-    DeletedBlobFile {
-        file: String,
-    },
+    DeletedBlobFile { file: String },
 
     /// The library-user should write a warning string to the log.
     ///
     /// This event should *not* be reported to the end-user using a popup or something like
     /// that.
-    Warning {
-        msg: String,
-    },
+    Warning { msg: String },
 
     /// The library-user should report an error to the end-user.
     ///
@@ -88,18 +70,14 @@ pub enum EventType {
     /// it might be better to delay showing these events until the function has really
     /// failed (returned false). It should be sufficient to report only the *last* error
     /// in a messasge box then.
-    Error {
-        msg: String,
-    },
+    Error { msg: String },
 
     /// An action cannot be performed because the user is not in the group.
     /// Reported eg. after a call to
     /// setChatName(), setChatProfileImage(),
     /// addContactToChat(), removeContactFromChat(),
     /// and messages sending functions.
-    ErrorSelfNotInGroup {
-        msg: String,
-    },
+    ErrorSelfNotInGroup { msg: String },
 
     /// Messages or chats changed.  One or more messages or chats changed for various
     /// reasons in the database:
@@ -110,10 +88,7 @@ pub enum EventType {
     /// `chatId` is set if only a single chat is affected by the changes, otherwise 0.
     /// `msgId` is set if only a single message is affected by the changes, otherwise 0.
     #[serde(rename_all = "camelCase")]
-    MsgsChanged {
-        chat_id: u32,
-        msg_id: u32,
-    },
+    MsgsChanged { chat_id: u32, msg_id: u32 },
 
     /// Reactions for the message changed.
     #[serde(rename_all = "camelCase")]
@@ -126,60 +101,39 @@ pub enum EventType {
     /// There is a fresh message. Typically, the user will show an notification
     /// when receiving this message.
     ///
-    /// There is no extra #DC_EVENT_MSGS_CHANGED event send together with this event.
+    /// There is no extra #DC_EVENT_MSGS_CHANGED event sent together with this event.
     #[serde(rename_all = "camelCase")]
-    IncomingMsg {
-        chat_id: u32,
-        msg_id: u32,
-    },
+    IncomingMsg { chat_id: u32, msg_id: u32 },
 
-    /// Downloading a bunch of messages just finished. This is an experimental
+    /// Downloading a bunch of messages just finished. This is an
     /// event to allow the UI to only show one notification per message bunch,
     /// instead of cluttering the user with many notifications.
-    ///
-    /// msg_ids contains the message ids.
     #[serde(rename_all = "camelCase")]
-    IncomingMsgBunch {
-        msg_ids: Vec<u32>,
-    },
+    IncomingMsgBunch,
 
     /// Messages were seen or noticed.
     /// chat id is always set.
     #[serde(rename_all = "camelCase")]
-    MsgsNoticed {
-        chat_id: u32,
-    },
+    MsgsNoticed { chat_id: u32 },
 
     /// A single message is sent successfully. State changed from  DC_STATE_OUT_PENDING to
     /// DC_STATE_OUT_DELIVERED, see `Message.state`.
     #[serde(rename_all = "camelCase")]
-    MsgDelivered {
-        chat_id: u32,
-        msg_id: u32,
-    },
+    MsgDelivered { chat_id: u32, msg_id: u32 },
 
     /// A single message could not be sent. State changed from DC_STATE_OUT_PENDING or DC_STATE_OUT_DELIVERED to
     /// DC_STATE_OUT_FAILED, see `Message.state`.
     #[serde(rename_all = "camelCase")]
-    MsgFailed {
-        chat_id: u32,
-        msg_id: u32,
-    },
+    MsgFailed { chat_id: u32, msg_id: u32 },
 
     /// A single message is read by the receiver. State changed from DC_STATE_OUT_DELIVERED to
     /// DC_STATE_OUT_MDN_RCVD, see `Message.state`.
     #[serde(rename_all = "camelCase")]
-    MsgRead {
-        chat_id: u32,
-        msg_id: u32,
-    },
+    MsgRead { chat_id: u32, msg_id: u32 },
 
     /// A single message is deleted.
     #[serde(rename_all = "camelCase")]
-    MsgDeleted {
-        chat_id: u32,
-        msg_id: u32,
-    },
+    MsgDeleted { chat_id: u32, msg_id: u32 },
 
     /// Chat changed.  The name or the image of a chat group was changed or members were added or removed.
     /// Or the verify state of a chat has changed.
@@ -189,24 +143,17 @@ pub enum EventType {
     /// This event does not include ephemeral timer modification, which
     /// is a separate event.
     #[serde(rename_all = "camelCase")]
-    ChatModified {
-        chat_id: u32,
-    },
+    ChatModified { chat_id: u32 },
 
     /// Chat ephemeral timer changed.
     #[serde(rename_all = "camelCase")]
-    ChatEphemeralTimerModified {
-        chat_id: u32,
-        timer: u32,
-    },
+    ChatEphemeralTimerModified { chat_id: u32, timer: u32 },
 
     /// Contact(s) created, renamed, blocked or deleted.
     ///
     /// @param data1 (int) If set, this is the contact_id of an added contact that should be selected.
     #[serde(rename_all = "camelCase")]
-    ContactsChanged {
-        contact_id: Option<u32>,
-    },
+    ContactsChanged { contact_id: Option<u32> },
 
     /// Location of one or more contact has changed.
     ///
@@ -214,9 +161,7 @@ pub enum EventType {
     ///     If the locations of several contacts have been changed,
     ///     this parameter is set to `None`.
     #[serde(rename_all = "camelCase")]
-    LocationChanged {
-        contact_id: Option<u32>,
-    },
+    LocationChanged { contact_id: Option<u32> },
 
     /// Inform about the configuration progress started by configure().
     ConfigureProgress {
@@ -234,9 +179,7 @@ pub enum EventType {
     /// @param data1 (usize) 0=error, 1-999=progress in permille, 1000=success and done
     /// @param data2 0
     #[serde(rename_all = "camelCase")]
-    ImexProgress {
-        progress: usize,
-    },
+    ImexProgress { progress: usize },
 
     /// A file has been exported. A file has been written by imex().
     /// This event may be sent multiple times by a single call to imex().
@@ -246,9 +189,7 @@ pub enum EventType {
     ///
     /// @param data2 0
     #[serde(rename_all = "camelCase")]
-    ImexFileWritten {
-        path: String,
-    },
+    ImexFileWritten { path: String },
 
     /// Progress information of a secure-join handshake from the view of the inviter
     /// (Alice, the person who shows the QR code).
@@ -263,10 +204,7 @@ pub enum EventType {
     ///     800=vg-member-added-received received, shown as "bob@addr securely joined GROUP", only sent for the verified-group-protocol.
     ///     1000=Protocol finished for this contact.
     #[serde(rename_all = "camelCase")]
-    SecurejoinInviterProgress {
-        contact_id: u32,
-        progress: usize,
-    },
+    SecurejoinInviterProgress { contact_id: u32, progress: usize },
 
     /// Progress information of a secure-join handshake from the view of the joiner
     /// (Bob, the person who scans the QR code).
@@ -277,10 +215,7 @@ pub enum EventType {
     ///     400=vg-/vc-request-with-auth sent, typically shown as "alice@addr verified, introducing myself."
     ///     (Bob has verified alice and waits until Alice does the same for him)
     #[serde(rename_all = "camelCase")]
-    SecurejoinJoinerProgress {
-        contact_id: u32,
-        progress: usize,
-    },
+    SecurejoinJoinerProgress { contact_id: u32, progress: usize },
 
     /// The connectivity to the server changed.
     /// This means that you should refresh the connectivity view
@@ -288,7 +223,16 @@ pub enum EventType {
     /// getConnectivityHtml() for details.
     ConnectivityChanged,
 
+    /// Deprecated by `ConfigSynced`.
     SelfavatarChanged,
+
+    /// A multi-device synced config value changed. Maybe the app needs to refresh smth. For
+    /// uniformity this is emitted on the source device too. The value isn't here, otherwise it
+    /// would be logged which might not be good for privacy.
+    ConfigSynced {
+        /// Configuration key.
+        key: String,
+    },
 
     #[serde(rename_all = "camelCase")]
     WebxdcStatusUpdate {
@@ -296,11 +240,32 @@ pub enum EventType {
         status_update_serial: u32,
     },
 
+    /// Data received over an ephemeral peer channel.
+    #[serde(rename_all = "camelCase")]
+    WebxdcRealtimeData { msg_id: u32, data: Vec<u8> },
+
     /// Inform that a message containing a webxdc instance has been deleted
     #[serde(rename_all = "camelCase")]
-    WebxdcInstanceDeleted {
-        msg_id: u32,
-    },
+    WebxdcInstanceDeleted { msg_id: u32 },
+
+    /// Tells that the Background fetch was completed (or timed out).
+    /// This event acts as a marker, when you reach this event you can be sure
+    /// that all events emitted during the background fetch were processed.
+    ///
+    /// This event is only emitted by the account manager
+    AccountsBackgroundFetchDone,
+    /// Inform that set of chats or the order of the chats in the chatlist has changed.
+    ///
+    /// Sometimes this is emitted together with `UIChatlistItemChanged`.
+    ChatlistChanged,
+
+    /// Inform that a single chat list item changed and needs to be rerendered.
+    /// If `chat_id` is set to None, then all currently visible chats need to be rerendered, and all not-visible items need to be cleared from cache if the UI has a cache.
+    #[serde(rename_all = "camelCase")]
+    ChatlistItemChanged { chat_id: Option<u32> },
+
+    /// Inform than some events have been skipped due to event channel overflow.
+    EventChannelOverflow { n: u64 },
 }
 
 impl From<CoreEventType> for EventType {
@@ -336,9 +301,7 @@ impl From<CoreEventType> for EventType {
                 chat_id: chat_id.to_u32(),
                 msg_id: msg_id.to_u32(),
             },
-            CoreEventType::IncomingMsgBunch { msg_ids } => IncomingMsgBunch {
-                msg_ids: msg_ids.into_iter().map(|id| id.to_u32()).collect(),
-            },
+            CoreEventType::IncomingMsgBunch => IncomingMsgBunch,
             CoreEventType::MsgsNoticed(chat_id) => MsgsNoticed {
                 chat_id: chat_id.to_u32(),
             },
@@ -396,6 +359,9 @@ impl From<CoreEventType> for EventType {
             },
             CoreEventType::ConnectivityChanged => ConnectivityChanged,
             CoreEventType::SelfavatarChanged => SelfavatarChanged,
+            CoreEventType::ConfigSynced { key } => ConfigSynced {
+                key: key.to_string(),
+            },
             CoreEventType::WebxdcStatusUpdate {
                 msg_id,
                 status_update_serial,
@@ -403,9 +369,19 @@ impl From<CoreEventType> for EventType {
                 msg_id: msg_id.to_u32(),
                 status_update_serial: status_update_serial.to_u32(),
             },
+            CoreEventType::WebxdcRealtimeData { msg_id, data } => WebxdcRealtimeData {
+                msg_id: msg_id.to_u32(),
+                data,
+            },
             CoreEventType::WebxdcInstanceDeleted { msg_id } => WebxdcInstanceDeleted {
                 msg_id: msg_id.to_u32(),
             },
+            CoreEventType::AccountsBackgroundFetchDone => AccountsBackgroundFetchDone,
+            CoreEventType::ChatlistItemChanged { chat_id } => ChatlistItemChanged {
+                chat_id: chat_id.map(|id| id.to_u32()),
+            },
+            CoreEventType::ChatlistChanged => ChatlistChanged,
+            CoreEventType::EventChannelOverflow { n } => EventChannelOverflow { n },
         }
     }
 }

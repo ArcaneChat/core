@@ -5,6 +5,7 @@
 //! - `id` - status update serial number
 //! - `msg_id` - ID of the message in the `msgs` table
 //! - `update_item` - JSON representation of the status update
+//! - `uid` - "id" field of the update, used for deduplication
 //!
 //! Status updates are scheduled for sending by adding a record
 //! to `smtp_status_updates_table` SQL table.
@@ -14,14 +15,17 @@
 //! - `last_serial` - serial number of the last status update to send
 //! - `descr` - text to send along with the updates
 
-use std::convert::TryFrom;
+mod integration;
+mod maps_integration;
+
 use std::path::Path;
 
 use anyhow::{anyhow, bail, ensure, format_err, Context as _, Result};
 
+use deltachat_contact_tools::sanitize_bidi_characters;
 use deltachat_derive::FromSql;
-use lettre_email::mime;
 use lettre_email::PartBuilder;
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::AsyncReadExt;
@@ -30,14 +34,13 @@ use crate::chat::{self, Chat};
 use crate::constants::Chattype;
 use crate::contact::ContactId;
 use crate::context::Context;
-use crate::download::DownloadState;
 use crate::events::EventType;
 use crate::message::{Message, MessageState, MsgId, Viewtype};
 use crate::mimefactory::wrapped_base64_encode;
 use crate::mimeparser::SystemMessage;
 use crate::param::Param;
 use crate::param::Params;
-use crate::tools::strip_rtlo_characters;
+use crate::tools::create_id;
 use crate::tools::{create_smeared_timestamp, get_abs_path};
 
 /// The current API version.
@@ -49,23 +52,6 @@ const WEBXDC_API_VERSION: u32 = 1;
 /// Suffix used to recognize webxdc files.
 pub const WEBXDC_SUFFIX: &str = "xdc";
 const WEBXDC_DEFAULT_ICON: &str = "__webxdc__/default-icon.png";
-
-/// Defines the maximal size in bytes of an .xdc file that can be sent.
-///
-/// We introduce a limit to force developer to create small .xdc
-/// to save user's traffic and disk space for a better ux.
-///
-/// The 100K limit should also let .xdc pass worse-quality auto-download filters
-/// which are usually 160K incl. base64 overhead.
-///
-/// The limit is also an experiment to see how small we can go;
-/// it is planned to raise that limit as needed in subsequent versions.
-const WEBXDC_SENDING_LIMIT: u64 = 655360;
-
-/// Be more tolerant for .xdc sizes on receiving -
-/// might be, the senders version uses already a larger limit
-/// and not showing the .xdc on some devices would be even worse ux.
-const WEBXDC_RECEIVING_LIMIT: u64 = 4194304;
 
 /// Raw information read from manifest.toml
 #[derive(Debug, Deserialize, Default)]
@@ -178,6 +164,13 @@ pub struct StatusUpdateItem {
     /// for a voting app.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+
+    /// Unique ID for deduplication.
+    /// This can be used if the message is sent over multiple transports.
+    ///
+    /// If there is no ID, message is always considered to be unique.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uid: Option<String>,
 }
 
 /// Update items as passed to the UIs.
@@ -210,14 +203,6 @@ impl Context {
             return Ok(false);
         }
 
-        if file.len() as u64 > WEBXDC_RECEIVING_LIMIT {
-            info!(
-                self,
-                "{} exceeds receiving limit of {} bytes", &filename, WEBXDC_RECEIVING_LIMIT
-            );
-            return Ok(false);
-        }
-
         let archive = match async_zip::read::mem::ZipFileReader::new(file.to_vec()).await {
             Ok(archive) => archive,
             Err(_) => {
@@ -234,21 +219,11 @@ impl Context {
         Ok(true)
     }
 
-    /// ensure that a file is an acceptable webxdc for sending
-    /// (sending has more strict size limits).
+    /// Ensure that a file is an acceptable webxdc for sending.
     pub(crate) async fn ensure_sendable_webxdc_file(&self, path: &Path) -> Result<()> {
         let filename = path.to_str().unwrap_or_default();
         if !filename.ends_with(WEBXDC_SUFFIX) {
             bail!("{} is not a valid webxdc file", filename);
-        }
-
-        let size = tokio::fs::metadata(path).await?.len();
-        if size > WEBXDC_SENDING_LIMIT {
-            bail!(
-                "webxdc {} exceeds acceptable size of {} bytes",
-                path.to_str().unwrap_or_default(),
-                WEBXDC_SENDING_LIMIT
-            );
         }
 
         let valid = match async_zip::read::fs::ZipFileReader::new(path).await {
@@ -312,12 +287,19 @@ impl Context {
     /// writes it to the database and handles events, info-messages, document name and summary.
     async fn create_status_update_record(
         &self,
-        instance: &mut Message,
+        instance: &Message,
         status_update_item: StatusUpdateItem,
         timestamp: i64,
         can_info_msg: bool,
         from_id: ContactId,
-    ) -> Result<StatusUpdateSerial> {
+    ) -> Result<Option<StatusUpdateSerial>> {
+        let Some(status_update_serial) = self
+            .write_status_update_inner(&instance.id, &status_update_item, timestamp)
+            .await?
+        else {
+            return Ok(None);
+        };
+
         if can_info_msg {
             if let Some(ref info) = status_update_item.info {
                 if let Some(info_msg_id) =
@@ -349,6 +331,7 @@ impl Context {
 
         let mut param_changed = false;
 
+        let mut instance = instance.clone();
         if let Some(ref document) = status_update_item.document {
             if instance
                 .param
@@ -366,7 +349,7 @@ impl Context {
             {
                 instance
                     .param
-                    .set(Param::WebxdcSummary, strip_rtlo_characters(summary));
+                    .set(Param::WebxdcSummary, sanitize_bidi_characters(summary));
                 param_changed = true;
             }
         }
@@ -376,10 +359,6 @@ impl Context {
             self.emit_msgs_changed(instance.chat_id, instance.id);
         }
 
-        let status_update_serial = self
-            .write_status_update_inner(&instance.id, status_update_item)
-            .await?;
-
         if instance.viewtype == Viewtype::Webxdc {
             self.emit_event(EventType::WebxdcStatusUpdate {
                 msg_id: instance.id,
@@ -387,23 +366,46 @@ impl Context {
             });
         }
 
-        Ok(status_update_serial)
+        Ok(Some(status_update_serial))
     }
 
+    /// Inserts a status update item into `msgs_status_updates` table.
+    ///
+    /// Returns serial ID of the status update if a new item is inserted.
     pub(crate) async fn write_status_update_inner(
         &self,
         instance_id: &MsgId,
-        status_update_item: StatusUpdateItem,
-    ) -> Result<StatusUpdateSerial> {
-        let rowid = self
-            .sql
-            .insert(
-                "INSERT INTO msgs_status_updates (msg_id, update_item) VALUES(?, ?);",
-                (instance_id, serde_json::to_string(&status_update_item)?),
-            )
-            .await?;
-        let status_update_serial = StatusUpdateSerial(u32::try_from(rowid)?);
-        Ok(status_update_serial)
+        status_update_item: &StatusUpdateItem,
+        timestamp: i64,
+    ) -> Result<Option<StatusUpdateSerial>> {
+        let uid = status_update_item.uid.as_deref();
+        let status_update_item = serde_json::to_string(&status_update_item)?;
+        let trans_fn = |t: &mut rusqlite::Transaction| {
+            t.execute(
+                "UPDATE msgs SET timestamp_rcvd=? WHERE id=?",
+                (timestamp, instance_id),
+            )?;
+            let rowid = t
+                .query_row(
+                    "INSERT INTO msgs_status_updates (msg_id, update_item, uid) VALUES(?, ?, ?)
+                     ON CONFLICT (uid) DO NOTHING
+                     RETURNING id",
+                    (instance_id, status_update_item, uid),
+                    |row| {
+                        let id: u32 = row.get(0)?;
+                        Ok(id)
+                    },
+                )
+                .optional()?;
+            Ok(rowid)
+        };
+        let Some(rowid) = self.sql.transaction(trans_fn).await? else {
+            let uid = uid.unwrap_or("-");
+            info!(self, "Ignoring duplicate status update with uid={uid}");
+            return Ok(None);
+        };
+        let status_update_serial = StatusUpdateSerial(rowid);
+        Ok(Some(status_update_serial))
     }
 
     /// Returns the update_item with `status_update_serial` from the webxdc with message id `msg_id`.
@@ -432,13 +434,8 @@ impl Context {
         update_str: &str,
         descr: &str,
     ) -> Result<()> {
-        let status_update_item: StatusUpdateItem =
-            if let Ok(item) = serde_json::from_str::<StatusUpdateItem>(update_str) {
-                item
-            } else {
-                bail!("create_status_update_record: no valid update item.");
-            };
-
+        let status_update_item: StatusUpdateItem = serde_json::from_str(update_str)
+            .with_context(|| format!("Failed to parse webxdc update item from {update_str:?}"))?;
         self.send_webxdc_status_update_struct(instance_msg_id, status_update_item, descr)
             .await?;
         Ok(())
@@ -449,17 +446,33 @@ impl Context {
     pub async fn send_webxdc_status_update_struct(
         &self,
         instance_msg_id: MsgId,
-        status_update: StatusUpdateItem,
+        mut status_update: StatusUpdateItem,
         descr: &str,
     ) -> Result<()> {
-        let mut instance = Message::load_from_db(self, instance_msg_id).await?;
-        if instance.viewtype != Viewtype::Webxdc {
-            bail!("send_webxdc_status_update: is no webxdc message");
+        let instance = Message::load_from_db(self, instance_msg_id)
+            .await
+            .with_context(|| {
+                format!("Failed to load message {instance_msg_id} from the database")
+            })?;
+        let viewtype = instance.viewtype;
+        if viewtype != Viewtype::Webxdc {
+            bail!("send_webxdc_status_update: message {instance_msg_id} is not a webxdc message, but a {viewtype} message.");
         }
 
-        let chat = Chat::load_from_db(self, instance.chat_id).await?;
-        if let Some(reason) = chat.why_cant_send(self).await? {
-            bail!("cannot send to {}: {}", chat.id, reason);
+        if instance.param.get_int(Param::WebxdcIntegration).is_some() {
+            return self
+                .intercept_send_webxdc_status_update(instance, status_update)
+                .await;
+        }
+
+        let chat_id = instance.chat_id;
+        let chat = Chat::load_from_db(self, chat_id)
+            .await
+            .with_context(|| format!("Failed to load chat {chat_id} from the database"))?;
+        if let Some(reason) = chat.why_cant_send(self).await.with_context(|| {
+            format!("Failed to check if webxdc update can be sent to chat {chat_id}")
+        })? {
+            bail!("Cannot send to {chat_id}: {reason}.");
         }
 
         let send_now = !matches!(
@@ -467,15 +480,18 @@ impl Context {
             MessageState::Undefined | MessageState::OutPreparing | MessageState::OutDraft
         );
 
+        status_update.uid = Some(create_id());
         let status_update_serial: StatusUpdateSerial = self
             .create_status_update_record(
-                &mut instance,
+                &instance,
                 status_update,
                 create_smeared_timestamp(self),
                 send_now,
                 ContactId::SELF,
             )
-            .await?;
+            .await
+            .context("Failed to create status update")?
+            .context("Duplicate status update UID was generated")?;
 
         if send_now {
             self.sql.insert(
@@ -483,7 +499,7 @@ impl Context {
                  ON CONFLICT(msg_id)
                  DO UPDATE SET last_serial=excluded.last_serial, descr=excluded.descr",
                 (instance.id, status_update_serial, status_update_serial, descr),
-            ).await?;
+            ).await.context("Failed to insert webxdc update into SMTP queue")?;
             self.scheduler.interrupt_smtp().await;
         }
         Ok(())
@@ -562,33 +578,22 @@ impl Context {
     /// Receives status updates from receive_imf to the database
     /// and sends out an event.
     ///
-    /// `from_id` is the sender
+    /// `instance` is a webxdc instance.
     ///
-    /// `msg_id` may be an instance (in case there are initial status updates)
-    /// or a reply to an instance (for all other updates).
+    /// `from_id` is the sender.
+    ///
+    /// `timestamp` is the timestamp of the update.
     ///
     /// `json` is an array containing one or more update items as created by send_webxdc_status_update(),
     /// the array is parsed using serde, the single payloads are used as is.
     pub(crate) async fn receive_status_update(
         &self,
         from_id: ContactId,
-        msg_id: MsgId,
+        instance: &Message,
+        timestamp: i64,
+        can_info_msg: bool,
         json: &str,
     ) -> Result<()> {
-        let msg = Message::load_from_db(self, msg_id).await?;
-        let (timestamp, mut instance, can_info_msg) = if msg.viewtype == Viewtype::Webxdc {
-            (msg.timestamp_sort, msg, false)
-        } else if let Some(parent) = msg.parent(self).await? {
-            if parent.viewtype == Viewtype::Webxdc {
-                (msg.timestamp_sort, parent, true)
-            } else if parent.download_state() != DownloadState::Done {
-                (msg.timestamp_sort, parent, false)
-            } else {
-                bail!("receive_status_update: message is not the child of a webxdc message.")
-            }
-        } else {
-            bail!("receive_status_update: status message has no parent.")
-        };
         let chat_id = instance.chat_id;
 
         if from_id != ContactId::SELF && !chat::is_contact_in_chat(self, chat_id, from_id).await? {
@@ -605,7 +610,7 @@ impl Context {
         let updates: StatusUpdates = serde_json::from_str(json)?;
         for update_item in updates.updates {
             self.create_status_update_record(
-                &mut instance,
+                instance,
                 update_item,
                 timestamp,
                 can_info_msg,
@@ -629,6 +634,14 @@ impl Context {
         instance_msg_id: MsgId,
         last_known_serial: StatusUpdateSerial,
     ) -> Result<String> {
+        let param = instance_msg_id.get_param(self).await?;
+        if param.get_int(Param::WebxdcIntegration).is_some() {
+            let instance = Message::load_from_db(self, instance_msg_id).await?;
+            return self
+                .intercept_get_webxdc_status_updates(instance, last_known_serial)
+                .await;
+        }
+
         let json = self
             .sql
             .query_map(
@@ -655,7 +668,10 @@ impl Context {
                         let (update_item_str, serial) = row;
                         let update_item = StatusUpdateItemAndSerial
                         {
-                            item: serde_json::from_str(&update_item_str)?,
+                            item: StatusUpdateItem {
+                                uid: None, // Erase UIDs, apps, bots and tests don't need to know them.
+                                ..serde_json::from_str(&update_item_str)?
+                            },
                             serial,
                             max_serial,
                         };
@@ -844,6 +860,9 @@ impl Message {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use regex::Regex;
     use serde_json::json;
 
     use super::*;
@@ -854,19 +873,12 @@ mod tests {
     use crate::chatlist::Chatlist;
     use crate::config::Config;
     use crate::contact::Contact;
-    use crate::receive_imf::{receive_imf, receive_imf_inner};
-    use crate::test_utils::TestContext;
+    use crate::download::DownloadState;
+    use crate::ephemeral;
+    use crate::receive_imf::{receive_imf, receive_imf_from_inbox};
+    use crate::test_utils::{TestContext, TestContextManager};
+    use crate::tools::{self, SystemTime};
     use crate::{message, sql};
-
-    #[allow(clippy::assertions_on_constants)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_webxdc_file_limits() -> Result<()> {
-        assert!(WEBXDC_SENDING_LIMIT >= 32768);
-        assert!(WEBXDC_SENDING_LIMIT < 16777216);
-        assert!(WEBXDC_RECEIVING_LIMIT >= WEBXDC_SENDING_LIMIT * 2);
-        assert!(WEBXDC_RECEIVING_LIMIT < 16777216);
-        Ok(())
-    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_is_webxdc_file() -> Result<()> {
@@ -1049,8 +1061,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_resend_webxdc_instance_and_info() -> Result<()> {
+        let mut tcm = TestContextManager::new();
+
         // Alice uses webxdc in a group
-        let alice = TestContext::new_alice().await;
+        let alice = tcm.alice().await;
         alice.set_config_bool(Config::BccSelf, false).await?;
         let alice_grp = create_group_chat(&alice, ProtectionStatus::Unprotected, "grp").await?;
         let alice_instance = send_webxdc_instance(&alice, alice_grp).await?;
@@ -1065,7 +1079,7 @@ mod tests {
         assert_eq!(alice_grp.get_msg_cnt(&alice).await?, 2);
         assert!(alice.get_last_msg_in(alice_grp).await.is_info());
 
-        // Alice adds Bob and resend already used webxdc
+        // Alice adds Bob and resends already used webxdc
         add_contact_to_chat(
             &alice,
             alice_grp,
@@ -1077,7 +1091,7 @@ mod tests {
         let sent1 = alice.pop_sent_msg().await;
 
         // Bob received webxdc, legacy info-messages updates are received but not added to the chat
-        let bob = TestContext::new_bob().await;
+        let bob = tcm.bob().await;
         let bob_instance = bob.recv_msg(&sent1).await;
         assert_eq!(bob_instance.viewtype, Viewtype::Webxdc);
         assert!(!bob_instance.is_info());
@@ -1189,7 +1203,7 @@ mod tests {
         let sent2 = alice.pop_sent_msg().await;
 
         // Bob does not download instance but already receives update
-        receive_imf_inner(
+        receive_imf_from_inbox(
             &bob,
             &alice_instance.rfc724_mid,
             sent1.payload().as_bytes(),
@@ -1200,11 +1214,11 @@ mod tests {
         .await?;
         let bob_instance = bob.get_last_msg().await;
         bob_instance.chat_id.accept(&bob).await?;
-        bob.recv_msg(&sent2).await;
+        bob.recv_msg_trash(&sent2).await;
         assert_eq!(bob_instance.download_state, DownloadState::Available);
 
         // Bob downloads instance, updates should be assigned correctly
-        let received_msg = receive_imf_inner(
+        let received_msg = receive_imf_from_inbox(
             &bob,
             &alice_instance.rfc724_mid,
             sent1.payload().as_bytes(),
@@ -1214,7 +1228,7 @@ mod tests {
         )
         .await?
         .unwrap();
-        assert_eq!(*received_msg.msg_ids.get(0).unwrap(), bob_instance.id);
+        assert_eq!(*received_msg.msg_ids.first().unwrap(), bob_instance.id);
         let bob_instance = bob.get_last_msg().await;
         assert_eq!(bob_instance.viewtype, Viewtype::Webxdc);
         assert_eq!(bob_instance.download_state, DownloadState::Done);
@@ -1235,9 +1249,12 @@ mod tests {
         let t = TestContext::new_alice().await;
         let chat_id = create_group_chat(&t, ProtectionStatus::Unprotected, "foo").await?;
         let instance = send_webxdc_instance(&t, chat_id).await?;
+        let now = tools::time();
         t.receive_status_update(
             ContactId::SELF,
-            instance.id,
+            &instance,
+            now,
+            true,
             r#"{"updates":[{"payload":1}]}"#,
         )
         .await?;
@@ -1265,9 +1282,12 @@ mod tests {
         let t = TestContext::new_alice().await;
         let chat_id = create_group_chat(&t, ProtectionStatus::Unprotected, "foo").await?;
         let instance = send_webxdc_instance(&t, chat_id).await?;
+        let now = tools::time();
         t.receive_status_update(
             ContactId::SELF,
-            instance.id,
+            &instance,
+            now,
+            true,
             r#"{"updates":[{"payload":1}, {"payload":2}]}"#,
         )
         .await?;
@@ -1332,7 +1352,7 @@ mod tests {
     async fn test_create_status_update_record() -> Result<()> {
         let t = TestContext::new_alice().await;
         let chat_id = create_group_chat(&t, ProtectionStatus::Unprotected, "foo").await?;
-        let mut instance = send_webxdc_instance(&t, chat_id).await?;
+        let instance = send_webxdc_instance(&t, chat_id).await?;
 
         assert_eq!(
             t.get_webxdc_status_updates(instance.id, StatusUpdateSerial(0))
@@ -1342,23 +1362,44 @@ mod tests {
 
         let update_id1 = t
             .create_status_update_record(
-                &mut instance,
+                &instance,
                 StatusUpdateItem {
                     payload: json!({"foo": "bar"}),
                     info: None,
                     document: None,
                     summary: None,
+                    uid: Some("iecie2Ze".to_string()),
+                },
+                1640178619,
+                true,
+                ContactId::SELF,
+            )
+            .await?
+            .unwrap();
+        assert_eq!(
+            t.get_webxdc_status_updates(instance.id, StatusUpdateSerial(0))
+                .await?,
+            r#"[{"payload":{"foo":"bar"},"serial":1,"max_serial":1}]"#
+        );
+
+        // Update with duplicate update ID is received.
+        // Whatever the payload is, update should be ignored just because ID is duplicate.
+        let update_id1_duplicate = t
+            .create_status_update_record(
+                &instance,
+                StatusUpdateItem {
+                    payload: json!({"nothing": "this should be ignored"}),
+                    info: None,
+                    document: None,
+                    summary: None,
+                    uid: Some("iecie2Ze".to_string()),
                 },
                 1640178619,
                 true,
                 ContactId::SELF,
             )
             .await?;
-        assert_eq!(
-            t.get_webxdc_status_updates(instance.id, StatusUpdateSerial(0))
-                .await?,
-            r#"[{"payload":{"foo":"bar"},"serial":1,"max_serial":1}]"#
-        );
+        assert_eq!(update_id1_duplicate, None);
 
         assert!(t
             .send_webxdc_status_update(instance.id, "\n\n\n", "")
@@ -1378,29 +1419,32 @@ mod tests {
 
         let update_id2 = t
             .create_status_update_record(
-                &mut instance,
+                &instance,
                 StatusUpdateItem {
                     payload: json!({"foo2": "bar2"}),
                     info: None,
                     document: None,
                     summary: None,
+                    uid: None,
                 },
                 1640178619,
                 true,
                 ContactId::SELF,
             )
-            .await?;
+            .await?
+            .unwrap();
         assert_eq!(
             t.get_webxdc_status_updates(instance.id, update_id1).await?,
-            r#"[{"payload":{"foo2":"bar2"},"serial":2,"max_serial":2}]"#
+            r#"[{"payload":{"foo2":"bar2"},"serial":3,"max_serial":3}]"#
         );
         t.create_status_update_record(
-            &mut instance,
+            &instance,
             StatusUpdateItem {
                 payload: Value::Bool(true),
                 info: None,
                 document: None,
                 summary: None,
+                uid: None,
             },
             1640178619,
             true,
@@ -1410,9 +1454,9 @@ mod tests {
         assert_eq!(
             t.get_webxdc_status_updates(instance.id, StatusUpdateSerial(0))
                 .await?,
-            r#"[{"payload":{"foo":"bar"},"serial":1,"max_serial":3},
-{"payload":{"foo2":"bar2"},"serial":2,"max_serial":3},
-{"payload":true,"serial":3,"max_serial":3}]"#
+            r#"[{"payload":{"foo":"bar"},"serial":1,"max_serial":4},
+{"payload":{"foo2":"bar2"},"serial":3,"max_serial":4},
+{"payload":true,"serial":4,"max_serial":4}]"#
         );
 
         t.send_webxdc_status_update(
@@ -1423,8 +1467,8 @@ mod tests {
         .await?;
         assert_eq!(
             t.get_webxdc_status_updates(instance.id, update_id2).await?,
-            r#"[{"payload":true,"serial":3,"max_serial":4},
-{"payload":1,"serial":4,"max_serial":4}]"#
+            r#"[{"payload":true,"serial":4,"max_serial":5},
+{"payload":1,"serial":5,"max_serial":5}]"#
         );
 
         Ok(())
@@ -1435,15 +1479,18 @@ mod tests {
         let t = TestContext::new_alice().await;
         let chat_id = create_group_chat(&t, ProtectionStatus::Unprotected, "foo").await?;
         let instance = send_webxdc_instance(&t, chat_id).await?;
+        let now = tools::time();
 
         assert!(t
-            .receive_status_update(ContactId::SELF, instance.id, r#"foo: bar"#)
+            .receive_status_update(ContactId::SELF, &instance, now, true, r#"foo: bar"#)
             .await
             .is_err()); // no json
         assert!(t
             .receive_status_update(
                 ContactId::SELF,
-                instance.id,
+                &instance,
+                now,
+                true,
                 r#"{"updada":[{"payload":{"foo":"bar"}}]}"#
             )
             .await
@@ -1451,7 +1498,9 @@ mod tests {
         assert!(t
             .receive_status_update(
                 ContactId::SELF,
-                instance.id,
+                &instance,
+                now,
+                true,
                 r#"{"updates":[{"foo":"bar"}]}"#
             )
             .await
@@ -1459,7 +1508,9 @@ mod tests {
         assert!(t
             .receive_status_update(
                 ContactId::SELF,
-                instance.id,
+                &instance,
+                now,
+                true,
                 r#"{"updates":{"payload":{"foo":"bar"}}}"#
             )
             .await
@@ -1467,8 +1518,10 @@ mod tests {
 
         t.receive_status_update(
             ContactId::SELF,
-            instance.id,
-            r#"{"updates":[{"payload":{"foo":"bar"}}]}"#,
+            &instance,
+            now,
+            true,
+            r#"{"updates":[{"payload":{"foo":"bar"}, "someTrash": "definitely TrAsH"}]}"#,
         )
         .await?;
         assert_eq!(
@@ -1479,7 +1532,9 @@ mod tests {
 
         t.receive_status_update(
             ContactId::SELF,
-            instance.id,
+            &instance,
+            now,
+            true,
             r#" {"updates": [ {"payload" :42} , {"payload": 23} ] } "#,
         )
         .await?;
@@ -1493,7 +1548,9 @@ mod tests {
 
         t.receive_status_update(
             ContactId::SELF,
-            instance.id,
+            &instance,
+            now,
+            true,
             r#" {"updates": [ {"payload" :"ok", "future_item": "test"}  ], "from": "future" } "#,
         )
         .await?; // ignore members that may be added in the future
@@ -1591,7 +1648,8 @@ mod tests {
         assert_eq!(bob_instance.viewtype, Viewtype::Webxdc);
         assert_eq!(bob_chat_id.get_msg_cnt(&bob).await?, 1);
 
-        bob.recv_msg(sent2).await;
+        let bob_received_update = bob.recv_msg_opt(sent2).await;
+        assert!(bob_received_update.is_none());
         expect_status_update_event(&bob, bob_instance.id).await?;
         assert_eq!(bob_chat_id.get_msg_cnt(&bob).await?, 1);
 
@@ -1604,7 +1662,7 @@ mod tests {
         // Alice has a second device and also receives messages there
         let alice2 = TestContext::new_alice().await;
         alice2.recv_msg(sent1).await;
-        alice2.recv_msg(sent2).await;
+        alice2.recv_msg_trash(sent2).await;
         let alice2_instance = alice2.get_last_msg().await;
         let alice2_chat_id = alice2_instance.chat_id;
         assert_eq!(alice2_instance.viewtype, Viewtype::Webxdc);
@@ -1672,7 +1730,13 @@ mod tests {
             )
             .await?
             .unwrap();
-        assert_eq!(json, "{\"updates\":[{\"payload\":2},\n{\"payload\":3}]}");
+        let json = Regex::new(r#""uid":"[^"]*""#)
+            .unwrap()
+            .replace_all(&json, "XXX");
+        assert_eq!(
+            json,
+            "{\"updates\":[{\"payload\":2,XXX},\n{\"payload\":3,XXX}]}"
+        );
 
         assert_eq!(
             t.sql
@@ -2130,8 +2194,8 @@ sth_for_the = "future""#
 
         // Bob receives the updates
         let bob_instance = bob.recv_msg(sent_instance).await;
-        bob.recv_msg(sent_update1).await;
-        bob.recv_msg(sent_update2).await;
+        bob.recv_msg_trash(sent_update1).await;
+        bob.recv_msg_trash(sent_update2).await;
         let info = Message::load_from_db(&bob, bob_instance.id)
             .await?
             .get_webxdc_info(&bob)
@@ -2141,8 +2205,8 @@ sth_for_the = "future""#
         // Alice has a second device and also receives the updates there
         let alice2 = TestContext::new_alice().await;
         let alice2_instance = alice2.recv_msg(sent_instance).await;
-        alice2.recv_msg(sent_update1).await;
-        alice2.recv_msg(sent_update2).await;
+        alice2.recv_msg_trash(sent_update1).await;
+        alice2.recv_msg_trash(sent_update2).await;
         let info = Message::load_from_db(&alice2, alice2_instance.id)
             .await?
             .get_webxdc_info(&alice2)
@@ -2183,7 +2247,7 @@ sth_for_the = "future""#
 
         // Bob receives the updates
         let bob_instance = bob.recv_msg(sent_instance).await;
-        bob.recv_msg(sent_update1).await;
+        bob.recv_msg_trash(sent_update1).await;
         let info = Message::load_from_db(&bob, bob_instance.id)
             .await?
             .get_webxdc_info(&bob)
@@ -2235,7 +2299,7 @@ sth_for_the = "future""#
         // Bob receives all messages
         let bob_instance = bob.recv_msg(sent1).await;
         let bob_chat_id = bob_instance.chat_id;
-        bob.recv_msg(sent2).await;
+        bob.recv_msg_trash(sent2).await;
         assert_eq!(bob_chat_id.get_msg_cnt(&bob).await?, 2);
         let info_msg = bob.get_last_msg().await;
         assert!(info_msg.is_info());
@@ -2254,7 +2318,7 @@ sth_for_the = "future""#
         let alice2 = TestContext::new_alice().await;
         let alice2_instance = alice2.recv_msg(sent1).await;
         let alice2_chat_id = alice2_instance.chat_id;
-        alice2.recv_msg(sent2).await;
+        alice2.recv_msg_trash(sent2).await;
         assert_eq!(alice2_chat_id.get_msg_cnt(&alice2).await?, 2);
         let info_msg = alice2.get_last_msg().await;
         assert!(info_msg.is_info());
@@ -2304,9 +2368,9 @@ sth_for_the = "future""#
         // When Bob receives the messages, they should be cleaned up as well
         let bob_instance = bob.recv_msg(sent1).await;
         let bob_chat_id = bob_instance.chat_id;
-        bob.recv_msg(sent2).await;
+        bob.recv_msg_trash(sent2).await;
         assert_eq!(bob_chat_id.get_msg_cnt(&bob).await?, 2);
-        bob.recv_msg(sent3).await;
+        bob.recv_msg_trash(sent3).await;
         assert_eq!(bob_chat_id.get_msg_cnt(&bob).await?, 2);
         let info_msg = bob.get_last_msg().await;
         assert_eq!(info_msg.get_text(), "i2");
@@ -2364,7 +2428,7 @@ sth_for_the = "future""#
 
         // Bob receives instance+update
         let bob_instance = bob.recv_msg(sent1).await;
-        bob.recv_msg(sent2).await;
+        bob.recv_msg_trash(sent2).await;
         assert!(bob_instance.get_showpadlock());
 
         // Bob adds Claire with unknown key, update to Alice+Claire cannot be encrypted
@@ -2494,7 +2558,7 @@ sth_for_the = "future""#
         .await?;
         bob.flush_status_updates().await?;
         let msg = bob.pop_sent_msg().await;
-        alice.recv_msg(&msg).await;
+        alice.recv_msg_trash(&msg).await;
         alice
             .get_webxdc_status_updates(alice_instance.id, StatusUpdateSerial(0))
             .await
@@ -2524,6 +2588,7 @@ sth_for_the = "future""#
         );
 
         remove_contact_from_chat(&alice, chat_id, contact_bob).await?;
+        alice.pop_sent_msg().await;
         let status =
             helper_send_receive_status_update(&bob, &alice, &bob_instance, &instance).await?;
 
@@ -2612,13 +2677,58 @@ sth_for_the = "future""#
             )
             .await?;
         alice.flush_status_updates().await?;
-        bob.recv_msg(&alice.pop_sent_msg().await).await;
+        let received_update = bob.recv_msg_opt(&alice.pop_sent_msg().await).await;
+        assert!(received_update.is_none());
 
         assert_eq!(
             bob.get_webxdc_status_updates(bob_instance.id, StatusUpdateSerial(0))
                 .await?,
             r#"[{"payload":"p","info":"i","serial":1,"max_serial":1}]"#
         );
+
+        Ok(())
+    }
+
+    // NB: This test also checks that a contact is not marked as bot after receiving from it a
+    // webxdc instance and status updates.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_status_update_vs_delete_device_after() -> Result<()> {
+        let alice = &TestContext::new_alice().await;
+        let bob = &TestContext::new_bob().await;
+        bob.set_config(Config::DeleteDeviceAfter, Some("3600"))
+            .await?;
+        let alice_chat = alice.create_chat(bob).await;
+        let alice_instance = send_webxdc_instance(alice, alice_chat.id).await?;
+        let bob_instance = bob.recv_msg(&alice.pop_sent_msg().await).await;
+        assert_eq!(bob.add_or_lookup_contact(alice).await.is_bot(), false);
+
+        SystemTime::shift(Duration::from_secs(1800));
+        let mut update = Message {
+            chat_id: alice_chat.id,
+            viewtype: Viewtype::Text,
+            text: "I'm an update".to_string(),
+            hidden: true,
+            ..Default::default()
+        };
+        update.param.set_cmd(SystemMessage::WebxdcStatusUpdate);
+        update
+            .param
+            .set(Param::Arg, r#"{"updates":[{"payload":{"foo":"bar"}}]}"#);
+        update.set_quote(alice, Some(&alice_instance)).await?;
+        let sent_msg = alice.send_msg(alice_chat.id, &mut update).await;
+        bob.recv_msg_trash(&sent_msg).await;
+        assert_eq!(bob.add_or_lookup_contact(alice).await.is_bot(), false);
+        assert_eq!(
+            bob.get_webxdc_status_updates(bob_instance.id, StatusUpdateSerial(0))
+                .await?,
+            r#"[{"payload":{"foo":"bar"},"serial":1,"max_serial":1}]"#
+        );
+        assert_eq!(bob.add_or_lookup_contact(alice).await.is_bot(), false);
+
+        SystemTime::shift(Duration::from_secs(2700));
+        ephemeral::delete_expired_messages(bob, tools::time()).await?;
+        let bob_instance = Message::load_from_db(bob, bob_instance.id).await?;
+        assert_eq!(bob_instance.chat_id.is_trash(), false);
 
         Ok(())
     }

@@ -1,5 +1,8 @@
 use std::collections::BTreeMap;
+use std::path::Path;
+use std::str;
 use std::sync::Arc;
+use std::time::Duration;
 use std::{collections::HashMap, str::FromStr};
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
@@ -15,11 +18,13 @@ use deltachat::constants::DC_MSG_ID_DAYMARKER;
 use deltachat::contact::{may_be_valid_addr, Contact, ContactId, Origin};
 use deltachat::context::get_info;
 use deltachat::ephemeral::Timer;
-use deltachat::imex;
 use deltachat::location;
 use deltachat::message::get_msg_read_receipts;
 use deltachat::message::{
     self, delete_msgs, markseen_msgs, Message, MessageState, MsgId, Viewtype,
+};
+use deltachat::peer_channels::{
+    leave_webxdc_realtime, send_webxdc_realtime_advertisement, send_webxdc_realtime_data,
 };
 use deltachat::provider::get_provider_info;
 use deltachat::qr::{self, Qr};
@@ -28,6 +33,8 @@ use deltachat::reaction::{get_msg_reactions, send_reaction};
 use deltachat::securejoin;
 use deltachat::stock_str::StockMessage;
 use deltachat::webxdc::StatusUpdateSerial;
+use deltachat::EventEmitter;
+use deltachat::{imex, info};
 use sanitize_filename::is_sanitized;
 use tokio::fs;
 use tokio::sync::{watch, Mutex, RwLock};
@@ -39,7 +46,7 @@ pub mod types;
 use num_traits::FromPrimitive;
 use types::account::Account;
 use types::chat::FullChat;
-use types::contact::ContactObject;
+use types::contact::{ContactObject, VcardContact};
 use types::events::Event;
 use types::http::HttpResponse;
 use types::message::{MessageData, MessageObject, MessageReadReceipt};
@@ -62,14 +69,14 @@ use crate::api::types::qr::QrObject;
 struct AccountState {
     /// The Qr code for current [`CommandApi::provide_backup`] call.
     ///
-    /// If there currently is a call to [`CommandApi::provide_backup`] this will be
-    /// `Pending` or `Ready`, otherwise `NoProvider`.
-    backup_provider_qr: watch::Sender<ProviderQr>,
+    /// If there is currently is a call to [`CommandApi::provide_backup`] this will be
+    /// `Some`, otherwise `None`.
+    backup_provider_qr: watch::Sender<Option<Qr>>,
 }
 
 impl Default for AccountState {
     fn default() -> Self {
-        let (tx, _rx) = watch::channel(ProviderQr::NoProvider);
+        let tx = watch::Sender::new(None);
         Self {
             backup_provider_qr: tx,
         }
@@ -80,21 +87,30 @@ impl Default for AccountState {
 pub struct CommandApi {
     pub(crate) accounts: Arc<RwLock<Accounts>>,
 
+    /// Receiver side of the event channel.
+    ///
+    /// Events from it can be received by calling `get_next_event` method.
+    event_emitter: Arc<EventEmitter>,
+
     states: Arc<Mutex<BTreeMap<u32, AccountState>>>,
 }
 
 impl CommandApi {
     pub fn new(accounts: Accounts) -> Self {
+        let event_emitter = Arc::new(accounts.get_event_emitter());
         CommandApi {
             accounts: Arc::new(RwLock::new(accounts)),
+            event_emitter,
             states: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
     #[allow(dead_code)]
-    pub fn from_arc(accounts: Arc<RwLock<Accounts>>) -> Self {
+    pub async fn from_arc(accounts: Arc<RwLock<Accounts>>) -> Self {
+        let event_emitter = Arc::new(accounts.read().await.get_event_emitter());
         CommandApi {
             accounts,
+            event_emitter,
             states: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
@@ -123,21 +139,13 @@ impl CommandApi {
             .with_state(account_id, |state| state.backup_provider_qr.subscribe())
             .await;
 
-        let val: ProviderQr = receiver.borrow_and_update().clone();
-        match val {
-            ProviderQr::NoProvider => bail!("No backup being provided"),
-            ProviderQr::Pending => loop {
-                if receiver.changed().await.is_err() {
-                    bail!("No backup being provided (account state dropped)");
-                }
-                let val: ProviderQr = receiver.borrow().clone();
-                match val {
-                    ProviderQr::NoProvider => bail!("No backup being provided"),
-                    ProviderQr::Pending => continue,
-                    ProviderQr::Ready(qr) => break Ok(qr),
-                };
-            },
-            ProviderQr::Ready(qr) => Ok(qr),
+        loop {
+            if let Some(qr) = receiver.borrow_and_update().clone() {
+                return Ok(qr);
+            }
+            if receiver.changed().await.is_err() {
+                bail!("No backup being provided (account state dropped)");
+            }
         }
     }
 }
@@ -165,8 +173,7 @@ impl CommandApi {
 
     /// Get the next event.
     async fn get_next_event(&self) -> Result<Event> {
-        let event_emitter = self.accounts.read().await.get_event_emitter();
-        event_emitter
+        self.event_emitter
             .recv()
             .await
             .map(|event| event.into())
@@ -179,6 +186,16 @@ impl CommandApi {
 
     async fn add_account(&self) -> Result<u32> {
         self.accounts.write().await.add_account().await
+    }
+
+    /// Imports/migrated an existing account from a database path into this account manager.
+    /// Returns the ID of new account.
+    async fn migrate_account(&self, path_to_db: String) -> Result<u32> {
+        self.accounts
+            .write()
+            .await
+            .migrate_account(std::path::PathBuf::from(path_to_db))
+            .await
     }
 
     async fn remove_account(&self, account_id: u32) -> Result<()> {
@@ -231,13 +248,27 @@ impl CommandApi {
         Ok(())
     }
 
+    /// Performs a background fetch for all accounts in parallel with a timeout.
+    ///
+    /// The `AccountsBackgroundFetchDone` event is emitted at the end even in case of timeout.
+    /// Process all events until you get this one and you can safely return to the background
+    /// without forgetting to create notifications caused by timing race conditions.
+    async fn accounts_background_fetch(&self, timeout_in_seconds: f64) -> Result<()> {
+        self.accounts
+            .write()
+            .await
+            .background_fetch(std::time::Duration::from_secs_f64(timeout_in_seconds))
+            .await;
+        Ok(())
+    }
+
     // ---------------------------------------------
     // Methods that work on individual accounts
     // ---------------------------------------------
 
     /// Starts background tasks for a single account.
     async fn start_io(&self, account_id: u32) -> Result<()> {
-        let mut ctx = self.get_context(account_id).await?;
+        let ctx = self.get_context(account_id).await?;
         ctx.start_io().await;
         Ok(())
     }
@@ -309,6 +340,16 @@ impl CommandApi {
     async fn get_info(&self, account_id: u32) -> Result<BTreeMap<&'static str, String>> {
         let ctx = self.get_context(account_id).await?;
         ctx.get_info().await
+    }
+
+    async fn get_blob_dir(&self, account_id: u32) -> Result<Option<String>> {
+        let ctx = self.get_context(account_id).await?;
+        Ok(ctx.get_blobdir().to_str().map(|s| s.to_owned()))
+    }
+
+    async fn draft_self_report(&self, account_id: u32) -> Result<u32> {
+        let ctx = self.get_context(account_id).await?;
+        Ok(ctx.draft_self_report().await?.to_u32())
     }
 
     /// Sets the given configuration key.
@@ -383,7 +424,7 @@ impl CommandApi {
     /// Configures this account with the currently set parameters.
     /// Setup the credential config before calling this.
     async fn configure(&self, account_id: u32) -> Result<()> {
-        let mut ctx = self.get_context(account_id).await?;
+        let ctx = self.get_context(account_id).await?;
         ctx.stop_io().await;
         let result = ctx.configure().await;
         if result.is_err() {
@@ -666,7 +707,22 @@ impl CommandApi {
         ChatId::new(chat_id).get_encryption_info(&ctx).await
     }
 
-    /// Get QR code (text and SVG) that will offer an Setup-Contact or Verified-Group invitation.
+    /// Get QR code text that will offer a [SecureJoin](https://securejoin.delta.chat/) invitation.
+    ///
+    /// If `chat_id` is a group chat ID, SecureJoin QR code for the group is returned.
+    /// If `chat_id` is unset, setup contact QR code is returned.
+    async fn get_chat_securejoin_qr_code(
+        &self,
+        account_id: u32,
+        chat_id: Option<u32>,
+    ) -> Result<String> {
+        let ctx = self.get_context(account_id).await?;
+        let chat = chat_id.map(ChatId::new);
+        let qr = securejoin::get_securejoin_qr(&ctx, chat).await?;
+        Ok(qr)
+    }
+
+    /// Get QR code (text and SVG) that will offer a Setup-Contact or Verified-Group invitation.
     /// The QR code is compatible to the OPENPGP4FPR format
     /// so that a basic fingerprint comparison also works e.g. with OpenKeychain.
     ///
@@ -678,8 +734,7 @@ impl CommandApi {
     ///     the Verified-Group-Invite protocol is offered in the QR code;
     ///     works for protected groups as well as for normal groups.
     ///     If not set, the Setup-Contact protocol is offered in the QR code.
-    ///     See https://securejoin.readthedocs.io/en/latest/new.html
-    ///     for details about both protocols.
+    ///     See https://securejoin.delta.chat/ for details about both protocols.
     ///
     /// return format: `[code, svg]`
     async fn get_chat_securejoin_qr_code_svg(
@@ -689,10 +744,9 @@ impl CommandApi {
     ) -> Result<(String, String)> {
         let ctx = self.get_context(account_id).await?;
         let chat = chat_id.map(ChatId::new);
-        Ok((
-            securejoin::get_securejoin_qr(&ctx, chat).await?,
-            get_securejoin_qr_svg(&ctx, chat).await?,
-        ))
+        let qr = securejoin::get_securejoin_qr(&ctx, chat).await?;
+        let svg = get_securejoin_qr_svg(&ctx, chat).await?;
+        Ok((qr, svg))
     }
 
     /// Continue a Setup-Contact or Verified-Group-Invite protocol
@@ -707,8 +761,7 @@ impl CommandApi {
     ///
     /// Subsequent calls of `secure_join()` will abort previous, unfinished handshakes.
     ///
-    /// See https://securejoin.readthedocs.io/en/latest/new.html
-    /// for details about both protocols.
+    /// See https://securejoin.delta.chat/ for details about both protocols.
     ///
     /// **qr**: The text of the scanned QR code. Typically, the same string as given
     ///     to `check_qr()`.
@@ -896,19 +949,35 @@ impl CommandApi {
             .to_u32())
     }
 
-    // for now only text messages, because we only used text messages in desktop thusfar
+    /// Add a message to the device-chat.
+    /// Device-messages usually contain update information
+    /// and some hints that are added during the program runs, multi-device etc.
+    /// The device-message may be defined by a label;
+    /// if a message with the same label was added or skipped before,
+    /// the message is not added again, even if the message was deleted in between.
+    /// If needed, the device-chat is created before.
+    ///
+    /// Sends the `MsgsChanged` event on success.
+    ///
+    /// Setting msg to None will prevent the device message with this label from being added in the future.
     async fn add_device_message(
         &self,
         account_id: u32,
         label: String,
-        text: String,
-    ) -> Result<u32> {
+        msg: Option<MessageData>,
+    ) -> Result<Option<u32>> {
         let ctx = self.get_context(account_id).await?;
-        let mut msg = Message::new(Viewtype::Text);
-        msg.set_text(text);
-        let message_id =
-            deltachat::chat::add_device_msg(&ctx, Some(&label), Some(&mut msg)).await?;
-        Ok(message_id.to_u32())
+        if let Some(msg) = msg {
+            let mut message = msg.create_message(&ctx).await?;
+            let message_id =
+                deltachat::chat::add_device_msg(&ctx, Some(&label), Some(&mut message)).await?;
+            if !message_id.is_unset() {
+                return Ok(Some(message_id.to_u32()));
+            }
+        } else {
+            deltachat::chat::add_device_msg(&ctx, Some(&label), None).await?;
+        }
+        Ok(None)
     }
 
     ///  Mark all messages in a chat as _noticed_.
@@ -1062,9 +1131,12 @@ impl CommandApi {
             .collect::<Vec<JSONRPCMessageListItem>>())
     }
 
-    async fn get_message(&self, account_id: u32, message_id: u32) -> Result<MessageObject> {
+    async fn get_message(&self, account_id: u32, msg_id: u32) -> Result<MessageObject> {
         let ctx = self.get_context(account_id).await?;
-        MessageObject::from_message_id(&ctx, message_id).await
+        let msg_id = MsgId::new(msg_id);
+        MessageObject::from_msg_id(&ctx, msg_id)
+            .await
+            .with_context(|| format!("Failed to load message {msg_id} for account {account_id}"))
     }
 
     async fn get_message_html(&self, account_id: u32, message_id: u32) -> Result<Option<String>> {
@@ -1084,7 +1156,7 @@ impl CommandApi {
         let ctx = self.get_context(account_id).await?;
         let mut messages: HashMap<u32, MessageLoadResult> = HashMap::new();
         for message_id in message_ids {
-            let message_result = MessageObject::from_message_id(&ctx, message_id).await;
+            let message_result = MessageObject::from_msg_id(&ctx, MsgId::new(message_id)).await;
             messages.insert(
                 message_id,
                 match message_result {
@@ -1387,6 +1459,51 @@ impl CommandApi {
         Ok(contact_id.map(|id| id.to_u32()))
     }
 
+    /// Parses a vCard file located at the given path. Returns contacts in their original order.
+    async fn parse_vcard(&self, path: String) -> Result<Vec<VcardContact>> {
+        let vcard = fs::read(Path::new(&path)).await?;
+        let vcard = str::from_utf8(&vcard)?;
+        Ok(deltachat_contact_tools::parse_vcard(vcard)
+            .into_iter()
+            .map(|c| c.into())
+            .collect())
+    }
+
+    /// Imports contacts from a vCard file located at the given path.
+    ///
+    /// Returns the ids of created/modified contacts in the order they appear in the vCard.
+    async fn import_vcard(&self, account_id: u32, path: String) -> Result<Vec<u32>> {
+        let ctx = self.get_context(account_id).await?;
+        let vcard = tokio::fs::read(Path::new(&path)).await?;
+        let vcard = str::from_utf8(&vcard)?;
+        Ok(deltachat::contact::import_vcard(&ctx, vcard)
+            .await?
+            .into_iter()
+            .map(|c| c.to_u32())
+            .collect())
+    }
+
+    /// Returns a vCard containing contacts with the given ids.
+    async fn make_vcard(&self, account_id: u32, contacts: Vec<u32>) -> Result<String> {
+        let ctx = self.get_context(account_id).await?;
+        let contacts: Vec<_> = contacts.iter().map(|&c| ContactId::new(c)).collect();
+        deltachat::contact::make_vcard(&ctx, &contacts).await
+    }
+
+    /// Sets vCard containing the given contacts to the message draft.
+    async fn set_draft_vcard(
+        &self,
+        account_id: u32,
+        msg_id: u32,
+        contacts: Vec<u32>,
+    ) -> Result<()> {
+        let ctx = self.get_context(account_id).await?;
+        let contacts: Vec<_> = contacts.iter().map(|&c| ContactId::new(c)).collect();
+        let mut msg = Message::load_from_db(&ctx, MsgId::new(msg_id)).await?;
+        msg.make_vcard(&ctx, &contacts).await?;
+        msg.get_chat_id().set_draft(&ctx, Some(&mut msg)).await
+    }
+
     // ---------------------------------------------
     //                   chat
     // ---------------------------------------------
@@ -1531,20 +1648,21 @@ impl CommandApi {
     /// Returns once a remote device has retrieved the backup, or is cancelled.
     async fn provide_backup(&self, account_id: u32) -> Result<()> {
         let ctx = self.get_context(account_id).await?;
-        self.with_state(account_id, |state| {
-            state.backup_provider_qr.send_replace(ProviderQr::Pending);
-        })
-        .await;
 
         let provider = imex::BackupProvider::prepare(&ctx).await?;
         self.with_state(account_id, |state| {
-            state
-                .backup_provider_qr
-                .send_replace(ProviderQr::Ready(provider.qr()));
+            state.backup_provider_qr.send_replace(Some(provider.qr()));
         })
         .await;
 
-        provider.await
+        let res = provider.await;
+
+        self.with_state(account_id, |state| {
+            state.backup_provider_qr.send_replace(None);
+        })
+        .await;
+
+        res
     }
 
     /// Returns the text of the QR code for the running [`CommandApi::provide_backup`].
@@ -1552,11 +1670,17 @@ impl CommandApi {
     /// This QR code text can be used in [`CommandApi::get_backup`] on a second device to
     /// retrieve the backup and setup this second device.
     ///
-    /// This call will fail if there is currently no concurrent call to
-    /// [`CommandApi::provide_backup`].  This call may block if the QR code is not yet
-    /// ready.
+    /// This call will block until the QR code is ready,
+    /// even if there is no concurrent call to [`CommandApi::provide_backup`],
+    /// but will fail after 10 seconds to avoid deadlocks.
     async fn get_backup_qr(&self, account_id: u32) -> Result<String> {
-        let qr = self.inner_get_backup_qr(account_id).await?;
+        let qr = tokio::time::timeout(
+            Duration::from_secs(10),
+            self.inner_get_backup_qr(account_id),
+        )
+        .await
+        .context("Backup provider did not start in time")?
+        .context("Failed to get backup QR code")?;
         qr::format_backup(&qr)
     }
 
@@ -1565,14 +1689,20 @@ impl CommandApi {
     /// This QR code can be used in [`CommandApi::get_backup`] on a second device to
     /// retrieve the backup and setup this second device.
     ///
-    /// This call will fail if there is currently no concurrent call to
-    /// [`CommandApi::provide_backup`].  This call may block if the QR code is not yet
-    /// ready.
+    /// This call will block until the QR code is ready,
+    /// even if there is no concurrent call to [`CommandApi::provide_backup`],
+    /// but will fail after 10 seconds to avoid deadlocks.
     ///
     /// Returns the QR code rendered as an SVG image.
     async fn get_backup_qr_svg(&self, account_id: u32) -> Result<String> {
         let ctx = self.get_context(account_id).await?;
-        let qr = self.inner_get_backup_qr(account_id).await?;
+        let qr = tokio::time::timeout(
+            Duration::from_secs(10),
+            self.inner_get_backup_qr(account_id),
+        )
+        .await
+        .context("Backup provider did not start in time")?
+        .context("Failed to get backup QR code")?;
         generate_backup_qr(&ctx, &qr).await
     }
 
@@ -1582,6 +1712,9 @@ impl CommandApi {
     /// the current device.
     ///
     /// Can be cancelled by stopping the ongoing process.
+    ///
+    /// Do not forget to call start_io on the account after a successful import,
+    /// otherwise it will not connect to the email server.
     async fn get_backup(&self, account_id: u32, qr_text: String) -> Result<()> {
         let ctx = self.get_context(account_id).await?;
         let qr = qr::check_qr(&ctx, &qr_text).await?;
@@ -1675,6 +1808,37 @@ impl CommandApi {
             .await
     }
 
+    async fn send_webxdc_realtime_data(
+        &self,
+        account_id: u32,
+        instance_msg_id: u32,
+        data: Vec<u8>,
+    ) -> Result<()> {
+        let ctx = self.get_context(account_id).await?;
+        send_webxdc_realtime_data(&ctx, MsgId::new(instance_msg_id), data).await
+    }
+
+    async fn send_webxdc_realtime_advertisement(
+        &self,
+        account_id: u32,
+        instance_msg_id: u32,
+    ) -> Result<()> {
+        let ctx = self.get_context(account_id).await?;
+        let fut = send_webxdc_realtime_advertisement(&ctx, MsgId::new(instance_msg_id)).await?;
+        if let Some(fut) = fut {
+            tokio::spawn(async move {
+                fut.await.ok();
+                info!(ctx, "send_webxdc_realtime_advertisement done")
+            });
+        }
+        Ok(())
+    }
+
+    async fn leave_webxdc_realtime(&self, account_id: u32, instance_message_id: u32) -> Result<()> {
+        let ctx = self.get_context(account_id).await?;
+        leave_webxdc_realtime(&ctx, MsgId::new(instance_message_id)).await
+    }
+
     async fn get_webxdc_status_updates(
         &self,
         account_id: u32,
@@ -1714,6 +1878,29 @@ impl CommandApi {
 
         use base64::{engine::general_purpose, Engine as _};
         Ok(general_purpose::STANDARD_NO_PAD.encode(blob))
+    }
+
+    /// Sets Webxdc file as integration.
+    /// `file` is the .xdc to use as Webxdc integration.
+    async fn set_webxdc_integration(&self, account_id: u32, file_path: String) -> Result<()> {
+        let ctx = self.get_context(account_id).await?;
+        ctx.set_webxdc_integration(&file_path).await
+    }
+
+    /// Returns Webxdc instance used for optional integrations.
+    /// UI can open the Webxdc as usual.
+    /// Returns `None` if there is no integration; the caller can add one using `set_webxdc_integration` then.
+    /// `integrate_for` is the chat to get the integration for.
+    async fn init_webxdc_integration(
+        &self,
+        account_id: u32,
+        chat_id: Option<u32>,
+    ) -> Result<Option<u32>> {
+        let ctx = self.get_context(account_id).await?;
+        Ok(ctx
+            .init_webxdc_integration(chat_id.map(ChatId::new))
+            .await?
+            .map(|msg_id| msg_id.to_u32()))
     }
 
     /// Makes an HTTP GET request and returns a response.
@@ -1808,38 +1995,7 @@ impl CommandApi {
 
     async fn send_msg(&self, account_id: u32, chat_id: u32, data: MessageData) -> Result<u32> {
         let ctx = self.get_context(account_id).await?;
-        let mut message = Message::new(if let Some(viewtype) = data.viewtype {
-            viewtype.into()
-        } else if data.file.is_some() {
-            Viewtype::File
-        } else {
-            Viewtype::Text
-        });
-        message.set_text(data.text.unwrap_or_default());
-        if data.html.is_some() {
-            message.set_html(data.html);
-        }
-        if data.override_sender_name.is_some() {
-            message.set_override_sender_name(data.override_sender_name);
-        }
-        if let Some(file) = data.file {
-            message.set_file(file, None);
-        }
-        if let Some((latitude, longitude)) = data.location {
-            message.set_location(latitude, longitude);
-        }
-        if let Some(id) = data.quoted_message_id {
-            message
-                .set_quote(
-                    &ctx,
-                    Some(
-                        &Message::load_from_db(&ctx, MsgId::new(id))
-                            .await
-                            .context("message to quote could not be loaded")?,
-                    ),
-                )
-                .await?;
-        }
+        let mut message = data.create_message(&ctx).await?;
         let msg_id = chat::send_msg(&ctx, ChatId::new(chat_id), &mut message)
             .await?
             .to_u32();
@@ -1853,6 +2009,15 @@ impl CommandApi {
         let chat = Chat::load_from_db(&ctx, chat_id).await?;
         let can_send = chat.can_send(&ctx).await?;
         Ok(can_send)
+    }
+
+    /// Saves a file copy at the user-provided path.
+    ///
+    /// Fails if file already exists at the provided path.
+    async fn save_msg_file(&self, account_id: u32, msg_id: u32, path: String) -> Result<()> {
+        let ctx = self.get_context(account_id).await?;
+        let message = Message::load_from_db(&ctx, MsgId::new(msg_id)).await?;
+        message.save_file(&ctx, Path::new(&path)).await
     }
 
     // ---------------------------------------------
@@ -1927,19 +2092,21 @@ impl CommandApi {
         );
         let destination_path = account_folder.join("stickers").join(collection);
         fs::create_dir_all(&destination_path).await?;
-        let file = message.get_file(&ctx).context("no file")?;
-        fs::copy(
-            &file,
-            destination_path.join(format!(
-                "{}.{}",
-                msg_id,
-                file.extension()
-                    .unwrap_or_default()
-                    .to_str()
-                    .unwrap_or_default()
-            )),
-        )
-        .await?;
+        let file = message.get_filename().context("no file?")?;
+        message
+            .save_file(
+                &ctx,
+                &destination_path.join(format!(
+                    "{}.{}",
+                    msg_id,
+                    Path::new(&file)
+                        .extension()
+                        .unwrap_or_default()
+                        .to_str()
+                        .unwrap_or_default()
+                )),
+            )
+            .await?;
         Ok(())
     }
 
@@ -2038,11 +2205,9 @@ impl CommandApi {
                 )
                 .await?;
         }
-        let msg_id = chat::send_msg(&ctx, ChatId::new(chat_id), &mut message)
-            .await?
-            .to_u32();
-        let message = MessageObject::from_message_id(&ctx, msg_id).await?;
-        Ok((msg_id, message))
+        let msg_id = chat::send_msg(&ctx, ChatId::new(chat_id), &mut message).await?;
+        let message = MessageObject::from_msg_id(&ctx, msg_id).await?;
+        Ok((msg_id.to_u32(), message))
     }
 
     // mimics the old desktop call, will get replaced with something better in the composer rewrite,
@@ -2121,13 +2286,6 @@ async fn set_config(
             value,
         )
         .await?;
-
-        match key {
-            "sentbox_watch" | "mvbox_move" | "only_fetch_mvbox" => {
-                ctx.restart_io_if_running().await;
-            }
-            _ => {}
-        }
     }
     Ok(())
 }
@@ -2142,16 +2300,4 @@ async fn get_config(
         ctx.get_config(Config::from_str(key).with_context(|| format!("unknown key {key:?}"))?)
             .await
     }
-}
-
-/// Whether a QR code for a BackupProvider is currently available.
-#[allow(clippy::large_enum_variant)]
-#[derive(Clone, Debug)]
-enum ProviderQr {
-    /// There is no provider, asking for a QR is an error.
-    NoProvider,
-    /// There is a provider, the QR code is pending.
-    Pending,
-    /// There is a provider and QR code.
-    Ready(Qr),
 }

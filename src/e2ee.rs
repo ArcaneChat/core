@@ -7,7 +7,7 @@ use crate::aheader::{Aheader, EncryptPreference};
 use crate::config::Config;
 use crate::context::Context;
 use crate::key::{load_self_public_key, load_self_secret_key, SignedPublicKey};
-use crate::peerstate::{Peerstate, PeerstateVerifiedStatus};
+use crate::peerstate::Peerstate;
 use crate::pgp;
 
 #[derive(Debug)]
@@ -52,7 +52,7 @@ impl EncryptHelper {
         &self,
         context: &Context,
         e2ee_guaranteed: bool,
-        peerstates: &[(Option<Peerstate>, &str)],
+        peerstates: &[(Option<Peerstate>, String)],
     ) -> Result<bool> {
         let mut prefer_encrypt_count = if self.prefer_encrypt == EncryptPreference::Mutual {
             1
@@ -62,21 +62,19 @@ impl EncryptHelper {
         for (peerstate, addr) in peerstates {
             match peerstate {
                 Some(peerstate) => {
-                    info!(
-                        context,
-                        "peerstate for {:?} is {}", addr, peerstate.prefer_encrypt
-                    );
+                    let prefer_encrypt = peerstate.prefer_encrypt;
+                    info!(context, "Peerstate for {addr:?} is {prefer_encrypt}.");
                     match peerstate.prefer_encrypt {
                         EncryptPreference::NoPreference | EncryptPreference::Reset => {}
                         EncryptPreference::Mutual => prefer_encrypt_count += 1,
                     };
                 }
                 None => {
-                    let msg = format!("peerstate for {addr:?} missing, cannot encrypt");
+                    let msg = format!("Peerstate for {addr:?} missing, cannot encrypt");
                     if e2ee_guaranteed {
-                        return Err(format_err!("{}", msg));
+                        return Err(format_err!("{msg}"));
                     } else {
-                        info!(context, "{}", msg);
+                        info!(context, "{msg}.");
                         return Ok(false);
                     }
                 }
@@ -94,9 +92,10 @@ impl EncryptHelper {
     pub async fn encrypt(
         self,
         context: &Context,
-        min_verified: PeerstateVerifiedStatus,
+        verified: bool,
         mail_to_encrypt: lettre_email::PartBuilder,
-        peerstates: Vec<(Option<Peerstate>, &str)>,
+        peerstates: Vec<(Option<Peerstate>, String)>,
+        compress: bool,
     ) -> Result<String> {
         let mut keyring: Vec<SignedPublicKey> = Vec::new();
 
@@ -107,7 +106,7 @@ impl EncryptHelper {
             .filter_map(|(state, addr)| state.clone().map(|s| (s, addr)))
         {
             let key = peerstate
-                .take_key(min_verified)
+                .take_key(verified)
                 .with_context(|| format!("proper enc-key for {addr} missing, cannot encrypt"))?;
             keyring.push(key);
             verifier_addresses.push(addr);
@@ -118,8 +117,8 @@ impl EncryptHelper {
 
         // Encrypt to secondary verified keys
         // if we also encrypt to the introducer ("verifier") of the key.
-        if min_verified == PeerstateVerifiedStatus::BidirectVerified {
-            for (peerstate, _addr) in peerstates {
+        if verified {
+            for (peerstate, _addr) in &peerstates {
                 if let Some(peerstate) = peerstate {
                     if let (Some(key), Some(verifier)) = (
                         peerstate.secondary_verified_key.as_ref(),
@@ -137,7 +136,7 @@ impl EncryptHelper {
 
         let raw_message = mail_to_encrypt.build().as_string().into_bytes();
 
-        let ctext = pgp::pk_encrypt(&raw_message, keyring, Some(sign_key)).await?;
+        let ctext = pgp::pk_encrypt(&raw_message, keyring, Some(sign_key), compress).await?;
 
         Ok(ctext)
     }
@@ -171,11 +170,10 @@ pub async fn ensure_secret_key_exists(context: &Context) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chat;
     use crate::key::DcKey;
     use crate::message::{Message, Viewtype};
     use crate::param::Param;
-    use crate::test_utils::{bob_keypair, TestContext};
+    use crate::test_utils::{bob_keypair, TestContext, TestContextManager};
 
     mod ensure_secret_key_exists {
         use super::*;
@@ -219,37 +217,35 @@ Sent with my Delta Chat Messenger: https://delta.chat";
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_encrypted_no_autocrypt() -> anyhow::Result<()> {
-        let alice = TestContext::new_alice().await;
-        let bob = TestContext::new_bob().await;
+        let mut tcm = TestContextManager::new();
+        let alice = tcm.alice().await;
+        let bob = tcm.bob().await;
 
         let chat_alice = alice.create_chat(&bob).await.id;
         let chat_bob = bob.create_chat(&alice).await.id;
 
         // Alice sends unencrypted message to Bob
         let mut msg = Message::new(Viewtype::Text);
-        chat::prepare_msg(&alice.ctx, chat_alice, &mut msg).await?;
-        chat::send_msg(&alice.ctx, chat_alice, &mut msg).await?;
-        let sent = alice.pop_sent_msg().await;
+        let sent = alice.send_msg(chat_alice, &mut msg).await;
 
         // Bob receives unencrypted message from Alice
-        let msg = bob.parse_msg(&sent).await;
-        assert!(!msg.was_encrypted());
+        let msg = bob.recv_msg(&sent).await;
+        assert!(!msg.get_showpadlock());
 
-        // Parsing a message is enough to update peerstate
         let peerstate_alice = Peerstate::from_addr(&bob.ctx, "alice@example.org")
             .await?
             .expect("no peerstate found in the database");
         assert_eq!(peerstate_alice.prefer_encrypt, EncryptPreference::Mutual);
 
-        // Bob sends encrypted message to Alice
+        // Bob sends empty encrypted message to Alice
         let mut msg = Message::new(Viewtype::Text);
-        chat::prepare_msg(&bob.ctx, chat_bob, &mut msg).await?;
-        chat::send_msg(&bob.ctx, chat_bob, &mut msg).await?;
-        let sent = bob.pop_sent_msg().await;
+        let sent = bob.send_msg(chat_bob, &mut msg).await;
 
-        // Alice receives encrypted message from Bob
-        let msg = alice.parse_msg(&sent).await;
-        assert!(msg.was_encrypted());
+        // Alice receives an empty encrypted message from Bob.
+        // This is also a regression test for previously existing bug
+        // that resulted in no padlock on encrypted empty messages.
+        let msg = alice.recv_msg(&sent).await;
+        assert!(msg.get_showpadlock());
 
         let peerstate_bob = Peerstate::from_addr(&alice.ctx, "bob@example.net")
             .await?
@@ -261,12 +257,10 @@ Sent with my Delta Chat Messenger: https://delta.chat";
         // Alice sends encrypted message without Autocrypt header.
         let mut msg = Message::new(Viewtype::Text);
         msg.param.set_int(Param::SkipAutocrypt, 1);
-        chat::prepare_msg(&alice.ctx, chat_alice, &mut msg).await?;
-        chat::send_msg(&alice.ctx, chat_alice, &mut msg).await?;
-        let sent = alice.pop_sent_msg().await;
+        let sent = alice.send_msg(chat_alice, &mut msg).await;
 
-        let msg = bob.parse_msg(&sent).await;
-        assert!(msg.was_encrypted());
+        let msg = bob.recv_msg(&sent).await;
+        assert!(msg.get_showpadlock());
         let peerstate_alice = Peerstate::from_addr(&bob.ctx, "alice@example.org")
             .await?
             .expect("no peerstate found in the database");
@@ -275,12 +269,10 @@ Sent with my Delta Chat Messenger: https://delta.chat";
         // Alice sends plaintext message with Autocrypt header.
         let mut msg = Message::new(Viewtype::Text);
         msg.force_plaintext();
-        chat::prepare_msg(&alice.ctx, chat_alice, &mut msg).await?;
-        chat::send_msg(&alice.ctx, chat_alice, &mut msg).await?;
-        let sent = alice.pop_sent_msg().await;
+        let sent = alice.send_msg(chat_alice, &mut msg).await;
 
-        let msg = bob.parse_msg(&sent).await;
-        assert!(!msg.was_encrypted());
+        let msg = bob.recv_msg(&sent).await;
+        assert!(!msg.get_showpadlock());
         let peerstate_alice = Peerstate::from_addr(&bob.ctx, "alice@example.org")
             .await?
             .expect("no peerstate found in the database");
@@ -290,12 +282,10 @@ Sent with my Delta Chat Messenger: https://delta.chat";
         let mut msg = Message::new(Viewtype::Text);
         msg.force_plaintext();
         msg.param.set_int(Param::SkipAutocrypt, 1);
-        chat::prepare_msg(&alice.ctx, chat_alice, &mut msg).await?;
-        chat::send_msg(&alice.ctx, chat_alice, &mut msg).await?;
-        let sent = alice.pop_sent_msg().await;
+        let sent = alice.send_msg(chat_alice, &mut msg).await;
 
-        let msg = bob.parse_msg(&sent).await;
-        assert!(!msg.was_encrypted());
+        let msg = bob.recv_msg(&sent).await;
+        assert!(!msg.get_showpadlock());
         let peerstate_alice = Peerstate::from_addr(&bob.ctx, "alice@example.org")
             .await?
             .expect("no peerstate found in the database");
@@ -304,7 +294,7 @@ Sent with my Delta Chat Messenger: https://delta.chat";
         Ok(())
     }
 
-    fn new_peerstates(prefer_encrypt: EncryptPreference) -> Vec<(Option<Peerstate>, &'static str)> {
+    fn new_peerstates(prefer_encrypt: EncryptPreference) -> Vec<(Option<Peerstate>, String)> {
         let addr = "bob@foo.bar";
         let pub_key = bob_keypair().public;
         let peerstate = Peerstate {
@@ -323,9 +313,10 @@ Sent with my Delta Chat Messenger: https://delta.chat";
             secondary_verified_key: None,
             secondary_verified_key_fingerprint: None,
             secondary_verifier: None,
+            backward_verified_key_id: None,
             fingerprint_changed: false,
         };
-        vec![(Some(peerstate), addr)]
+        vec![(Some(peerstate), addr.to_string())]
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -350,7 +341,7 @@ Sent with my Delta Chat Messenger: https://delta.chat";
         assert!(encrypt_helper.should_encrypt(&t, false, &ps).unwrap());
 
         // test with missing peerstate
-        let ps = vec![(None, "bob@foo.bar")];
+        let ps = vec![(None, "bob@foo.bar".to_string())];
         assert!(encrypt_helper.should_encrypt(&t, true, &ps).is_err());
         assert!(!encrypt_helper.should_encrypt(&t, false, &ps).unwrap());
     }

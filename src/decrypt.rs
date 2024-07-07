@@ -4,12 +4,12 @@ use std::collections::HashSet;
 use std::str::FromStr;
 
 use anyhow::Result;
+use deltachat_contact_tools::addr_cmp;
 use mailparse::ParsedMail;
 
 use crate::aheader::Aheader;
 use crate::authres::handle_authres;
 use crate::authres::{self, DkimResults};
-use crate::contact::addr_cmp;
 use crate::context::Context;
 use crate::headerdef::{HeaderDef, HeaderDefMap};
 use crate::key::{DcKey, Fingerprint, SignedPublicKey, SignedSecretKey};
@@ -23,34 +23,12 @@ use crate::pgp;
 ///
 /// If the message is wrongly signed, HashSet will be empty.
 pub fn try_decrypt(
-    context: &Context,
     mail: &ParsedMail<'_>,
     private_keyring: &[SignedSecretKey],
     public_keyring_for_validate: &[SignedPublicKey],
 ) -> Result<Option<(Vec<u8>, HashSet<Fingerprint>)>> {
-    let encrypted_data_part = match {
-        let mime = get_autocrypt_mime(mail);
-        if mime.is_some() {
-            info!(context, "Detected Autocrypt-mime message.");
-        }
-        mime
-    }
-    .or_else(|| {
-        let mime = get_mixed_up_mime(mail);
-        if mime.is_some() {
-            info!(context, "Detected mixed-up mime message.");
-        }
-        mime
-    })
-    .or_else(|| {
-        let mime = get_attachment_mime(mail);
-        if mime.is_some() {
-            info!(context, "Detected attached Autocrypt-mime message.");
-        }
-        mime
-    }) {
-        None => return Ok(None),
-        Some(res) => res,
+    let Some(encrypted_data_part) = get_encrypted_mime(mail) else {
+        return Ok(None);
     };
 
     decrypt_part(
@@ -79,43 +57,39 @@ pub(crate) async fn prepare_decryption(
             autocrypt_header: None,
             peerstate: None,
             message_time,
-            dkim_results: DkimResults {
-                dkim_passed: false,
-                dkim_should_work: false,
-                allow_keychange: true,
-            },
+            dkim_results: DkimResults { dkim_passed: false },
         });
     }
 
-    let autocrypt_header =
-        if let Some(autocrypt_header_value) = mail.headers.get_header_value(HeaderDef::Autocrypt) {
-            match Aheader::from_str(&autocrypt_header_value) {
-                Ok(header) if addr_cmp(&header.addr, from) => Some(header),
-                Ok(header) => {
-                    warn!(
-                        context,
-                        "Autocrypt header address {:?} is not {:?}.", header.addr, from
-                    );
-                    None
-                }
-                Err(err) => {
-                    warn!(context, "Failed to parse Autocrypt header: {:#}.", err);
-                    None
-                }
+    let autocrypt_header = if context.is_self_addr(from).await? {
+        None
+    } else if let Some(aheader_value) = mail.headers.get_header_value(HeaderDef::Autocrypt) {
+        match Aheader::from_str(&aheader_value) {
+            Ok(header) if addr_cmp(&header.addr, from) => Some(header),
+            Ok(header) => {
+                warn!(
+                    context,
+                    "Autocrypt header address {:?} is not {:?}.", header.addr, from
+                );
+                None
             }
-        } else {
-            None
-        };
+            Err(err) => {
+                warn!(context, "Failed to parse Autocrypt header: {:#}.", err);
+                None
+            }
+        }
+    } else {
+        None
+    };
 
-    let dkim_results = handle_authres(context, mail, from, message_time).await?;
-
+    let dkim_results = handle_authres(context, mail, from).await?;
+    let allow_aeap = get_encrypted_mime(mail).is_some();
     let peerstate = get_autocrypt_peerstate(
         context,
         from,
         autocrypt_header.as_ref(),
         message_time,
-        // Disallowing keychanges is disabled for now:
-        true, // dkim_results.allow_keychange,
+        allow_aeap,
     )
     .await?;
 
@@ -142,6 +116,13 @@ pub struct DecryptionInfo {
     /// peerstate in this case.
     pub message_time: i64,
     pub(crate) dkim_results: authres::DkimResults,
+}
+
+/// Returns a reference to the encrypted payload of a message.
+fn get_encrypted_mime<'a, 'b>(mail: &'a ParsedMail<'b>) -> Option<&'a ParsedMail<'b>> {
+    get_autocrypt_mime(mail)
+        .or_else(|| get_mixed_up_mime(mail))
+        .or_else(|| get_attachment_mime(mail))
 }
 
 /// Returns a reference to the encrypted payload of a ["Mixed
@@ -282,6 +263,7 @@ pub(crate) fn validate_detached_signature<'a, 'b>(
     }
 }
 
+/// Returns public keyring for `peerstate`.
 pub(crate) fn keyring_from_peerstate(peerstate: Option<&Peerstate>) -> Vec<SignedPublicKey> {
     let mut public_keyring_for_validate = Vec::new();
     if let Some(peerstate) = peerstate {
@@ -299,33 +281,34 @@ pub(crate) fn keyring_from_peerstate(peerstate: Option<&Peerstate>) -> Vec<Signe
 /// If we already know this fingerprint from another contact's peerstate, return that
 /// peerstate in order to make AEAP work, but don't save it into the db yet.
 ///
-/// The param `allow_change` is used to prevent the autocrypt key from being changed
-/// if we suspect that the message may be forged and have a spoofed sender identity.
-///
 /// Returns updated peerstate.
 pub(crate) async fn get_autocrypt_peerstate(
     context: &Context,
     from: &str,
     autocrypt_header: Option<&Aheader>,
     message_time: i64,
-    allow_change: bool,
+    allow_aeap: bool,
 ) -> Result<Option<Peerstate>> {
+    let allow_change = !context.is_self_addr(from).await?;
     let mut peerstate;
 
     // Apply Autocrypt header
     if let Some(header) = autocrypt_header {
-        // The "from_verified_fingerprint" part is for AEAP:
-        // If we know this fingerprint from another addr,
-        // we may want to do a transition from this other addr
-        // (and keep its peerstate)
-        // For security reasons, for now, we only do a transition
-        // if the fingerprint is verified.
-        peerstate = Peerstate::from_verified_fingerprint_or_addr(
-            context,
-            &header.public_key.fingerprint(),
-            from,
-        )
-        .await?;
+        if allow_aeap {
+            // If we know this fingerprint from another addr,
+            // we may want to do a transition from this other addr
+            // (and keep its peerstate)
+            // For security reasons, for now, we only do a transition
+            // if the fingerprint is verified.
+            peerstate = Peerstate::from_verified_fingerprint_or_addr(
+                context,
+                &header.public_key.fingerprint(),
+                from,
+            )
+            .await?;
+        } else {
+            peerstate = Peerstate::from_addr(context, from).await?;
+        }
 
         if let Some(ref mut peerstate) = peerstate {
             if addr_cmp(&peerstate.addr, from) {

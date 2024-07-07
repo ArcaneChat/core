@@ -1,12 +1,13 @@
 import logging
 
-from deltachat_rpc_client import Chat, SpecialContactId
+import pytest
+from deltachat_rpc_client import Chat, EventType, SpecialContactId
 
 
-def test_qr_setup_contact(acfactory) -> None:
+def test_qr_setup_contact(acfactory, tmp_path) -> None:
     alice, bob = acfactory.get_online_accounts(2)
 
-    qr_code, _svg = alice.get_qr_code()
+    qr_code = alice.get_qr_code()
     bob.secure_join(qr_code)
 
     alice.wait_for_securejoin_inviter_success()
@@ -23,16 +24,29 @@ def test_qr_setup_contact(acfactory) -> None:
     bob_contact_alice_snapshot = bob_contact_alice.get_snapshot()
     assert bob_contact_alice_snapshot.is_verified
 
+    # Test that if Bob changes the key, backwards verification is lost.
+    logging.info("Bob 2 is created")
+    bob2 = acfactory.new_configured_account()
+    bob2.export_self_keys(tmp_path)
 
-def test_qr_securejoin(acfactory):
+    logging.info("Bob imports a key")
+    bob.import_self_keys(tmp_path / "private-key-default.asc")
+
+    assert bob.get_config("key_id") == "2"
+    bob_contact_alice_snapshot = bob_contact_alice.get_snapshot()
+    assert not bob_contact_alice_snapshot.is_verified
+
+
+@pytest.mark.parametrize("protect", [True, False])
+def test_qr_securejoin(acfactory, protect):
     alice, bob = acfactory.get_online_accounts(2)
 
     logging.info("Alice creates a verified group")
-    alice_chat = alice.create_group("Verified group", protect=True)
-    assert alice_chat.get_basic_snapshot().is_protected
+    alice_chat = alice.create_group("Verified group", protect=protect)
+    assert alice_chat.get_basic_snapshot().is_protected == protect
 
     logging.info("Bob joins verified group")
-    qr_code, _svg = alice_chat.get_qr_code()
+    qr_code = alice_chat.get_qr_code()
     bob.secure_join(qr_code)
 
     # Check that at least some of the handshake messages are deleted.
@@ -53,7 +67,7 @@ def test_qr_securejoin(acfactory):
 
     snapshot = bob.get_message_by_id(bob.wait_for_incoming_msg_event().msg_id).get_snapshot()
     assert snapshot.text == "Member Me ({}) added by {}.".format(bob.get_config("addr"), alice.get_config("addr"))
-    assert snapshot.chat.get_basic_snapshot().is_protected
+    assert snapshot.chat.get_basic_snapshot().is_protected == protect
 
     # Test that Bob verified Alice's profile.
     bob_contact_alice = bob.get_contact_by_addr(alice.get_config("addr"))
@@ -77,7 +91,7 @@ def test_qr_securejoin_contact_request(acfactory) -> None:
 
     alice_chat = alice.create_group("Verified group", protect=True)
     logging.info("Bob joins verified group")
-    qr_code, _svg = alice_chat.get_qr_code()
+    qr_code = alice_chat.get_qr_code()
     bob.secure_join(qr_code)
     while True:
         event = bob.wait_for_event()
@@ -92,7 +106,7 @@ def test_qr_readreceipt(acfactory) -> None:
     alice, bob, charlie = acfactory.get_online_accounts(3)
 
     logging.info("Bob and Charlie setup contact with Alice")
-    qr_code, _svg = alice.get_qr_code()
+    qr_code = alice.get_qr_code()
 
     bob.secure_join(qr_code)
     charlie.secure_join(qr_code)
@@ -150,6 +164,21 @@ def test_qr_readreceipt(acfactory) -> None:
     assert not bob.get_chat_by_contact(bob_contact_charlie)
 
 
+def test_setup_contact_resetup(acfactory) -> None:
+    """Tests that setup contact works after Alice resets the device and changes the key."""
+    alice, bob = acfactory.get_online_accounts(2)
+
+    qr_code = alice.get_qr_code()
+    bob.secure_join(qr_code)
+    bob.wait_for_securejoin_joiner_success()
+
+    alice = acfactory.resetup_account(alice)
+
+    qr_code = alice.get_qr_code()
+    bob.secure_join(qr_code)
+    bob.wait_for_securejoin_joiner_success()
+
+
 def test_verified_group_recovery(acfactory) -> None:
     """Tests verified group recovery by reverifying a member and sending a message in a group."""
     ac1, ac2, ac3 = acfactory.get_online_accounts(3)
@@ -159,9 +188,9 @@ def test_verified_group_recovery(acfactory) -> None:
     assert chat.get_basic_snapshot().is_protected
 
     logging.info("ac2 joins verified group")
-    qr_code, _svg = chat.get_qr_code()
+    qr_code = chat.get_qr_code()
     ac2.secure_join(qr_code)
-    ac1.wait_for_securejoin_inviter_success()
+    ac2.wait_for_securejoin_joiner_success()
 
     # ac1 has ac2 directly verified.
     ac1_contact_ac2 = ac1.get_contact_by_addr(ac2.get_config("addr"))
@@ -169,16 +198,16 @@ def test_verified_group_recovery(acfactory) -> None:
 
     logging.info("ac3 joins verified group")
     ac3_chat = ac3.secure_join(qr_code)
-    ac1.wait_for_securejoin_inviter_success()
+    ac3.wait_for_securejoin_joiner_success()
+    ac3.wait_for_incoming_msg_event()  # Member added
 
     logging.info("ac2 logs in on a new device")
     ac2 = acfactory.resetup_account(ac2)
 
     logging.info("ac2 reverifies with ac3")
-    qr_code, _svg = ac3.get_qr_code()
+    qr_code = ac3.get_qr_code()
     ac2.secure_join(qr_code)
-
-    ac3.wait_for_securejoin_inviter_success()
+    ac2.wait_for_securejoin_joiner_success()
 
     logging.info("ac3 sends a message to the group")
     assert len(ac3_chat.get_contacts()) == 3
@@ -223,9 +252,9 @@ def test_verified_group_member_added_recovery(acfactory) -> None:
     assert chat.get_basic_snapshot().is_protected
 
     logging.info("ac2 joins verified group")
-    qr_code, _svg = chat.get_qr_code()
+    qr_code = chat.get_qr_code()
     ac2.secure_join(qr_code)
-    ac1.wait_for_securejoin_inviter_success()
+    ac2.wait_for_securejoin_joiner_success()
 
     # ac1 has ac2 directly verified.
     ac1_contact_ac2 = ac1.get_contact_by_addr(ac2.get_config("addr"))
@@ -233,16 +262,16 @@ def test_verified_group_member_added_recovery(acfactory) -> None:
 
     logging.info("ac3 joins verified group")
     ac3_chat = ac3.secure_join(qr_code)
-    ac1.wait_for_securejoin_inviter_success()
+    ac3.wait_for_securejoin_joiner_success()
+    ac3.wait_for_incoming_msg_event()  # Member added
 
     logging.info("ac2 logs in on a new device")
     ac2 = acfactory.resetup_account(ac2)
 
     logging.info("ac2 reverifies with ac3")
-    qr_code, _svg = ac3.get_qr_code()
+    qr_code = ac3.get_qr_code()
     ac2.secure_join(qr_code)
-
-    ac3.wait_for_securejoin_inviter_success()
+    ac2.wait_for_securejoin_joiner_success()
 
     logging.info("ac3 sends a message to the group")
     assert len(ac3_chat.get_contacts()) == 3
@@ -307,7 +336,7 @@ def test_qr_join_chat_with_pending_bobstate_issue4894(acfactory):
     ac1, ac2, ac3, ac4 = acfactory.get_online_accounts(4)
 
     logging.info("ac3: verify with ac2")
-    qr_code, _svg = ac2.get_qr_code()
+    qr_code = ac2.get_qr_code()
     ac3.secure_join(qr_code)
     ac2.wait_for_securejoin_inviter_success()
 
@@ -317,7 +346,7 @@ def test_qr_join_chat_with_pending_bobstate_issue4894(acfactory):
 
     logging.info("ac1: create verified group that ac2 fully joins")
     ch1 = ac1.create_group("Group", protect=True)
-    qr_code, _svg = ch1.get_qr_code()
+    qr_code = ch1.get_qr_code()
     ac2.secure_join(qr_code)
     ac1.wait_for_securejoin_inviter_success()
 
@@ -330,7 +359,7 @@ def test_qr_join_chat_with_pending_bobstate_issue4894(acfactory):
             break
 
     logging.info("ac1: let ac2 join again but shutoff ac1 in the middle of securejoin")
-    qr_code, _svg = ch1.get_qr_code()
+    qr_code = ch1.get_qr_code()
     ac2.secure_join(qr_code)
     ac1.remove()
     logging.info("ac2 now has pending bobstate but ac1 is shutoff")
@@ -352,7 +381,7 @@ def test_qr_join_chat_with_pending_bobstate_issue4894(acfactory):
             break
 
     logging.info("ac3: create a join-code for group VG and let ac4 join, check that ac2 got it")
-    qr_code, _svg = vg.get_qr_code()
+    qr_code = vg.get_qr_code()
     ac4.secure_join(qr_code)
     ac3.wait_for_securejoin_inviter_success()
     while 1:
@@ -373,7 +402,7 @@ def test_qr_new_group_unblocked(acfactory):
 
     ac1, ac2 = acfactory.get_online_accounts(2)
     ac1_chat = ac1.create_group("Group for joining", protect=True)
-    qr_code, _svg = ac1_chat.get_qr_code()
+    qr_code = ac1_chat.get_qr_code()
     ac2.secure_join(qr_code)
 
     ac1.wait_for_securejoin_inviter_success()
@@ -396,7 +425,7 @@ def test_aeap_flow_verified(acfactory):
     logging.info("ac1: create verified-group QR, ac2 scans and joins")
     chat = ac1.create_group("hello", protect=True)
     assert chat.get_basic_snapshot().is_protected
-    qr_code, _svg = chat.get_qr_code()
+    qr_code = chat.get_qr_code()
     logging.info("ac2: start QR-code based join-group protocol")
     ac2.secure_join(qr_code)
     ac1.wait_for_securejoin_inviter_success()
@@ -429,3 +458,161 @@ def test_aeap_flow_verified(acfactory):
     assert ac1new.get_config("addr") in [
         contact.get_snapshot().address for contact in msg_in_2_snapshot.chat.get_contacts()
     ]
+
+
+def test_gossip_verification(acfactory) -> None:
+    alice, bob, carol = acfactory.get_online_accounts(3)
+
+    # Bob verifies Alice.
+    qr_code = alice.get_qr_code()
+    bob.secure_join(qr_code)
+    bob.wait_for_securejoin_joiner_success()
+
+    # Bob verifies Carol.
+    qr_code = carol.get_qr_code()
+    bob.secure_join(qr_code)
+    bob.wait_for_securejoin_joiner_success()
+
+    bob_contact_alice = bob.create_contact(alice.get_config("addr"), "Alice")
+    bob_contact_carol = bob.create_contact(carol.get_config("addr"), "Carol")
+    carol_contact_alice = carol.create_contact(alice.get_config("addr"), "Alice")
+
+    logging.info("Bob creates an Autocrypt group")
+    bob_group_chat = bob.create_group("Autocrypt Group")
+    assert not bob_group_chat.get_basic_snapshot().is_protected
+    bob_group_chat.add_contact(bob_contact_alice)
+    bob_group_chat.add_contact(bob_contact_carol)
+    bob_group_chat.send_message(text="Hello Autocrypt group")
+
+    snapshot = carol.get_message_by_id(carol.wait_for_incoming_msg_event().msg_id).get_snapshot()
+    assert snapshot.text == "Hello Autocrypt group"
+    assert snapshot.show_padlock
+
+    # Autocrypt group does not propagate verification.
+    carol_contact_alice_snapshot = carol_contact_alice.get_snapshot()
+    assert not carol_contact_alice_snapshot.is_verified
+
+    logging.info("Bob creates a Securejoin group")
+    bob_group_chat = bob.create_group("Securejoin Group", protect=True)
+    assert bob_group_chat.get_basic_snapshot().is_protected
+    bob_group_chat.add_contact(bob_contact_alice)
+    bob_group_chat.add_contact(bob_contact_carol)
+    bob_group_chat.send_message(text="Hello Securejoin group")
+
+    snapshot = carol.get_message_by_id(carol.wait_for_incoming_msg_event().msg_id).get_snapshot()
+    assert snapshot.text == "Hello Securejoin group"
+    assert snapshot.show_padlock
+
+    # Securejoin propagates verification.
+    carol_contact_alice_snapshot = carol_contact_alice.get_snapshot()
+    assert carol_contact_alice_snapshot.is_verified
+
+
+def test_securejoin_after_contact_resetup(acfactory) -> None:
+    """
+    Regression test for a bug that prevented joining verified group with a QR code
+    if the group is already created and contains
+    a contact with inconsistent (Autocrypt and verified keys exist but don't match) key state.
+    """
+    ac1, ac2, ac3 = acfactory.get_online_accounts(3)
+
+    # ac3 creates protected group with ac1.
+    ac3_chat = ac3.create_group("Verified group", protect=True)
+
+    # ac1 joins ac3 group.
+    ac3_qr_code = ac3_chat.get_qr_code()
+    ac1.secure_join(ac3_qr_code)
+    ac1.wait_for_securejoin_joiner_success()
+
+    # ac1 waits for member added message and creates a QR code.
+    snapshot = ac1.get_message_by_id(ac1.wait_for_incoming_msg_event().msg_id).get_snapshot()
+    ac1_qr_code = snapshot.chat.get_qr_code()
+
+    # ac2 verifies ac1
+    qr_code = ac1.get_qr_code()
+    ac2.secure_join(qr_code)
+    ac2.wait_for_securejoin_joiner_success()
+
+    # ac1 is verified for ac2.
+    ac2_contact_ac1 = ac2.create_contact(ac1.get_config("addr"), "")
+    assert ac2_contact_ac1.get_snapshot().is_verified
+
+    # ac1 resetups the account.
+    ac1 = acfactory.resetup_account(ac1)
+
+    # ac1 sends a message to ac2.
+    ac1_contact_ac2 = ac1.create_contact(ac2.get_config("addr"), "")
+    ac1_chat_ac2 = ac1_contact_ac2.create_chat()
+    ac1_chat_ac2.send_text("Hello!")
+
+    # ac2 receives a message.
+    snapshot = ac2.get_message_by_id(ac2.wait_for_incoming_msg_event().msg_id).get_snapshot()
+    assert snapshot.text == "Hello!"
+
+    # ac1 is no longer verified for ac2 as new Autocrypt key is not the same as old verified key.
+    assert not ac2_contact_ac1.get_snapshot().is_verified
+
+    # ac1 goes offline.
+    ac1.remove()
+
+    # Scanning a QR code results in creating an unprotected group with an inviter.
+    # In this case inviter is ac1 which has an inconsistent key state.
+    # Normally inviter becomes verified as a result of Securejoin protocol
+    # and then the group chat becomes verified when "Member added" is received,
+    # but in this case ac1 is offline and this Securejoin process will never finish.
+    logging.info("ac2 scans ac1 QR code, this is not expected to finish")
+    ac2.secure_join(ac1_qr_code)
+
+    logging.info("ac2 scans ac3 QR code")
+    ac2.secure_join(ac3_qr_code)
+
+    logging.info("ac2 waits for joiner success")
+    ac2.wait_for_securejoin_joiner_success()
+
+    # Wait for member added.
+    logging.info("ac2 waits for member added message")
+    snapshot = ac2.get_message_by_id(ac2.wait_for_incoming_msg_event().msg_id).get_snapshot()
+    assert snapshot.is_info
+    ac2_chat = snapshot.chat
+    assert ac2_chat.get_basic_snapshot().is_protected
+    assert len(ac2_chat.get_contacts()) == 3
+
+    # ac1 is still "not verified" for ac2 due to inconsistent state.
+    assert not ac2_contact_ac1.get_snapshot().is_verified
+
+
+def test_withdraw_securejoin_qr(acfactory):
+    alice, bob = acfactory.get_online_accounts(2)
+
+    logging.info("Alice creates a verified group")
+    alice_chat = alice.create_group("Verified group", protect=True)
+    assert alice_chat.get_basic_snapshot().is_protected
+    logging.info("Bob joins verified group")
+
+    qr_code = alice_chat.get_qr_code()
+    bob_chat = bob.secure_join(qr_code)
+    bob.wait_for_securejoin_joiner_success()
+
+    snapshot = bob.get_message_by_id(bob.wait_for_incoming_msg_event().msg_id).get_snapshot()
+    assert snapshot.text == "Member Me ({}) added by {}.".format(bob.get_config("addr"), alice.get_config("addr"))
+    assert snapshot.chat.get_basic_snapshot().is_protected
+    bob_chat.leave()
+
+    snapshot = alice.get_message_by_id(alice.wait_for_incoming_msg_event().msg_id).get_snapshot()
+    assert snapshot.text == "Group left by {}.".format(bob.get_config("addr"))
+
+    logging.info("Alice withdraws QR code.")
+    qr = alice.check_qr(qr_code)
+    assert qr["kind"] == "withdrawVerifyGroup"
+    alice.set_config_from_qr(qr_code)
+
+    logging.info("Bob scans withdrawn QR code.")
+    bob_chat = bob.secure_join(qr_code)
+
+    logging.info("Bob scanned withdrawn QR code")
+    while True:
+        event = alice.wait_for_event()
+        if event.kind == EventType.MSGS_CHANGED and event.chat_id != 0:
+            break
+    snapshot = alice.get_message_by_id(event.msg_id).get_snapshot()
+    assert snapshot.text == "Cannot establish guaranteed end-to-end encryption with {}".format(bob.get_config("addr"))

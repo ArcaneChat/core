@@ -94,10 +94,11 @@ pub mod webxdc;
 #[macro_use]
 mod dehtml;
 mod authres;
-mod color;
+pub mod color;
 pub mod html;
 pub mod net;
 pub mod plaintext;
+mod push;
 pub mod summary;
 
 mod debug_logging;
@@ -105,6 +106,7 @@ pub mod receive_imf;
 pub mod tools;
 
 pub mod accounts;
+pub mod peer_channels;
 pub mod reaction;
 
 /// If set IMAP/incoming and SMTP/outgoing MIME messages will be printed.

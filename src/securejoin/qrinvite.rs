@@ -4,8 +4,6 @@
 //! with it rather hard, so here we have a wrapper type that specifically deals with Secure-Join
 //! QR-codes so that the Secure-Join code can have more guarantees when dealing with this.
 
-use std::convert::TryFrom;
-
 use anyhow::{bail, Error, Result};
 
 use crate::contact::ContactId;
@@ -97,7 +95,7 @@ impl TryFrom<Qr> for QrInvite {
                 invitenumber,
                 authcode,
             }),
-            _ => bail!("Unsupported QR type {:?}", qr),
+            _ => bail!("Unsupported QR type"),
         }
     }
 }

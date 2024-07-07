@@ -1,14 +1,16 @@
 //! Migrations module.
 
-use anyhow::{Context as _, Result};
+use anyhow::{ensure, Context as _, Result};
+use deltachat_contact_tools::EmailAddress;
+use rusqlite::OptionalExtension;
 
 use crate::config::Config;
 use crate::constants::ShowEmails;
 use crate::context::Context;
 use crate::imap;
+use crate::message::MsgId;
 use crate::provider::get_provider_by_domain;
 use crate::sql::Sql;
-use crate::tools::EmailAddress;
 
 const DBVERSION: i32 = 68;
 const VERSION_CFG: &str = "dbversion";
@@ -135,9 +137,9 @@ ALTER TABLE acpeerstates ADD COLUMN gossip_key;"#,
         // the current ones are defined by chats.blocked=2
         sql.execute_migration(
             r#"
-DELETE FROM msgs WHERE chat_id=1 OR chat_id=2;"
-CREATE INDEX chats_contacts_index2 ON chats_contacts (contact_id);"
-ALTER TABLE msgs ADD COLUMN timestamp_sent INTEGER DEFAULT 0;")
+DELETE FROM msgs WHERE chat_id=1 OR chat_id=2;
+CREATE INDEX chats_contacts_index2 ON chats_contacts (contact_id);
+ALTER TABLE msgs ADD COLUMN timestamp_sent INTEGER DEFAULT 0;
 ALTER TABLE msgs ADD COLUMN timestamp_rcvd INTEGER DEFAULT 0;"#,
             27,
         )
@@ -265,7 +267,7 @@ CREATE INDEX msgs_index6 ON msgs (location_id);"#,
         // so, msg_id may or may not exist.
         sql.execute_migration(
             r#"
-CREATE TABLE devmsglabels (id INTEGER PRIMARY KEY AUTOINCREMENT, label TEXT, msg_id INTEGER DEFAULT 0);",
+CREATE TABLE devmsglabels (id INTEGER PRIMARY KEY AUTOINCREMENT, label TEXT, msg_id INTEGER DEFAULT 0);
 CREATE INDEX devmsglabels_index1 ON devmsglabels (label);"#, 59)
             .await?;
         if exists_before_update && sql.get_raw_config_int("bcc_self").await?.is_none() {
@@ -366,7 +368,7 @@ UPDATE chats SET protected=1, type=120 WHERE type=130;"#,
         if let Ok(addr) = context.get_primary_self_addr().await {
             if let Ok(domain) = EmailAddress::new(&addr).map(|email| email.domain) {
                 context
-                    .set_config(
+                    .set_config_internal(
                         Config::ConfiguredProvider,
                         get_provider_by_domain(&domain).map(|provider| provider.id),
                     )
@@ -576,7 +578,7 @@ CREATE INDEX smtp_messageid ON imap(rfc724_mid);
     if dbversion < 90 {
         sql.execute_migration(
             r#"CREATE TABLE smtp_mdns (
-              msg_id INTEGER NOT NULL, -- id of the message in msgs table which requested MDN
+              msg_id INTEGER NOT NULL, -- id of the message in msgs table which requested MDN (DEPRECATED 2024-06-21)
               from_id INTEGER NOT NULL, -- id of the contact that sent the message, MDN destination
               rfc724_mid TEXT NOT NULL, -- Message-ID header
               retries INTEGER NOT NULL DEFAULT 0 -- Number of failed attempts to send MDN
@@ -611,6 +613,7 @@ CREATE INDEX smtp_messageid ON imap(rfc724_mid);
         ).await?;
     }
     if dbversion < 93 {
+        // `sending_domains` is now unused, but was not removed for backwards compatibility.
         sql.execute_migration(
             "CREATE TABLE sending_domains(domain TEXT PRIMARY KEY, dkim_works INTEGER DEFAULT 0);",
             93,
@@ -763,6 +766,195 @@ CREATE INDEX smtp_messageid ON imap(rfc724_mid);
         .await?;
     }
 
+    if dbversion < 105 {
+        // Create UNIQUE uid column and drop unused update_item_read column.
+        sql.execute_migration(
+            r#"CREATE TABLE new_msgs_status_updates (
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+msg_id INTEGER,
+update_item TEXT DEFAULT '',
+uid TEXT UNIQUE
+);
+INSERT OR IGNORE INTO new_msgs_status_updates SELECT
+  id, msg_id, update_item, NULL
+FROM msgs_status_updates;
+DROP TABLE msgs_status_updates;
+ALTER TABLE new_msgs_status_updates RENAME TO msgs_status_updates;
+CREATE INDEX msgs_status_updates_index1 ON msgs_status_updates (msg_id);
+CREATE INDEX msgs_status_updates_index2 ON msgs_status_updates (uid);
+"#,
+            105,
+        )
+        .await?;
+    }
+
+    if dbversion < 106 {
+        // Recreate `config` table with UNIQUE constraint on `keyname`.
+        sql.execute_migration(
+            "CREATE TABLE new_config (
+               id INTEGER PRIMARY KEY,
+               keyname TEXT UNIQUE,
+               value TEXT NOT NULL
+             );
+             INSERT OR IGNORE INTO new_config SELECT
+               id, keyname, value
+             FROM config;
+             DROP TABLE config;
+             ALTER TABLE new_config RENAME TO config;
+             CREATE INDEX config_index1 ON config (keyname);",
+            106,
+        )
+        .await?;
+    }
+
+    if dbversion < 107 {
+        sql.execute_migration(
+            "CREATE TABLE new_keypairs (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               private_key UNIQUE NOT NULL,
+               public_key UNIQUE NOT NULL
+             );
+             INSERT OR IGNORE INTO new_keypairs SELECT id, private_key, public_key FROM keypairs;
+
+             INSERT OR IGNORE
+             INTO config (keyname, value)
+             VALUES
+             ('key_id', (SELECT id FROM new_keypairs
+                         WHERE private_key=
+                           (SELECT private_key FROM keypairs
+                            WHERE addr=(SELECT value FROM config WHERE keyname='configured_addr')
+                            AND is_default=1)));
+
+             -- We do not drop the old `keypairs` table for now,
+             -- but move it to `old_keypairs`. We can remove it later
+             -- in next migrations. This may be needed for recovery
+             -- in case something is wrong with the migration.
+             ALTER TABLE keypairs RENAME TO old_keypairs;
+             ALTER TABLE new_keypairs RENAME TO keypairs;
+             ",
+            107,
+        )
+        .await?;
+    }
+
+    if dbversion < 108 {
+        let version = 108;
+        let chunk_size = context.get_max_smtp_rcpt_to().await?;
+        sql.transaction(move |trans| {
+            Sql::set_db_version_trans(trans, version)?;
+            let id_max =
+                trans.query_row("SELECT IFNULL((SELECT MAX(id) FROM smtp), 0)", (), |row| {
+                    let id_max: i64 = row.get(0)?;
+                    Ok(id_max)
+                })?;
+            while let Some((id, rfc724_mid, mime, msg_id, recipients, retries)) = trans
+                .query_row(
+                    "SELECT id, rfc724_mid, mime, msg_id, recipients, retries FROM smtp \
+                    WHERE id<=? LIMIT 1",
+                    (id_max,),
+                    |row| {
+                        let id: i64 = row.get(0)?;
+                        let rfc724_mid: String = row.get(1)?;
+                        let mime: String = row.get(2)?;
+                        let msg_id: MsgId = row.get(3)?;
+                        let recipients: String = row.get(4)?;
+                        let retries: i64 = row.get(5)?;
+                        Ok((id, rfc724_mid, mime, msg_id, recipients, retries))
+                    },
+                )
+                .optional()?
+            {
+                trans.execute("DELETE FROM smtp WHERE id=?", (id,))?;
+                let recipients = recipients.split(' ').collect::<Vec<_>>();
+                for recipients in recipients.chunks(chunk_size) {
+                    let recipients = recipients.join(" ");
+                    trans.execute(
+                        "INSERT INTO smtp (rfc724_mid, mime, msg_id, recipients, retries) \
+                        VALUES (?, ?, ?, ?, ?)",
+                        (&rfc724_mid, &mime, msg_id, recipients, retries),
+                    )?;
+                }
+            }
+            Ok(())
+        })
+        .await
+        .with_context(|| format!("migration failed for version {version}"))?;
+
+        sql.set_db_version_in_cache(version).await?;
+    }
+
+    if dbversion < 109 {
+        sql.execute_migration(
+            r#"ALTER TABLE acpeerstates
+               ADD COLUMN backward_verified_key_id -- What we think the contact has as our verified key
+               INTEGER;
+               UPDATE acpeerstates
+               SET backward_verified_key_id=(SELECT value FROM config WHERE keyname='key_id')
+               WHERE verified_key IS NOT NULL
+               "#,
+            109,
+        )
+        .await?;
+    }
+
+    if dbversion < 110 {
+        sql.execute_migration(
+            "ALTER TABLE keypairs ADD COLUMN addr TEXT DEFAULT '' COLLATE NOCASE;
+            ALTER TABLE keypairs ADD COLUMN is_default INTEGER DEFAULT 0;
+            ALTER TABLE keypairs ADD COLUMN created INTEGER DEFAULT 0;
+            UPDATE keypairs SET addr=(SELECT value FROM config WHERE keyname='configured_addr'), is_default=1;",
+            110,
+        )
+        .await?;
+    }
+
+    if dbversion < 111 {
+        sql.execute_migration(
+            "CREATE TABLE iroh_gossip_peers (msg_id TEXT not NULL, topic TEXT NOT NULL, public_key TEXT NOT NULL)",
+            111,
+        )
+        .await?;
+    }
+
+    if dbversion < 112 {
+        sql.execute_migration(
+            "DROP TABLE iroh_gossip_peers; CREATE TABLE iroh_gossip_peers (msg_id INTEGER not NULL, topic BLOB NOT NULL, public_key BLOB NOT NULL, relay_server TEXT, UNIQUE (public_key, topic)) STRICT",
+            112,
+        )
+        .await?;
+    }
+
+    if dbversion < 113 {
+        sql.execute_migration(
+            "DROP TABLE iroh_gossip_peers; CREATE TABLE iroh_gossip_peers (msg_id INTEGER not NULL, topic BLOB NOT NULL, public_key BLOB NOT NULL, relay_server TEXT, UNIQUE (topic, public_key), PRIMARY KEY(topic, public_key)) STRICT",
+            113,
+        )
+        .await?;
+    }
+
+    if dbversion < 114 {
+        sql.execute_migration("CREATE INDEX reactions_index1 ON reactions (msg_id)", 114)
+            .await?;
+    }
+
+    if dbversion < 115 {
+        sql.execute_migration("ALTER TABLE msgs ADD COLUMN txt_normalized TEXT", 115)
+            .await?;
+    }
+    let migration_version: i32 = 115;
+
+    let migration_version: i32 = migration_version + 1;
+    ensure!(migration_version == 116, "Fix the number here");
+    if dbversion < migration_version {
+        // Whether the message part doesn't need to be stored on the server. If all parts are marked
+        // deleted, a server-side deletion is issued.
+        sql.execute_migration(
+            "ALTER TABLE msgs ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0",
+            migration_version,
+        )
+        .await?;
+    }
+
     let new_version = sql
         .get_raw_config_int(VERSION_CFG)
         .await?
@@ -771,13 +963,11 @@ CREATE INDEX smtp_messageid ON imap(rfc724_mid);
         let created_db = if exists_before_update {
             ""
         } else {
-            "Created new database; "
+            "Created new database. "
         };
-        info!(
-            context,
-            "{}[migration] v{}-v{}", created_db, dbversion, new_version
-        );
+        info!(context, "{}Migration done from v{}.", created_db, dbversion);
     }
+    info!(context, "Database version: v{new_version}.");
 
     Ok((
         recalc_fingerprints,
@@ -802,8 +992,21 @@ impl Sql {
         Ok(())
     }
 
+    async fn set_db_version_in_cache(&self, version: i32) -> Result<()> {
+        let mut lock = self.config_cache.write().await;
+        lock.insert(VERSION_CFG.to_string(), Some(format!("{version}")));
+        Ok(())
+    }
+
     async fn execute_migration(&self, query: &str, version: i32) -> Result<()> {
         self.transaction(move |transaction| {
+            let curr_version: String = transaction.query_row(
+                "SELECT IFNULL(value, ?) FROM config WHERE keyname=?;",
+                ("0", VERSION_CFG),
+                |row| row.get(0),
+            )?;
+            let curr_version: i32 = curr_version.parse()?;
+            ensure!(curr_version < version, "Db version must be increased");
             Self::set_db_version_trans(transaction, version)?;
             transaction.execute_batch(query)?;
 
@@ -812,10 +1015,6 @@ impl Sql {
         .await
         .with_context(|| format!("execute_migration failed for version {version}"))?;
 
-        let mut lock = self.config_cache.write().await;
-        lock.insert(VERSION_CFG.to_string(), Some(format!("{version}")));
-        drop(lock);
-
-        Ok(())
+        self.set_db_version_in_cache(version).await
     }
 }

@@ -1,3 +1,4 @@
+use crate::api::VcardContact;
 use anyhow::{Context as _, Result};
 use deltachat::chat::Chat;
 use deltachat::chat::ChatItem;
@@ -35,6 +36,10 @@ pub struct MessageObject {
     parent_id: Option<u32>,
 
     text: String,
+
+    /// Check if a message has a POI location bound to it.
+    /// These locations are also returned by `get_locations` method.
+    /// The UI may decide to display a special icon beside such messages.
     has_location: bool,
     has_html: bool,
     view_type: MessageViewtype,
@@ -83,6 +88,8 @@ pub struct MessageObject {
     download_state: DownloadState,
 
     reactions: Option<JSONRPCReactions>,
+
+    vcard_contact: Option<VcardContact>,
 }
 
 #[derive(Serialize, TypeDef, schemars::JsonSchema)]
@@ -105,11 +112,6 @@ enum MessageQuote {
 }
 
 impl MessageObject {
-    pub async fn from_message_id(context: &Context, message_id: u32) -> Result<Self> {
-        let msg_id = MsgId::new(message_id);
-        Self::from_msg_id(context, msg_id).await
-    }
-
     pub async fn from_msg_id(context: &Context, msg_id: MsgId) -> Result<Self> {
         let message = Message::load_from_db(context, msg_id).await?;
 
@@ -174,6 +176,13 @@ impl MessageObject {
             Some(reactions.into())
         };
 
+        let vcard_contacts: Vec<VcardContact> = message
+            .vcard_contacts(context)
+            .await?
+            .into_iter()
+            .map(Into::into)
+            .collect();
+
         Ok(MessageObject {
             id: msg_id.to_u32(),
             chat_id: message.get_chat_id().to_u32(),
@@ -233,6 +242,8 @@ impl MessageObject {
             download_state,
 
             reactions,
+
+            vcard_contact: vcard_contacts.first().cloned(),
         })
     }
 }
@@ -275,6 +286,11 @@ pub enum MessageViewtype {
 
     /// Message is an webxdc instance.
     Webxdc,
+
+    /// Message containing shared contacts represented as a vCard (virtual contact file)
+    /// with email addresses and possibly other fields.
+    /// Use `parse_vcard()` to retrieve them.
+    Vcard,
 }
 
 impl From<Viewtype> for MessageViewtype {
@@ -291,6 +307,7 @@ impl From<Viewtype> for MessageViewtype {
             Viewtype::File => MessageViewtype::File,
             Viewtype::VideochatInvitation => MessageViewtype::VideochatInvitation,
             Viewtype::Webxdc => MessageViewtype::Webxdc,
+            Viewtype::Vcard => MessageViewtype::Vcard,
         }
     }
 }
@@ -309,6 +326,7 @@ impl From<MessageViewtype> for Viewtype {
             MessageViewtype::File => Viewtype::File,
             MessageViewtype::VideochatInvitation => Viewtype::VideochatInvitation,
             MessageViewtype::Webxdc => Viewtype::Webxdc,
+            MessageViewtype::Vcard => Viewtype::Vcard,
         }
     }
 }
@@ -345,6 +363,15 @@ pub enum SystemMessageType {
     SecurejoinMessage,
     LocationStreamingEnabled,
     LocationOnly,
+    InvalidUnencryptedMail,
+
+    /// 1:1 chats info message telling that SecureJoin has started and the user should wait for it
+    /// to complete.
+    SecurejoinWait,
+
+    /// 1:1 chats info message telling that SecureJoin is still running, but the user may already
+    /// send messages.
+    SecurejoinWaitTimeout,
 
     /// Chat ephemeral message timer is changed.
     EphemeralTimerChanged,
@@ -364,6 +391,9 @@ pub enum SystemMessageType {
 
     /// Webxdc info added with `info` set in `send_webxdc_status_update()`.
     WebxdcInfoMessage,
+
+    /// This message contains a users iroh node address.
+    IrohNodeAddr,
 }
 
 impl From<deltachat::mimeparser::SystemMessage> for SystemMessageType {
@@ -385,6 +415,10 @@ impl From<deltachat::mimeparser::SystemMessage> for SystemMessageType {
             SystemMessage::MultiDeviceSync => SystemMessageType::MultiDeviceSync,
             SystemMessage::WebxdcStatusUpdate => SystemMessageType::WebxdcStatusUpdate,
             SystemMessage::WebxdcInfoMessage => SystemMessageType::WebxdcInfoMessage,
+            SystemMessage::InvalidUnencryptedMail => SystemMessageType::InvalidUnencryptedMail,
+            SystemMessage::IrohNodeAddr => SystemMessageType::IrohNodeAddr,
+            SystemMessage::SecurejoinWait => SystemMessageType::SecurejoinWait,
+            SystemMessage::SecurejoinWaitTimeout => SystemMessageType::SecurejoinWaitTimeout,
         }
     }
 }
@@ -546,6 +580,44 @@ pub struct MessageData {
     pub quoted_message_id: Option<u32>,
 }
 
+impl MessageData {
+    pub(crate) async fn create_message(self, context: &Context) -> Result<Message> {
+        let mut message = Message::new(if let Some(viewtype) = self.viewtype {
+            viewtype.into()
+        } else if self.file.is_some() {
+            Viewtype::File
+        } else {
+            Viewtype::Text
+        });
+        message.set_text(self.text.unwrap_or_default());
+        if self.html.is_some() {
+            message.set_html(self.html);
+        }
+        if self.override_sender_name.is_some() {
+            message.set_override_sender_name(self.override_sender_name);
+        }
+        if let Some(file) = self.file {
+            message.set_file(file, None);
+        }
+        if let Some((latitude, longitude)) = self.location {
+            message.set_location(latitude, longitude);
+        }
+        if let Some(id) = self.quoted_message_id {
+            message
+                .set_quote(
+                    context,
+                    Some(
+                        &Message::load_from_db(context, MsgId::new(id))
+                            .await
+                            .context("message to quote could not be loaded")?,
+                    ),
+                )
+                .await?;
+        }
+        Ok(message)
+    }
+}
+
 #[derive(Serialize, TypeDef, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageReadReceipt {
@@ -596,7 +668,7 @@ impl MessageInfo {
 #[derive(
     Debug, PartialEq, Eq, Copy, Clone, Serialize, Deserialize, TypeDef, schemars::JsonSchema,
 )]
-#[serde(rename_all = "camelCase", tag = "variant")]
+#[serde(rename_all = "camelCase", tag = "kind")]
 pub enum EphemeralTimer {
     /// Timer is disabled.
     Disabled,

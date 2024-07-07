@@ -2,7 +2,7 @@
 
 use mailparse::{MailHeader, MailHeaderMap};
 
-#[derive(Debug, Display, Clone, PartialEq, Eq, EnumVariantNames, IntoStaticStr)]
+#[derive(Debug, Display, Clone, PartialEq, Eq, IntoStaticStr)]
 #[strum(serialize_all = "kebab_case")]
 #[allow(missing_docs)]
 pub enum HeaderDef {
@@ -38,6 +38,9 @@ pub enum HeaderDef {
     /// Mailing list ID defined in [RFC 2919](https://tools.ietf.org/html/rfc2919).
     ListId,
     ListPost,
+
+    /// List-Help header defined in [RFC 2369](https://datatracker.ietf.org/doc/html/rfc2369).
+    ListHelp,
     References,
 
     /// In-Reply-To header containing Message-ID of the parent message.
@@ -71,6 +74,11 @@ pub enum HeaderDef {
     Autocrypt,
     AutocryptSetupMessage,
     SecureJoin,
+
+    /// Deprecated header containing Group-ID in `vg-request-with-auth` message.
+    ///
+    /// It is not used by Alice as Alice knows the group corresponding to the AUTH token.
+    /// Bob still sends it for backwards compatibility.
     SecureJoinGroup,
     SecureJoinFingerprint,
     SecureJoinInvitenumber,
@@ -84,6 +92,12 @@ pub enum HeaderDef {
     /// A header that includes the results of the DKIM, SPF and DMARC checks.
     /// See <https://datatracker.ietf.org/doc/html/rfc8601>
     AuthenticationResults,
+
+    /// Node address from iroh where direct addresses have been removed.
+    IrohNodeAddr,
+
+    /// Advertised gossip topic for one webxdc.
+    IrohGossipTopic,
 
     #[cfg(test)]
     TestHeader,

@@ -6,6 +6,9 @@
   <a href="https://github.com/deltachat/deltachat-core-rust/actions/workflows/ci.yml">
     <img alt="Rust CI" src="https://github.com/deltachat/deltachat-core-rust/actions/workflows/ci.yml/badge.svg">
   </a>
+  <a href="https://deps.rs/repo/github/deltachat/deltachat-core-rust">
+    <img alt="dependency status" src="https://deps.rs/repo/github/deltachat/deltachat-core-rust/status.svg">
+  </a>
 </p>
 
 <p align="center">
@@ -27,7 +30,7 @@ $ curl https://sh.rustup.rs -sSf | sh
 Compile and run Delta Chat Core command line utility, using `cargo`:
 
 ```
-$ RUST_LOG=deltachat_repl=info cargo run -p deltachat-repl -- ~/deltachat-db
+$ cargo run -p deltachat-repl -- ~/deltachat-db
 ```
 where ~/deltachat-db is the database file. Delta Chat will create it if it does not exist.
 
@@ -121,7 +124,7 @@ $ cargo build -p deltachat_ffi --release
 
 - `DCC_MIME_DEBUG`: if set outgoing and incoming message will be printed 
 
-- `RUST_LOG=deltachat_repl=info,async_imap=trace,async_smtp=trace`: enable IMAP and
+- `RUST_LOG=async_imap=trace,async_smtp=trace`: enable IMAP and
 SMTP tracing in addition to info messages.
 
 ### Expensive tests
@@ -192,6 +195,7 @@ or its language bindings:
 - [Desktop](https://github.com/deltachat/deltachat-desktop)
 - [Pidgin](https://code.ur.gs/lupine/purple-plugin-delta/)
 - [Telepathy](https://code.ur.gs/lupine/telepathy-padfoot/)
+- [Ubuntu Touch](https://codeberg.org/lk108/deltatouch)
 - several **Bots**
 
 [^1]: Out of date / unmaintained, if you like those languages feel free to start maintaining them. If you have questions we'll help you, please ask in the issues.

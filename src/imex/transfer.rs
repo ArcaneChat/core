@@ -38,6 +38,7 @@ use iroh::progress::ProgressEmitter;
 use iroh::protocol::AuthToken;
 use iroh::provider::{DataSource, Event, Provider, Ticket};
 use iroh::Hash;
+use iroh_old as iroh;
 use tokio::fs::{self, File};
 use tokio::io::{self, AsyncWriteExt, BufWriter};
 use tokio::sync::broadcast::error::RecvError;
@@ -52,6 +53,7 @@ use crate::context::Context;
 use crate::message::{Message, Viewtype};
 use crate::qr::{self, Qr};
 use crate::stock_str::backup_transfer_msg_body;
+use crate::tools::time;
 use crate::{e2ee, EventType};
 
 use super::{export_database, DBFILE_BACKUP_NAME};
@@ -158,7 +160,7 @@ impl BackupProvider {
         // Generate the token up front: we also use it to encrypt the database.
         let token = AuthToken::generate();
         context.emit_event(SendProgress::Started.into());
-        export_database(context, dbfile, token.to_string())
+        export_database(context, dbfile, token.to_string(), time())
             .await
             .context("Database export failed")?;
         context.emit_event(SendProgress::DatabaseExported.into());
@@ -596,7 +598,6 @@ mod tests {
     use std::time::Duration;
 
     use crate::chat::{get_chat_msgs, send_msg, ChatItem};
-    use crate::message::{Message, Viewtype};
     use crate::test_utils::TestContextManager;
 
     use super::*;
@@ -638,7 +639,7 @@ mod tests {
         let self_chat = ctx1.get_self_chat().await;
         let msgs = get_chat_msgs(&ctx1, self_chat.id).await.unwrap();
         assert_eq!(msgs.len(), 2);
-        let msgid = match msgs.get(0).unwrap() {
+        let msgid = match msgs.first().unwrap() {
             ChatItem::Message { msg_id } => msg_id,
             _ => panic!("wrong chat item"),
         };
@@ -655,6 +656,12 @@ mod tests {
         assert_eq!(path.with_file_name("hello.txt"), path);
         let text = fs::read_to_string(&path).await.unwrap();
         assert_eq!(text, "i am attachment");
+
+        let path = path.with_file_name("saved.txt");
+        msg.save_file(&ctx1, &path).await.unwrap();
+        let text = fs::read_to_string(&path).await.unwrap();
+        assert_eq!(text, "i am attachment");
+        assert!(msg.save_file(&ctx1, &path).await.is_err());
 
         // Check that both received the ImexProgress events.
         ctx0.evtracker

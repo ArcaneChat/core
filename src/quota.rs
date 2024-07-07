@@ -1,6 +1,7 @@
 //! # Support for IMAP QUOTA extension.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context as _, Result};
 use async_imap::types::{Quota, QuotaResource};
@@ -10,9 +11,8 @@ use crate::config::Config;
 use crate::context::Context;
 use crate::imap::scan_folders::get_watched_folders;
 use crate::imap::session::Session as ImapSession;
-use crate::imap::Imap;
 use crate::message::{Message, Viewtype};
-use crate::tools::time;
+use crate::tools::{self, time_elapsed};
 use crate::{stock_str, EventType};
 
 /// warn about a nearly full mailbox after this usage percentage is reached.
@@ -40,8 +40,8 @@ pub struct QuotaInfo {
     /// set to `Ok()` for valid quota information.
     pub(crate) recent: Result<BTreeMap<String, Vec<QuotaResource>>>,
 
-    /// Timestamp when structure was modified.
-    pub(crate) modified: i64,
+    /// When the structure was modified.
+    pub(crate) modified: tools::Time,
 }
 
 async fn get_unique_quota_roots_and_usage(
@@ -103,6 +103,16 @@ pub fn needs_quota_warning(curr_percentage: u64, warned_at_percentage: u64) -> b
 }
 
 impl Context {
+    /// Returns whether the quota value needs an update. If so, `update_recent_quota()` should be
+    /// called.
+    pub(crate) async fn quota_needs_update(&self, ratelimit_secs: u64) -> bool {
+        let quota = self.quota.read().await;
+        quota
+            .as_ref()
+            .filter(|quota| time_elapsed(&quota.modified) < Duration::from_secs(ratelimit_secs))
+            .is_none()
+    }
+
     /// Updates `quota.recent`, sets `quota.modified` to the current time
     /// and emits an event to let the UIs update connectivity view.
     ///
@@ -111,13 +121,7 @@ impl Context {
     /// As the message is added only once, the user is not spammed
     /// in case for some providers the quota is always at ~100%
     /// and new space is allocated as needed.
-    pub(crate) async fn update_recent_quota(&self, imap: &mut Imap) -> Result<()> {
-        if let Err(err) = imap.prepare(self).await {
-            warn!(self, "could not connect: {:#}", err);
-            return Ok(());
-        }
-
-        let session = imap.session.as_mut().context("no session")?;
+    pub(crate) async fn update_recent_quota(&self, session: &mut ImapSession) -> Result<()> {
         let quota = if session.can_check_quota() {
             let folders = get_watched_folders(self).await?;
             get_unique_quota_roots_and_usage(session, folders).await
@@ -132,13 +136,17 @@ impl Context {
                         highest,
                         self.get_config_int(Config::QuotaExceeding).await? as u64,
                     ) {
-                        self.set_config(Config::QuotaExceeding, Some(&highest.to_string()))
-                            .await?;
+                        self.set_config_internal(
+                            Config::QuotaExceeding,
+                            Some(&highest.to_string()),
+                        )
+                        .await?;
                         let mut msg = Message::new(Viewtype::Text);
                         msg.text = stock_str::quota_exceeding(self, highest).await;
                         add_device_msg_with_importance(self, None, Some(&mut msg), true).await?;
                     } else if highest <= QUOTA_ALLCLEAR_PERCENTAGE {
-                        self.set_config(Config::QuotaExceeding, None).await?;
+                        self.set_config_internal(Config::QuotaExceeding, None)
+                            .await?;
                     }
                 }
                 Err(err) => warn!(self, "cannot get highest quota usage: {:#}", err),
@@ -147,7 +155,7 @@ impl Context {
 
         *self.quota.write().await = Some(QuotaInfo {
             recent: quota,
-            modified: time(),
+            modified: tools::Time::now(),
         });
 
         self.emit_event(EventType::ConnectivityChanged);
@@ -158,10 +166,7 @@ impl Context {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::quota::{
-        QUOTA_ALLCLEAR_PERCENTAGE, QUOTA_ERROR_THRESHOLD_PERCENTAGE,
-        QUOTA_WARN_THRESHOLD_PERCENTAGE,
-    };
+    use crate::test_utils::TestContextManager;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_needs_quota_warning() -> Result<()> {
@@ -189,5 +194,25 @@ mod tests {
         assert!(QUOTA_WARN_THRESHOLD_PERCENTAGE < QUOTA_ERROR_THRESHOLD_PERCENTAGE);
         assert!(QUOTA_ERROR_THRESHOLD_PERCENTAGE < 100);
         Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_quota_needs_update() {
+        let mut tcm = TestContextManager::new();
+        let t = &tcm.unconfigured().await;
+        const TIMEOUT: u64 = 60;
+        assert!(t.quota_needs_update(TIMEOUT).await);
+
+        *t.quota.write().await = Some(QuotaInfo {
+            recent: Ok(Default::default()),
+            modified: tools::Time::now() - Duration::from_secs(TIMEOUT + 1),
+        });
+        assert!(t.quota_needs_update(TIMEOUT).await);
+
+        *t.quota.write().await = Some(QuotaInfo {
+            recent: Ok(Default::default()),
+            modified: tools::Time::now(),
+        });
+        assert!(!t.quota_needs_update(TIMEOUT).await);
     }
 }

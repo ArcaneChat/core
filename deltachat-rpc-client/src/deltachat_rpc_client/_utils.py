@@ -104,7 +104,11 @@ def _run_cli(
         if not client.is_configured():
             assert args.email, "Account is not configured and email must be provided"
             assert args.password, "Account is not configured and password must be provided"
-            configure_thread = Thread(run=client.configure, kwargs={"email": args.email, "password": args.password})
+            configure_thread = Thread(
+                target=client.configure,
+                daemon=True,
+                kwargs={"email": args.email, "password": args.password},
+            )
             configure_thread.start()
         client.run_forever()
 
@@ -168,3 +172,33 @@ def parse_system_add_remove(text: str) -> Optional[Tuple[str, str, str]]:
             return "removed", addr, addr
 
     return None
+
+
+class futuremethod:  # noqa: N801
+    """Decorator for async methods."""
+
+    def __init__(self, func):
+        self._func = func
+
+    def __get__(self, instance, owner=None):
+        if instance is None:
+            return self
+
+        def future(*args):
+            generator = self._func(instance, *args)
+            res = next(generator)
+
+            def f():
+                try:
+                    generator.send(res())
+                except StopIteration as e:
+                    return e.value
+
+            return f
+
+        def wrapper(*args):
+            f = future(*args)
+            return f()
+
+        wrapper.future = future
+        return wrapper

@@ -1,20 +1,24 @@
 //! # [Autocrypt Peer State](https://autocrypt.org/level1.html#peer-state-management) module.
 
+use std::mem;
+
 use anyhow::{Context as _, Error, Result};
+use deltachat_contact_tools::{addr_cmp, ContactAddress};
 use num_traits::FromPrimitive;
 
 use crate::aheader::{Aheader, EncryptPreference};
 use crate::chat::{self, Chat};
 use crate::chatlist::Chatlist;
+use crate::config::Config;
 use crate::constants::Chattype;
-use crate::contact::{addr_cmp, Contact, ContactAddress, Origin};
+use crate::contact::{Contact, Origin};
 use crate::context::Context;
 use crate::events::EventType;
 use crate::key::{DcKey, Fingerprint, SignedPublicKey};
 use crate::message::Message;
 use crate::mimeparser::SystemMessage;
 use crate::sql::Sql;
-use crate::stock_str;
+use crate::{chatlist_events, stock_str};
 
 /// Type of the public key stored inside the peerstate.
 #[derive(Debug)]
@@ -24,17 +28,6 @@ pub enum PeerstateKeyType {
 
     /// Public key sent in the `Autocrypt` header.
     PublicKey,
-}
-
-/// Verification status of the contact peerstate.
-#[derive(Debug, PartialEq, Eq, Clone, Copy, FromPrimitive)]
-#[repr(u8)]
-pub enum PeerstateVerifiedStatus {
-    /// Peerstate is not verified.
-    Unverified = 0,
-    //Verified = 1, // not used
-    /// Peerstate is verified and we assume that the contact has verified our peerstate.
-    BidirectVerified = 2,
 }
 
 /// Peerstate represents the state of an Autocrypt peer.
@@ -94,6 +87,10 @@ pub struct Peerstate {
     /// The address that introduced secondary verified key.
     pub secondary_verifier: Option<String>,
 
+    /// Row ID of the key in the `keypairs` table
+    /// that we think the peer knows as verified.
+    pub backward_verified_key_id: Option<i64>,
+
     /// True if it was detected
     /// that the fingerprint of the key used in chats with
     /// opportunistic encryption was changed after Peerstate creation.
@@ -103,13 +100,28 @@ pub struct Peerstate {
 impl Peerstate {
     /// Creates a peerstate from the `Autocrypt` header.
     pub fn from_header(header: &Aheader, message_time: i64) -> Self {
+        Self::from_public_key(
+            &header.addr,
+            message_time,
+            header.prefer_encrypt,
+            &header.public_key,
+        )
+    }
+
+    /// Creates a peerstate from the given public key.
+    pub fn from_public_key(
+        addr: &str,
+        last_seen: i64,
+        prefer_encrypt: EncryptPreference,
+        public_key: &SignedPublicKey,
+    ) -> Self {
         Peerstate {
-            addr: header.addr.clone(),
-            last_seen: message_time,
-            last_seen_autocrypt: message_time,
-            prefer_encrypt: header.prefer_encrypt,
-            public_key: Some(header.public_key.clone()),
-            public_key_fingerprint: Some(header.public_key.fingerprint()),
+            addr: addr.to_string(),
+            last_seen,
+            last_seen_autocrypt: last_seen,
+            prefer_encrypt,
+            public_key: Some(public_key.clone()),
+            public_key_fingerprint: Some(public_key.fingerprint()),
             gossip_key: None,
             gossip_key_fingerprint: None,
             gossip_timestamp: 0,
@@ -119,6 +131,7 @@ impl Peerstate {
             secondary_verified_key: None,
             secondary_verified_key_fingerprint: None,
             secondary_verifier: None,
+            backward_verified_key_id: None,
             fingerprint_changed: false,
         }
     }
@@ -148,18 +161,23 @@ impl Peerstate {
             secondary_verified_key: None,
             secondary_verified_key_fingerprint: None,
             secondary_verifier: None,
+            backward_verified_key_id: None,
             fingerprint_changed: false,
         }
     }
 
     /// Loads peerstate corresponding to the given address from the database.
     pub async fn from_addr(context: &Context, addr: &str) -> Result<Option<Peerstate>> {
+        if context.is_self_addr(addr).await? {
+            return Ok(None);
+        }
         let query = "SELECT addr, last_seen, last_seen_autocrypt, prefer_encrypted, public_key, \
                      gossip_timestamp, gossip_key, public_key_fingerprint, gossip_key_fingerprint, \
                      verified_key, verified_key_fingerprint, \
                      verifier, \
                      secondary_verified_key, secondary_verified_key_fingerprint, \
-                     secondary_verifier \
+                     secondary_verifier, \
+                     backward_verified_key_id \
                      FROM acpeerstates \
                      WHERE addr=? COLLATE NOCASE LIMIT 1;";
         Self::from_stmt(context, query, (addr,)).await
@@ -170,12 +188,14 @@ impl Peerstate {
         context: &Context,
         fingerprint: &Fingerprint,
     ) -> Result<Option<Peerstate>> {
+        // NOTE: If it's our key fingerprint, this returns None currently.
         let query = "SELECT addr, last_seen, last_seen_autocrypt, prefer_encrypted, public_key, \
                      gossip_timestamp, gossip_key, public_key_fingerprint, gossip_key_fingerprint, \
                      verified_key, verified_key_fingerprint, \
                      verifier, \
                      secondary_verified_key, secondary_verified_key_fingerprint, \
-                     secondary_verifier \
+                     secondary_verifier, \
+                     backward_verified_key_id \
                      FROM acpeerstates  \
                      WHERE public_key_fingerprint=? \
                      OR gossip_key_fingerprint=? \
@@ -193,18 +213,23 @@ impl Peerstate {
         fingerprint: &Fingerprint,
         addr: &str,
     ) -> Result<Option<Peerstate>> {
+        if context.is_self_addr(addr).await? {
+            return Ok(None);
+        }
         let query = "SELECT addr, last_seen, last_seen_autocrypt, prefer_encrypted, public_key, \
                      gossip_timestamp, gossip_key, public_key_fingerprint, gossip_key_fingerprint, \
                      verified_key, verified_key_fingerprint, \
                      verifier, \
                      secondary_verified_key, secondary_verified_key_fingerprint, \
-                     secondary_verifier \
+                     secondary_verifier, \
+                     backward_verified_key_id \
                      FROM acpeerstates  \
                      WHERE verified_key_fingerprint=? \
                      OR addr=? COLLATE NOCASE \
-                     ORDER BY verified_key_fingerprint=? DESC, last_seen DESC LIMIT 1;";
+                     ORDER BY verified_key_fingerprint=? DESC, addr=? COLLATE NOCASE DESC, \
+                     last_seen DESC LIMIT 1;";
         let fp = fingerprint.hex();
-        Self::from_stmt(context, query, (&fp, &addr, &fp)).await
+        Self::from_stmt(context, query, (&fp, addr, &fp, addr)).await
     }
 
     async fn from_stmt(
@@ -266,6 +291,7 @@ impl Peerstate {
                         let secondary_verifier: Option<String> = row.get("secondary_verifier")?;
                         secondary_verifier.filter(|s| !s.is_empty())
                     },
+                    backward_verified_key_id: row.get("backward_verified_key_id")?,
                     fingerprint_changed: false,
                 };
 
@@ -322,7 +348,7 @@ impl Peerstate {
             return;
         }
 
-        if message_time > self.last_seen {
+        if message_time >= self.last_seen {
             self.last_seen = message_time;
             self.last_seen_autocrypt = message_time;
             if (header.prefer_encrypt == EncryptPreference::Mutual
@@ -345,7 +371,7 @@ impl Peerstate {
             return;
         }
 
-        if message_time > self.gossip_timestamp {
+        if message_time >= self.gossip_timestamp {
             self.gossip_timestamp = message_time;
             if self.gossip_key.as_ref() != Some(&gossip_header.public_key) {
                 self.gossip_key = Some(gossip_header.public_key.clone());
@@ -373,8 +399,8 @@ impl Peerstate {
     }
 
     /// Returns the contents of the `Autocrypt-Gossip` header for outgoing messages.
-    pub fn render_gossip_header(&self, min_verified: PeerstateVerifiedStatus) -> Option<String> {
-        if let Some(key) = self.peek_key(min_verified) {
+    pub fn render_gossip_header(&self, verified: bool) -> Option<String> {
+        if let Some(key) = self.peek_key(verified) {
             let header = Aheader::new(
                 self.addr.clone(),
                 key.clone(), // TODO: avoid cloning
@@ -397,43 +423,41 @@ impl Peerstate {
     /// Converts the peerstate into the contact public key.
     ///
     /// Similar to [`Self::peek_key`], but consumes the peerstate and returns owned key.
-    pub fn take_key(mut self, min_verified: PeerstateVerifiedStatus) -> Option<SignedPublicKey> {
-        match min_verified {
-            PeerstateVerifiedStatus::BidirectVerified => self.verified_key.take(),
-            PeerstateVerifiedStatus::Unverified => {
-                self.public_key.take().or_else(|| self.gossip_key.take())
-            }
+    pub fn take_key(mut self, verified: bool) -> Option<SignedPublicKey> {
+        if verified {
+            self.verified_key.take()
+        } else {
+            self.public_key.take().or_else(|| self.gossip_key.take())
         }
     }
 
     /// Returns a reference to the contact public key.
     ///
-    /// `min_verified` determines the minimum required verification status of the key.
+    /// `verified` determines the required verification status of the key.
     /// If verified key is requested, returns the verified key,
     /// otherwise returns the Autocrypt key.
     ///
     /// Returned key is suitable for sending in `Autocrypt-Gossip` header.
     ///
     /// Returns `None` if there is no suitable public key.
-    pub fn peek_key(&self, min_verified: PeerstateVerifiedStatus) -> Option<&SignedPublicKey> {
-        match min_verified {
-            PeerstateVerifiedStatus::BidirectVerified => self.verified_key.as_ref(),
-            PeerstateVerifiedStatus::Unverified => {
-                self.public_key.as_ref().or(self.gossip_key.as_ref())
-            }
+    pub fn peek_key(&self, verified: bool) -> Option<&SignedPublicKey> {
+        if verified {
+            self.verified_key.as_ref()
+        } else {
+            self.public_key.as_ref().or(self.gossip_key.as_ref())
         }
     }
 
     /// Returns a reference to the contact's public key fingerprint.
     ///
     /// Similar to [`Self::peek_key`], but returns the fingerprint instead of the key.
-    fn peek_key_fingerprint(&self, min_verified: PeerstateVerifiedStatus) -> Option<&Fingerprint> {
-        match min_verified {
-            PeerstateVerifiedStatus::BidirectVerified => self.verified_key_fingerprint.as_ref(),
-            PeerstateVerifiedStatus::Unverified => self
-                .public_key_fingerprint
+    fn peek_key_fingerprint(&self, verified: bool) -> Option<&Fingerprint> {
+        if verified {
+            self.verified_key_fingerprint.as_ref()
+        } else {
+            self.public_key_fingerprint
                 .as_ref()
-                .or(self.gossip_key_fingerprint.as_ref()),
+                .or(self.gossip_key_fingerprint.as_ref())
         }
     }
 
@@ -443,127 +467,150 @@ impl Peerstate {
     /// Note that verified groups always use the verified key no matter if the
     /// opportunistic key matches or not.
     pub(crate) fn is_using_verified_key(&self) -> bool {
-        let verified = self.peek_key_fingerprint(PeerstateVerifiedStatus::BidirectVerified);
+        let verified = self.peek_key_fingerprint(true);
 
-        verified.is_some()
-            && verified == self.peek_key_fingerprint(PeerstateVerifiedStatus::Unverified)
+        verified.is_some() && verified == self.peek_key_fingerprint(false)
     }
 
-    /// Set this peerstate to verified
-    /// Make sure to call `self.save_to_db` to save these changes
+    pub(crate) async fn is_backward_verified(&self, context: &Context) -> Result<bool> {
+        let Some(backward_verified_key_id) = self.backward_verified_key_id else {
+            return Ok(false);
+        };
+
+        let self_key_id = context.get_config_i64(Config::KeyId).await?;
+
+        let backward_verified = backward_verified_key_id == self_key_id;
+        Ok(backward_verified)
+    }
+
+    /// Set this peerstate to verified;
+    /// make sure to call `self.save_to_db` to save these changes.
+    ///
     /// Params:
-    /// verifier:
+    ///
+    /// * key: The new verified key.
+    /// * fingerprint: Only set to verified if the key's fingerprint matches this.
+    /// * verifier:
     ///   The address which introduces the given contact.
     ///   If we are verifying the contact, use that contacts address.
     pub fn set_verified(
         &mut self,
-        which_key: PeerstateKeyType,
+        key: SignedPublicKey,
         fingerprint: Fingerprint,
         verifier: String,
     ) -> Result<()> {
-        match which_key {
-            PeerstateKeyType::PublicKey => {
-                if self.public_key_fingerprint.is_some()
-                    && self.public_key_fingerprint.as_ref().unwrap() == &fingerprint
-                {
-                    self.verified_key = self.public_key.clone();
-                    self.verified_key_fingerprint = Some(fingerprint);
-                    self.verifier = Some(verifier);
-                    Ok(())
-                } else {
-                    Err(Error::msg(format!(
-                        "{fingerprint} is not peer's public key fingerprint",
-                    )))
-                }
-            }
-            PeerstateKeyType::GossipKey => {
-                if self.gossip_key_fingerprint.is_some()
-                    && self.gossip_key_fingerprint.as_ref().unwrap() == &fingerprint
-                {
-                    self.verified_key = self.gossip_key.clone();
-                    self.verified_key_fingerprint = Some(fingerprint);
-                    self.verifier = Some(verifier);
-                    Ok(())
-                } else {
-                    Err(Error::msg(format!(
-                        "{fingerprint} is not peer's gossip key fingerprint",
-                    )))
-                }
-            }
+        if key.fingerprint() == fingerprint {
+            self.verified_key = Some(key);
+            self.verified_key_fingerprint = Some(fingerprint);
+            self.verifier = Some(verifier);
+            Ok(())
+        } else {
+            Err(Error::msg(format!(
+                "{fingerprint} is not peer's key fingerprint",
+            )))
         }
     }
 
-    /// Sets current gossiped key as the secondary verified key.
+    /// Sets the gossiped key as the secondary verified key.
     ///
     /// If gossiped key is the same as the current verified key,
     /// do nothing to avoid overwriting secondary verified key
     /// which may be different.
-    pub fn set_secondary_verified_key_from_gossip(&mut self, verifier: String) {
-        if self.gossip_key_fingerprint != self.verified_key_fingerprint {
-            self.secondary_verified_key = self.gossip_key.clone();
-            self.secondary_verified_key_fingerprint = self.gossip_key_fingerprint.clone();
+    pub fn set_secondary_verified_key(&mut self, gossip_key: SignedPublicKey, verifier: String) {
+        let fingerprint = gossip_key.fingerprint();
+        if self.verified_key_fingerprint.as_ref() != Some(&fingerprint) {
+            self.secondary_verified_key = Some(gossip_key);
+            self.secondary_verified_key_fingerprint = Some(fingerprint);
             self.secondary_verifier = Some(verifier);
         }
     }
 
     /// Saves the peerstate to the database.
     pub async fn save_to_db(&self, sql: &Sql) -> Result<()> {
-        sql.execute(
-            "INSERT INTO acpeerstates (
-                last_seen,
-                last_seen_autocrypt,
-                prefer_encrypted,
-                public_key,
-                gossip_timestamp,
-                gossip_key,
-                public_key_fingerprint,
-                gossip_key_fingerprint,
-                verified_key,
-                verified_key_fingerprint,
-                verifier,
-                secondary_verified_key,
-                secondary_verified_key_fingerprint,
-                secondary_verifier,
-                addr)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                ON CONFLICT (addr)
-                DO UPDATE SET
-                  last_seen = excluded.last_seen,
-                  last_seen_autocrypt = excluded.last_seen_autocrypt,
-                  prefer_encrypted = excluded.prefer_encrypted,
-                  public_key = excluded.public_key,
-                  gossip_timestamp = excluded.gossip_timestamp,
-                  gossip_key = excluded.gossip_key,
-                  public_key_fingerprint = excluded.public_key_fingerprint,
-                  gossip_key_fingerprint = excluded.gossip_key_fingerprint,
-                  verified_key = excluded.verified_key,
-                  verified_key_fingerprint = excluded.verified_key_fingerprint,
-                  verifier = excluded.verifier,
-                  secondary_verified_key = excluded.secondary_verified_key,
-                  secondary_verified_key_fingerprint = excluded.secondary_verified_key_fingerprint,
-                  secondary_verifier = excluded.secondary_verifier",
-            (
-                self.last_seen,
-                self.last_seen_autocrypt,
-                self.prefer_encrypt as i64,
-                self.public_key.as_ref().map(|k| k.to_bytes()),
-                self.gossip_timestamp,
-                self.gossip_key.as_ref().map(|k| k.to_bytes()),
-                self.public_key_fingerprint.as_ref().map(|fp| fp.hex()),
-                self.gossip_key_fingerprint.as_ref().map(|fp| fp.hex()),
-                self.verified_key.as_ref().map(|k| k.to_bytes()),
-                self.verified_key_fingerprint.as_ref().map(|fp| fp.hex()),
-                self.verifier.as_deref().unwrap_or(""),
-                self.secondary_verified_key.as_ref().map(|k| k.to_bytes()),
-                self.secondary_verified_key_fingerprint
-                    .as_ref()
-                    .map(|fp| fp.hex()),
-                self.secondary_verifier.as_deref().unwrap_or(""),
-                &self.addr,
-            ),
-        )
-        .await?;
-        Ok(())
+        self.save_to_db_ex(sql, None).await
+    }
+
+    /// Saves the peerstate to the database.
+    ///
+    /// * `old_addr`: Old address of the peerstate in case of an AEAP transition.
+    pub(crate) async fn save_to_db_ex(&self, sql: &Sql, old_addr: Option<&str>) -> Result<()> {
+        let trans_fn = |t: &mut rusqlite::Transaction| {
+            if let Some(old_addr) = old_addr {
+                // We are doing an AEAP transition to the new address and the SQL INSERT below will
+                // save the existing peerstate as belonging to this new address. We now need to
+                // "unverify" the peerstate that belongs to the current address in case if the
+                // contact later wants to move back to the current address. Otherwise the old entry
+                // will be just found and updated instead of doing AEAP. We can't just delete the
+                // existing peerstate as this would break encryption to it. This is critical for
+                // non-verified groups -- if we can't encrypt to the old address, we can't securely
+                // remove it from the group (to add the new one instead).
+                t.execute(
+                    "UPDATE acpeerstates \
+                     SET verified_key=NULL, verified_key_fingerprint='', verifier='' \
+                     WHERE addr=?",
+                    (old_addr,),
+                )?;
+            }
+            t.execute(
+                "INSERT INTO acpeerstates (
+                    last_seen,
+                    last_seen_autocrypt,
+                    prefer_encrypted,
+                    public_key,
+                    gossip_timestamp,
+                    gossip_key,
+                    public_key_fingerprint,
+                    gossip_key_fingerprint,
+                    verified_key,
+                    verified_key_fingerprint,
+                    verifier,
+                    secondary_verified_key,
+                    secondary_verified_key_fingerprint,
+                    secondary_verifier,
+                    backward_verified_key_id,
+                    addr)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT (addr)
+                    DO UPDATE SET
+                    last_seen = excluded.last_seen,
+                    last_seen_autocrypt = excluded.last_seen_autocrypt,
+                    prefer_encrypted = excluded.prefer_encrypted,
+                    public_key = excluded.public_key,
+                    gossip_timestamp = excluded.gossip_timestamp,
+                    gossip_key = excluded.gossip_key,
+                    public_key_fingerprint = excluded.public_key_fingerprint,
+                    gossip_key_fingerprint = excluded.gossip_key_fingerprint,
+                    verified_key = excluded.verified_key,
+                    verified_key_fingerprint = excluded.verified_key_fingerprint,
+                    verifier = excluded.verifier,
+                    secondary_verified_key = excluded.secondary_verified_key,
+                    secondary_verified_key_fingerprint = excluded.secondary_verified_key_fingerprint,
+                    secondary_verifier = excluded.secondary_verifier,
+                    backward_verified_key_id = excluded.backward_verified_key_id",
+                (
+                    self.last_seen,
+                    self.last_seen_autocrypt,
+                    self.prefer_encrypt as i64,
+                    self.public_key.as_ref().map(|k| k.to_bytes()),
+                    self.gossip_timestamp,
+                    self.gossip_key.as_ref().map(|k| k.to_bytes()),
+                    self.public_key_fingerprint.as_ref().map(|fp| fp.hex()),
+                    self.gossip_key_fingerprint.as_ref().map(|fp| fp.hex()),
+                    self.verified_key.as_ref().map(|k| k.to_bytes()),
+                    self.verified_key_fingerprint.as_ref().map(|fp| fp.hex()),
+                    self.verifier.as_deref().unwrap_or(""),
+                    self.secondary_verified_key.as_ref().map(|k| k.to_bytes()),
+                    self.secondary_verified_key_fingerprint
+                        .as_ref()
+                        .map(|fp| fp.hex()),
+                    self.secondary_verifier.as_deref().unwrap_or(""),
+                    self.backward_verified_key_id,
+                    &self.addr,
+                ),
+            )?;
+            Ok(())
+        };
+        sql.transaction(trans_fn).await
     }
 
     /// Returns the address that verified the contact
@@ -648,7 +695,7 @@ impl Peerstate {
                             let (new_contact_id, _) = Contact::add_or_lookup(
                                 context,
                                 "",
-                                new_addr,
+                                &new_addr,
                                 Origin::IncomingUnknownFrom,
                             )
                             .await?;
@@ -684,6 +731,9 @@ impl Peerstate {
             .await?;
         }
 
+        chatlist_events::emit_chatlist_changed(context);
+        // update the chats the contact is part of
+        chatlist_events::emit_chatlist_items_changed_for_contact(context, contact_id);
         Ok(())
     }
 
@@ -710,46 +760,51 @@ pub(crate) async fn maybe_do_aeap_transition(
     mime_parser: &mut crate::mimeparser::MimeMessage,
 ) -> Result<()> {
     let info = &mime_parser.decryption_info;
-    if let Some(peerstate) = &info.peerstate {
-        // If the from addr is different from the peerstate address we know,
-        // we may want to do an AEAP transition.
-        if !addr_cmp(&peerstate.addr, &mime_parser.from.addr)
-                // Check if it's a chat message; we do this to avoid
-                // some accidental transitions if someone writes from multiple
-                // addresses with an MUA.
-                && mime_parser.has_chat_version()
-                // Check if the message is signed correctly.
-                // If it's not signed correctly, the whole autocrypt header will be mostly
-                // ignored anyway and the message shown as not encrypted, so we don't
-                // have to handle this case.
-                && !mime_parser.signatures.is_empty()
-                // Check if the From: address was also in the signed part of the email.
-                // Without this check, an attacker could replay a message from Alice 
-                // to Bob. Then Bob's device would do an AEAP transition from Alice's
-                // to the attacker's address, allowing for easier phishing.
-                && mime_parser.from_is_signed
-                && info.message_time > peerstate.last_seen
-        {
-            let info = &mut mime_parser.decryption_info;
-            let peerstate = info.peerstate.as_mut().context("no peerstate??")?;
-            // Add info messages to chats with this (verified) contact
-            //
-            peerstate
-                .handle_setup_change(
-                    context,
-                    info.message_time,
-                    PeerstateChange::Aeap(info.from.clone()),
-                )
-                .await?;
+    let Some(peerstate) = &info.peerstate else {
+        return Ok(());
+    };
 
-            peerstate.addr = info.from.clone();
-            let header = info.autocrypt_header.as_ref().context(
-                "Internal error: Tried to do an AEAP transition without an autocrypt header??",
-            )?;
-            peerstate.apply_header(header, info.message_time);
+    // If the from addr is different from the peerstate address we know,
+    // we may want to do an AEAP transition.
+    if !addr_cmp(&peerstate.addr, &mime_parser.from.addr)
+            // Check if it's a chat message; we do this to avoid
+            // some accidental transitions if someone writes from multiple
+            // addresses with an MUA.
+            && mime_parser.has_chat_version()
+            // Check if the message is encrypted and signed correctly. If it's not encrypted, it's
+            // probably from a new contact sharing the same key.
+            && !mime_parser.signatures.is_empty()
+            // Check if the From: address was also in the signed part of the email.
+            // Without this check, an attacker could replay a message from Alice
+            // to Bob. Then Bob's device would do an AEAP transition from Alice's
+            // to the attacker's address, allowing for easier phishing.
+            && mime_parser.from_is_signed
+            // DC avoids sending messages with the same timestamp, that's why `>` is here unlike in
+            // `Peerstate::apply_header()`.
+            && info.message_time > peerstate.last_seen
+    {
+        let info = &mut mime_parser.decryption_info;
+        let peerstate = info.peerstate.as_mut().context("no peerstate??")?;
+        // Add info messages to chats with this (verified) contact
+        //
+        peerstate
+            .handle_setup_change(
+                context,
+                info.message_time,
+                PeerstateChange::Aeap(info.from.clone()),
+            )
+            .await?;
 
-            peerstate.save_to_db(&context.sql).await?;
-        }
+        let old_addr = mem::take(&mut peerstate.addr);
+        peerstate.addr.clone_from(&info.from);
+        let header = info.autocrypt_header.as_ref().context(
+            "Internal error: Tried to do an AEAP transition without an autocrypt header??",
+        )?;
+        peerstate.apply_header(header, info.message_time);
+
+        peerstate
+            .save_to_db_ex(&context.sql, Some(&old_addr))
+            .await?;
     }
 
     Ok(())
@@ -766,30 +821,6 @@ enum PeerstateChange {
     /// The contact changed their address to the given new address
     /// (Automatic Email Address Porting).
     Aeap(String),
-}
-
-/// Removes duplicate peerstates from `acpeerstates` database table.
-///
-/// Normally there should be no more than one peerstate per address.
-/// However, the database does not enforce this condition.
-///
-/// Previously there were bugs that caused creation of additional
-/// peerstates when existing peerstate could not be read due to a
-/// temporary database error or a failure to parse stored data.  This
-/// procedure fixes the problem by removing duplicate records.
-pub(crate) async fn deduplicate_peerstates(sql: &Sql) -> Result<()> {
-    sql.execute(
-        "DELETE FROM acpeerstates
-         WHERE id NOT IN (
-         SELECT MIN(id)
-         FROM acpeerstates
-         GROUP BY addr
-         )",
-        (),
-    )
-    .await?;
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -820,6 +851,7 @@ mod tests {
             secondary_verified_key: None,
             secondary_verified_key_fingerprint: None,
             secondary_verifier: None,
+            backward_verified_key_id: None,
             fingerprint_changed: false,
         };
 
@@ -863,6 +895,7 @@ mod tests {
             secondary_verified_key: None,
             secondary_verified_key_fingerprint: None,
             secondary_verifier: None,
+            backward_verified_key_id: None,
             fingerprint_changed: false,
         };
 
@@ -899,6 +932,7 @@ mod tests {
             secondary_verified_key: None,
             secondary_verified_key_fingerprint: None,
             secondary_verifier: None,
+            backward_verified_key_id: None,
             fingerprint_changed: false,
         };
 
@@ -965,6 +999,7 @@ mod tests {
             secondary_verified_key: None,
             secondary_verified_key_fingerprint: None,
             secondary_verifier: None,
+            backward_verified_key_id: None,
             fingerprint_changed: false,
         };
 
@@ -980,7 +1015,7 @@ mod tests {
         assert_eq!(peerstate.prefer_encrypt, EncryptPreference::Reset);
 
         // Same header will be applied in the future.
-        peerstate.apply_header(&header, 400);
+        peerstate.apply_header(&header, 300);
         assert_eq!(peerstate.prefer_encrypt, EncryptPreference::Mutual);
     }
 }

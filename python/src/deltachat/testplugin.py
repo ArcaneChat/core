@@ -115,7 +115,7 @@ def pytest_configure(config):
     deltachat.register_global_plugin(la)
 
 
-def pytest_report_header(config, startdir):
+def pytest_report_header(config):
     info = get_core_info()
     summary = [
         "Deltachat core={} sqlite={} journal_mode={}".format(
@@ -275,6 +275,7 @@ class ACSetup:
     def __init__(self, testprocess, init_time) -> None:
         self._configured_events = Queue()
         self._account2state: Dict[Account, str] = {}
+        self._account2config: Dict[Account, Dict[str, str]] = {}
         self._imap_cleaned: Set[str] = set()
         self.testprocess = testprocess
         self.init_time = init_time
@@ -336,6 +337,8 @@ class ACSetup:
         if not success:
             pytest.fail(f"configuring online account {acc} failed: {comment}")
         self._account2state[acc] = self.CONFIGURED
+        if acc in self._account2config:
+            acc.update_config(self._account2config[acc])
         return acc
 
     def _onconfigure_start_io(self, acc):
@@ -523,6 +526,7 @@ class ACFactory:
         configdict.setdefault("sentbox_watch", False)
         configdict.setdefault("sync_msgs", False)
         ac.update_config(configdict)
+        self._acsetup._account2config[ac] = configdict
         self._preconfigure_key(ac, configdict["addr"])
         return ac
 
@@ -548,6 +552,15 @@ class ACFactory:
 
         bot_cfg = self.get_next_liveconfig()
         bot_ac = self.prepare_account_from_liveconfig(bot_cfg)
+        self._acsetup.start_configure(bot_ac)
+        self.wait_configured(bot_ac)
+        bot_ac.start_io()
+        # Wait for DC_EVENT_IMAP_INBOX_IDLE so that all emails appeared in the bot's Inbox later are
+        # considered new and not existing ones, and thus processed by the bot.
+        print(bot_ac._logid, "waiting for inbox IDLE to become ready")
+        bot_ac._evtracker.wait_idle_inbox_ready()
+        bot_ac.stop_io()
+        self._acsetup._account2state[bot_ac] = self._acsetup.IDLEREADY
 
         # Forget ac as it will be opened by the bot subprocess
         # but keep something in the list to not confuse account generation
@@ -589,6 +602,20 @@ class ACFactory:
     def get_accepted_chat(self, ac1: Account, ac2: Account):
         ac2.create_chat(ac1)
         return ac1.create_chat(ac2)
+
+    def get_protected_chat(self, ac1: Account, ac2: Account):
+        chat = ac1.create_group_chat("Protected Group", verified=True)
+        qr = chat.get_join_qr()
+        ac2.qr_join_chat(qr)
+        ac2._evtracker.wait_securejoin_joiner_progress(1000)
+        ev = ac2._evtracker.get_matching("DC_EVENT_MSGS_CHANGED")
+        msg = ac2.get_message_by_id(ev.data2)
+        assert msg is not None
+        assert msg.text == "Messages are guaranteed to be end-to-end encrypted from now on."
+        msg = ac2._evtracker.wait_next_incoming_message()
+        assert msg is not None
+        assert "Member Me " in msg.text and " added by " in msg.text
+        return chat
 
     def introduce_each_other(self, accounts, sending=True):
         to_wait = []

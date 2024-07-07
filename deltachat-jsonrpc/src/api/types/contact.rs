@@ -1,5 +1,5 @@
 use anyhow::Result;
-use deltachat::contact::VerifiedStatus;
+use deltachat::color;
 use deltachat::context::Context;
 use serde::Serialize;
 use typescript_type_def::TypeDef;
@@ -46,6 +46,9 @@ pub struct ContactObject {
     /// the contact's last seen timestamp
     last_seen: i64,
     was_seen_recently: bool,
+
+    /// If the contact is a bot.
+    is_bot: bool,
 }
 
 impl ContactObject {
@@ -57,7 +60,7 @@ impl ContactObject {
             Some(path_buf) => path_buf.to_str().map(|s| s.to_owned()),
             None => None,
         };
-        let is_verified = contact.is_verified(context).await? == VerifiedStatus::BidirectVerified;
+        let is_verified = contact.is_verified(context).await?;
         let is_profile_verified = contact.is_profile_verified(context).await?;
 
         let verifier_id = contact
@@ -81,6 +84,39 @@ impl ContactObject {
             verifier_id,
             last_seen: contact.last_seen(),
             was_seen_recently: contact.was_seen_recently(),
+            is_bot: contact.is_bot(),
         })
+    }
+}
+
+#[derive(Clone, Serialize, TypeDef, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct VcardContact {
+    /// Email address.
+    addr: String,
+    /// The contact's name, or the email address if no name was given.
+    display_name: String,
+    /// Public PGP key in Base64.
+    key: Option<String>,
+    /// Profile image in Base64.
+    profile_image: Option<String>,
+    /// Contact color as hex string.
+    color: String,
+    /// Last update timestamp.
+    timestamp: Option<i64>,
+}
+
+impl From<deltachat_contact_tools::VcardContact> for VcardContact {
+    fn from(vc: deltachat_contact_tools::VcardContact) -> Self {
+        let display_name = vc.display_name().to_string();
+        let color = color::str_to_color(&vc.addr.to_lowercase());
+        Self {
+            addr: vc.addr,
+            display_name,
+            key: vc.key,
+            profile_image: vc.profile_image,
+            color: color_int_to_hex_string(color),
+            timestamp: vc.timestamp.ok(),
+        }
     }
 }

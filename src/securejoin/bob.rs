@@ -9,14 +9,13 @@ use super::bobstate::{BobHandshakeStage, BobState};
 use super::qrinvite::QrInvite;
 use super::HandshakeMessage;
 use crate::chat::{is_contact_in_chat, ChatId, ProtectionStatus};
-use crate::config::Config;
-use crate::constants::{Blocked, Chattype};
+use crate::constants::{self, Blocked, Chattype};
 use crate::contact::Contact;
 use crate::context::Context;
 use crate::events::EventType;
-use crate::mimeparser::MimeMessage;
+use crate::mimeparser::{MimeMessage, SystemMessage};
 use crate::sync::Sync::*;
-use crate::tools::time;
+use crate::tools::{create_smeared_timestamp, time};
 use crate::{chat, stock_str};
 
 /// Starts the securejoin protocol with the QR `invite`.
@@ -58,7 +57,6 @@ pub(super) async fn start_protocol(context: &Context, invite: QrInvite) -> Resul
         QrInvite::Group { .. } => {
             // For a secure-join we need to create the group and add the contact.  The group will
             // only become usable once the protocol is finished.
-            // TODO: how does this group become usable?
             let group_chat_id = state.joining_chat_id(context).await?;
             if !is_contact_in_chat(context, group_chat_id, invite.contact_id()).await? {
                 chat::add_to_chat_contacts_table(context, group_chat_id, &[invite.contact_id()])
@@ -71,7 +69,29 @@ pub(super) async fn start_protocol(context: &Context, invite: QrInvite) -> Resul
         QrInvite::Contact { .. } => {
             // For setup-contact the BobState already ensured the 1:1 chat exists because it
             // uses it to send the handshake messages.
-            Ok(state.alice_chat())
+            let chat_id = state.alice_chat();
+            // Calculate the sort timestamp before checking the chat protection status so that if we
+            // race with its change, we don't add our message below the protection message.
+            let sort_to_bottom = true;
+            let ts_sort = chat_id
+                .calc_sort_timestamp(context, 0, sort_to_bottom, false)
+                .await?;
+            if chat_id.is_protected(context).await? == ProtectionStatus::Unprotected {
+                let ts_start = time();
+                chat::add_info_msg_with_cmd(
+                    context,
+                    chat_id,
+                    &stock_str::securejoin_wait(context).await,
+                    SystemMessage::SecurejoinWait,
+                    ts_sort,
+                    Some(ts_start),
+                    None,
+                    None,
+                )
+                .await?;
+                chat_id.spawn_securejoin_wait(context, constants::SECUREJOIN_WAIT_TIMEOUT);
+            }
+            Ok(chat_id)
         }
     }
 }
@@ -84,65 +104,31 @@ pub(super) async fn handle_auth_required(
     context: &Context,
     message: &MimeMessage,
 ) -> Result<HandshakeMessage> {
-    match BobState::from_db(&context.sql).await? {
-        Some(mut bobstate) => match bobstate.handle_message(context, message).await? {
-            Some(BobHandshakeStage::Terminated(why)) => {
-                bobstate.notify_aborted(context, why).await?;
-                Ok(HandshakeMessage::Done)
-            }
-            Some(_stage) => {
-                if bobstate.is_join_group() {
-                    // The message reads "Alice replied, waiting to be added to the group…",
-                    // so only show it on secure-join and not on setup-contact.
-                    let contact_id = bobstate.invite().contact_id();
-                    let msg = stock_str::secure_join_replies(context, contact_id).await;
-                    let chat_id = bobstate.joining_chat_id(context).await?;
-                    chat::add_info_msg(context, chat_id, &msg, time()).await?;
-                }
-                bobstate.emit_progress(context, JoinerProgress::RequestWithAuthSent);
-                Ok(HandshakeMessage::Done)
-            }
-            None => Ok(HandshakeMessage::Ignore),
-        },
-        None => Ok(HandshakeMessage::Ignore),
-    }
-}
-
-/// Handles `vc-contact-confirm` and `vg-member-added` handshake messages.
-///
-/// # Bob - the joiner's side
-/// ## Step 7 in the "Setup Contact protocol"
-pub(super) async fn handle_contact_confirm(
-    context: &Context,
-    mut bobstate: BobState,
-    message: &MimeMessage,
-) -> Result<HandshakeMessage> {
-    let retval = if bobstate.is_join_group() {
-        HandshakeMessage::Propagate
-    } else {
-        HandshakeMessage::Ignore
+    let Some(mut bobstate) = BobState::from_db(&context.sql).await? else {
+        return Ok(HandshakeMessage::Ignore);
     };
-    match bobstate.handle_message(context, message).await? {
+
+    match bobstate.handle_auth_required(context, message).await? {
         Some(BobHandshakeStage::Terminated(why)) => {
             bobstate.notify_aborted(context, why).await?;
             Ok(HandshakeMessage::Done)
         }
-        Some(BobHandshakeStage::Completed) => {
-            // Note this goes to the 1:1 chat, as when joining a group we implicitly also
-            // verify both contacts (this could be a bug/security issue, see
-            // e.g. https://github.com/deltachat/deltachat-core-rust/issues/1177).
-            bobstate.notify_peer_verified(context).await?;
-            bobstate.emit_progress(context, JoinerProgress::Succeeded);
-            Ok(retval)
+        Some(_stage) => {
+            if bobstate.is_join_group() {
+                // The message reads "Alice replied, waiting to be added to the group…",
+                // so only show it on secure-join and not on setup-contact.
+                let contact_id = bobstate.invite().contact_id();
+                let msg = stock_str::secure_join_replies(context, contact_id).await;
+                let chat_id = bobstate.joining_chat_id(context).await?;
+                chat::add_info_msg(context, chat_id, &msg, time()).await?;
+            }
+            bobstate
+                .set_peer_verified(context, message.timestamp_sent)
+                .await?;
+            bobstate.emit_progress(context, JoinerProgress::RequestWithAuthSent);
+            Ok(HandshakeMessage::Done)
         }
-        Some(_) => {
-            warn!(
-                context,
-                "Impossible state returned from handling handshake message"
-            );
-            Ok(retval)
-        }
-        None => Ok(retval),
+        None => Ok(HandshakeMessage::Ignore),
     }
 }
 
@@ -155,7 +141,7 @@ impl BobState {
         }
     }
 
-    fn emit_progress(&self, context: &Context, progress: JoinerProgress) {
+    pub(crate) fn emit_progress(&self, context: &Context, progress: JoinerProgress) {
         let contact_id = self.invite().contact_id();
         context.emit_event(EventType::SecurejoinJoinerProgress {
             contact_id,
@@ -193,6 +179,7 @@ impl BobState {
                             Blocked::Not,
                             ProtectionStatus::Unprotected, // protection is added later as needed
                             None,
+                            create_smeared_timestamp(context),
                         )
                         .await?
                     }
@@ -217,28 +204,17 @@ impl BobState {
         Ok(())
     }
 
-    /// Notifies the user that the SecureJoin peer is verified.
-    ///
-    /// This creates an info message in the chat being joined.
-    async fn notify_peer_verified(&self, context: &Context) -> Result<()> {
+    /// Turns 1:1 chat with SecureJoin peer into protected chat.
+    pub(crate) async fn set_peer_verified(&self, context: &Context, timestamp: i64) -> Result<()> {
         let contact = Contact::get_by_id(context, self.invite().contact_id()).await?;
-        let chat_id = self.joining_chat_id(context).await?;
-
-        if context
-            .get_config_bool(Config::VerifiedOneOnOneChats)
-            .await?
-        {
-            self.alice_chat()
-                .set_protection(
-                    context,
-                    ProtectionStatus::Protected,
-                    time(),
-                    Some(contact.id),
-                )
-                .await?;
-        }
-
-        context.emit_event(EventType::ChatModified(chat_id));
+        self.alice_chat()
+            .set_protection(
+                context,
+                ProtectionStatus::Protected,
+                timestamp,
+                Some(contact.id),
+            )
+            .await?;
         Ok(())
     }
 }
@@ -247,7 +223,7 @@ impl BobState {
 ///
 /// This has an `From<JoinerProgress> for usize` impl yielding numbers between 0 and a 1000
 /// which can be shown as a progress bar.
-enum JoinerProgress {
+pub(crate) enum JoinerProgress {
     /// An error occurred.
     Error,
     /// vg-vc-request-with-auth sent.

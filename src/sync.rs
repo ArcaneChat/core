@@ -1,7 +1,6 @@
 //! # Synchronize items between devices.
 
 use anyhow::Result;
-use lettre_email::mime::{self};
 use lettre_email::PartBuilder;
 use serde::{Deserialize, Serialize};
 
@@ -20,7 +19,7 @@ use crate::tools::time;
 use crate::{stock_str, token};
 
 /// Whether to send device sync messages. Aimed for usage in the internal API.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub(crate) enum Sync {
     Nosync,
     Sync,
@@ -31,6 +30,15 @@ impl From<Sync> for bool {
         match sync {
             Sync::Nosync => false,
             Sync::Sync => true,
+        }
+    }
+}
+
+impl From<bool> for Sync {
+    fn from(sync: bool) -> Sync {
+        match sync {
+            false => Sync::Nosync,
+            true => Sync::Sync,
         }
     }
 }
@@ -49,6 +57,10 @@ pub(crate) enum SyncData {
     AlterChat {
         id: chat::SyncId,
         action: chat::SyncAction,
+    },
+    Config {
+        key: Config,
+        val: String,
     },
 }
 
@@ -89,7 +101,7 @@ impl Context {
     /// Adds item and timestamp to the list of items that should be synchronized to other devices.
     /// If device synchronization is disabled, the function does nothing.
     async fn add_sync_item_with_timestamp(&self, data: SyncData, timestamp: i64) -> Result<()> {
-        if !self.get_config_bool(Config::SyncMsgs).await? {
+        if !self.should_send_sync_msgs().await? {
             return Ok(());
         }
 
@@ -109,7 +121,7 @@ impl Context {
     /// If device synchronization is disabled,
     /// no tokens exist or the chat is unpromoted, the function does nothing.
     pub(crate) async fn sync_qr_code_tokens(&self, chat_id: Option<ChatId>) -> Result<()> {
-        if !self.get_config_bool(Config::SyncMsgs).await? {
+        if !self.should_send_sync_msgs().await? {
             return Ok(());
         }
 
@@ -263,6 +275,7 @@ impl Context {
                     AddQrToken(token) => self.add_qr_token(token).await,
                     DeleteQrToken(token) => self.delete_qr_token(token).await,
                     AlterChat { id, action } => self.sync_alter_chat(id, action).await,
+                    SyncData::Config { key, val } => self.sync_config(key, val).await,
                 },
                 SyncDataOrUnknown::Unknown(data) => {
                     warn!(self, "Ignored unknown sync item: {data}.");
@@ -302,25 +315,37 @@ impl Context {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, SystemTime};
+    use std::time::Duration;
 
     use anyhow::bail;
 
     use super::*;
-    use crate::chat::Chat;
     use crate::chatlist::Chatlist;
     use crate::contact::{Contact, Origin};
-    use crate::test_utils::TestContext;
-    use crate::token::Namespace;
+    use crate::test_utils::{TestContext, TestContextManager};
+    use crate::tools::SystemTime;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_config_sync_msgs() -> Result<()> {
         let t = TestContext::new_alice().await;
-        assert!(!t.get_config_bool(Config::SyncMsgs).await?);
+        assert_eq!(t.get_config_bool(Config::SyncMsgs).await?, false);
+        assert_eq!(t.get_config_bool(Config::BccSelf).await?, true);
+        assert_eq!(t.should_send_sync_msgs().await?, false);
+
         t.set_config_bool(Config::SyncMsgs, true).await?;
-        assert!(t.get_config_bool(Config::SyncMsgs).await?);
+        assert_eq!(t.get_config_bool(Config::SyncMsgs).await?, true);
+        assert_eq!(t.get_config_bool(Config::BccSelf).await?, true);
+        assert_eq!(t.should_send_sync_msgs().await?, true);
+
+        t.set_config_bool(Config::BccSelf, false).await?;
+        assert_eq!(t.get_config_bool(Config::SyncMsgs).await?, true);
+        assert_eq!(t.get_config_bool(Config::BccSelf).await?, false);
+        assert_eq!(t.should_send_sync_msgs().await?, false);
+
         t.set_config_bool(Config::SyncMsgs, false).await?;
-        assert!(!t.get_config_bool(Config::SyncMsgs).await?);
+        assert_eq!(t.get_config_bool(Config::SyncMsgs).await?, false);
+        assert_eq!(t.get_config_bool(Config::BccSelf).await?, false);
+        assert_eq!(t.should_send_sync_msgs().await?, false);
         Ok(())
     }
 
@@ -430,7 +455,7 @@ mod tests {
         )?;
         assert_eq!(sync_items.items.len(), 1);
         let SyncDataOrUnknown::SyncData(AlterChat { id, action }) =
-            &sync_items.items.get(0).unwrap().data
+            &sync_items.items.first().unwrap().data
         else {
             bail!("bad item");
         };
@@ -474,7 +499,7 @@ mod tests {
 
         assert_eq!(sync_items.items.len(), 1);
         if let SyncDataOrUnknown::SyncData(AddQrToken(token)) =
-            &sync_items.items.get(0).unwrap().data
+            &sync_items.items.first().unwrap().data
         {
             assert_eq!(token.invitenumber, "in");
             assert_eq!(token.auth, "yip");
@@ -497,7 +522,7 @@ mod tests {
     async fn test_execute_sync_items() -> Result<()> {
         let t = TestContext::new_alice().await;
 
-        assert!(!token::exists(&t, Namespace::Auth, "yip-auth").await);
+        assert!(!token::exists(&t, Namespace::Auth, "yip-auth").await?);
 
         let sync_items = t
             .parse_sync_items(
@@ -520,10 +545,10 @@ mod tests {
                 .await?
                 .is_none()
         );
-        assert!(token::exists(&t, Namespace::InviteNumber, "yip-in").await);
-        assert!(token::exists(&t, Namespace::Auth, "yip-auth").await);
-        assert!(!token::exists(&t, Namespace::Auth, "non-existent").await);
-        assert!(!token::exists(&t, Namespace::Auth, "directly deleted").await);
+        assert!(token::exists(&t, Namespace::InviteNumber, "yip-in").await?);
+        assert!(token::exists(&t, Namespace::Auth, "yip-auth").await?);
+        assert!(!token::exists(&t, Namespace::Auth, "non-existent").await?);
+        assert!(!token::exists(&t, Namespace::Auth, "directly deleted").await?);
 
         Ok(())
     }
@@ -559,15 +584,41 @@ mod tests {
         let sent_msg = alice.pop_sent_msg().await;
         let alice2 = TestContext::new_alice().await;
         alice2.set_config_bool(Config::SyncMsgs, true).await?;
-        alice2.recv_msg(&sent_msg).await;
-        assert!(token::exists(&alice2, token::Namespace::Auth, "testtoken").await);
+        alice2.recv_msg_trash(&sent_msg).await;
+        assert!(token::exists(&alice2, token::Namespace::Auth, "testtoken").await?);
         assert_eq!(Chatlist::try_load(&alice2, 0, None, None).await?.len(), 0);
 
         // the same sync message sent to bob must not be executed
         let bob = TestContext::new_bob().await;
         bob.recv_msg(&sent_msg).await;
-        assert!(!token::exists(&bob, token::Namespace::Auth, "testtoken").await);
+        assert!(!token::exists(&bob, token::Namespace::Auth, "testtoken").await?);
 
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_bot_no_sync_msgs() -> Result<()> {
+        let mut tcm = TestContextManager::new();
+        let alice = &tcm.alice().await;
+        let bob = &tcm.bob().await;
+        alice.set_config_bool(Config::SyncMsgs, true).await?;
+        let chat_id = alice.create_chat(bob).await.id;
+
+        chat::send_text_msg(alice, chat_id, "hi".to_string()).await?;
+        alice
+            .set_config(Config::Displayname, Some("Alice Human"))
+            .await?;
+        alice.pop_sent_msg().await; // Sync message
+        let msg = bob.recv_msg(&alice.pop_sent_msg().await).await;
+        assert_eq!(msg.text, "hi");
+
+        alice.set_config_bool(Config::Bot, true).await?;
+        chat::send_text_msg(alice, chat_id, "hi".to_string()).await?;
+        alice
+            .set_config(Config::Displayname, Some("Alice Bot"))
+            .await?;
+        let msg = bob.recv_msg(&alice.pop_sent_msg().await).await;
+        assert_eq!(msg.text, "hi");
         Ok(())
     }
 }

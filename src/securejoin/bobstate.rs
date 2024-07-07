@@ -11,9 +11,10 @@ use anyhow::Result;
 use rusqlite::Connection;
 
 use super::qrinvite::QrInvite;
-use super::{encrypted_and_signed, fingerprint_equals_sender, mark_peer_as_verified};
+use super::{encrypted_and_signed, verify_sender_by_fingerprint};
 use crate::chat::{self, ChatId};
-use crate::contact::{Contact, Origin};
+use crate::config::Config;
+use crate::contact::{ContactId, Origin};
 use crate::context::Context;
 use crate::events::EventType;
 use crate::headerdef::HeaderDef;
@@ -21,7 +22,9 @@ use crate::key::{load_self_public_key, DcKey};
 use crate::message::{Message, Viewtype};
 use crate::mimeparser::{MimeMessage, SystemMessage};
 use crate::param::Param;
+use crate::securejoin::Peerstate;
 use crate::sql::Sql;
+use crate::tools::time;
 
 /// The stage of the [`BobState`] securejoin handshake protocol state machine.
 ///
@@ -30,14 +33,9 @@ use crate::sql::Sql;
 #[derive(Clone, Copy, Debug, Display)]
 pub enum BobHandshakeStage {
     /// Step 2 completed: (vc|vg)-request message sent.
-    ///
-    /// Note that this is only ever returned by [`BobState::start_protocol`] and never by
-    /// [`BobState::handle_message`].
     RequestSent,
     /// Step 4 completed: (vc|vg)-request-with-auth message sent.
     RequestWithAuthSent,
-    /// The protocol completed successfully.
-    Completed,
     /// The protocol prematurely terminated with given reason.
     Terminated(&'static str),
 }
@@ -92,21 +90,26 @@ impl BobState {
         invite: QrInvite,
         chat_id: ChatId,
     ) -> Result<(Self, BobHandshakeStage, Vec<Self>)> {
-        let (stage, next) =
-            if fingerprint_equals_sender(context, invite.fingerprint(), invite.contact_id()).await?
-            {
-                // The scanned fingerprint matches Alice's key, we can proceed to step 4b.
-                info!(context, "Taking securejoin protocol shortcut");
-                send_handshake_message(context, &invite, chat_id, BobHandshakeMsg::RequestWithAuth)
-                    .await?;
-                (
-                    BobHandshakeStage::RequestWithAuthSent,
-                    SecureJoinStep::ContactConfirm,
-                )
-            } else {
-                send_handshake_message(context, &invite, chat_id, BobHandshakeMsg::Request).await?;
-                (BobHandshakeStage::RequestSent, SecureJoinStep::AuthRequired)
-            };
+        let peer_verified =
+            verify_sender_by_fingerprint(context, invite.fingerprint(), invite.contact_id())
+                .await?;
+
+        let (stage, next);
+        if peer_verified {
+            // The scanned fingerprint matches Alice's key, we can proceed to step 4b.
+            info!(context, "Taking securejoin protocol shortcut");
+            send_handshake_message(context, &invite, chat_id, BobHandshakeMsg::RequestWithAuth)
+                .await?;
+
+            stage = BobHandshakeStage::RequestWithAuthSent;
+            next = SecureJoinStep::ContactConfirm;
+        } else {
+            send_handshake_message(context, &invite, chat_id, BobHandshakeMsg::Request).await?;
+
+            stage = BobHandshakeStage::RequestSent;
+            next = SecureJoinStep::AuthRequired;
+        };
+
         let (id, aborted_states) =
             Self::insert_new_db_entry(context, next, invite.clone(), chat_id).await?;
         let state = Self {
@@ -115,6 +118,12 @@ impl BobState {
             next,
             chat_id,
         };
+
+        if peer_verified {
+            // Mark 1:1 chat as verified already.
+            state.set_peer_verified(context, time()).await?;
+        }
+
         Ok((state, stage, aborted_states))
     }
 
@@ -230,13 +239,13 @@ impl BobState {
         Ok(())
     }
 
-    /// Handles the given message for the securejoin handshake for Bob.
+    /// Handles {vc,vg}-auth-required message of the securejoin handshake for Bob.
     ///
     /// If the message was not used for this handshake `None` is returned, otherwise the new
-    /// stage is returned.  Once [`BobHandshakeStage::Completed`] or
-    /// [`BobHandshakeStage::Terminated`] are reached this [`BobState`] should be destroyed,
+    /// stage is returned.  Once [`BobHandshakeStage::Terminated`] is reached this
+    /// [`BobState`] should be destroyed,
     /// further calling it will just result in the messages being unused by this handshake.
-    pub(crate) async fn handle_message(
+    pub(crate) async fn handle_auth_required(
         &mut self,
         context: &Context,
         mime_message: &MimeMessage,
@@ -252,46 +261,14 @@ impl BobState {
                 return Ok(None);
             }
         };
-        if !self.is_msg_expected(context, step.as_str()) {
+        if !self.is_msg_expected(context, step) {
             info!(context, "{} message out of sync for BobState", step);
             return Ok(None);
         }
-        match step.as_str() {
-            "vg-auth-required" | "vc-auth-required" => {
-                self.step_auth_required(context, mime_message).await
-            }
-            "vg-member-added" | "vc-contact-confirm" => {
-                self.step_contact_confirm(context, mime_message).await
-            }
-            _ => {
-                warn!(context, "Invalid step for BobState: {}", step);
-                Ok(None)
-            }
-        }
-    }
 
-    /// Returns `true` if the message is expected according to the protocol.
-    fn is_msg_expected(&self, context: &Context, step: &str) -> bool {
-        let variant_matches = match self.invite {
-            QrInvite::Contact { .. } => step.starts_with("vc-"),
-            QrInvite::Group { .. } => step.starts_with("vg-"),
-        };
-        let step_matches = self.next.matches(context, step);
-        variant_matches && step_matches
-    }
-
-    /// Handles a *vc-auth-required* or *vg-auth-required* message.
-    ///
-    /// # Bob - the joiner's side
-    /// ## Step 4 in the "Setup Contact protocol", section 2.1 of countermitm 0.10.0
-    async fn step_auth_required(
-        &mut self,
-        context: &Context,
-        mime_message: &MimeMessage,
-    ) -> Result<Option<BobHandshakeStage>> {
         info!(
             context,
-            "Bob Step 4 - handling vc-auth-require/vg-auth-required message"
+            "Bob Step 4 - handling {{vc,vg}}-auth-required message."
         );
         if !encrypted_and_signed(context, mime_message, Some(self.invite.fingerprint())) {
             let reason = if mime_message.was_encrypted() {
@@ -303,14 +280,19 @@ impl BobState {
                 .await?;
             return Ok(Some(BobHandshakeStage::Terminated(reason)));
         }
-        if !fingerprint_equals_sender(context, self.invite.fingerprint(), self.invite.contact_id())
-            .await?
+        if !verify_sender_by_fingerprint(
+            context,
+            self.invite.fingerprint(),
+            self.invite.contact_id(),
+        )
+        .await?
         {
             self.update_next(&context.sql, SecureJoinStep::Terminated)
                 .await?;
             return Ok(Some(BobHandshakeStage::Terminated("Fingerprint mismatch")));
         }
         info!(context, "Fingerprint verified.",);
+
         self.update_next(&context.sql, SecureJoinStep::ContactConfirm)
             .await?;
         self.send_handshake_message(context, BobHandshakeMsg::RequestWithAuth)
@@ -318,47 +300,43 @@ impl BobState {
         Ok(Some(BobHandshakeStage::RequestWithAuthSent))
     }
 
+    /// Returns `true` if the message is expected according to the protocol.
+    pub(crate) fn is_msg_expected(&self, context: &Context, step: &str) -> bool {
+        let variant_matches = match self.invite {
+            QrInvite::Contact { .. } => step.starts_with("vc-"),
+            QrInvite::Group { .. } => step.starts_with("vg-"),
+        };
+        let step_matches = self.next.matches(context, step);
+        variant_matches && step_matches
+    }
+
     /// Handles a *vc-contact-confirm* or *vg-member-added* message.
     ///
     /// # Bob - the joiner's side
     /// ## Step 7 in the "Setup Contact protocol", section 2.1 of countermitm 0.10.0
-    ///
-    /// This deviates from the protocol by also sending a confirmation message in response
-    /// to the *vc-contact-confirm* message.  This has no specific value to the protocol and
-    /// is only done out of symmetry with *vg-member-added* handling.
-    async fn step_contact_confirm(
-        &mut self,
-        context: &Context,
-        mime_message: &MimeMessage,
-    ) -> Result<Option<BobHandshakeStage>> {
-        info!(
+    pub(crate) async fn step_contact_confirm(&mut self, context: &Context) -> Result<()> {
+        let fingerprint = self.invite.fingerprint();
+        let Some(ref mut peerstate) = Peerstate::from_fingerprint(context, fingerprint).await?
+        else {
+            return Ok(());
+        };
+
+        // Mark peer as backward verified.
+        peerstate.backward_verified_key_id =
+            Some(context.get_config_i64(Config::KeyId).await?).filter(|&id| id > 0);
+        peerstate.save_to_db(&context.sql).await?;
+
+        ContactId::scaleup_origin(
             context,
-            "Bob Step 7 - handling vc-contact-confirm/vg-member-added message"
-        );
-        mark_peer_as_verified(
-            context,
-            self.invite.fingerprint().clone(),
-            mime_message.from.addr.to_string(),
+            &[self.invite.contact_id()],
+            Origin::SecurejoinJoined,
         )
         .await?;
-        Contact::scaleup_origin_by_id(context, self.invite.contact_id(), Origin::SecurejoinJoined)
-            .await?;
         context.emit_event(EventType::ContactsChanged(None));
-
-        self.send_handshake_message(context, BobHandshakeMsg::ContactConfirmReceived)
-            .await
-            .map_err(|_| {
-                warn!(
-                    context,
-                    "Failed to send vc-contact-confirm-received/vg-member-added-received"
-                );
-            })
-            // This is not an error affecting the protocol outcome.
-            .ok();
 
         self.update_next(&context.sql, SecureJoinStep::Completed)
             .await?;
-        Ok(Some(BobHandshakeStage::Completed))
+        Ok(())
     }
 
     /// Sends the requested handshake message to Alice.
@@ -366,6 +344,15 @@ impl BobState {
     /// This takes care of adding the required headers for the step.
     async fn send_handshake_message(&self, context: &Context, step: BobHandshakeMsg) -> Result<()> {
         send_handshake_message(context, &self.invite, self.chat_id, step).await
+    }
+
+    /// Returns whether we are waiting for a SecureJoin message from Alice, i.e. the protocol hasn't
+    /// yet completed.
+    pub(crate) fn in_progress(&self) -> bool {
+        !matches!(
+            self.next,
+            SecureJoinStep::Terminated | SecureJoinStep::Completed
+        )
     }
 }
 
@@ -400,20 +387,24 @@ async fn send_handshake_message(
             // Sends the Secure-Join-Auth header in mimefactory.rs.
             msg.param.set(Param::Arg2, invite.authcode());
             msg.param.set_int(Param::GuaranteeE2ee, 1);
-        }
-        BobHandshakeMsg::ContactConfirmReceived => {
-            msg.param.set_int(Param::GuaranteeE2ee, 1);
+
+            // Sends our own fingerprint in the Secure-Join-Fingerprint header.
+            let bob_fp = load_self_public_key(context).await?.fingerprint();
+            msg.param.set(Param::Arg3, bob_fp.hex());
+
+            // Sends the grpid in the Secure-Join-Group header.
+            //
+            // `Secure-Join-Group` header is deprecated,
+            // but old Delta Chat core requires that Alice receives it.
+            //
+            // Previous Delta Chat core also sent `Secure-Join-Group` header
+            // in `vg-request` messages,
+            // but it was not used on the receiver.
+            if let QrInvite::Group { ref grpid, .. } = invite {
+                msg.param.set(Param::Arg4, grpid);
+            }
         }
     };
-
-    // Sends our own fingerprint in the Secure-Join-Fingerprint header.
-    let bob_fp = load_self_public_key(context).await?.fingerprint();
-    msg.param.set(Param::Arg3, bob_fp.hex());
-
-    // Sends the grpid in the Secure-Join-Group header.
-    if let QrInvite::Group { ref grpid, .. } = invite {
-        msg.param.set(Param::Arg4, grpid);
-    }
 
     chat::send_msg(context, chat_id, &mut msg).await?;
     Ok(())
@@ -425,8 +416,6 @@ enum BobHandshakeMsg {
     Request,
     /// vc-request-with-auth or vg-request-with-auth
     RequestWithAuth,
-    /// vc-contact-confirm-received or vg-member-added-received
-    ContactConfirmReceived,
 }
 
 impl BobHandshakeMsg {
@@ -453,10 +442,6 @@ impl BobHandshakeMsg {
             Self::RequestWithAuth => match invite {
                 QrInvite::Contact { .. } => "vc-request-with-auth",
                 QrInvite::Group { .. } => "vg-request-with-auth",
-            },
-            Self::ContactConfirmReceived => match invite {
-                QrInvite::Contact { .. } => "vc-contact-confirm-received",
-                QrInvite::Group { .. } => "vg-member-added-received",
             },
         }
     }

@@ -206,8 +206,27 @@ pub(crate) const WORSE_AVATAR_SIZE: u32 = 128;
 pub const BALANCED_IMAGE_SIZE: u32 = 1280;
 pub const WORSE_IMAGE_SIZE: u32 = 640;
 
+// Key for the folder configuration version (see below).
+pub(crate) const DC_FOLDERS_CONFIGURED_KEY: &str = "folders_configured";
 // this value can be increased if the folder configuration is changed and must be redone on next program start
 pub(crate) const DC_FOLDERS_CONFIGURED_VERSION: i32 = 4;
+
+// If more recipients are needed in SMTP's `RCPT TO:` header, the recipient list is split into
+// chunks. This does not affect MIME's `To:` header. Can be overwritten by setting
+// `max_smtp_rcpt_to` in the provider db.
+pub(crate) const DEFAULT_MAX_SMTP_RCPT_TO: usize = 50;
+
+/// How far the last quota check needs to be in the past to be checked by the background function (in seconds).
+pub(crate) const DC_BACKGROUND_FETCH_QUOTA_CHECK_RATELIMIT: u64 = 12 * 60 * 60; // 12 hours
+
+/// How far in the future the sender timestamp of a message is allowed to be, in seconds. Also used
+/// in the group membership consistency algo to reject outdated membership changes.
+pub(crate) const TIMESTAMP_SENT_TOLERANCE: i64 = 60;
+
+/// How long a 1:1 chat can't be used for sending while the SecureJoin is in progress. This should
+/// be 10-20 seconds so that we are reasonably sure that the app remains active and receiving also
+/// on mobile devices. See also [`crate::chat::CantSendReason::SecurejoinWait`].
+pub(crate) const SECUREJOIN_WAIT_TIMEOUT: u64 = 15;
 
 #[cfg(test)]
 mod tests {

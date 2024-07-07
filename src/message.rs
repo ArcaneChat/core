@@ -2,24 +2,29 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::str;
 
 use anyhow::{ensure, format_err, Context as _, Result};
+use deltachat_contact_tools::{parse_vcard, VcardContact};
 use deltachat_derive::{FromSql, ToSql};
 use serde::{Deserialize, Serialize};
+use tokio::{fs, io};
 
 use crate::blob::BlobObject;
-use crate::chat::{Chat, ChatId};
+use crate::chat::{Chat, ChatId, ChatIdBlocked};
+use crate::chatlist_events;
 use crate::config::Config;
 use crate::constants::{
     Blocked, Chattype, VideochatType, DC_CHAT_ID_TRASH, DC_DESIRED_TEXT_LEN, DC_MSG_ID_LAST_SPECIAL,
 };
-use crate::contact::{Contact, ContactId};
+use crate::contact::{self, Contact, ContactId};
 use crate::context::Context;
 use crate::debug_logging::set_debug_logging_xdc;
 use crate::download::DownloadState;
 use crate::ephemeral::{start_ephemeral_timers_msgids, Timer as EphemeralTimer};
 use crate::events::EventType;
 use crate::imap::markseen_on_imap_table;
+use crate::location::delete_poi_location;
 use crate::mimeparser::{parse_message_id, SystemMessage};
 use crate::param::{Param, Params};
 use crate::pgp::split_armored_data;
@@ -82,29 +87,47 @@ impl MsgId {
         Ok(result)
     }
 
+    pub(crate) async fn get_param(self, context: &Context) -> Result<Params> {
+        let res: Option<String> = context
+            .sql
+            .query_get_value("SELECT param FROM msgs WHERE id=?", (self,))
+            .await?;
+        Ok(res
+            .map(|s| s.parse().unwrap_or_default())
+            .unwrap_or_default())
+    }
+
     /// Put message into trash chat and delete message text.
     ///
     /// It means the message is deleted locally, but not on the server.
     /// We keep some infos to
     /// 1. not download the same message again
     /// 2. be able to delete the message on the server if we want to
-    pub async fn trash(self, context: &Context) -> Result<()> {
+    ///
+    /// * `on_server`: Delete the message on the server also if it is seen on IMAP later, but only
+    ///   if all parts of the message are trashed with this flag. `true` if the user explicitly
+    ///   deletes the message. As for trashing a partially downloaded message when replacing it with
+    ///   a fully downloaded one, see `receive_imf::add_parts()`.
+    pub async fn trash(self, context: &Context, on_server: bool) -> Result<()> {
         let chat_id = DC_CHAT_ID_TRASH;
+        let deleted_subst = match on_server {
+            true => ", deleted=1",
+            false => "",
+        };
         context
             .sql
             .execute(
                 // If you change which information is removed here, also change delete_expired_messages() and
                 // which information receive_imf::add_parts() still adds to the db if the chat_id is TRASH
-                r#"
-UPDATE msgs 
-SET 
-  chat_id=?, txt='', 
-  subject='', txt_raw='', 
-  mime_headers='', 
-  from_id=0, to_id=0, 
-  param='' 
-WHERE id=?;
-"#,
+                &format!(
+                    "UPDATE msgs SET \
+                     chat_id=?, txt='', txt_normalized=NULL, \
+                     subject='', txt_raw='', \
+                     mime_headers='', \
+                     from_id=0, to_id=0, \
+                     param=''{deleted_subst} \
+                     WHERE id=?"
+                ),
                 (chat_id, self),
             )
             .await?;
@@ -138,6 +161,7 @@ WHERE id=?;
             chat_id,
             msg_id: self,
         });
+        chatlist_events::emit_chatlist_item_changed(context, chat_id);
         Ok(())
     }
 
@@ -201,12 +225,14 @@ WHERE id=?;
         let fts = timestamp_to_str(msg.get_timestamp());
         ret += &format!("Sent: {fts}");
 
-        let name = Contact::get_by_id(context, msg.from_id)
-            .await
-            .map(|contact| contact.get_name_n_addr())
-            .unwrap_or_default();
-
-        ret += &format!(" by {name}");
+        let from_contact = Contact::get_by_id(context, msg.from_id).await?;
+        let name = from_contact.get_name_n_addr();
+        if let Some(override_sender_name) = msg.get_override_sender_name() {
+            let addr = from_contact.get_addr();
+            ret += &format!(" by ~{override_sender_name} ({addr})");
+        } else {
+            ret += &format!(" by {name}");
+        }
         ret += "\n";
 
         if msg.from_id != ContactId::SELF {
@@ -360,7 +386,7 @@ impl rusqlite::types::FromSql for MsgId {
     fn column_result(value: rusqlite::types::ValueRef) -> rusqlite::types::FromSqlResult<Self> {
         // Would be nice if we could use match here, but alas.
         i64::column_result(value).and_then(|val| {
-            if 0 <= val && val <= i64::from(std::u32::MAX) {
+            if 0 <= val && val <= i64::from(u32::MAX) {
                 Ok(MsgId::new(val as u32))
             } else {
                 Err(rusqlite::types::FromSqlError::OutOfRange(val))
@@ -457,7 +483,19 @@ impl Message {
     }
 
     /// Loads message with given ID from the database.
+    ///
+    /// Returns an error if the message does not exist.
     pub async fn load_from_db(context: &Context, id: MsgId) -> Result<Message> {
+        let message = Self::load_from_db_optional(context, id)
+            .await?
+            .with_context(|| format!("Message {id} does not exist"))?;
+        Ok(message)
+    }
+
+    /// Loads message with given ID from the database.
+    ///
+    /// Returns `None` if the message does not exist.
+    pub async fn load_from_db_optional(context: &Context, id: MsgId) -> Result<Option<Message>> {
         ensure!(
             !id.is_special(),
             "Can not load special message ID {} from DB",
@@ -465,7 +503,7 @@ impl Message {
         );
         let msg = context
             .sql
-            .query_row(
+            .query_row_optional(
                 concat!(
                     "SELECT",
                     "    m.id AS id,",
@@ -492,7 +530,7 @@ impl Message {
                     "    m.location_id AS location,",
                     "    c.blocked AS blocked",
                     " FROM msgs m LEFT JOIN chats c ON c.id=m.chat_id",
-                    " WHERE m.id=?;"
+                    " WHERE m.id=? AND chat_id!=3;"
                 ),
                 (id,),
                 |row| {
@@ -579,6 +617,33 @@ impl Message {
         self.param.get_path(Param::File, context).unwrap_or(None)
     }
 
+    /// Returns vector of vcards if the file has a vCard attachment.
+    pub async fn vcard_contacts(&self, context: &Context) -> Result<Vec<VcardContact>> {
+        if self.viewtype != Viewtype::Vcard {
+            return Ok(Vec::new());
+        }
+
+        let path = self
+            .get_file(context)
+            .context("vCard message does not have an attachment")?;
+        let bytes = tokio::fs::read(path).await?;
+        let vcard_contents = std::str::from_utf8(&bytes).context("vCard is not a valid UTF-8")?;
+        Ok(parse_vcard(vcard_contents))
+    }
+
+    /// Save file copy at the user-provided path.
+    pub async fn save_file(&self, context: &Context, path: &Path) -> Result<()> {
+        let path_src = self.get_file(context).context("No file")?;
+        let mut src = fs::OpenOptions::new().read(true).open(path_src).await?;
+        let mut dst = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .await?;
+        io::copy(&mut src, &mut dst).await?;
+        Ok(())
+    }
+
     /// If message is an image or gif, set Param::Width and Param::Height
     pub(crate) async fn try_calc_and_set_dimensions(&mut self, context: &Context) -> Result<()> {
         if self.viewtype.has_file() {
@@ -614,13 +679,11 @@ impl Message {
         Ok(())
     }
 
-    /// Check if a message has a location bound to it.
-    /// These messages are also returned by get_locations()
-    /// and the UI may decide to display a special icon beside such messages,
+    /// Check if a message has a POI location bound to it.
+    /// These locations are also returned by [`location::get_range()`].
+    /// The UI may decide to display a special icon beside such messages.
     ///
-    /// @memberof Message
-    /// @param msg The message object.
-    /// @return 1=Message has location bound to it, 0=No location bound to message.
+    /// [`location::get_range()`]: crate::location::get_range
     pub fn has_location(&self) -> bool {
         self.location_id != 0
     }
@@ -630,13 +693,17 @@ impl Message {
     /// at a position different from the self-location.
     /// You should not call this function
     /// if you want to bind the current self-location to a message;
-    /// this is done by set_location() and send_locations_to_chat().
+    /// this is done by [`location::set()`] and [`send_locations_to_chat()`].
     ///
-    /// Typically results in the event #DC_EVENT_LOCATION_CHANGED with
-    /// contact_id set to ContactId::SELF.
+    /// Typically results in the event [`LocationChanged`] with
+    /// `contact_id` set to [`ContactId::SELF`].
     ///
-    /// @param latitude North-south position of the location.
-    /// @param longitude East-west position of the location.
+    /// `latitude` is the North-south position of the location.
+    /// `longitutde` is the East-west position of the location.
+    ///
+    /// [`location::set()`]: crate::location::set
+    /// [`send_locations_to_chat()`]: crate::location::send_locations_to_chat
+    /// [`LocationChanged`]: crate::events::EventType::LocationChanged
     pub fn set_location(&mut self, latitude: f64, longitude: f64) {
         if latitude == 0.0 && longitude == 0.0 {
             return;
@@ -757,7 +824,7 @@ impl Message {
         self.param.get_int(Param::GuaranteeE2ee).unwrap_or_default() != 0
     }
 
-    /// Returns true if message is Auto-Submitted.
+    /// Returns true if message is auto-generated.
     pub fn is_bot(&self) -> bool {
         self.param.get_bool(Param::Bot).unwrap_or_default()
     }
@@ -794,7 +861,7 @@ impl Message {
             None
         };
 
-        Ok(Summary::new(context, self, chat, contact.as_ref()).await)
+        Summary::new(context, self, chat, contact.as_ref()).await
     }
 
     // It's a little unfortunate that the UI has to first call `dc_msg_get_override_sender_name` and then if it was `NULL`, call
@@ -1017,8 +1084,33 @@ impl Message {
         filemime: Option<&str>,
     ) -> Result<()> {
         let blob = BlobObject::create(context, suggested_name, data).await?;
+        self.param.set(Param::Filename, suggested_name);
         self.param.set(Param::File, blob.as_name());
         self.param.set_optional(Param::MimeType, filemime);
+        Ok(())
+    }
+
+    /// Makes message a vCard-containing message using the specified contacts.
+    pub async fn make_vcard(&mut self, context: &Context, contacts: &[ContactId]) -> Result<()> {
+        ensure!(
+            matches!(self.viewtype, Viewtype::File | Viewtype::Vcard),
+            "Wrong viewtype for vCard: {}",
+            self.viewtype,
+        );
+        let vcard = contact::make_vcard(context, contacts).await?;
+        self.set_file_from_bytes(context, "vcard.vcf", vcard.as_bytes(), None)
+            .await
+    }
+
+    /// Updates message state from the vCard attachment.
+    pub(crate) async fn try_set_vcard(&mut self, context: &Context, path: &Path) -> Result<()> {
+        let vcard = fs::read(path).await.context("Could not read {path}")?;
+        if let Some(summary) = get_vcard_summary(&vcard) {
+            self.param.set(Param::Summary1, summary);
+        } else {
+            warn!(context, "try_set_vcard: Not a valid DeltaChat vCard.");
+            self.viewtype = Viewtype::File;
+        }
         Ok(())
     }
 
@@ -1086,7 +1178,7 @@ impl Message {
                 .get_bool(Param::GuaranteeE2ee)
                 .unwrap_or_default()
             {
-                self.param.set(Param::GuaranteeE2ee, "1");
+                self.param.set(Param::ProtectQuote, "1");
             }
 
             let text = quote.get_text();
@@ -1130,14 +1222,9 @@ impl Message {
     /// `References` header is not taken into account.
     pub async fn parent(&self, context: &Context) -> Result<Option<Message>> {
         if let Some(in_reply_to) = &self.in_reply_to {
-            if let Some(msg_id) = rfc724_mid_exists(context, in_reply_to).await? {
-                let msg = Message::load_from_db(context, msg_id).await?;
-                return if msg.chat_id.is_trash() {
-                    // If message is already moved to trash chat, pretend it does not exist.
-                    Ok(None)
-                } else {
-                    Ok(Some(msg))
-                };
+            if let Some((msg_id, _ts_sent)) = rfc724_mid_exists(context, in_reply_to).await? {
+                let msg = Message::load_from_db_optional(context, msg_id).await?;
+                return Ok(msg);
             }
         }
         Ok(None)
@@ -1377,9 +1464,9 @@ pub(crate) fn guess_msgtype_from_suffix(path: &Path) -> Option<(Viewtype, &str)>
         "tif" => (Viewtype::File, "image/tiff"),
         "ttf" => (Viewtype::File, "font/ttf"),
         "txt" => (Viewtype::File, "text/plain"),
-        "vcard" => (Viewtype::File, "text/vcard"),
-        "vcf" => (Viewtype::File, "text/vcard"),
-        "wav" => (Viewtype::File, "audio/wav"),
+        "vcard" => (Viewtype::Vcard, "text/vcard"),
+        "vcf" => (Viewtype::Vcard, "text/vcard"),
+        "wav" => (Viewtype::Audio, "audio/wav"),
         "weba" => (Viewtype::File, "audio/webm"),
         "webm" => (Viewtype::Video, "video/webm"),
         "webp" => (Viewtype::Image, "image/webp"), // iOS via SDWebImage, Android since 4.0
@@ -1470,8 +1557,9 @@ pub async fn delete_msgs(context: &Context, msg_ids: &[MsgId]) -> Result<()> {
         if msg.location_id > 0 {
             delete_poi_location(context, msg.location_id).await?;
         }
+        let on_server = true;
         msg_id
-            .trash(context)
+            .trash(context, on_server)
             .await
             .with_context(|| format!("Unable to trash message {msg_id}"))?;
 
@@ -1518,26 +1606,20 @@ pub async fn delete_msgs(context: &Context, msg_ids: &[MsgId]) -> Result<()> {
 
     for modified_chat_id in modified_chat_ids {
         context.emit_msgs_changed(modified_chat_id, MsgId::new(0));
+        chatlist_events::emit_chatlist_item_changed(context, modified_chat_id);
     }
 
     if !msg_ids.is_empty() {
+        context.emit_msgs_changed_without_ids();
+        chatlist_events::emit_chatlist_changed(context);
         // Run housekeeping to delete unused blobs.
-        context.set_config(Config::LastHousekeeping, None).await?;
+        context
+            .set_config_internal(Config::LastHousekeeping, None)
+            .await?;
     }
 
     // Interrupt Inbox loop to start message deletion and run housekeeping.
     context.scheduler.interrupt_inbox().await;
-    Ok(())
-}
-
-async fn delete_poi_location(context: &Context, location_id: u32) -> Result<()> {
-    context
-        .sql
-        .execute(
-            "DELETE FROM locations WHERE independent = 1 AND id=?;",
-            (location_id as i32,),
-        )
-        .await?;
     Ok(())
 }
 
@@ -1550,7 +1632,7 @@ pub async fn markseen_msgs(context: &Context, msg_ids: Vec<MsgId>) -> Result<()>
     let old_last_msg_id = MsgId::new(context.get_config_u32(Config::LastMsgId).await?);
     let last_msg_id = msg_ids.iter().fold(&old_last_msg_id, std::cmp::max);
     context
-        .set_config_u32(Config::LastMsgId, last_msg_id.to_u32())
+        .set_config_internal(Config::LastMsgId, Some(&last_msg_id.to_u32().to_string()))
         .await?;
 
     let msgs = context
@@ -1617,9 +1699,7 @@ pub async fn markseen_msgs(context: &Context, msg_ids: Vec<MsgId>) -> Result<()>
         _curr_ephemeral_timer,
     ) in msgs
     {
-        if curr_blocked == Blocked::Not
-            && (curr_state == MessageState::InFresh || curr_state == MessageState::InNoticed)
-        {
+        if curr_state == MessageState::InFresh || curr_state == MessageState::InNoticed {
             update_msg_state(context, id, MessageState::InSeen).await?;
             info!(context, "Seen message {}.", id);
 
@@ -1631,7 +1711,11 @@ pub async fn markseen_msgs(context: &Context, msg_ids: Vec<MsgId>) -> Result<()>
             // "Group left by me", a read receipt will quote "Group left by <name>", and the name can
             // be a display name stored in address book rather than the name sent in the From field by
             // the user.
-            if curr_param.get_bool(Param::WantsMdn).unwrap_or_default()
+            //
+            // We also don't send read receipts for contact requests.
+            // Read receipts will not be sent even after accepting the chat.
+            if curr_blocked == Blocked::Not
+                && curr_param.get_bool(Param::WantsMdn).unwrap_or_default()
                 && curr_param.get_cmd() == SystemMessage::Unknown
             {
                 let mdns_enabled = context.get_config_bool(Config::MdnsEnabled).await?;
@@ -1656,6 +1740,7 @@ pub async fn markseen_msgs(context: &Context, msg_ids: Vec<MsgId>) -> Result<()>
 
     for updated_chat_id in updated_chat_ids {
         context.emit_event(EventType::MsgsNoticed(updated_chat_id));
+        chatlist_events::emit_chatlist_item_changed(context, updated_chat_id);
     }
 
     Ok(())
@@ -1666,9 +1751,17 @@ pub(crate) async fn update_msg_state(
     msg_id: MsgId,
     state: MessageState,
 ) -> Result<()> {
+    ensure!(state != MessageState::OutFailed, "use set_msg_failed()!");
+    let error_subst = match state >= MessageState::OutPending {
+        true => ", error=''",
+        false => "",
+    };
     context
         .sql
-        .execute("UPDATE msgs SET state=? WHERE id=?;", (state, msg_id))
+        .execute(
+            &format!("UPDATE msgs SET state=?1 {error_subst} WHERE id=?2 AND (?1!=?3 OR state<?3)"),
+            (state, msg_id, MessageState::OutDelivered),
+        )
         .await?;
     Ok(())
 }
@@ -1708,6 +1801,7 @@ pub(crate) async fn set_msg_failed(
         chat_id: msg.chat_id,
         msg_id: msg.id,
     });
+    chatlist_events::emit_chatlist_item_changed(context, msg.chat_id);
 
     Ok(())
 }
@@ -1771,8 +1865,9 @@ pub async fn estimate_deletion_cnt(
     from_server: bool,
     seconds: i64,
 ) -> Result<usize> {
-    let self_chat_id = ChatId::lookup_by_contact(context, ContactId::SELF)
+    let self_chat_id = ChatIdBlocked::lookup_by_contact(context, ContactId::SELF)
         .await?
+        .map(|c| c.id)
         .unwrap_or_default();
     let threshold_timestamp = time() - seconds;
 
@@ -1811,18 +1906,26 @@ pub async fn estimate_deletion_cnt(
     Ok(cnt)
 }
 
+/// See [`rfc724_mid_exists_ex()`].
 pub(crate) async fn rfc724_mid_exists(
     context: &Context,
     rfc724_mid: &str,
-) -> Result<Option<MsgId>> {
-    rfc724_mid_exists_and(context, rfc724_mid, "1").await
+) -> Result<Option<(MsgId, i64)>> {
+    Ok(rfc724_mid_exists_ex(context, rfc724_mid, "1")
+        .await?
+        .map(|(id, ts_sent, _)| (id, ts_sent)))
 }
 
-pub(crate) async fn rfc724_mid_exists_and(
+/// Returns [MsgId] and "sent" timestamp of the most recent message with given `rfc724_mid`
+/// (Message-ID header) and bool `expr` result if such messages exists in the db.
+///
+/// * `expr`: SQL expression additionally passed into `SELECT`. Evaluated to `true` iff it is true
+///   for all messages with the given `rfc724_mid`.
+pub(crate) async fn rfc724_mid_exists_ex(
     context: &Context,
     rfc724_mid: &str,
-    cond: &str,
-) -> Result<Option<MsgId>> {
+    expr: &str,
+) -> Result<Option<(MsgId, i64, bool)>> {
     let rfc724_mid = rfc724_mid.trim_start_matches('<').trim_end_matches('>');
     if rfc724_mid.is_empty() {
         warn!(context, "Empty rfc724_mid passed to rfc724_mid_exists");
@@ -1832,17 +1935,59 @@ pub(crate) async fn rfc724_mid_exists_and(
     let res = context
         .sql
         .query_row_optional(
-            &("SELECT id FROM msgs WHERE rfc724_mid=? AND ".to_string() + cond),
+            &("SELECT id, timestamp_sent, MIN(".to_string()
+                + expr
+                + ") FROM msgs WHERE rfc724_mid=? ORDER BY timestamp_sent DESC"),
             (rfc724_mid,),
             |row| {
                 let msg_id: MsgId = row.get(0)?;
-
-                Ok(msg_id)
+                let timestamp_sent: i64 = row.get(1)?;
+                let expr_res: bool = row.get(2)?;
+                Ok((msg_id, timestamp_sent, expr_res))
             },
         )
         .await?;
 
     Ok(res)
+}
+
+/// Given a list of Message-IDs, returns the most relevant message found in the database.
+///
+/// Relevance here is `(download_state == Done, index)`, where `index` is an index of Message-ID in
+/// `mids`. This means Message-IDs should be ordered from the least late to the latest one (like in
+/// the References header).
+/// Only messages that are not in the trash chat are considered.
+pub(crate) async fn get_by_rfc724_mids(
+    context: &Context,
+    mids: &[String],
+) -> Result<Option<Message>> {
+    let mut latest = None;
+    for id in mids.iter().rev() {
+        let Some((msg_id, _)) = rfc724_mid_exists(context, id).await? else {
+            continue;
+        };
+        let Some(msg) = Message::load_from_db_optional(context, msg_id).await? else {
+            continue;
+        };
+        if msg.download_state == DownloadState::Done {
+            return Ok(Some(msg));
+        }
+        latest.get_or_insert(msg);
+    }
+    Ok(latest)
+}
+
+/// Returns the 1st part of summary text (i.e. before the dash if any) for a valid DeltaChat vCard.
+pub(crate) fn get_vcard_summary(vcard: &[u8]) -> Option<String> {
+    let vcard = str::from_utf8(vcard).ok()?;
+    let contacts = deltachat_contact_tools::parse_vcard(vcard);
+    let [c] = &contacts[..] else {
+        return None;
+    };
+    if !deltachat_contact_tools::may_be_valid_addr(&c.addr) {
+        return None;
+    }
+    Some(c.display_name().to_string())
 }
 
 /// How a message is primarily displayed.
@@ -1872,7 +2017,8 @@ pub enum Viewtype {
     Text = 10,
 
     /// Image message.
-    /// If the image is an animated GIF, the type DC_MSG_GIF should be used.
+    /// If the image is a GIF and has the appropriate extension, the viewtype is auto-changed to
+    /// `Gif` when sending the message.
     /// File, width and height are set via dc_msg_set_file(), dc_msg_set_dimension
     /// and retrieved via dc_msg_set_file(), dc_msg_set_dimension().
     Image = 20,
@@ -1916,6 +2062,11 @@ pub enum Viewtype {
 
     /// Message is an webxdc instance.
     Webxdc = 80,
+
+    /// Message containing shared contacts represented as a vCard (virtual contact file)
+    /// with email addresses and possibly other fields.
+    /// Use `parse_vcard()` to retrieve them.
+    Vcard = 90,
 }
 
 impl Viewtype {
@@ -1933,8 +2084,18 @@ impl Viewtype {
             Viewtype::File => true,
             Viewtype::VideochatInvitation => false,
             Viewtype::Webxdc => true,
+            Viewtype::Vcard => true,
         }
     }
+}
+
+/// Returns text for storing in the `msgs.txt_normalized` column (to make case-insensitive search
+/// possible for non-ASCII messages).
+pub(crate) fn normalize_text(text: &str) -> Option<String> {
+    if text.is_ascii() {
+        return None;
+    };
+    Some(text.to_lowercase()).filter(|t| t != text)
 }
 
 #[cfg(test)]
@@ -1942,8 +2103,12 @@ mod tests {
     use num_traits::FromPrimitive;
 
     use super::*;
-    use crate::chat::{self, marknoticed_chat, ChatItem};
+    use crate::chat::{
+        self, add_contact_to_chat, marknoticed_chat, send_text_msg, ChatItem, ProtectionStatus,
+    };
     use crate::chatlist::Chatlist;
+    use crate::config::Config;
+    use crate::reaction::send_reaction;
     use crate::receive_imf::receive_imf;
     use crate::test_utils as test;
     use crate::test_utils::{TestContext, TestContextManager};
@@ -1966,8 +2131,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_prepare_message_and_send() {
-        use crate::config::Config;
-
         let d = test::TestContext::new().await;
         let ctx = &d.ctx;
 
@@ -1985,7 +2148,7 @@ mod tests {
         assert_eq!(_msg2.get_filemime(), None);
     }
 
-    /// Tests that message cannot be prepared if account has no configured address.
+    /// Tests that message can be prepared even if account has no configured address.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_prepare_not_configured() {
         let d = test::TestContext::new().await;
@@ -1995,7 +2158,7 @@ mod tests {
 
         let mut msg = Message::new(Viewtype::Text);
 
-        assert!(chat::prepare_msg(ctx, chat.id, &mut msg).await.is_err());
+        assert!(chat::prepare_msg(ctx, chat.id, &mut msg).await.is_ok());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2106,8 +2269,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_quote() {
-        use crate::config::Config;
-
         let d = test::TestContext::new().await;
         let ctx = &d.ctx;
 
@@ -2141,6 +2302,42 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_unencrypted_quote_encrypted_message() -> Result<()> {
+        let mut tcm = TestContextManager::new();
+
+        let alice = &tcm.alice().await;
+        let bob = &tcm.bob().await;
+
+        let alice_group = alice
+            .create_group_with_members(ProtectionStatus::Unprotected, "Group chat", &[bob])
+            .await;
+        let sent = alice.send_text(alice_group, "Hi! I created a group").await;
+        let bob_received_message = bob.recv_msg(&sent).await;
+
+        let bob_group = bob_received_message.chat_id;
+        bob_group.accept(bob).await?;
+        let sent = bob.send_text(bob_group, "Encrypted message").await;
+        let alice_received_message = alice.recv_msg(&sent).await;
+        assert!(alice_received_message.get_showpadlock());
+
+        // Alice adds contact without key so chat becomes unencrypted.
+        let alice_flubby_contact_id =
+            Contact::create(alice, "Flubby", "flubby@example.org").await?;
+        add_contact_to_chat(alice, alice_group, alice_flubby_contact_id).await?;
+
+        // Alice quotes encrypted message in unencrypted chat.
+        let mut msg = Message::new(Viewtype::Text);
+        msg.set_quote(alice, Some(&alice_received_message)).await?;
+        chat::send_msg(alice, alice_group, &mut msg).await?;
+
+        let bob_received_message = bob.recv_msg(&alice.pop_sent_msg().await).await;
+        assert_eq!(bob_received_message.quoted_text().unwrap(), "...");
+        assert_eq!(bob_received_message.get_showpadlock(), false);
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_get_chat_id() {
         // Alice receives a message that pops up as a contact request
         let alice = TestContext::new_alice().await;
@@ -2168,6 +2365,7 @@ mod tests {
     async fn test_set_override_sender_name() {
         // send message with overridden sender name
         let alice = TestContext::new_alice().await;
+        let alice2 = TestContext::new_alice().await;
         let bob = TestContext::new_bob().await;
         let chat = alice.create_chat(&bob).await;
         let contact_id = *chat::get_chat_contacts(&alice, chat.id)
@@ -2187,6 +2385,7 @@ mod tests {
         assert_eq!(msg.get_sender_name(&contact), "over ride".to_string());
         assert_ne!(contact.get_display_name(), "over ride".to_string());
         chat::send_msg(&alice, chat.id, &mut msg).await.unwrap();
+        let sent_msg = alice.pop_sent_msg().await;
 
         // bob receives that message
         let chat = bob.create_chat(&alice).await;
@@ -2196,7 +2395,7 @@ mod tests {
             .first()
             .unwrap();
         let contact = Contact::get_by_id(&bob, contact_id).await.unwrap();
-        let msg = bob.recv_msg(&alice.pop_sent_msg().await).await;
+        let msg = bob.recv_msg(&sent_msg).await;
         assert_eq!(msg.chat_id, chat.id);
         assert_eq!(msg.text, "bla blubb");
         assert_eq!(
@@ -2210,6 +2409,13 @@ mod tests {
         // (mailing lists may also use `Sender:`-header)
         let chat = Chat::load_from_db(&bob, msg.chat_id).await.unwrap();
         assert_ne!(chat.typ, Chattype::Mailinglist);
+
+        // Alice receives message on another device.
+        let msg = alice2.recv_msg(&sent_msg).await;
+        assert_eq!(
+            msg.get_override_sender_name(),
+            Some("over ride".to_string())
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2410,6 +2616,7 @@ mod tests {
             Viewtype::from_i32(70).unwrap()
         );
         assert_eq!(Viewtype::Webxdc, Viewtype::from_i32(80).unwrap());
+        assert_eq!(Viewtype::Vcard, Viewtype::from_i32(90).unwrap());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2429,6 +2636,24 @@ mod tests {
         assert_eq!(received.text, "> Second quote");
         assert!(received.quoted_text().is_none());
         assert!(received.quoted_message(&bob).await?.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_get_message_summary_text() -> Result<()> {
+        let t = TestContext::new_alice().await;
+        let chat = t.get_self_chat().await;
+        let msg_id = send_text_msg(&t, chat.id, "foo".to_string()).await?;
+        let msg = Message::load_from_db(&t, msg_id).await?;
+        let summary = msg.get_summary(&t, None).await?;
+        assert_eq!(summary.text, "foo");
+
+        // message summary does not change when reactions are applied (in contrast to chatlist summary)
+        send_reaction(&t, msg_id, "🫵").await?;
+        let msg = Message::load_from_db(&t, msg_id).await?;
+        let summary = msg.get_summary(&t, None).await?;
+        assert_eq!(summary.text, "foo");
 
         Ok(())
     }

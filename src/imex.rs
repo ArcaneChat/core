@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use ::pgp::types::KeyTrait;
 use anyhow::{bail, ensure, format_err, Context as _, Result};
+use deltachat_contact_tools::EmailAddress;
 use futures::StreamExt;
 use futures_lite::FutureExt;
 use rand::{thread_rng, Rng};
@@ -31,7 +32,6 @@ use crate::sql;
 use crate::stock_str;
 use crate::tools::{
     create_folder, delete_file, get_filesuffix_lc, open_file_std, read_file, time, write_file,
-    EmailAddress,
 };
 
 mod transfer;
@@ -193,7 +193,9 @@ pub async fn render_setup_file(context: &Context, passphrase: &str) -> Result<St
         true => Some(("Autocrypt-Prefer-Encrypt", "mutual")),
     };
     let private_key_asc = private_key.to_asc(ac_headers);
-    let encr = pgp::symm_encrypt(passphrase, private_key_asc.as_bytes()).await?;
+    let encr = pgp::symm_encrypt(passphrase, private_key_asc.as_bytes())
+        .await?
+        .replace('\n', "\r\n");
 
     let replacement = format!(
         concat!(
@@ -284,7 +286,7 @@ pub async fn continue_key_transfer(
         let file = open_file_std(context, filename)?;
         let sc = normalize_setup_code(setup_code);
         let armored_key = decrypt_setup_file(&sc, file).await?;
-        set_self_key(context, &armored_key, true, true).await?;
+        set_self_key(context, &armored_key, true).await?;
         maybe_add_bcc_self_device_msg(context).await?;
 
         Ok(())
@@ -293,35 +295,32 @@ pub async fn continue_key_transfer(
     }
 }
 
-async fn set_self_key(
-    context: &Context,
-    armored: &str,
-    set_default: bool,
-    prefer_encrypt_required: bool,
-) -> Result<()> {
+async fn set_self_key(context: &Context, armored: &str, set_default: bool) -> Result<()> {
     // try hard to only modify key-state
     let (private_key, header) = SignedSecretKey::from_asc(armored)?;
     let public_key = private_key.split_public_key()?;
-    let preferencrypt = header.get("Autocrypt-Prefer-Encrypt");
-    match preferencrypt.map(|s| s.as_str()) {
-        Some(headerval) => {
-            let e2ee_enabled = match headerval {
-                "nopreference" => 0,
-                "mutual" => 1,
-                _ => {
-                    bail!("invalid Autocrypt-Prefer-Encrypt header: {:?}", header);
-                }
-            };
-            context
-                .sql
-                .set_raw_config_int("e2ee_enabled", e2ee_enabled)
-                .await?;
-        }
-        None => {
-            if prefer_encrypt_required {
-                bail!("missing Autocrypt-Prefer-Encrypt header");
+    if let Some(preferencrypt) = header.get("Autocrypt-Prefer-Encrypt") {
+        let e2ee_enabled = match preferencrypt.as_str() {
+            "nopreference" => 0,
+            "mutual" => 1,
+            _ => {
+                bail!("invalid Autocrypt-Prefer-Encrypt header: {:?}", header);
             }
-        }
+        };
+        context
+            .sql
+            .set_raw_config_int("e2ee_enabled", e2ee_enabled)
+            .await?;
+    } else {
+        // `Autocrypt-Prefer-Encrypt` is not included
+        // in keys exported to file.
+        //
+        // `Autocrypt-Prefer-Encrypt` also SHOULD be sent
+        // in Autocrypt Setup Message according to Autocrypt specification,
+        // but K-9 6.802 does not include this header.
+        //
+        // We keep current setting in this case.
+        info!(context, "No Autocrypt-Prefer-Encrypt header.");
     };
 
     let self_addr = context.get_primary_self_addr().await?;
@@ -375,17 +374,25 @@ async fn imex_inner(
     path: &Path,
     passphrase: Option<String>,
 ) -> Result<()> {
-    info!(context, "Import/export dir: {}", path.display());
+    info!(
+        context,
+        "{} path: {}",
+        match what {
+            ImexMode::ExportSelfKeys | ImexMode::ExportBackup => "Export",
+            ImexMode::ImportSelfKeys | ImexMode::ImportBackup => "Import",
+        },
+        path.display()
+    );
     ensure!(context.sql.is_open().await, "Database not opened.");
     context.emit_event(EventType::ImexProgress(10));
 
     if what == ImexMode::ExportBackup || what == ImexMode::ExportSelfKeys {
         // before we export anything, make sure the private key exists
-        if e2ee::ensure_secret_key_exists(context).await.is_err() {
-            bail!("Cannot create private key or private key not available.");
-        } else {
-            create_folder(context, &path).await?;
-        }
+        e2ee::ensure_secret_key_exists(context)
+            .await
+            .context("Cannot create private key or private key not available")?;
+
+        create_folder(context, &path).await?;
     }
 
     match what {
@@ -491,7 +498,7 @@ fn get_next_backup_path(
     backup_time: i64,
 ) -> Result<(PathBuf, PathBuf, PathBuf)> {
     let folder = PathBuf::from(folder);
-    let stem = chrono::NaiveDateTime::from_timestamp_opt(backup_time, 0)
+    let stem = chrono::DateTime::<chrono::Utc>::from_timestamp(backup_time, 0)
         .context("can't get next backup path")?
         // Don't change this file name format, in `dc_imex_has_backup` we use string comparison to determine which backup is newer:
         .format("delta-chat-backup-%Y-%m-%d")
@@ -526,7 +533,7 @@ async fn export_backup(context: &Context, dir: &Path, passphrase: String) -> Res
     let _d1 = DeleteOnDrop(temp_db_path.clone());
     let _d2 = DeleteOnDrop(temp_path.clone());
 
-    export_database(context, &temp_db_path, passphrase)
+    export_database(context, &temp_db_path, passphrase, now)
         .await
         .context("could not export database")?;
 
@@ -596,7 +603,7 @@ async fn export_backup_inner(
 async fn import_secret_key(context: &Context, path: &Path, set_default: bool) -> Result<()> {
     let buf = read_file(context, &path).await?;
     let armored = std::string::String::from_utf8_lossy(&buf);
-    set_self_key(context, &armored, set_default, false).await?;
+    set_self_key(context, &armored, set_default).await?;
     Ok(())
 }
 
@@ -670,7 +677,7 @@ async fn export_self_keys(context: &Context, dir: &Path) -> Result<()> {
     let keys = context
         .sql
         .query_map(
-            "SELECT id, public_key, private_key, is_default FROM keypairs;",
+            "SELECT id, public_key, private_key, id=(SELECT value FROM config WHERE keyname='key_id') FROM keypairs;",
             (),
             |row| {
                 let id = row.get(0)?;
@@ -762,19 +769,27 @@ where
 /// overwritten.
 ///
 /// This also verifies that IO is not running during the export.
-async fn export_database(context: &Context, dest: &Path, passphrase: String) -> Result<()> {
+async fn export_database(
+    context: &Context,
+    dest: &Path,
+    passphrase: String,
+    timestamp: i64,
+) -> Result<()> {
     ensure!(
         !context.scheduler.is_running().await,
         "cannot export backup, IO is running"
     );
-    let now = time().try_into().context("32-bit UNIX time overflow")?;
+    let timestamp = timestamp.try_into().context("32-bit UNIX time overflow")?;
 
     // TODO: Maybe introduce camino crate for UTF-8 paths where we need them.
     let dest = dest
         .to_str()
         .with_context(|| format!("path {} is not valid unicode", dest.display()))?;
 
-    context.sql.set_raw_config_int("backup_time", now).await?;
+    context
+        .sql
+        .set_raw_config_int("backup_time", timestamp)
+        .await?;
     sql::housekeeping(context).await.log_err(context).ok();
     context
         .sql
@@ -809,8 +824,9 @@ mod tests {
 
     use super::*;
     use crate::pgp::{split_armored_data, HEADER_AUTOCRYPT, HEADER_SETUPCODE};
+    use crate::receive_imf::receive_imf;
     use crate::stock_str::StockMessage;
-    use crate::test_utils::{alice_keypair, TestContext};
+    use crate::test_utils::{alice_keypair, TestContext, TestContextManager};
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_render_setup_file() {
@@ -818,15 +834,17 @@ mod tests {
         let msg = render_setup_file(&t, "hello").await.unwrap();
         println!("{}", &msg);
         // Check some substrings, indicating things got substituted.
-        // In particular note the mixing of `\r\n` and `\n` depending
-        // on who generated the strings.
         assert!(msg.contains("<title>Autocrypt Setup Message</title"));
         assert!(msg.contains("<h1>Autocrypt Setup Message</h1>"));
         assert!(msg.contains("<p>This is the Autocrypt Setup Message used to"));
         assert!(msg.contains("-----BEGIN PGP MESSAGE-----\r\n"));
         assert!(msg.contains("Passphrase-Format: numeric9x4\r\n"));
-        assert!(msg.contains("Passphrase-Begin: he\n"));
-        assert!(msg.contains("-----END PGP MESSAGE-----\n"));
+        assert!(msg.contains("Passphrase-Begin: he\r\n"));
+        assert!(msg.contains("-----END PGP MESSAGE-----\r\n"));
+
+        for line in msg.rsplit_terminator('\n') {
+            assert!(line.ends_with('\r'));
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -918,6 +936,37 @@ mod tests {
         if let Err(err) = imex(&context3.ctx, ImexMode::ImportSelfKeys, &keyfile, None).await {
             panic!("got error on import: {err:#}");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_import_second_key() -> Result<()> {
+        let alice = &TestContext::new_alice().await;
+        let chat = alice.create_chat(alice).await;
+        let sent = alice.send_text(chat.id, "Encrypted with old key").await;
+        let export_dir = tempfile::tempdir().unwrap();
+
+        let alice = &TestContext::new().await;
+        alice.configure_addr("alice@example.org").await;
+        imex(alice, ImexMode::ExportSelfKeys, export_dir.path(), None).await?;
+
+        let alice = &TestContext::new_alice().await;
+        let old_key = key::load_self_secret_key(alice).await?;
+
+        imex(alice, ImexMode::ImportSelfKeys, export_dir.path(), None).await?;
+
+        let new_key = key::load_self_secret_key(alice).await?;
+        assert_ne!(new_key, old_key);
+        assert_eq!(
+            key::load_self_secret_keyring(alice).await?,
+            vec![new_key, old_key]
+        );
+
+        let msg = alice.recv_msg(&sent).await;
+        assert!(msg.get_showpadlock());
+        assert_eq!(msg.chat_id, alice.get_self_chat().await.id);
+        assert_eq!(msg.get_text(), "Encrypted with old key");
+
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1047,13 +1096,17 @@ mod tests {
     const S_EM_SETUPCODE: &str = "1742-0185-6197-1303-7016-8412-3581-4441-0597";
     const S_EM_SETUPFILE: &str = include_str!("../test-data/message/stress.txt");
 
+    // Autocrypt Setup Message payload "encrypted" with plaintext algorithm.
+    const S_PLAINTEXT_SETUPFILE: &str =
+        include_str!("../test-data/message/plaintext-autocrypt-setup.txt");
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_split_and_decrypt() {
         let buf_1 = S_EM_SETUPFILE.as_bytes().to_vec();
         let (typ, headers, base64) = split_armored_data(&buf_1).unwrap();
         assert_eq!(typ, BlockType::Message);
         assert!(S_EM_SETUPCODE.starts_with(headers.get(HEADER_SETUPCODE).unwrap()));
-        assert!(headers.get(HEADER_AUTOCRYPT).is_none());
+        assert!(!headers.contains_key(HEADER_AUTOCRYPT));
 
         assert!(!base64.is_empty());
 
@@ -1067,7 +1120,24 @@ mod tests {
 
         assert_eq!(typ, BlockType::PrivateKey);
         assert_eq!(headers.get(HEADER_AUTOCRYPT), Some(&"mutual".to_string()));
-        assert!(headers.get(HEADER_SETUPCODE).is_none());
+        assert!(!headers.contains_key(HEADER_SETUPCODE));
+    }
+
+    /// Tests that Autocrypt Setup Message encrypted with "plaintext" algorithm cannot be
+    /// decrypted.
+    ///
+    /// According to <https://datatracker.ietf.org/doc/html/rfc4880#section-13.4>
+    /// "Implementations MUST NOT use plaintext in Symmetrically Encrypted Data packets".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_decrypt_plaintext_autocrypt_setup_message() {
+        let setup_file = S_PLAINTEXT_SETUPFILE.to_string();
+        let incorrect_setupcode = "0000-0000-0000-0000-0000-0000-0000-0000-0000";
+        assert!(decrypt_setup_file(
+            incorrect_setupcode,
+            std::io::Cursor::new(setup_file.as_bytes()),
+        )
+        .await
+        .is_err());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1085,11 +1155,13 @@ mod tests {
         alice2.configure_addr("alice@example.org").await;
         alice2.recv_msg(&sent).await;
         let msg = alice2.get_last_msg().await;
+        assert!(msg.is_setupmessage());
 
         // Send a message that cannot be decrypted because the keys are
         // not synchronized yet.
         let sent = alice2.send_text(msg.chat_id, "Test").await;
-        alice.recv_msg(&sent).await;
+        let trashed_message = alice.recv_msg_opt(&sent).await;
+        assert!(trashed_message.is_none());
         assert_ne!(alice.get_last_msg().await.get_text(), "Test");
 
         // Transfer the key.
@@ -1099,6 +1171,45 @@ mod tests {
         let sent = alice2.send_text(msg.chat_id, "Test").await;
         alice.recv_msg(&sent).await;
         assert_eq!(alice.get_last_msg().await.get_text(), "Test");
+
+        Ok(())
+    }
+
+    /// Tests that Autocrypt Setup Messages is only clickable if it is self-sent.
+    /// This prevents Bob from tricking Alice into changing the key
+    /// by sending her an Autocrypt Setup Message as long as Alice's server
+    /// does not allow to forge the `From:` header.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_key_transfer_non_self_sent() -> Result<()> {
+        let mut tcm = TestContextManager::new();
+        let alice = tcm.alice().await;
+        let bob = tcm.bob().await;
+
+        let _setup_code = initiate_key_transfer(&alice).await?;
+
+        // Get Autocrypt Setup Message.
+        let sent = alice.pop_sent_msg().await;
+
+        let rcvd = bob.recv_msg(&sent).await;
+        assert!(!rcvd.is_setupmessage());
+
+        Ok(())
+    }
+
+    /// Tests reception of Autocrypt Setup Message from K-9 6.802.
+    ///
+    /// Unlike Autocrypt Setup Message sent by Delta Chat,
+    /// this message does not contain `Autocrypt-Prefer-Encrypt` header.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_key_transfer_k_9() -> Result<()> {
+        let t = &TestContext::new().await;
+        t.configure_addr("autocrypt@nine.testrun.org").await;
+
+        let raw = include_bytes!("../test-data/message/k-9-autocrypt-setup-message.eml");
+        let received = receive_imf(t, raw, false).await?.unwrap();
+
+        let setup_code = "0655-9868-8252-5455-4232-5158-1237-5333-2638";
+        continue_key_transfer(t, *received.msg_ids.last().unwrap(), setup_code).await?;
 
         Ok(())
     }

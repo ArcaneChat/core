@@ -24,9 +24,11 @@ jobs:
     name: Lint Rust
     runs-on: ubuntu-latest
     env:
-      RUSTUP_TOOLCHAIN: 1.73.0
+      RUSTUP_TOOLCHAIN: 1.79.0
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
+        with:
+          show-progress: false
       - name: Install rustfmt and clippy
         run: rustup toolchain install $RUSTUP_TOOLCHAIN --profile minimal --component rustfmt --component clippy
       - name: Cache rust cargo artifacts
@@ -38,11 +40,25 @@ jobs:
       - name: Check
         run: cargo check --workspace --all-targets --all-features
 
+  npm_constants:
+    name: Check if node constants are up to date
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          show-progress: false
+      - name: Rebuild constants
+        run: npm run build:core:constants
+      - name: Check that constants are not changed
+        run: git diff --exit-code
+
   cargo_deny:
     name: cargo deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
+        with:
+          show-progress: false
       - uses: EmbarkStudios/cargo-deny-action@v1
         with:
           arguments: --all-features --workspace
@@ -53,7 +69,9 @@ jobs:
     name: Check provider database
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
+        with:
+          show-progress: false
       - name: Check provider database
         run: scripts/update-provider-database.sh
 
@@ -63,8 +81,9 @@ jobs:
     env:
       RUSTDOCFLAGS: -Dwarnings
     steps:
-      - name: Checkout sources
-        uses: actions/checkout@v3
+      - uses: actions/checkout@v4
+        with:
+          show-progress: false
       - name: Cache rust cargo artifacts
         uses: swatinem/rust-cache@v2
       - name: Rustdoc
@@ -76,18 +95,20 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            rust: 1.73.0
+            rust: 1.79.0
           - os: windows-latest
-            rust: 1.73.0
+            rust: 1.79.0
           - os: macos-latest
-            rust: 1.73.0
+            rust: 1.79.0
 
-          # Minimum Supported Rust Version = 1.70.0
+          # Minimum Supported Rust Version = 1.77.0
           - os: ubuntu-latest
-            rust: 1.70.0
+            rust: 1.77.0
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
+        with:
+          show-progress: false
 
       - name: Install Rust ${{ matrix.rust }}
         run: rustup toolchain install --profile minimal ${{ matrix.rust }}
@@ -96,10 +117,20 @@ jobs:
       - name: Cache rust cargo artifacts
         uses: swatinem/rust-cache@v2
 
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
       - name: Tests
         env:
           RUST_BACKTRACE: 1
-        run: cargo test --workspace
+        run: cargo nextest run --workspace
+
+      - name: Doc-Tests
+        env:
+          RUST_BACKTRACE: 1
+        run: cargo test --workspace --doc
 
       - name: Test cargo vendor
         run: cargo vendor
@@ -111,7 +142,9 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
+        with:
+          show-progress: false
 
       - name: Cache rust cargo artifacts
         uses: swatinem/rust-cache@v2
@@ -120,7 +153,7 @@ jobs:
         run: cargo build -p deltachat_ffi --features jsonrpc
 
       - name: Upload C library
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.os }}-libdeltachat.a
           path: target/debug/libdeltachat.a
@@ -133,7 +166,9 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
+        with:
+          show-progress: false
 
       - name: Cache rust cargo artifacts
         uses: swatinem/rust-cache@v2
@@ -142,7 +177,7 @@ jobs:
         run: cargo build -p deltachat-rpc-server
 
       - name: Upload deltachat-rpc-server
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.os }}-deltachat-rpc-server
           path: ${{ matrix.os == 'windows-latest' && 'target/debug/deltachat-rpc-server.exe' || 'target/debug/deltachat-rpc-server' }}
@@ -152,8 +187,9 @@ jobs:
     name: Python lint
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout sources
-        uses: actions/checkout@v3
+      - uses: actions/checkout@v4
+        with:
+          show-progress: false
 
       - name: Install tox
         run: pip install tox
@@ -193,16 +229,18 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
+        with:
+          show-progress: false
 
       - name: Download libdeltachat.a
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: ${{ matrix.os }}-libdeltachat.a
           path: target/debug
 
       - name: Install python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
 
@@ -243,10 +281,12 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
+        with:
+          show-progress: false
 
       - name: Install python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
 
@@ -254,7 +294,7 @@ jobs:
         run: pip install tox
 
       - name: Download deltachat-rpc-server
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: ${{ matrix.os }}-deltachat-rpc-server
           path: target/debug

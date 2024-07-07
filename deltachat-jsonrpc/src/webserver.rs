@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -33,10 +34,8 @@ async fn main() -> Result<(), std::io::Error> {
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     log::info!("JSON-RPC WebSocket server listening on {}", addr);
-    axum::Server::bind(&addr)
-        .serve(app.into_make_service())
-        .await
-        .unwrap();
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    axum::serve(listener, app).await.unwrap();
 
     Ok(())
 }

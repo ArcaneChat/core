@@ -20,11 +20,13 @@ use std::fmt;
 
 use anyhow::Result;
 
-use crate::chat::{send_msg, ChatId};
+use crate::chat::{send_msg, Chat, ChatId};
+use crate::chatlist_events;
 use crate::contact::ContactId;
 use crate::context::Context;
 use crate::events::EventType;
 use crate::message::{rfc724_mid_exists, Message, MsgId, Viewtype};
+use crate::param::Param;
 
 /// A single reaction consisting of multiple emoji sequences.
 ///
@@ -170,6 +172,7 @@ async fn set_msg_id_reaction(
     msg_id: MsgId,
     chat_id: ChatId,
     contact_id: ContactId,
+    timestamp: i64,
     reaction: Reaction,
 ) -> Result<()> {
     if reaction.is_empty() {
@@ -194,6 +197,17 @@ async fn set_msg_id_reaction(
                 (msg_id, contact_id, reaction.as_str()),
             )
             .await?;
+        let mut chat = Chat::load_from_db(context, chat_id).await?;
+        if chat
+            .param
+            .update_timestamp(Param::LastReactionTimestamp, timestamp)?
+        {
+            chat.param
+                .set_i64(Param::LastReactionMsgId, i64::from(msg_id.to_u32()));
+            chat.param
+                .set_i64(Param::LastReactionContactId, i64::from(contact_id.to_u32()));
+            chat.update_param(context).await?;
+        }
     }
 
     context.emit_event(EventType::ReactionsChanged {
@@ -201,6 +215,7 @@ async fn set_msg_id_reaction(
         msg_id,
         contact_id,
     });
+    chatlist_events::emit_chatlist_item_changed(context, chat_id);
     Ok(())
 }
 
@@ -223,7 +238,15 @@ pub async fn send_reaction(context: &Context, msg_id: MsgId, reaction: &str) -> 
     let reaction_msg_id = send_msg(context, chat_id, &mut reaction_msg).await?;
 
     // Only set reaction if we successfully sent the message.
-    set_msg_id_reaction(context, msg_id, msg.chat_id, ContactId::SELF, reaction).await?;
+    set_msg_id_reaction(
+        context,
+        msg_id,
+        msg.chat_id,
+        ContactId::SELF,
+        reaction_msg.timestamp_sort,
+        reaction,
+    )
+    .await?;
     Ok(reaction_msg_id)
 }
 
@@ -250,10 +273,11 @@ pub(crate) async fn set_msg_reaction(
     in_reply_to: &str,
     chat_id: ChatId,
     contact_id: ContactId,
+    timestamp: i64,
     reaction: Reaction,
 ) -> Result<()> {
-    if let Some(msg_id) = rfc724_mid_exists(context, in_reply_to).await? {
-        set_msg_id_reaction(context, msg_id, chat_id, contact_id, reaction).await
+    if let Some((msg_id, _)) = rfc724_mid_exists(context, in_reply_to).await? {
+        set_msg_id_reaction(context, msg_id, chat_id, contact_id, timestamp, reaction).await
     } else {
         info!(
             context,
@@ -307,18 +331,72 @@ pub async fn get_msg_reactions(context: &Context, msg_id: MsgId) -> Result<React
     Ok(Reactions { reactions })
 }
 
+impl Chat {
+    /// Check if there is a reaction newer than the given timestamp.
+    ///
+    /// If so, reaction details are returned and can be used to create a summary string.
+    pub async fn get_last_reaction_if_newer_than(
+        &self,
+        context: &Context,
+        timestamp: i64,
+    ) -> Result<Option<(Message, ContactId, String)>> {
+        if self
+            .param
+            .get_i64(Param::LastReactionTimestamp)
+            .filter(|&reaction_timestamp| reaction_timestamp > timestamp)
+            .is_none()
+        {
+            return Ok(None);
+        };
+        let reaction_msg_id = MsgId::new(
+            self.param
+                .get_int(Param::LastReactionMsgId)
+                .unwrap_or_default() as u32,
+        );
+        let Some(reaction_msg) = Message::load_from_db_optional(context, reaction_msg_id).await?
+        else {
+            // The message reacted to may be deleted.
+            // These are no errors as `Param::LastReaction*` are just weak pointers.
+            // Instead, just return `Ok(None)` and let the caller create another summary.
+            return Ok(None);
+        };
+        let reaction_contact_id = ContactId::new(
+            self.param
+                .get_int(Param::LastReactionContactId)
+                .unwrap_or_default() as u32,
+        );
+        if let Some(reaction) = context
+            .sql
+            .query_get_value(
+                "SELECT reaction FROM reactions WHERE msg_id=? AND contact_id=?",
+                (reaction_msg.id, reaction_contact_id),
+            )
+            .await?
+        {
+            Ok(Some((reaction_msg, reaction_contact_id, reaction)))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use deltachat_contact_tools::ContactAddress;
+
     use super::*;
-    use crate::chat::get_chat_msgs;
+    use crate::chat::{forward_msgs, get_chat_msgs, send_text_msg};
+    use crate::chatlist::Chatlist;
     use crate::config::Config;
-    use crate::constants::DC_CHAT_ID_TRASH;
-    use crate::contact::{Contact, ContactAddress, Origin};
+    use crate::contact::{Contact, Origin};
     use crate::download::DownloadState;
-    use crate::message::MessageState;
-    use crate::receive_imf::{receive_imf, receive_imf_inner};
+    use crate::message::{delete_msgs, MessageState};
+    use crate::receive_imf::{receive_imf, receive_imf_from_inbox};
+    use crate::sql::housekeeping;
     use crate::test_utils::TestContext;
     use crate::test_utils::TestContextManager;
+    use crate::tools::SystemTime;
+    use std::time::Duration;
 
     #[test]
     fn test_parse_reaction() {
@@ -392,7 +470,7 @@ Can we chat at 1pm pacific, today?"
         let bob_id = Contact::add_or_lookup(
             &alice,
             "",
-            ContactAddress::new("bob@example.net")?,
+            &ContactAddress::new("bob@example.net")?,
             Origin::ManuallyCreated,
         )
         .await?
@@ -425,7 +503,7 @@ Content-Disposition: reaction\n\
         let contacts = reactions.contacts();
         assert_eq!(contacts.len(), 1);
 
-        assert_eq!(contacts.get(0), Some(&bob_id));
+        assert_eq!(contacts.first(), Some(&bob_id));
         let bob_reaction = reactions.get(bob_id);
         assert_eq!(bob_reaction.is_empty(), false);
         assert_eq!(bob_reaction.emojis(), vec!["👍"]);
@@ -518,15 +596,14 @@ Here's my footer -- bob@example.net"
         assert_eq!(get_chat_msgs(&bob, bob_msg.chat_id).await?.len(), 2);
 
         let bob_reaction_msg = bob.pop_sent_msg().await;
-        let alice_reaction_msg = alice.recv_msg_opt(&bob_reaction_msg).await.unwrap();
-        assert_eq!(alice_reaction_msg.chat_id, DC_CHAT_ID_TRASH);
+        alice.recv_msg_trash(&bob_reaction_msg).await;
         assert_eq!(get_chat_msgs(&alice, chat_alice.id).await?.len(), 2);
 
         let reactions = get_msg_reactions(&alice, alice_msg.sender_msg_id).await?;
         assert_eq!(reactions.to_string(), "👍1");
         let contacts = reactions.contacts();
         assert_eq!(contacts.len(), 1);
-        let bob_id = contacts.get(0).unwrap();
+        let bob_id = contacts.first().unwrap();
         let bob_reaction = reactions.get(*bob_id);
         assert_eq!(bob_reaction.is_empty(), false);
         assert_eq!(bob_reaction.emojis(), vec!["👍"]);
@@ -545,6 +622,145 @@ Here's my footer -- bob@example.net"
             reactions.emoji_sorted_by_frequency(),
             vec![("👍".to_string(), 2), ("😀".to_string(), 1)]
         );
+
+        Ok(())
+    }
+
+    async fn assert_summary(t: &TestContext, expected: &str) {
+        let chatlist = Chatlist::try_load(t, 0, None, None).await.unwrap();
+        let summary = chatlist.get_summary(t, 0, None).await.unwrap();
+        assert_eq!(summary.text, expected);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_reaction_summary() -> Result<()> {
+        let alice = TestContext::new_alice().await;
+        let bob = TestContext::new_bob().await;
+        alice.set_config(Config::Displayname, Some("ALICE")).await?;
+        bob.set_config(Config::Displayname, Some("BOB")).await?;
+
+        // Alice sends message to Bob
+        let alice_chat = alice.create_chat(&bob).await;
+        let alice_msg1 = alice.send_text(alice_chat.id, "Party?").await;
+        let bob_msg1 = bob.recv_msg(&alice_msg1).await;
+
+        // Bob reacts to Alice's message, this is shown in the summaries
+        SystemTime::shift(Duration::from_secs(10));
+        bob_msg1.chat_id.accept(&bob).await?;
+        send_reaction(&bob, bob_msg1.id, "👍").await?;
+        let bob_send_reaction = bob.pop_sent_msg().await;
+        alice.recv_msg_trash(&bob_send_reaction).await;
+
+        let chatlist = Chatlist::try_load(&bob, 0, None, None).await?;
+        let summary = chatlist.get_summary(&bob, 0, None).await?;
+        assert_eq!(summary.text, "You reacted 👍 to \"Party?\"");
+        assert_eq!(summary.timestamp, bob_msg1.get_timestamp()); // time refers to message, not to reaction
+        assert_eq!(summary.state, MessageState::InFresh); // state refers to message, not to reaction
+        assert!(summary.prefix.is_none());
+        assert!(summary.thumbnail_path.is_none());
+        assert_summary(&alice, "BOB reacted 👍 to \"Party?\"").await;
+
+        // Alice reacts to own message as well
+        SystemTime::shift(Duration::from_secs(10));
+        send_reaction(&alice, alice_msg1.sender_msg_id, "🍿").await?;
+        let alice_send_reaction = alice.pop_sent_msg().await;
+        bob.recv_msg_opt(&alice_send_reaction).await;
+
+        assert_summary(&alice, "You reacted 🍿 to \"Party?\"").await;
+        assert_summary(&bob, "ALICE reacted 🍿 to \"Party?\"").await;
+
+        // Alice sends a newer message, this overwrites reaction summaries
+        SystemTime::shift(Duration::from_secs(10));
+        let alice_msg2 = alice.send_text(alice_chat.id, "kewl").await;
+        bob.recv_msg(&alice_msg2).await;
+
+        assert_summary(&alice, "kewl").await;
+        assert_summary(&bob, "kewl").await;
+
+        // Reactions to older messages still overwrite newer messages
+        SystemTime::shift(Duration::from_secs(10));
+        send_reaction(&alice, alice_msg1.sender_msg_id, "🤘").await?;
+        let alice_send_reaction = alice.pop_sent_msg().await;
+        bob.recv_msg_opt(&alice_send_reaction).await;
+
+        assert_summary(&alice, "You reacted 🤘 to \"Party?\"").await;
+        assert_summary(&bob, "ALICE reacted 🤘 to \"Party?\"").await;
+
+        // Retracted reactions remove all summary reactions
+        SystemTime::shift(Duration::from_secs(10));
+        send_reaction(&alice, alice_msg1.sender_msg_id, "").await?;
+        let alice_remove_reaction = alice.pop_sent_msg().await;
+        bob.recv_msg_opt(&alice_remove_reaction).await;
+
+        assert_summary(&alice, "kewl").await;
+        assert_summary(&bob, "kewl").await;
+
+        // Alice adds another reaction and then deletes the message reacted to; this will also delete reaction summary
+        SystemTime::shift(Duration::from_secs(10));
+        send_reaction(&alice, alice_msg1.sender_msg_id, "🧹").await?;
+        assert_summary(&alice, "You reacted 🧹 to \"Party?\"").await;
+
+        delete_msgs(&alice, &[alice_msg1.sender_msg_id]).await?; // this will leave a tombstone
+        assert_summary(&alice, "kewl").await;
+        housekeeping(&alice).await?; // this will delete the tombstone
+        assert_summary(&alice, "kewl").await;
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_reaction_forwarded_summary() -> Result<()> {
+        let alice = TestContext::new_alice().await;
+
+        // Alice adds a message to "Saved Messages"
+        let self_chat = alice.get_self_chat().await;
+        let msg_id = send_text_msg(&alice, self_chat.id, "foo".to_string()).await?;
+        assert_summary(&alice, "foo").await;
+
+        // Alice reacts to that message
+        SystemTime::shift(Duration::from_secs(10));
+        send_reaction(&alice, msg_id, "🐫").await?;
+        assert_summary(&alice, "You reacted 🐫 to \"foo\"").await;
+        let reactions = get_msg_reactions(&alice, msg_id).await?;
+        assert_eq!(reactions.reactions.len(), 1);
+
+        // Alice forwards that message to Bob: Reactions are not forwarded, the message is prefixed by "Forwarded".
+        let bob_id = Contact::create(&alice, "", "bob@example.net").await?;
+        let bob_chat_id = ChatId::create_for_contact(&alice, bob_id).await?;
+        forward_msgs(&alice, &[msg_id], bob_chat_id).await?;
+        assert_summary(&alice, "Forwarded: foo").await; // forwarded messages are prefixed
+        let chatlist = Chatlist::try_load(&alice, 0, None, None).await.unwrap();
+        let forwarded_msg_id = chatlist.get_msg_id(0)?.unwrap();
+        let reactions = get_msg_reactions(&alice, forwarded_msg_id).await?;
+        assert!(reactions.reactions.is_empty()); // reactions are not forwarded
+
+        // Alice reacts to forwarded message:
+        // For reaction summary neither original message author nor "Forwarded" prefix is shown
+        SystemTime::shift(Duration::from_secs(10));
+        send_reaction(&alice, forwarded_msg_id, "🐳").await?;
+        assert_summary(&alice, "You reacted 🐳 to \"foo\"").await;
+        let reactions = get_msg_reactions(&alice, msg_id).await?;
+        assert_eq!(reactions.reactions.len(), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_reaction_self_chat_multidevice_summary() -> Result<()> {
+        let alice0 = TestContext::new_alice().await;
+        let alice1 = TestContext::new_alice().await;
+        let chat = alice0.get_self_chat().await;
+
+        let msg_id = send_text_msg(&alice0, chat.id, "mom's birthday!".to_string()).await?;
+        alice1.recv_msg(&alice0.pop_sent_msg().await).await;
+
+        SystemTime::shift(Duration::from_secs(10));
+        send_reaction(&alice0, msg_id, "👆").await?;
+        let sync = alice0.pop_sent_msg().await;
+        receive_imf(&alice1, sync.payload().as_bytes(), false).await?;
+
+        assert_summary(&alice0, "You reacted 👆 to \"mom's birthday!\"").await;
+        assert_summary(&alice1, "You reacted 👆 to \"mom's birthday!\"").await;
 
         Ok(())
     }
@@ -568,7 +784,7 @@ Here's my footer -- bob@example.net"
         let msg_full = format!("{msg_header}\n\n100k text...");
 
         // Alice downloads message from Bob partially.
-        let alice_received_message = receive_imf_inner(
+        let alice_received_message = receive_imf_from_inbox(
             &alice,
             "first@example.org",
             msg_header.as_bytes(),
@@ -578,20 +794,20 @@ Here's my footer -- bob@example.net"
         )
         .await?
         .unwrap();
-        let alice_msg_id = *alice_received_message.msg_ids.get(0).unwrap();
+        let alice_msg_id = *alice_received_message.msg_ids.first().unwrap();
 
         // Bob downloads own message on the other device.
         let bob_received_message = receive_imf(&bob, msg_full.as_bytes(), false)
             .await?
             .unwrap();
-        let bob_msg_id = *bob_received_message.msg_ids.get(0).unwrap();
+        let bob_msg_id = *bob_received_message.msg_ids.first().unwrap();
 
         // Bob reacts to own message.
         send_reaction(&bob, bob_msg_id, "👍").await.unwrap();
         let bob_reaction_msg = bob.pop_sent_msg().await;
 
         // Alice receives a reaction.
-        alice.recv_msg_opt(&bob_reaction_msg).await.unwrap();
+        alice.recv_msg_trash(&bob_reaction_msg).await;
 
         let reactions = get_msg_reactions(&alice, alice_msg_id).await?;
         assert_eq!(reactions.to_string(), "👍1");
@@ -599,7 +815,7 @@ Here's my footer -- bob@example.net"
         assert_eq!(msg.download_state(), DownloadState::Available);
 
         // Alice downloads full message.
-        receive_imf_inner(
+        receive_imf_from_inbox(
             &alice,
             "first@example.org",
             msg_full.as_bytes(),
@@ -643,7 +859,7 @@ Here's my footer -- bob@example.net"
         {
             send_reaction(&alice2, alice2_msg.id, "👍").await?;
             let msg = alice2.pop_sent_msg().await;
-            alice1.recv_msg(&msg).await;
+            alice1.recv_msg_trash(&msg).await;
         }
 
         // Check that the status is still the same.
@@ -651,6 +867,26 @@ Here's my footer -- bob@example.net"
             alice1.get_config(Config::Selfstatus).await?.as_deref(),
             Some("New status")
         );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_send_reaction_multidevice() -> Result<()> {
+        let alice0 = TestContext::new_alice().await;
+        let alice1 = TestContext::new_alice().await;
+        let bob_id = Contact::create(&alice0, "", "bob@example.net").await?;
+        let chat_id = ChatId::create_for_contact(&alice0, bob_id).await?;
+
+        let alice0_msg_id = send_text_msg(&alice0, chat_id, "foo".to_string()).await?;
+        let alice1_msg = alice1.recv_msg(&alice0.pop_sent_msg().await).await;
+
+        send_reaction(&alice0, alice0_msg_id, "👀").await?;
+        alice1.recv_msg_trash(&alice0.pop_sent_msg().await).await;
+
+        expect_reactions_changed_event(&alice0, chat_id, alice0_msg_id, ContactId::SELF).await?;
+        expect_reactions_changed_event(&alice1, alice1_msg.chat_id, alice1_msg.id, ContactId::SELF)
+            .await?;
+
         Ok(())
     }
 }

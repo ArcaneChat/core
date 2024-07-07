@@ -17,7 +17,6 @@ typedef struct _dc_array     dc_array_t;
 typedef struct _dc_chatlist  dc_chatlist_t;
 typedef struct _dc_chat      dc_chat_t;
 typedef struct _dc_msg       dc_msg_t;
-typedef struct _dc_reactions dc_reactions_t;
 typedef struct _dc_contact   dc_contact_t;
 typedef struct _dc_lot       dc_lot_t;
 typedef struct _dc_provider  dc_provider_t;
@@ -25,7 +24,6 @@ typedef struct _dc_event     dc_event_t;
 typedef struct _dc_event_emitter dc_event_emitter_t;
 typedef struct _dc_jsonrpc_instance dc_jsonrpc_instance_t;
 typedef struct _dc_backup_provider dc_backup_provider_t;
-typedef struct _dc_http_response dc_http_response_t;
 
 // Alias for backwards compatibility, use dc_event_emitter_t instead.
 typedef struct _dc_event_emitter dc_accounts_event_emitter_t;
@@ -364,8 +362,12 @@ uint32_t        dc_get_id                    (dc_context_t* context);
  *     Must be freed using dc_event_emitter_unref() after usage.
  *
  * Note: Use only one event emitter per context.
- * Having more than one event emitter running at the same time on the same context
- * will result in events being randomly delivered to one of the emitters.
+ * The result of having multiple event emitters is unspecified.
+ * Currently events are broadcasted to all existing event emitters,
+ * but previous versions delivered events to only one event emitter
+ * and this behavior may change again in the future.
+ * Events emitted before creation of event emitter
+ * may or may not be available to event emitter.
  */
 dc_event_emitter_t* dc_get_event_emitter(dc_context_t* context);
 
@@ -424,19 +426,16 @@ char*           dc_get_blobdir               (const dc_context_t* context);
  *                    Sending messages to self is needed for a proper multi-account setup,
  *                    however, on the other hand, may lead to unwanted notifications in non-delta clients.
  * - `sentbox_watch`= 1=watch `Sent`-folder for changes,
- *                    0=do not watch the `Sent`-folder (default),
- *                    changes require restarting IO by calling dc_stop_io() and then dc_start_io().
+ *                    0=do not watch the `Sent`-folder (default).
  * - `mvbox_move`   = 1=detect chat messages,
  *                    move them to the `DeltaChat` folder,
  *                    and watch the `DeltaChat` folder for updates (default),
  *                    0=do not move chat-messages
- *                    changes require restarting IO by calling dc_stop_io() and then dc_start_io().
  * - `only_fetch_mvbox` = 1=Do not fetch messages from folders other than the
  *                    `DeltaChat` folder. Messages will still be fetched from the
  *                    spam folder and `sendbox_watch` will also still be respected
  *                    if enabled.
  *                    0=watch all folders normally (default)
- *                    changes require restarting IO by calling dc_stop_io() and then dc_start_io().
  * - `show_emails`  = DC_SHOW_EMAILS_OFF (0)=
  *                    show direct replies to chats only,
  *                    DC_SHOW_EMAILS_ACCEPTED_CONTACTS (1)=
@@ -482,8 +481,9 @@ char*           dc_get_blobdir               (const dc_context_t* context);
  * - `bot`          = Set to "1" if this is a bot.
  *                    Prevents adding the "Device messages" and "Saved messages" chats,
  *                    adds Auto-Submitted header to outgoing messages,
- *                    accepts contact requests automatically (calling dc_accept_chat() is not needed for bots)
- *                    and does not cut large incoming text messages.
+ *                    accepts contact requests automatically (calling dc_accept_chat() is not needed),
+ *                    does not cut large incoming text messages,
+ *                    handles existing messages the same way as new ones if `fetch_existing_msgs=1`.
  * - `last_msg_id` = database ID of the last message processed by the bot.
  *                   This ID and IDs below it are guaranteed not to be returned
  *                   by dc_get_next_msgs() and dc_wait_next_msgs().
@@ -494,8 +494,8 @@ char*           dc_get_blobdir               (const dc_context_t* context);
  *                   For most bots calling `dc_markseen_msgs()` is the
  *                   recommended way to update this value
  *                   even for self-sent messages.
- * - `fetch_existing_msgs` = 1=fetch most recent existing messages on configure (default),
- *                    0=do not fetch existing messages on configure.
+ * - `fetch_existing_msgs` = 0=do not fetch existing messages on configure (default),
+ *                    1=fetch most recent existing messages on configure.
  *                    In both cases, existing recipients are added to the contact database.
  * - `disable_idle` = 1=disable IMAP IDLE even if the server supports it,
  *                    0=use IMAP IDLE if the server supports it.
@@ -518,11 +518,15 @@ char*           dc_get_blobdir               (const dc_context_t* context);
  *                    0=Nothing else happens when the key changes.
  *                    1=After the key changed, `dc_chat_can_send()` returns false and `dc_chat_is_protection_broken()` returns true
  *                    until `dc_accept_chat()` is called.
+ * - `is_chatmail` = 1 if the the server is a chatmail server, 0 otherwise.
  * - `ui.*`         = All keys prefixed by `ui.` can be used by the user-interfaces for system-specific purposes.
  *                    The prefix should be followed by the system and maybe subsystem,
  *                    e.g. `ui.desktop.foo`, `ui.desktop.linux.bar`, `ui.android.foo`, `ui.dc40.bar`, `ui.bot.simplebot.baz`.
  *                    These keys go to backups and allow easy per-account settings when using @ref dc_accounts_t,
  *                    however, are not handled by the core otherwise.
+ * - `webxdc_realtime_enabled` = Whether the realtime APIs should be enabled.
+ *                               0 = WebXDC realtime API is disabled and behaves as noop (default).
+ *                               1 = WebXDC realtime API is enabled.
  *
  * If you want to retrieve a value, use dc_get_config().
  *
@@ -690,8 +694,25 @@ int             dc_get_connectivity          (dc_context_t* context);
 char*           dc_get_connectivity_html     (dc_context_t* context);
 
 
+#define DC_PUSH_NOT_CONNECTED 0
+#define DC_PUSH_HEARTBEAT     1
+#define DC_PUSH_CONNECTED     2
+
 /**
- * Standalone version of dc_accounts_all_work_done().
+ * Get the current push notification state.
+ * One of:
+ * - DC_PUSH_NOT_CONNECTED
+ * - DC_PUSH_HEARTBEAT
+ * - DC_PUSH_CONNECTED
+ *
+ * @memberof dc_context_t
+ * @param context The context object.
+ * @return Push notification state.
+ */
+int              dc_get_push_state           (dc_context_t* context);
+
+
+/**
  * Only used by the python tests.
  */
 int             dc_all_work_done             (dc_context_t* context);
@@ -1105,34 +1126,6 @@ uint32_t dc_send_videochat_invitation (dc_context_t* context, uint32_t chat_id);
 
 
 /**
- * Send a reaction to message.
- *
- * Reaction is a string of emojis separated by spaces. Reaction to a
- * single message can be sent multiple times. The last reaction
- * received overrides all previously received reactions. It is
- * possible to remove all reactions by sending an empty string.
- *
- * @memberof dc_context_t
- * @param context The context object.
- * @param msg_id ID of the message you react to.
- * @param reaction A string consisting of emojis separated by spaces.
- * @return The ID of the message sent out or 0 for errors.
- */
-uint32_t dc_send_reaction (dc_context_t* context, uint32_t msg_id, char *reaction);
-
-
-/**
- * Get a structure with reactions to the message.
- *
- * @memberof dc_context_t
- * @param context The context object.
- * @param msg_id The message ID to get reactions for.
- * @return A structure with all reactions to the message.
- */
-dc_reactions_t* dc_get_msg_reactions (dc_context_t *context, int msg_id);
-
-
-/**
  * A webxdc instance sends a status update to its other members.
  *
  * In JS land, that would be mapped to something as:
@@ -1193,6 +1186,65 @@ int dc_send_webxdc_status_update (dc_context_t* context, uint32_t msg_id, const 
  *        If there are no updates, an empty JSON-array is returned.
  */
 char* dc_get_webxdc_status_updates (dc_context_t* context, uint32_t msg_id, uint32_t serial);
+
+
+/**
+ * Set Webxdc file as integration.
+ * see dc_init_webxdc_integration() for more details about Webxdc integrations.
+ *
+ * @warning This is an experimental API which may change in the future
+ *
+ * @memberof dc_context_t
+ * @param context The context object.
+ * @param file The .xdc file to use as Webxdc integration.
+ */
+void             dc_set_webxdc_integration (dc_context_t* context, const char* file);
+
+
+/**
+ * Init a Webxdc integration.
+ *
+ * A Webxdc integration is
+ * a Webxdc showing a map, getting locations via setUpdateListener(), setting POIs via sendUpdate();
+ * core takes eg. care of feeding locations to the Webxdc or sending the data out.
+ *
+ * @warning This is an experimental API, esp. support of integration types (eg. image editor, tools) is left out for simplicity
+ *
+ * Currently, Webxdc integrations are .xdc files shipped together with the main app.
+ * Before dc_init_webxdc_integration() can be called,
+ * UI has to call dc_set_webxdc_integration() to define a .xdc file to be used as integration.
+ *
+ * dc_init_webxdc_integration() returns a Webxdc message ID that
+ * UI can open and use mostly as usual.
+ *
+ * Concrete behaviour and status updates depend on the integration, driven by UI needs.
+ *
+ * There is no need to de-initialize the integration,
+ * however, unless documented otherwise,
+ * the integration is valid only as long as not re-initialized
+ * In other words, UI must not have a Webxdc with the same integration open twice.
+ *
+ * Example:
+ *
+ * ~~~
+ * // Define a .xdc file to be used as maps integration
+ * dc_set_webxdc_integration(context, path_to_maps_xdc);
+ *
+ * // Integrate the map to a chat, the map will show locations for this chat then:
+ * uint32_t webxdc_instance = dc_init_webxdc_integration(context, any_chat_id);
+ *
+ * // Or use the Webxdc as a global map, showing locations of all chats:
+ * uint32_t webxdc_instance = dc_init_webxdc_integration(context, 0);
+ * ~~~
+ *
+ * @memberof dc_context_t
+ * @param context The context object.
+ * @param chat_id The chat to get the integration for.
+ * @return ID of the message that refers to the Webxdc instance.
+ *     UI can open a Webxdc as usual with this instance.
+ */
+uint32_t        dc_init_webxdc_integration    (dc_context_t* context, uint32_t chat_id);
+
 
 /**
  * Save a draft for a chat in the database.
@@ -2561,7 +2613,7 @@ dc_lot_t*       dc_check_qr                  (dc_context_t* context, const char*
  *     the Verified-Group-Invite protocol is offered in the QR code;
  *     works for protected groups as well as for normal groups.
  *     If set to 0, the Setup-Contact protocol is offered in the QR code.
- *     See https://securejoin.readthedocs.io/en/latest/new.html
+ *     See https://securejoin.delta.chat/
  *     for details about both protocols.
  * @return The text that should go to the QR code,
  *     On errors, an empty QR code is returned, NULL is never returned.
@@ -2597,8 +2649,7 @@ char*           dc_get_securejoin_qr_svg         (dc_context_t* context, uint32_
  *
  * Subsequent calls of dc_join_securejoin() will abort previous, unfinished handshakes.
  *
- * See https://securejoin.readthedocs.io/en/latest/new.html
- * for details about both protocols.
+ * See https://securejoin.delta.chat/ for details about both protocols.
  *
  * @memberof dc_context_t
  * @param context The context object.
@@ -3084,23 +3135,6 @@ int            dc_accounts_select_account       (dc_accounts_t* accounts, uint32
 
 
 /**
- * This is meant especially for iOS, because iOS needs to tell the system when its background work is done.
- *
- * iOS can:
- * - call dc_start_io() (in case IO was not running)
- * - call dc_maybe_network()
- * - while dc_accounts_all_work_done() returns false:
- *   - Wait for #DC_EVENT_CONNECTIVITY_CHANGED
- *
- * @memberof dc_accounts_t
- * @param accounts The account manager as created by dc_accounts_new().
- * @return Whether all accounts finished their background work.
- *      #DC_EVENT_CONNECTIVITY_CHANGED will be sent when this turns to true.
- */
-int            dc_accounts_all_work_done        (dc_accounts_t* accounts);
-
-
-/**
  * Start job and IMAP/SMTP tasks for all accounts managed by the account manager.
  * If IO is already running, nothing happens.
  * This is similar to dc_start_io(), which, however,
@@ -3149,6 +3183,33 @@ void           dc_accounts_maybe_network        (dc_accounts_t* accounts);
  */
 void           dc_accounts_maybe_network_lost    (dc_accounts_t* accounts);
 
+
+/**
+ * Perform a background fetch for all accounts in parallel with a timeout.
+ * Pauses the scheduler, fetches messages from imap and then resumes the scheduler.
+ *
+ * dc_accounts_background_fetch() was created for the iOS Background fetch.
+ *
+ * The `DC_EVENT_ACCOUNTS_BACKGROUND_FETCH_DONE` event is emitted at the end
+ * even in case of timeout, unless the function fails and returns 0.
+ * Process all events until you get this one and you can safely return to the background
+ * without forgetting to create notifications caused by timing race conditions.
+ *
+ * @memberof dc_accounts_t
+ * @param timeout The timeout in seconds
+ * @return Return 1 if DC_EVENT_ACCOUNTS_BACKGROUND_FETCH_DONE was emitted and 0 otherwise.
+ */
+int            dc_accounts_background_fetch    (dc_accounts_t* accounts, uint64_t timeout);
+
+
+/**
+ * Sets device token for Apple Push Notification service.
+ * Returns immediately.
+ *
+ * @memberof dc_accounts_t
+ * @param token Hexadecimal device token
+ */
+void           dc_accounts_set_push_device_token (dc_accounts_t* accounts, const char *token);
 
 /**
  * Create the event emitter that is used to receive events.
@@ -4050,6 +4111,19 @@ char*           dc_msg_get_file               (const dc_msg_t* msg);
 
 
 /**
+ * Save file copy at the user-provided path.
+ *
+ * Fails if file already exists at the provided path.
+ *
+ * @memberof dc_msg_t
+ * @param msg The message object.
+ * @param path Destination file path with filename and extension.
+ * @return 0 on failure, 1 on success.
+ */
+int             dc_msg_save_file              (const dc_msg_t* msg, const char* path);
+
+
+/**
  * Get an original attachment filename, with extension but without the path. To get the full path,
  * use dc_msg_get_file().
  *
@@ -4113,7 +4187,6 @@ char*             dc_msg_get_webxdc_blob      (const dc_msg_t* msg, const char* 
  *   true if the Webxdc should get full internet access, including Webrtc.
  *   currently, this is only true for encrypted Webxdc's in the self chat
  *   that have requested internet access in the manifest.
- *   this is useful for development and maybe for internal integrations at some point.
  *
  * @memberof dc_msg_t
  * @param msg The webxdc instance.
@@ -4322,9 +4395,9 @@ int             dc_msg_has_deviating_timestamp(const dc_msg_t* msg);
 
 
 /**
- * Check if a message has a location bound to it.
- * These messages are also returned by dc_get_locations()
- * and the UI may decide to display a special icon beside such messages,
+ * Check if a message has a POI location bound to it.
+ * These locations are also returned by dc_get_locations()
+ * The UI may decide to display a special icon beside such messages.
  *
  * @memberof dc_msg_t
  * @param msg The message object.
@@ -4396,6 +4469,9 @@ int             dc_msg_is_info                (const dc_msg_t* msg);
  * Currently, the following types are defined:
  * - DC_INFO_PROTECTION_ENABLED (11) - Info-message for "Chat is now protected"
  * - DC_INFO_PROTECTION_DISABLED (12) - Info-message for "Chat is no longer protected"
+ * - DC_INFO_INVALID_UNENCRYPTED_MAIL (13) - Info-message for "Provider requires end-to-end encryption which is not setup yet",
+ *   the UI should change the corresponding string using #DC_STR_INVALID_UNENCRYPTED_MAIL
+ *   and also offer a way to fix the encryption, eg. by a button offering a QR scan
  *
  * Even when you display an icon,
  * you should still display the text of the informational message using dc_msg_get_text()
@@ -4422,6 +4498,7 @@ int             dc_msg_get_info_type          (const dc_msg_t* msg);
 #define         DC_INFO_EPHEMERAL_TIMER_CHANGED   10
 #define         DC_INFO_PROTECTION_ENABLED        11
 #define         DC_INFO_PROTECTION_DISABLED       12
+#define         DC_INFO_INVALID_UNENCRYPTED_MAIL  13
 #define         DC_INFO_WEBXDC_INFO_MESSAGE       32
 
 /**
@@ -5067,6 +5144,15 @@ int             dc_contact_is_blocked        (const dc_contact_t* contact);
  */
 int             dc_contact_is_verified       (dc_contact_t* contact);
 
+/**
+ * Returns whether contact is a bot.
+ *
+ * @memberof dc_contact_t
+ * @param contact The contact object.
+ * @return 0 if the contact is not a bot, 1 otherwise.
+ */
+int             dc_contact_is_bot            (dc_contact_t* contact);
+
 
 /**
  * Return the contact ID that verified a contact.
@@ -5186,72 +5272,6 @@ void            dc_provider_unref                     (dc_provider_t* provider);
 
 
 /**
- * Return an HTTP(S) GET response.
- * This function can be used to download remote content for HTML emails.
- *
- * @memberof dc_context_t
- * @param context The context object to take proxy settings from.
- * @param url HTTP or HTTPS URL.
- * @return The response must be released using dc_http_response_unref() after usage.
- *     NULL is returned on errors.
- */
-dc_http_response_t*     dc_get_http_response      (const dc_context_t* context, const char* url);
-
-
-/**
- * @class dc_http_response_t
- *
- * An object containing an HTTP(S) GET response.
- * Created by dc_get_http_response().
- */
-
-
-/**
- * Returns HTTP response MIME type as a string, e.g. "text/plain" or "text/html".
- *
- * @memberof dc_http_response_t
- * @param response HTTP response as returned by dc_get_http_response().
- * @return The string which must be released using dc_str_unref() after usage. May be NULL.
- */
-char*                   dc_http_response_get_mimetype (const dc_http_response_t* response);
-
-/**
- * Returns HTTP response encoding, e.g. "utf-8".
- *
- * @memberof dc_http_response_t
- * @param response HTTP response as returned by dc_get_http_response().
- * @return The string which must be released using dc_str_unref() after usage. May be NULL.
- */
-char*                   dc_http_response_get_encoding (const dc_http_response_t* response);
-
-/**
- * Returns HTTP response contents.
- *
- * @memberof dc_http_response_t
- * @param response HTTP response as returned by dc_get_http_response().
- * @return The blob which must be released using dc_str_unref() after usage. NULL is never returned.
- */
-uint8_t*                dc_http_response_get_blob     (const dc_http_response_t* response);
-
-/**
- * Returns HTTP response content size.
- *
- * @memberof dc_http_response_t
- * @param response HTTP response as returned by dc_get_http_response().
- * @return The blob size.
- */
-size_t                  dc_http_response_get_size     (const dc_http_response_t* response);
-
-/**
- * Free an HTTP response object.
- *
- * @memberof dc_http_response_t
- * @param response HTTP response as returned by dc_get_http_response().
- */
-void                    dc_http_response_unref        (const dc_http_response_t* response);
-
-
-/**
  * @class dc_lot_t
  *
  * An object containing a set of values.
@@ -5346,48 +5366,6 @@ uint32_t        dc_lot_get_id            (const dc_lot_t* lot);
  * @return The timestamp as defined by the creator of the object. 0 if there is not timestamp or on errors.
  */
 int64_t         dc_lot_get_timestamp     (const dc_lot_t* lot);
-
-
-/**
- * @class dc_reactions_t
- *
- * An object representing all reactions for a single message.
- */
-
-/**
- * Returns array of contacts which reacted to the given message.
- *
- * @memberof dc_reactions_t
- * @param reactions The object containing message reactions.
- * @return array of contact IDs. Use dc_array_get_cnt() to get array length and
- *         dc_array_get_id() to get the IDs. Should be freed using `dc_array_unref()` after usage.
- */
-dc_array_t*     dc_reactions_get_contacts(dc_reactions_t* reactions);
-
-
-/**
- * Returns a string containing space-separated reactions of a single contact.
- *
- * @memberof dc_reactions_t
- * @param reactions The object containing message reactions.
- * @param contact_id ID of the contact.
- * @return Space-separated list of emoji sequences, which could be empty.
- *         Returned string should not be modified and should be freed
- *         with dc_str_unref() after usage.
- */
-char*           dc_reactions_get_by_contact_id(dc_reactions_t* reactions, uint32_t contact_id);
-
-
-/**
- * Frees an object containing message reactions.
- *
- * Reactions objects are created by dc_get_msg_reactions().
- *
- * @memberof dc_reactions_t
- * @param reactions The object to free.
- *     If NULL is given, nothing is done.
- */
-void            dc_reactions_unref       (dc_reactions_t* reactions);
 
 
 /**
@@ -5506,6 +5484,11 @@ void            dc_reactions_unref       (dc_reactions_t* reactions);
  */
 #define DC_MSG_WEBXDC    80
 
+/**
+ * Message containing shared contacts represented as a vCard (virtual contact file)
+ * with email addresses and possibly other fields.
+ */
+#define DC_MSG_VCARD     90
 
 /**
  * @}
@@ -6080,10 +6063,12 @@ void dc_event_unref(dc_event_t* event);
  * Downloading a bunch of messages just finished. This is an
  * event to allow the UI to only show one notification per message bunch,
  * instead of cluttering the user with many notifications.
- * For each of the msg_ids, an additional #DC_EVENT_INCOMING_MSG event was emitted before.
+ * UI may store #DC_EVENT_INCOMING_MSG events
+ * and display notifications for all messages at once
+ * when this event arrives.
  * 
  * @param data1 0
- * @param data2 (char*) msg_ids, a json object with the message ids.
+ * @param data2 0
  */
 #define DC_EVENT_INCOMING_MSG_BUNCH       2006
 
@@ -6268,6 +6253,18 @@ void dc_event_unref(dc_event_t* event);
 
 
 /**
+ * A multi-device synced config value changed. Maybe the app needs to refresh smth. For uniformity
+ * this is emitted on the source device too. The value isn't reported, otherwise it would be logged
+ * which might not be good for privacy. You can get the new value with
+ * `dc_get_config(context, data2)`.
+ *
+ * @param data1 0
+ * @param data2 (char*) Configuration key.
+ */
+#define DC_EVENT_CONFIG_SYNCED                    2111
+
+
+/**
  * webxdc status update received.
  * To get the received status update, use dc_get_webxdc_status_updates() with
  * `serial` set to the last known update
@@ -6291,6 +6288,53 @@ void dc_event_unref(dc_event_t* event);
 
 #define DC_EVENT_WEBXDC_INSTANCE_DELETED          2121
 
+/**
+ * Data received over an ephemeral peer channel.
+ *
+ * @param data1 (int) msg_id
+ * @param data2 (int) + (char*) binary data.
+ *     length is returned as integer with dc_event_get_data2_int()
+ *     and binary data is returned as dc_event_get_data2_str().
+ *     Binary data must be passed to dc_str_unref() afterwards.
+ */
+
+#define DC_EVENT_WEBXDC_REALTIME_DATA             2150
+
+/**
+ * Tells that the Background fetch was completed (or timed out).
+ *
+ * This event acts as a marker, when you reach this event you can be sure
+ * that all events emitted during the background fetch were processed.
+ * 
+ * This event is only emitted by the account manager
+ */
+
+#define DC_EVENT_ACCOUNTS_BACKGROUND_FETCH_DONE   2200
+
+/**
+ * Inform that set of chats or the order of the chats in the chatlist has changed.
+ *
+ * Sometimes this is emitted together with `DC_EVENT_CHATLIST_ITEM_CHANGED`.
+ */
+
+#define DC_EVENT_CHATLIST_CHANGED              2300
+
+/**
+ * Inform that all or a single chat list item changed and needs to be rerendered
+ * If `chat_id` is set to 0, then all currently visible chats need to be rerendered, and all not-visible items need to be cleared from cache if the UI has a cache.
+ * 
+ * @param data1 (int) chat_id chat id of chatlist item to be rerendered, if chat_id = 0 all (cached & visible) items need to be rerendered
+ */
+
+#define DC_EVENT_CHATLIST_ITEM_CHANGED         2301
+
+
+/**
+ * Inform that some events have been skipped due to event channel overflow.
+ *
+ * @param data1 (int) number of events that have been skipped
+ */
+#define DC_EVENT_CHANNEL_OVERFLOW              2400
 
 /**
  * @}
@@ -6605,6 +6649,8 @@ void dc_event_unref(dc_event_t* event);
 ///
 /// Used as message text of outgoing read receipts.
 /// - %1$s will be replaced by the subject of the displayed message
+///
+/// @deprecated Deprecated 2024-06-23, use DC_STR_READRCPT_MAILBODY2 instead.
 #define DC_STR_READRCPT_MAILBODY          32
 
 /// @deprecated Deprecated, this string is no longer needed.
@@ -6621,7 +6667,7 @@ void dc_event_unref(dc_event_t* event);
 /// - %1$s will be replaced by the name of the verified contact
 #define DC_STR_CONTACT_VERIFIED           35
 
-/// "Cannot verify %1$s."
+/// "Cannot establish guaranteed end-to-end encryption with %1$s."
 ///
 /// Used in status messages.
 /// - %1$s will be replaced by the name of the contact that cannot be verified
@@ -7059,6 +7105,8 @@ void dc_event_unref(dc_event_t* event);
 /// "You added member %1$s."
 ///
 /// Used in status messages.
+///
+/// `%1$s` will be replaced by the added member's name.
 #define DC_STR_ADD_MEMBER_BY_YOU 128
 
 /// "Member %1$s added by %2$s."
@@ -7279,6 +7327,55 @@ void dc_event_unref(dc_event_t* event);
 ///
 /// Used as the first info messages in newly created groups.
 #define DC_STR_NEW_GROUP_SEND_FIRST_MESSAGE 172
+
+/// "Member %1$s added."
+///
+/// Used as info messages.
+///
+/// `%1$s` will be replaced by the added member's name.
+#define DC_STR_MESSAGE_ADD_MEMBER 173
+
+/// "Your email provider %1$s requires end-to-end encryption which is not setup yet."
+///
+/// Used as info messages when a message cannot be sent because it cannot be encrypted.
+///
+/// `%1$s` will be replaced by the provider's domain.
+#define DC_STR_INVALID_UNENCRYPTED_MAIL 174
+
+/// "You reacted %1$s to '%2$s'"
+///
+/// `%1$s` will be replaced by the reaction, usually an emoji
+/// `%2$s` will be replaced by the summary of the message the reaction refers to
+///
+/// Used in summaries.
+#define DC_STR_YOU_REACTED 176
+
+/// "%1$s reacted %2$s to '%3$s'"
+///
+/// `%1$s` will be replaced by the name the contact who reacted
+/// `%2$s` will be replaced by the reaction, usually an emoji
+/// `%3$s` will be replaced by the summary of the message the reaction refers to
+///
+/// Used in summaries.
+#define DC_STR_REACTED_BY 177
+
+/// "Establishing guaranteed end-to-end encryption, please wait…"
+///
+/// Used as info message.
+#define DC_STR_SECUREJOIN_WAIT 190
+
+/// "Could not yet establish guaranteed end-to-end encryption, but you may already send a message."
+///
+/// Used as info message.
+#define DC_STR_SECUREJOIN_WAIT_TIMEOUT 191
+
+/// "The message is a receipt notification."
+///
+/// Used as message text of outgoing read receipts.
+#define DC_STR_READRCPT_MAILBODY2 192
+
+/// "Contact". Deprecated, currently unused.
+#define DC_STR_CONTACT 200
 
 /**
  * @}

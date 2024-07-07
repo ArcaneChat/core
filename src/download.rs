@@ -3,17 +3,17 @@
 use std::cmp::max;
 use std::collections::BTreeMap;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use deltachat_derive::{FromSql, ToSql};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::context::Context;
-use crate::imap::{Imap, ImapActionResult};
+use crate::imap::session::Session;
 use crate::message::{Message, MsgId, Viewtype};
 use crate::mimeparser::{MimeMessage, Part};
 use crate::tools::time;
-use crate::{stock_str, EventType};
+use crate::{chatlist_events, stock_str, EventType};
 
 /// Download limits should not be used below `MIN_DOWNLOAD_LIMIT`.
 ///
@@ -115,6 +115,7 @@ impl MsgId {
             chat_id: msg.chat_id,
             msg_id: self,
         });
+        chatlist_events::emit_chatlist_item_changed(context, msg.chat_id);
         Ok(())
     }
 }
@@ -129,50 +130,44 @@ impl Message {
 /// Actually download a message partially downloaded before.
 ///
 /// Most messages are downloaded automatically on fetch instead.
-pub(crate) async fn download_msg(context: &Context, msg_id: MsgId, imap: &mut Imap) -> Result<()> {
-    imap.prepare(context).await?;
-
+pub(crate) async fn download_msg(
+    context: &Context,
+    msg_id: MsgId,
+    session: &mut Session,
+) -> Result<()> {
     let msg = Message::load_from_db(context, msg_id).await?;
     let row = context
         .sql
         .query_row_optional(
-            "SELECT uid, folder FROM imap WHERE rfc724_mid=? AND target!=''",
+            "SELECT uid, folder, uidvalidity FROM imap WHERE rfc724_mid=? AND target!=''",
             (&msg.rfc724_mid,),
             |row| {
                 let server_uid: u32 = row.get(0)?;
                 let server_folder: String = row.get(1)?;
-                Ok((server_uid, server_folder))
+                let uidvalidity: u32 = row.get(2)?;
+                Ok((server_uid, server_folder, uidvalidity))
             },
         )
         .await?;
 
-    if let Some((server_uid, server_folder)) = row {
-        match imap
-            .fetch_single_msg(context, &server_folder, server_uid, msg.rfc724_mid.clone())
-            .await
-        {
-            ImapActionResult::RetryLater | ImapActionResult::Failed => {
-                msg.id
-                    .update_download_state(context, DownloadState::Failure)
-                    .await?;
-                Err(anyhow!("Call download_full() again to try over."))
-            }
-            ImapActionResult::Success => {
-                // update_download_state() not needed as receive_imf() already
-                // set the state and emitted the event.
-                Ok(())
-            }
-        }
-    } else {
+    let Some((server_uid, server_folder, uidvalidity)) = row else {
         // No IMAP record found, we don't know the UID and folder.
-        msg.id
-            .update_download_state(context, DownloadState::Failure)
-            .await?;
-        Err(anyhow!("Call download_full() again to try over."))
-    }
+        return Err(anyhow!("Call download_full() again to try over."));
+    };
+
+    session
+        .fetch_single_msg(
+            context,
+            &server_folder,
+            uidvalidity,
+            server_uid,
+            msg.rfc724_mid.clone(),
+        )
+        .await?;
+    Ok(())
 }
 
-impl Imap {
+impl Session {
     /// Download a single message and pipe it to receive_imf().
     ///
     /// receive_imf() is not directly aware that this is a result of a call to download_msg(),
@@ -181,33 +176,36 @@ impl Imap {
         &mut self,
         context: &Context,
         folder: &str,
+        uidvalidity: u32,
         uid: u32,
         rfc724_mid: String,
-    ) -> ImapActionResult {
-        if let Some(imapresult) = self
-            .prepare_imap_operation_on_msg(context, folder, uid)
-            .await
-        {
-            return imapresult;
+    ) -> Result<()> {
+        if uid == 0 {
+            bail!("Attempt to fetch UID 0");
         }
+
+        self.select_with_uidvalidity(context, folder).await?;
 
         // we are connected, and the folder is selected
         info!(context, "Downloading message {}/{} fully...", folder, uid);
 
         let mut uid_message_ids: BTreeMap<u32, String> = BTreeMap::new();
         uid_message_ids.insert(uid, rfc724_mid);
-        let (last_uid, _received) = match self
-            .fetch_many_msgs(context, folder, vec![uid], &uid_message_ids, false, false)
-            .await
-        {
-            Ok(res) => res,
-            Err(_) => return ImapActionResult::Failed,
-        };
+        let (last_uid, _received) = self
+            .fetch_many_msgs(
+                context,
+                folder,
+                uidvalidity,
+                vec![uid],
+                &uid_message_ids,
+                false,
+                false,
+            )
+            .await?;
         if last_uid.is_none() {
-            ImapActionResult::Failed
-        } else {
-            ImapActionResult::Success
+            bail!("Failed to fetch UID {uid}");
         }
+        Ok(())
     }
 }
 
@@ -256,8 +254,7 @@ mod tests {
     use super::*;
     use crate::chat::{get_chat_msgs, send_msg};
     use crate::ephemeral::Timer;
-    use crate::message::Viewtype;
-    use crate::receive_imf::receive_imf_inner;
+    use crate::receive_imf::receive_imf_from_inbox;
     use crate::test_utils::TestContext;
 
     #[test]
@@ -338,7 +335,7 @@ mod tests {
              Date: Sun, 22 Mar 2020 22:37:57 +0000\
              Content-Type: text/plain";
 
-        receive_imf_inner(
+        receive_imf_from_inbox(
             &t,
             "Mr.12345678901@example.com",
             header.as_bytes(),
@@ -354,7 +351,7 @@ mod tests {
             .get_text()
             .contains(&stock_str::partial_download_msg_body(&t, 100000).await));
 
-        receive_imf_inner(
+        receive_imf_from_inbox(
             &t,
             "Mr.12345678901@example.com",
             format!("{header}\n\n100k text...").as_bytes(),
@@ -383,7 +380,7 @@ mod tests {
             .await?;
 
         // download message from bob partially, this must not change the ephemeral timer
-        receive_imf_inner(
+        receive_imf_from_inbox(
             &t,
             "first@example.org",
             b"From: Bob <bob@example.org>\n\
@@ -426,7 +423,7 @@ mod tests {
         let sent2_rfc724_mid = sent2.load_from_db().await.rfc724_mid;
 
         // not downloading the status update results in an placeholder
-        receive_imf_inner(
+        receive_imf_from_inbox(
             &bob,
             &sent2_rfc724_mid,
             sent2.payload().as_bytes(),
@@ -442,7 +439,7 @@ mod tests {
 
         // downloading the status update afterwards expands to nothing and moves the placeholder to trash-chat
         // (usually status updates are too small for not being downloaded directly)
-        receive_imf_inner(
+        receive_imf_from_inbox(
             &bob,
             &sent2_rfc724_mid,
             sent2.payload().as_bytes(),
@@ -452,10 +449,9 @@ mod tests {
         )
         .await?;
         assert_eq!(get_chat_msgs(&bob, chat_id).await?.len(), 0);
-        assert!(Message::load_from_db(&bob, msg.id)
+        assert!(Message::load_from_db_optional(&bob, msg.id)
             .await?
-            .chat_id
-            .is_trash());
+            .is_none());
 
         Ok(())
     }
@@ -493,7 +489,7 @@ mod tests {
             ";
 
         // not downloading the mdn results in an placeholder
-        receive_imf_inner(
+        receive_imf_from_inbox(
             &bob,
             "bar@example.org",
             raw,
@@ -509,12 +505,11 @@ mod tests {
 
         // downloading the mdn afterwards expands to nothing and deletes the placeholder directly
         // (usually mdn are too small for not being downloaded directly)
-        receive_imf_inner(&bob, "bar@example.org", raw, false, None, false).await?;
+        receive_imf_from_inbox(&bob, "bar@example.org", raw, false, None, false).await?;
         assert_eq!(get_chat_msgs(&bob, chat_id).await?.len(), 0);
-        assert!(Message::load_from_db(&bob, msg.id)
+        assert!(Message::load_from_db_optional(&bob, msg.id)
             .await?
-            .chat_id
-            .is_trash());
+            .is_none());
 
         Ok(())
     }

@@ -16,16 +16,16 @@ mod server_params;
 use anyhow::{bail, ensure, Context as _, Result};
 use auto_mozilla::moz_autoconfigure;
 use auto_outlook::outlk_autodiscover;
+use deltachat_contact_tools::EmailAddress;
 use futures::FutureExt;
 use futures_lite::FutureExt as _;
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use server_params::{expand_param_vector, ServerParams};
 use tokio::task;
 
-use crate::config::Config;
-use crate::contact::addr_cmp;
+use crate::config::{self, Config};
 use crate::context::Context;
-use crate::imap::Imap;
+use crate::imap::{session::Session as ImapSession, Imap};
 use crate::log::LogExt;
 use crate::login_param::{CertificateChecks, LoginParam, ServerLoginParam};
 use crate::message::{Message, Viewtype};
@@ -34,8 +34,10 @@ use crate::provider::{Protocol, Socket, UsernamePattern};
 use crate::smtp::Smtp;
 use crate::socks::Socks5Config;
 use crate::stock_str;
-use crate::tools::{time, EmailAddress};
+use crate::sync::Sync::*;
+use crate::tools::time;
 use crate::{chat, e2ee, provider};
+use deltachat_contact_tools::addr_cmp;
 
 macro_rules! progress {
     ($context:tt, $progress:expr, $comment:expr) => {
@@ -110,13 +112,19 @@ impl Context {
 
         let mut param = LoginParam::load_candidate_params(self).await?;
         let old_addr = self.get_config(Config::ConfiguredAddr).await?;
+
+        // Reset our knowledge about whether the server is a chatmail server.
+        // We will update it when we connect to IMAP.
+        self.set_config_internal(Config::IsChatmail, None).await?;
+
         let success = configure(self, &mut param).await;
-        self.set_config(Config::NotifyAboutWrongPw, None).await?;
+        self.set_config_internal(Config::NotifyAboutWrongPw, None)
+            .await?;
 
         on_configure_completed(self, param, old_addr).await?;
 
         success?;
-        self.set_config(Config::NotifyAboutWrongPw, Some("1"))
+        self.set_config_internal(Config::NotifyAboutWrongPw, Some("1"))
             .await?;
         Ok(())
     }
@@ -132,7 +140,9 @@ async fn on_configure_completed(
             for def in config_defaults {
                 if !context.config_exists(def.key).await? {
                     info!(context, "apply config_defaults {}={}", def.key, def.value);
-                    context.set_config(def.key, Some(def.value)).await?;
+                    context
+                        .set_config_ex(Nosync, def.key, Some(def.value))
+                        .await?;
                 } else {
                     info!(
                         context,
@@ -352,8 +362,8 @@ async fn configure(ctx: &Context, param: &mut LoginParam) -> Result<()> {
         let mut smtp_configured = false;
         let mut errors = Vec::new();
         for smtp_server in smtp_servers {
-            smtp_param.user = smtp_server.username.clone();
-            smtp_param.server = smtp_server.hostname.clone();
+            smtp_param.user.clone_from(&smtp_server.username);
+            smtp_param.server.clone_from(&smtp_server.hostname);
             smtp_param.port = smtp_server.port;
             smtp_param.security = smtp_server.socket;
             smtp_param.certificate_checks = match smtp_server.strict_tls {
@@ -391,7 +401,7 @@ async fn configure(ctx: &Context, param: &mut LoginParam) -> Result<()> {
 
     // Configure IMAP
 
-    let mut imap: Option<Imap> = None;
+    let mut imap: Option<(Imap, ImapSession)> = None;
     let imap_servers: Vec<&ServerParams> = servers
         .iter()
         .filter(|params| params.protocol == Protocol::Imap)
@@ -399,8 +409,8 @@ async fn configure(ctx: &Context, param: &mut LoginParam) -> Result<()> {
     let imap_servers_count = imap_servers.len();
     let mut errors = Vec::new();
     for (imap_server_index, imap_server) in imap_servers.into_iter().enumerate() {
-        param.imap.user = imap_server.username.clone();
-        param.imap.server = imap_server.hostname.clone();
+        param.imap.user.clone_from(&imap_server.username);
+        param.imap.server.clone_from(&imap_server.hostname);
         param.imap.port = imap_server.port;
         param.imap.security = imap_server.socket;
         param.imap.certificate_checks = match imap_server.strict_tls {
@@ -429,7 +439,7 @@ async fn configure(ctx: &Context, param: &mut LoginParam) -> Result<()> {
             600 + (800 - 600) * (1 + imap_server_index) / imap_servers_count
         );
     }
-    let mut imap = match imap {
+    let (mut imap, mut imap_session) = match imap {
         Some(imap) => imap,
         None => bail!(nicer_configuration_error(ctx, errors).await),
     };
@@ -448,11 +458,22 @@ async fn configure(ctx: &Context, param: &mut LoginParam) -> Result<()> {
 
     progress!(ctx, 900);
 
+    if imap_session.is_chatmail() {
+        ctx.set_config(Config::IsChatmail, Some("1")).await?;
+        ctx.set_config(Config::SentboxWatch, None).await?;
+        ctx.set_config(Config::MvboxMove, Some("0")).await?;
+        ctx.set_config(Config::OnlyFetchMvbox, None).await?;
+        ctx.set_config(Config::ShowEmails, None).await?;
+        ctx.set_config(Config::E2eeEnabled, Some("1")).await?;
+    }
+
     let create_mvbox = ctx.should_watch_mvbox().await?;
 
-    imap.configure_folders(ctx, create_mvbox).await?;
+    imap.configure_folders(ctx, &mut imap_session, create_mvbox)
+        .await?;
 
-    imap.select_with_uidvalidity(ctx, "INBOX")
+    imap_session
+        .select_with_uidvalidity(ctx, "INBOX")
         .await
         .context("could not read INBOX status")?;
 
@@ -470,7 +491,7 @@ async fn configure(ctx: &Context, param: &mut LoginParam) -> Result<()> {
 
     // the trailing underscore is correct
     param.save_as_configured_params(ctx).await?;
-    ctx.set_config(Config::ConfiguredTimestamp, Some(&time().to_string()))
+    ctx.set_config_internal(Config::ConfiguredTimestamp, Some(&time().to_string()))
         .await?;
 
     progress!(ctx, 920);
@@ -478,7 +499,7 @@ async fn configure(ctx: &Context, param: &mut LoginParam) -> Result<()> {
     e2ee::ensure_secret_key_exists(ctx).await?;
     info!(ctx, "key generation completed");
 
-    ctx.set_config_bool(Config::FetchedExistingMsgs, false)
+    ctx.set_config_internal(Config::FetchedExistingMsgs, config::from_bool(false))
         .await?;
     ctx.scheduler.interrupt_inbox().await;
 
@@ -492,8 +513,8 @@ async fn configure(ctx: &Context, param: &mut LoginParam) -> Result<()> {
 
 /// Retrieve available autoconfigurations.
 ///
-/// A Search configurations from the domain used in the email-address, prefer encrypted
-/// B. If we have no configuration yet, search configuration in Thunderbird's centeral database
+/// A. Search configurations from the domain used in the email-address
+/// B. If we have no configuration yet, search configuration in Thunderbird's central database
 async fn get_autoconfig(
     ctx: &Context,
     param: &LoginParam,
@@ -572,7 +593,7 @@ async fn try_imap_one_param(
     socks5_config: &Option<Socks5Config>,
     addr: &str,
     provider_strict_tls: bool,
-) -> Result<Imap, ConfigurationError> {
+) -> Result<(Imap, ImapSession), ConfigurationError> {
     let inf = format!(
         "imap: {}@{}:{} security={} certificate_checks={} oauth2={} socks5_config={}",
         param.user,
@@ -604,15 +625,15 @@ async fn try_imap_one_param(
 
     match imap.connect(context).await {
         Err(err) => {
-            info!(context, "failure: {:#}", err);
+            info!(context, "IMAP failure: {err:#}.");
             Err(ConfigurationError {
                 config: inf,
                 msg: format!("{err:#}"),
             })
         }
-        Ok(()) => {
-            info!(context, "success: {}", inf);
-            Ok(imap)
+        Ok(session) => {
+            info!(context, "IMAP success: {inf}.");
+            Ok((imap, session))
         }
     }
 }
@@ -645,13 +666,13 @@ async fn try_smtp_one_param(
         .connect(context, param, socks5_config, addr, provider_strict_tls)
         .await
     {
-        info!(context, "failure: {}", err);
+        info!(context, "SMTP failure: {err:#}.");
         Err(ConfigurationError {
             config: inf,
             msg: format!("{err:#}"),
         })
     } else {
-        info!(context, "success: {}", inf);
+        info!(context, "SMTP success: {inf}.");
         smtp.disconnect();
         Ok(())
     }
@@ -709,7 +730,7 @@ pub enum Error {
 
     #[error("XML error at position {position}: {error}")]
     InvalidXml {
-        position: usize,
+        position: u64,
         #[source]
         error: quick_xml::Error,
     },

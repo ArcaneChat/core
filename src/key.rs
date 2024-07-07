@@ -6,6 +6,7 @@ use std::io::Cursor;
 
 use anyhow::{ensure, Context as _, Result};
 use base64::Engine as _;
+use deltachat_contact_tools::EmailAddress;
 use num_traits::FromPrimitive;
 use pgp::composed::Deserializable;
 pub use pgp::composed::{SignedPublicKey, SignedSecretKey};
@@ -16,8 +17,9 @@ use tokio::runtime::Handle;
 use crate::config::Config;
 use crate::constants::KeyGenType;
 use crate::context::Context;
+use crate::log::LogExt;
 use crate::pgp::KeyPair;
-use crate::tools::{time, EmailAddress};
+use crate::tools::{self, time_elapsed};
 
 /// Convenience trait for working with keys.
 ///
@@ -78,21 +80,20 @@ pub(crate) trait DcKey: Serialize + Deserializable + KeyTrait + Clone {
 }
 
 pub(crate) async fn load_self_public_key(context: &Context) -> Result<SignedPublicKey> {
-    match context
+    let public_key = context
         .sql
         .query_row_optional(
-            r#"SELECT public_key
-               FROM keypairs
-               WHERE addr=(SELECT value FROM config WHERE keyname="configured_addr")
-               AND is_default=1"#,
+            "SELECT public_key
+             FROM keypairs
+             WHERE id=(SELECT value FROM config WHERE keyname='key_id')",
             (),
             |row| {
                 let bytes: Vec<u8> = row.get(0)?;
                 Ok(bytes)
             },
         )
-        .await?
-    {
+        .await?;
+    match public_key {
         Some(bytes) => SignedPublicKey::from_slice(&bytes),
         None => {
             let keypair = generate_keypair(context).await?;
@@ -101,28 +102,64 @@ pub(crate) async fn load_self_public_key(context: &Context) -> Result<SignedPubl
     }
 }
 
+/// Returns our own public keyring.
+pub(crate) async fn load_self_public_keyring(context: &Context) -> Result<Vec<SignedPublicKey>> {
+    let keys = context
+        .sql
+        .query_map(
+            r#"SELECT public_key
+               FROM keypairs
+               ORDER BY id=(SELECT value FROM config WHERE keyname='key_id') DESC"#,
+            (),
+            |row| row.get::<_, Vec<u8>>(0),
+            |keys| keys.collect::<Result<Vec<_>, _>>().map_err(Into::into),
+        )
+        .await?
+        .into_iter()
+        .filter_map(|bytes| SignedPublicKey::from_slice(&bytes).log_err(context).ok())
+        .collect();
+    Ok(keys)
+}
+
 pub(crate) async fn load_self_secret_key(context: &Context) -> Result<SignedSecretKey> {
-    match context
+    let private_key = context
         .sql
         .query_row_optional(
-            r#"SELECT private_key
-               FROM keypairs
-               WHERE addr=(SELECT value FROM config WHERE keyname="configured_addr")
-               AND is_default=1"#,
+            "SELECT private_key
+             FROM keypairs
+             WHERE id=(SELECT value FROM config WHERE keyname='key_id')",
             (),
             |row| {
                 let bytes: Vec<u8> = row.get(0)?;
                 Ok(bytes)
             },
         )
-        .await?
-    {
+        .await?;
+    match private_key {
         Some(bytes) => SignedSecretKey::from_slice(&bytes),
         None => {
             let keypair = generate_keypair(context).await?;
             Ok(keypair.secret)
         }
     }
+}
+
+pub(crate) async fn load_self_secret_keyring(context: &Context) -> Result<Vec<SignedSecretKey>> {
+    let keys = context
+        .sql
+        .query_map(
+            r#"SELECT private_key
+               FROM keypairs
+               ORDER BY id=(SELECT value FROM config WHERE keyname='key_id') DESC"#,
+            (),
+            |row| row.get::<_, Vec<u8>>(0),
+            |keys| keys.collect::<Result<Vec<_>, _>>().map_err(Into::into),
+        )
+        .await?
+        .into_iter()
+        .filter_map(|bytes| SignedSecretKey::from_slice(&bytes).log_err(context).ok())
+        .collect();
+    Ok(keys)
 }
 
 impl DcKey for SignedPublicKey {
@@ -187,7 +224,7 @@ async fn generate_keypair(context: &Context) -> Result<KeyPair> {
     match load_keypair(context, &addr).await? {
         Some(key_pair) => Ok(key_pair),
         None => {
-            let start = std::time::SystemTime::now();
+            let start = tools::Time::now();
             let keytype = KeyGenType::from_i32(context.get_config_int(Config::KeyGenType).await?)
                 .unwrap_or_default();
             info!(context, "Generating keypair with type {}", keytype);
@@ -199,7 +236,7 @@ async fn generate_keypair(context: &Context) -> Result<KeyPair> {
             info!(
                 context,
                 "Keypair generated in {:.3}s.",
-                start.elapsed().unwrap_or_default().as_secs()
+                time_elapsed(&start).as_secs(),
             );
             Ok(keypair)
         }
@@ -213,13 +250,10 @@ pub(crate) async fn load_keypair(
     let res = context
         .sql
         .query_row_optional(
-            r#"
-        SELECT public_key, private_key
-          FROM keypairs
-         WHERE addr=?1
-           AND is_default=1;
-        "#,
-            (addr,),
+            "SELECT public_key, private_key
+             FROM keypairs
+             WHERE id=(SELECT value FROM config WHERE keyname='key_id')",
+            (),
             |row| {
                 let pub_bytes: Vec<u8> = row.get(0)?;
                 let sec_bytes: Vec<u8> = row.get(1)?;
@@ -241,7 +275,7 @@ pub(crate) async fn load_keypair(
 
 /// Use of a key pair for encryption or decryption.
 ///
-/// This is used by [store_self_keypair] to know what kind of key is
+/// This is used by `store_self_keypair` to know what kind of key is
 /// being saved.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum KeyPairUse {
@@ -263,46 +297,54 @@ pub enum KeyPairUse {
 /// same key again overwrites it.
 ///
 /// [Config::ConfiguredAddr]: crate::config::Config::ConfiguredAddr
-pub async fn store_self_keypair(
+pub(crate) async fn store_self_keypair(
     context: &Context,
     keypair: &KeyPair,
     default: KeyPairUse,
 ) -> Result<()> {
-    context
+    let mut config_cache_lock = context.sql.config_cache.write().await;
+    let new_key_id = context
         .sql
         .transaction(|transaction| {
             let public_key = DcKey::to_bytes(&keypair.public);
             let secret_key = DcKey::to_bytes(&keypair.secret);
-            transaction
-                .execute(
-                    "DELETE FROM keypairs WHERE public_key=? OR private_key=?;",
-                    (&public_key, &secret_key),
-                )
-                .context("failed to remove old use of key")?;
-            if default == KeyPairUse::Default {
-                transaction
-                    .execute("UPDATE keypairs SET is_default=0;", ())
-                    .context("failed to clear default")?;
-            }
+
             let is_default = match default {
-                KeyPairUse::Default => i32::from(true),
-                KeyPairUse::ReadOnly => i32::from(false),
+                KeyPairUse::Default => true,
+                KeyPairUse::ReadOnly => false,
             };
 
+            // `addr` and `is_default` written for compatibility with older versions,
+            // until new cores are rolled out everywhere.
+            // otherwise "add second device" or "backup" may break.
+            // moreover, this allows downgrades to the previous version.
+            // writing of `addr` and `is_default` can be removed ~ 2024-08
             let addr = keypair.addr.to_string();
-            let t = time();
-
             transaction
                 .execute(
-                    "INSERT INTO keypairs (addr, is_default, public_key, private_key, created)
-                VALUES (?,?,?,?,?);",
-                    (addr, is_default, &public_key, &secret_key, t),
+                    "INSERT OR REPLACE INTO keypairs (public_key, private_key, addr, is_default)
+                     VALUES (?,?,?,?)",
+                    (&public_key, &secret_key, addr, is_default),
                 )
-                .context("failed to insert keypair")?;
+                .context("Failed to insert keypair")?;
 
-            Ok(())
+            if is_default {
+                let new_key_id = transaction.last_insert_rowid();
+                transaction.execute(
+                    "INSERT OR REPLACE INTO config (keyname, value) VALUES ('key_id', ?)",
+                    (new_key_id,),
+                )?;
+                Ok(Some(new_key_id))
+            } else {
+                Ok(None)
+            }
         })
         .await?;
+
+    if let Some(new_key_id) = new_key_id {
+        // Update config cache if transaction succeeded and changed current default key.
+        config_cache_lock.insert("key_id".to_string(), Some(new_key_id.to_string()));
+    }
 
     Ok(())
 }

@@ -5,16 +5,21 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 
 use anyhow::{ensure, Context as _, Result};
+use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
-use tokio::time::{sleep, Duration};
 use uuid::Uuid;
 
-use crate::context::Context;
+#[cfg(not(target_os = "ios"))]
+use tokio::sync::oneshot;
+#[cfg(not(target_os = "ios"))]
+use tokio::time::{sleep, Duration};
+
+use crate::context::{Context, ContextBuilder};
 use crate::events::{Event, EventEmitter, EventType, Events};
+use crate::push::PushSubscriber;
 use crate::stock_str::StockStrings;
 
 /// Account manager, that can handle multiple accounts in a single place.
@@ -33,6 +38,9 @@ pub struct Accounts {
     /// This way changing a translation for one context automatically
     /// changes it for all other contexts.
     pub(crate) stockstrings: StockStrings,
+
+    /// Push notification subscriber shared between accounts.
+    push_subscriber: PushSubscriber,
 }
 
 impl Accounts {
@@ -69,8 +77,9 @@ impl Accounts {
             .context("failed to load accounts config")?;
         let events = Events::new();
         let stockstrings = StockStrings::new();
+        let push_subscriber = PushSubscriber::new();
         let accounts = config
-            .load_accounts(&events, &stockstrings, &dir)
+            .load_accounts(&events, &stockstrings, push_subscriber.clone(), &dir)
             .await
             .context("failed to load accounts")?;
 
@@ -80,6 +89,7 @@ impl Accounts {
             accounts,
             events,
             stockstrings,
+            push_subscriber,
         })
     }
 
@@ -116,13 +126,17 @@ impl Accounts {
         let account_config = self.config.new_account().await?;
         let dbfile = account_config.dbfile(&self.dir);
 
-        let ctx = Context::new(
-            &dbfile,
-            account_config.id,
-            self.events.clone(),
-            self.stockstrings.clone(),
-        )
-        .await?;
+        let ctx = ContextBuilder::new(dbfile)
+            .with_id(account_config.id)
+            .with_events(self.events.clone())
+            .with_stock_strings(self.stockstrings.clone())
+            .with_push_subscriber(self.push_subscriber.clone())
+            .build()
+            .await?;
+        // Try to open without a passphrase,
+        // but do not return an error if account is passphare-protected.
+        ctx.open("".to_string()).await?;
+
         self.accounts.insert(account_config.id, ctx);
 
         Ok(account_config.id)
@@ -131,14 +145,15 @@ impl Accounts {
     /// Adds a new closed account.
     pub async fn add_closed_account(&mut self) -> Result<u32> {
         let account_config = self.config.new_account().await?;
+        let dbfile = account_config.dbfile(&self.dir);
 
-        let ctx = Context::new_closed(
-            &account_config.dbfile(&self.dir),
-            account_config.id,
-            self.events.clone(),
-            self.stockstrings.clone(),
-        )
-        .await?;
+        let ctx = ContextBuilder::new(dbfile)
+            .with_id(account_config.id)
+            .with_events(self.events.clone())
+            .with_stock_strings(self.stockstrings.clone())
+            .with_push_subscriber(self.push_subscriber.clone())
+            .build()
+            .await?;
         self.accounts.insert(account_config.id, ctx);
 
         Ok(account_config.id)
@@ -238,25 +253,6 @@ impl Accounts {
         self.accounts.keys().copied().collect()
     }
 
-    /// This is meant especially for iOS, because iOS needs to tell the system when its background work is done.
-    ///
-    /// Returns whether all accounts finished their background work.
-    /// DC_EVENT_CONNECTIVITY_CHANGED will be sent when this turns to true.
-    ///
-    /// iOS can:
-    /// - call dc_start_io() (in case IO was not running)
-    /// - call dc_maybe_network()
-    /// - while dc_accounts_all_work_done() returns false:
-    ///   -  Wait for DC_EVENT_CONNECTIVITY_CHANGED
-    pub async fn all_work_done(&self) -> bool {
-        for account in self.accounts.values() {
-            if !account.all_work_done().await {
-                return false;
-            }
-        }
-        true
-    }
-
     /// Starts background tasks such as IMAP and SMTP loops for all accounts.
     pub async fn start_io(&mut self) {
         for account in self.accounts.values_mut() {
@@ -288,6 +284,42 @@ impl Accounts {
         }
     }
 
+    /// Performs a background fetch for all accounts in parallel.
+    ///
+    /// This is an auxiliary function and not part of public API.
+    /// Use [Accounts::background_fetch] instead.
+    async fn background_fetch_without_timeout(&self) {
+        async fn background_fetch_and_log_error(account: Context) {
+            if let Err(error) = account.background_fetch().await {
+                warn!(account, "{error:#}");
+            }
+        }
+
+        join_all(
+            self.accounts
+                .values()
+                .cloned()
+                .map(background_fetch_and_log_error),
+        )
+        .await;
+    }
+
+    /// Performs a background fetch for all accounts in parallel with a timeout.
+    ///
+    /// The `AccountsBackgroundFetchDone` event is emitted at the end,
+    /// process all events until you get this one and you can safely return to the background
+    /// without forgetting to create notifications caused by timing race conditions.
+    pub async fn background_fetch(&self, timeout: std::time::Duration) {
+        if let Err(_err) =
+            tokio::time::timeout(timeout, self.background_fetch_without_timeout()).await
+        {
+            self.emit_event(EventType::Warning(
+                "Background fetch timed out.".to_string(),
+            ));
+        }
+        self.emit_event(EventType::AccountsBackgroundFetchDone);
+    }
+
     /// Emits a single event.
     pub fn emit_event(&self, event: EventType) {
         self.events.emit(Event { id: 0, typ: event })
@@ -297,12 +329,19 @@ impl Accounts {
     pub fn get_event_emitter(&self) -> EventEmitter {
         self.events.get_emitter()
     }
+
+    /// Sets notification token for Apple Push Notification service.
+    pub async fn set_push_device_token(&mut self, token: &str) -> Result<()> {
+        self.push_subscriber.set_device_token(token).await;
+        Ok(())
+    }
 }
 
 /// Configuration file name.
 const CONFIG_NAME: &str = "accounts.toml";
 
 /// Lockfile name.
+#[cfg(not(target_os = "ios"))]
 const LOCKFILE_NAME: &str = "accounts.lock";
 
 /// Database file name.
@@ -338,22 +377,16 @@ impl Drop for Config {
 }
 
 impl Config {
-    /// Creates a new Config for `file`, but doesn't open/sync it.
-    async fn new_nosync(file: PathBuf, lock: bool) -> Result<Self> {
-        let dir = file.parent().context("Cannot get config file directory")?;
-        let inner = InnerConfig {
-            accounts: Vec::new(),
-            selected_account: 0,
-            next_id: 1,
-        };
-        if !lock {
-            let cfg = Self {
-                file,
-                inner,
-                lock_task: None,
-            };
-            return Ok(cfg);
-        }
+    #[cfg(target_os = "ios")]
+    async fn create_lock_task(_dir: PathBuf) -> Result<Option<JoinHandle<anyhow::Result<()>>>> {
+        // Do not lock accounts.toml on iOS.
+        // This results in 0xdead10cc crashes on suspend.
+        // iOS itself ensures that multiple instances of Delta Chat are not running.
+        Ok(None)
+    }
+
+    #[cfg(not(target_os = "ios"))]
+    async fn create_lock_task(dir: PathBuf) -> Result<Option<JoinHandle<anyhow::Result<()>>>> {
         let lockfile = dir.join(LOCKFILE_NAME);
         let mut lock = fd_lock::RwLock::new(fs::File::create(lockfile).await?);
         let (locked_tx, locked_rx) = oneshot::channel();
@@ -384,12 +417,32 @@ impl Config {
             rx.await?;
             Ok(())
         });
+        locked_rx.await?;
+        Ok(Some(lock_task))
+    }
+
+    /// Creates a new Config for `file`, but doesn't open/sync it.
+    async fn new_nosync(file: PathBuf, lock: bool) -> Result<Self> {
+        let dir = file.parent().context("Cannot get config file directory")?;
+        let inner = InnerConfig {
+            accounts: Vec::new(),
+            selected_account: 0,
+            next_id: 1,
+        };
+        if !lock {
+            let cfg = Self {
+                file,
+                inner,
+                lock_task: None,
+            };
+            return Ok(cfg);
+        }
+        let lock_task = Self::create_lock_task(dir.to_path_buf()).await?;
         let cfg = Self {
             file,
             inner,
-            lock_task: Some(lock_task),
+            lock_task,
         };
-        locked_rx.await?;
         Ok(cfg)
     }
 
@@ -406,11 +459,13 @@ impl Config {
     /// Takes a mutable reference because the saved file is a part of the `Config` state. This
     /// protects from parallel calls resulting to a wrong file contents.
     async fn sync(&mut self) -> Result<()> {
+        #[cfg(not(target_os = "ios"))]
         ensure!(!self
             .lock_task
             .as_ref()
             .context("Config is read-only")?
             .is_finished());
+
         let tmp_path = self.file.with_extension("toml.tmp");
         let mut file = fs::File::create(&tmp_path)
             .await
@@ -430,10 +485,6 @@ impl Config {
 
     /// Read a configuration from the given file into memory.
     pub async fn from_file(file: PathBuf, writable: bool) -> Result<Self> {
-        let dir = file
-            .parent()
-            .context("Cannot get config file directory")?
-            .to_path_buf();
         let mut config = Self::new_nosync(file, writable).await?;
         let bytes = fs::read(&config.file)
             .await
@@ -445,9 +496,13 @@ impl Config {
         // Convert them to relative paths.
         let mut modified = false;
         for account in &mut config.inner.accounts {
-            if let Ok(new_dir) = account.dir.strip_prefix(&dir) {
-                account.dir = new_dir.to_path_buf();
-                modified = true;
+            if account.dir.is_absolute() {
+                if let Some(old_path_parent) = account.dir.parent() {
+                    if let Ok(new_path) = account.dir.strip_prefix(old_path_parent) {
+                        account.dir = new_path.to_path_buf();
+                        modified = true;
+                    }
+                }
             }
         }
         if modified && writable {
@@ -465,24 +520,24 @@ impl Config {
         &self,
         events: &Events,
         stockstrings: &StockStrings,
+        push_subscriber: PushSubscriber,
         dir: &Path,
     ) -> Result<BTreeMap<u32, Context>> {
         let mut accounts = BTreeMap::new();
 
         for account_config in &self.inner.accounts {
-            let ctx = Context::new(
-                &account_config.dbfile(dir),
-                account_config.id,
-                events.clone(),
-                stockstrings.clone(),
-            )
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to create context from file {:?}",
-                    account_config.dbfile(dir)
-                )
-            })?;
+            let dbfile = account_config.dbfile(dir);
+            let ctx = ContextBuilder::new(dbfile.clone())
+                .with_id(account_config.id)
+                .with_events(events.clone())
+                .with_stock_strings(stockstrings.clone())
+                .with_push_subscriber(push_subscriber.clone())
+                .build()
+                .await
+                .with_context(|| format!("failed to create context from file {:?}", &dbfile))?;
+            // Try to open without a passphrase,
+            // but do not return an error if account is passphare-protected.
+            ctx.open("".to_string()).await?;
 
             accounts.insert(account_config.id, ctx);
         }
@@ -526,8 +581,12 @@ impl Config {
             }
             if self.inner.selected_account == id {
                 // reset selected account
-                self.inner.selected_account =
-                    self.inner.accounts.get(0).map(|e| e.id).unwrap_or_default();
+                self.inner.selected_account = self
+                    .inner
+                    .accounts
+                    .first()
+                    .map(|e| e.id)
+                    .unwrap_or_default();
             }
         }
 

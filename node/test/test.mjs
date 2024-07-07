@@ -1,13 +1,17 @@
 // @ts-check
-import DeltaChat from '../dist'
+import { DeltaChat } from '../dist/index.js'
 
 import { deepStrictEqual, strictEqual } from 'assert'
 import chai, { expect } from 'chai'
 import chaiAsPromised from 'chai-as-promised'
-import { EventId2EventName, C } from '../dist/constants'
+import { EventId2EventName, C } from '../dist/constants.js'
 import { join } from 'path'
 import { statSync } from 'fs'
-import { Context } from '../dist/context'
+import { Context } from '../dist/context.js'
+import {fileURLToPath} from 'url';
+
+const __dirname = fileURLToPath(new URL('.', import.meta.url));
+
 chai.use(chaiAsPromised)
 chai.config.truncateThreshold = 0 // Do not truncate assertion errors.
 
@@ -22,6 +26,8 @@ function createTempUser(chatmailDomain) {
 }
 
 describe('static tests', function () {
+  this.timeout(60 * 5 * 1000) // increase timeout to 5 min
+
   it('reverse lookup of events', function () {
     const eventKeys = Object.keys(EventId2EventName).map((k) => Number(k))
     const eventValues = Object.values(EventId2EventName)
@@ -235,7 +241,7 @@ describe('Basic offline Tests', function () {
       'delete_device_after',
       'delete_server_after',
       'deltachat_core_version',
-      'display_name',
+      'displayname',
       'download_limit',
       'e2ee_enabled',
       'entered_account_settings',
@@ -246,6 +252,7 @@ describe('Basic offline Tests', function () {
       'journal_mode',
       'key_gen_type',
       'last_housekeeping',
+      'last_cant_decrypt_outgoing_msgs',
       'level',
       'mdns_enabled',
       'media_quality',
@@ -696,7 +703,7 @@ describe('Offline Tests with unconfigured account', function () {
 })
 
 describe('Integration tests', function () {
-  this.timeout(60 * 3000) // increase timeout to 1min
+  this.timeout(60 * 5 * 1000) // increase timeout to 5 min
 
   let [dc, context, accountId, directory, account] = [
     null,

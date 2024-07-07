@@ -1,27 +1,27 @@
 //! # SQLite wrapper.
 
 use std::collections::{HashMap, HashSet};
-use std::convert::TryFrom;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context as _, Result};
-use rusqlite::{self, config::DbConfig, types::ValueRef, Connection, OpenFlags, Row};
+use rusqlite::{config::DbConfig, types::ValueRef, Connection, OpenFlags, Row};
 use tokio::sync::{Mutex, MutexGuard, RwLock};
 
 use crate::blob::BlobObject;
-use crate::chat::{add_device_msg, update_device_icon, update_saved_messages_icon};
+use crate::chat::{self, add_device_msg, update_device_icon, update_saved_messages_icon};
 use crate::config::Config;
 use crate::constants::DC_CHAT_ID_TRASH;
 use crate::context::Context;
 use crate::debug_logging::set_debug_logging_xdc;
 use crate::ephemeral::start_ephemeral_timers;
 use crate::imex::BLOBS_BACKUP_NAME;
+use crate::location::delete_orphaned_poi_locations;
 use crate::log::LogExt;
 use crate::message::{Message, MsgId, Viewtype};
 use crate::param::{Param, Params};
-use crate::peerstate::{deduplicate_peerstates, Peerstate};
+use crate::peerstate::Peerstate;
 use crate::stock_str;
-use crate::tools::{delete_file, time};
+use crate::tools::{delete_file, time, SystemTime};
 
 /// Extension to [`rusqlite::ToSql`] trait
 /// which also includes [`Send`] and [`Sync`].
@@ -248,7 +248,7 @@ impl Sql {
                 msg.set_text(stock_str::delete_server_turned_off(context).await);
                 add_device_msg(context, None, Some(&mut msg)).await?;
                 context
-                    .set_config(Config::DeleteServerAfter, Some("0"))
+                    .set_config_internal(Config::DeleteServerAfter, Some("0"))
                     .await?;
             }
         }
@@ -259,12 +259,14 @@ impl Sql {
                 match blob.recode_to_avatar_size(context).await {
                     Ok(()) => {
                         context
-                            .set_config(Config::Selfavatar, Some(&avatar))
+                            .set_config_internal(Config::Selfavatar, Some(&avatar))
                             .await?
                     }
                     Err(e) => {
                         warn!(context, "Migrations can't recode avatar, removing. {:#}", e);
-                        context.set_config(Config::Selfavatar, None).await?
+                        context
+                            .set_config_internal(Config::Selfavatar, None)
+                            .await?
                     }
                 }
             }
@@ -287,21 +289,23 @@ impl Sql {
         let passphrase_nonempty = !passphrase.is_empty();
         if let Err(err) = self.try_open(context, &self.dbfile, passphrase).await {
             self.close().await;
-            Err(err)
-        } else {
-            info!(context, "Opened database {:?}.", self.dbfile);
-            *self.is_encrypted.write().await = Some(passphrase_nonempty);
-
-            // setup debug logging if there is an entry containing its id
-            if let Some(xdc_id) = self
-                .get_raw_config_u32(Config::DebugLogging.as_ref())
-                .await?
-            {
-                set_debug_logging_xdc(context, Some(MsgId::new(xdc_id))).await?;
-            }
-
-            Ok(())
+            return Err(err);
         }
+        info!(context, "Opened database {:?}.", self.dbfile);
+        *self.is_encrypted.write().await = Some(passphrase_nonempty);
+
+        // setup debug logging if there is an entry containing its id
+        if let Some(xdc_id) = self
+            .get_raw_config_u32(Config::DebugLogging.as_ref())
+            .await?
+        {
+            set_debug_logging_xdc(context, Some(MsgId::new(xdc_id))).await?;
+        }
+        chat::resume_securejoin_wait(context)
+            .await
+            .log_err(context)
+            .ok();
+        Ok(())
     }
 
     /// Changes the passphrase of encrypted database.
@@ -572,22 +576,13 @@ impl Sql {
     pub async fn set_raw_config(&self, key: &str, value: Option<&str>) -> Result<()> {
         let mut lock = self.config_cache.write().await;
         if let Some(value) = value {
-            let exists = self
-                .exists("SELECT COUNT(*) FROM config WHERE keyname=?;", (key,))
-                .await?;
-
-            if exists {
-                self.execute("UPDATE config SET value=? WHERE keyname=?;", (value, key))
-                    .await?;
-            } else {
-                self.execute(
-                    "INSERT INTO config (keyname, value) VALUES (?, ?);",
-                    (key, value),
-                )
-                .await?;
-            }
+            self.execute(
+                "INSERT OR REPLACE INTO config (keyname, value) VALUES (?, ?)",
+                (key, value),
+            )
+            .await?;
         } else {
-            self.execute("DELETE FROM config WHERE keyname=?;", (key,))
+            self.execute("DELETE FROM config WHERE keyname=?", (key,))
                 .await?;
         }
         lock.insert(key.to_string(), value.map(|s| s.to_string()));
@@ -608,7 +603,7 @@ impl Sql {
 
         let mut lock = self.config_cache.write().await;
         let value = self
-            .query_get_value("SELECT value FROM config WHERE keyname=?;", (key,))
+            .query_get_value("SELECT value FROM config WHERE keyname=?", (key,))
             .await
             .context(format!("failed to fetch raw config: {key}"))?;
         lock.insert(key.to_string(), value.clone());
@@ -676,20 +671,26 @@ impl Sql {
 /// `passphrase` is the SQLCipher database passphrase.
 /// Empty string if database is not encrypted.
 fn new_connection(path: &Path, passphrase: &str) -> Result<Connection> {
-    let mut flags = OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    flags.insert(OpenFlags::SQLITE_OPEN_READ_WRITE);
-    flags.insert(OpenFlags::SQLITE_OPEN_CREATE);
-
+    let flags = OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::SQLITE_OPEN_READ_WRITE
+        | OpenFlags::SQLITE_OPEN_CREATE;
     let conn = Connection::open_with_flags(path, flags)?;
     conn.execute_batch(
         "PRAGMA cipher_memory_security = OFF; -- Too slow on Android
          PRAGMA secure_delete=on;
          PRAGMA busy_timeout = 0; -- fail immediately
-         PRAGMA temp_store=memory; -- Avoid SQLITE_IOERR_GETTEMPPATH errors on Android
          PRAGMA soft_heap_limit = 8388608; -- 8 MiB limit, same as set in Android SQLiteDatabase.
          PRAGMA foreign_keys=on;
          ",
     )?;
+
+    // Avoid SQLITE_IOERR_GETTEMPPATH errors on Android and maybe other systems.
+    // Downside is more RAM consumption esp. on VACUUM.
+    // Therefore, on systems known to have working default (using files), stay with that.
+    if cfg!(not(target_os = "ios")) {
+        conn.pragma_update(None, "temp_store", "memory")?;
+    }
+
     conn.pragma_update(None, "key", passphrase)?;
     // Try to enable auto_vacuum. This will only be
     // applied if the database is new or after successful
@@ -711,7 +712,7 @@ pub async fn housekeeping(context: &Context) -> Result<()> {
     // Setting `Config::LastHousekeeping` at the beginning avoids endless loops when things do not
     // work out for whatever reason or are interrupted by the OS.
     if let Err(e) = context
-        .set_config(Config::LastHousekeeping, Some(&time().to_string()))
+        .set_config_internal(Config::LastHousekeeping, Some(&time().to_string()))
         .await
     {
         warn!(context, "Can't set config: {e:#}.");
@@ -738,10 +739,6 @@ pub async fn housekeeping(context: &Context) -> Result<()> {
         );
     }
 
-    if let Err(err) = deduplicate_peerstates(&context.sql).await {
-        warn!(context, "Failed to deduplicate peerstates: {:#}.", err)
-    }
-
     // Try to clear the freelist to free some space on the disk. This
     // only works if auto_vacuum is enabled.
     match context
@@ -765,8 +762,9 @@ pub async fn housekeeping(context: &Context) -> Result<()> {
     context
         .sql
         .execute(
-            "DELETE FROM msgs_mdns WHERE msg_id NOT IN (SELECT id FROM msgs)",
-            (),
+            "DELETE FROM msgs_mdns WHERE msg_id NOT IN \
+            (SELECT id FROM msgs WHERE chat_id!=?)",
+            (DC_CHAT_ID_TRASH,),
         )
         .await
         .context("failed to remove old MDNs")
@@ -776,11 +774,20 @@ pub async fn housekeeping(context: &Context) -> Result<()> {
     context
         .sql
         .execute(
-            "DELETE FROM msgs_status_updates WHERE msg_id NOT IN (SELECT id FROM msgs)",
-            (),
+            "DELETE FROM msgs_status_updates WHERE msg_id NOT IN \
+            (SELECT id FROM msgs WHERE chat_id!=?)",
+            (DC_CHAT_ID_TRASH,),
         )
         .await
         .context("failed to remove old webxdc status updates")
+        .log_err(context)
+        .ok();
+
+    // Delete POI locations
+    // which don't have corresponding message.
+    delete_orphaned_poi_locations(context)
+        .await
+        .context("Failed to delete orphaned POI locations")
         .log_err(context)
         .ok();
 
@@ -808,13 +815,6 @@ pub async fn remove_unused_files(context: &Context) -> Result<()> {
         &context.sql,
         &mut files_in_use,
         "SELECT param FROM msgs  WHERE chat_id!=3   AND type!=10;",
-        Param::File,
-    )
-    .await?;
-    maybe_add_from_param(
-        &context.sql,
-        &mut files_in_use,
-        "SELECT param FROM jobs;",
         Param::File,
     )
     .await?;
@@ -857,9 +857,9 @@ pub async fn remove_unused_files(context: &Context) -> Result<()> {
             Ok(mut dir_handle) => {
                 /* avoid deletion of files that are just created to build a message object */
                 let diff = std::time::Duration::from_secs(60 * 60);
-                let keep_files_newer_than = std::time::SystemTime::now()
+                let keep_files_newer_than = SystemTime::now()
                     .checked_sub(diff)
-                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                    .unwrap_or(SystemTime::UNIX_EPOCH);
 
                 while let Ok(Some(entry)) = dir_handle.next_entry().await {
                     let name_f = entry.file_name();
@@ -992,16 +992,19 @@ async fn maybe_add_from_param(
     Ok(())
 }
 
-/// Removes from the database locally deleted messages that also don't
+/// Removes from the database stale locally deleted messages that also don't
 /// have a server UID.
 async fn prune_tombstones(sql: &Sql) -> Result<()> {
+    // Keep tombstones for the last two days to prevent redownloading locally deleted messages.
+    let timestamp_max = time().saturating_sub(2 * 24 * 3600);
     sql.execute(
         "DELETE FROM msgs
          WHERE chat_id=?
+         AND timestamp<=?
          AND NOT EXISTS (
          SELECT * FROM imap WHERE msgs.rfc724_mid=rfc724_mid AND target!=''
          )",
-        (DC_CHAT_ID_TRASH,),
+        (DC_CHAT_ID_TRASH, timestamp_max),
     )
     .await?;
     Ok(())
@@ -1019,10 +1022,7 @@ pub fn repeat_vars(count: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use async_channel as channel;
-
     use super::*;
-    use crate::config::Config;
     use crate::{test_utils::TestContext, EventType};
 
     #[test]
@@ -1098,8 +1098,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (event_sink, event_source) = channel::unbounded();
-        t.add_event_sender(event_sink).await;
+        let event_source = t.get_event_emitter();
 
         let a = t.get_config(Config::Selfavatar).await.unwrap().unwrap();
         assert_eq!(avatar_bytes, &tokio::fs::read(&a).await.unwrap()[..]);

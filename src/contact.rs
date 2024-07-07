@@ -1,91 +1,47 @@
 //! Contacts module
 
-use std::cmp::Reverse;
+use std::cmp::{min, Reverse};
 use std::collections::BinaryHeap;
-use std::convert::{TryFrom, TryInto};
 use std::fmt;
-use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::UNIX_EPOCH;
 
 use anyhow::{bail, ensure, Context as _, Result};
 use async_channel::{self as channel, Receiver, Sender};
+use base64::Engine as _;
+pub use deltachat_contact_tools::may_be_valid_addr;
+use deltachat_contact_tools::{
+    self as contact_tools, addr_cmp, addr_normalize, sanitize_name, sanitize_name_and_addr,
+    ContactAddress, VcardContact,
+};
 use deltachat_derive::{FromSql, ToSql};
-use once_cell::sync::Lazy;
-use regex::Regex;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use tokio::task;
 use tokio::time::{timeout, Duration};
 
-use crate::aheader::EncryptPreference;
-use crate::chat::{ChatId, ProtectionStatus};
+use crate::aheader::{Aheader, EncryptPreference};
+use crate::blob::BlobObject;
+use crate::chat::{ChatId, ChatIdBlocked, ProtectionStatus};
 use crate::color::str_to_color;
 use crate::config::Config;
 use crate::constants::{Blocked, Chattype, DC_GCL_ADD_SELF, DC_GCL_VERIFIED_ONLY};
 use crate::context::Context;
 use crate::events::EventType;
-use crate::key::{load_self_public_key, DcKey};
+use crate::key::{load_self_public_key, DcKey, SignedPublicKey};
+use crate::log::LogExt;
 use crate::login_param::LoginParam;
 use crate::message::MessageState;
 use crate::mimeparser::AvatarAction;
 use crate::param::{Param, Params};
-use crate::peerstate::{Peerstate, PeerstateVerifiedStatus};
+use crate::peerstate::Peerstate;
 use crate::sql::{self, params_iter};
-use crate::sync::{self, Sync::*, SyncData};
-use crate::tools::{
-    duration_to_str, get_abs_path, improve_single_line_input, strip_rtlo_characters, time,
-    EmailAddress,
-};
-use crate::{chat, stock_str};
+use crate::sync::{self, Sync::*};
+use crate::tools::{duration_to_str, get_abs_path, smeared_time, time, SystemTime};
+use crate::{chat, chatlist_events, stock_str};
 
 /// Time during which a contact is considered as seen recently.
 const SEEN_RECENTLY_SECONDS: i64 = 600;
-
-/// Valid contact address.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct ContactAddress<'a>(&'a str);
-
-impl Deref for ContactAddress<'_> {
-    type Target = str;
-
-    fn deref(&self) -> &Self::Target {
-        self.0
-    }
-}
-
-impl AsRef<str> for ContactAddress<'_> {
-    fn as_ref(&self) -> &str {
-        self.0
-    }
-}
-
-impl fmt::Display for ContactAddress<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl<'a> ContactAddress<'a> {
-    /// Constructs a new contact address from string,
-    /// normalizing and validating it.
-    pub fn new(s: &'a str) -> Result<Self> {
-        let addr = addr_normalize(s);
-        if !may_be_valid_addr(addr) {
-            bail!("invalid address {:?}", s);
-        }
-        Ok(Self(addr))
-    }
-}
-
-/// Allow converting [`ContactAddress`] to an SQLite type.
-impl rusqlite::types::ToSql for ContactAddress<'_> {
-    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput> {
-        let val = rusqlite::types::Value::Text(self.0.to_string());
-        let out = rusqlite::types::ToSqlOutput::Owned(val);
-        Ok(out)
-    }
-}
 
 /// Contact ID, including reserved IDs.
 ///
@@ -165,6 +121,29 @@ impl ContactId {
             .await?;
         Ok(())
     }
+
+    /// Updates the origin of the contacts, but only if `origin` is higher than the current one.
+    pub(crate) async fn scaleup_origin(
+        context: &Context,
+        ids: &[Self],
+        origin: Origin,
+    ) -> Result<()> {
+        context
+            .sql
+            .execute(
+                &format!(
+                    "UPDATE contacts SET origin=? WHERE id IN ({}) AND origin<?",
+                    sql::repeat_vars(ids.len())
+                ),
+                rusqlite::params_from_iter(
+                    params_iter(&[origin])
+                        .chain(params_iter(ids))
+                        .chain(params_iter(&[origin])),
+                ),
+            )
+            .await?;
+        Ok(())
+    }
 }
 
 impl fmt::Display for ContactId {
@@ -203,6 +182,162 @@ impl rusqlite::types::FromSql for ContactId {
                 .map_err(|_| rusqlite::types::FromSqlError::OutOfRange(val))
         })
     }
+}
+
+/// Returns a vCard containing contacts with the given ids.
+pub async fn make_vcard(context: &Context, contacts: &[ContactId]) -> Result<String> {
+    let now = time();
+    let mut vcard_contacts = Vec::with_capacity(contacts.len());
+    for id in contacts {
+        let c = Contact::get_by_id(context, *id).await?;
+        let key = match *id {
+            ContactId::SELF => Some(load_self_public_key(context).await?),
+            _ => Peerstate::from_addr(context, &c.addr)
+                .await?
+                .and_then(|peerstate| peerstate.take_key(false)),
+        };
+        let key = key.map(|k| k.to_base64());
+        let profile_image = match c.get_profile_image(context).await? {
+            None => None,
+            Some(path) => tokio::fs::read(path)
+                .await
+                .log_err(context)
+                .ok()
+                .map(|data| base64::engine::general_purpose::STANDARD.encode(data)),
+        };
+        vcard_contacts.push(VcardContact {
+            addr: c.addr,
+            authname: c.authname,
+            key,
+            profile_image,
+            // Use the current time to not reveal our or contact's online time.
+            timestamp: Ok(now),
+        });
+    }
+    Ok(contact_tools::make_vcard(&vcard_contacts))
+}
+
+/// Imports contacts from the given vCard.
+///
+/// Returns the ids of successfully processed contacts in the order they appear in `vcard`,
+/// regardless of whether they are just created, modified or left untouched.
+pub async fn import_vcard(context: &Context, vcard: &str) -> Result<Vec<ContactId>> {
+    let contacts = contact_tools::parse_vcard(vcard);
+    let mut contact_ids = Vec::with_capacity(contacts.len());
+    for c in &contacts {
+        let Ok(id) = import_vcard_contact(context, c)
+            .await
+            .with_context(|| format!("import_vcard_contact() failed for {}", c.addr))
+            .log_err(context)
+        else {
+            continue;
+        };
+        contact_ids.push(id);
+    }
+    Ok(contact_ids)
+}
+
+async fn import_vcard_contact(context: &Context, contact: &VcardContact) -> Result<ContactId> {
+    let addr = ContactAddress::new(&contact.addr).context("Invalid address")?;
+    // Importing a vCard is also an explicit user action like creating a chat with the contact. We
+    // mustn't use `Origin::AddressBook` here because the vCard may be created not by us, also we
+    // want `contact.authname` to be saved as the authname and not a locally given name.
+    let origin = Origin::CreateChat;
+    let (id, modified) =
+        match Contact::add_or_lookup(context, &contact.authname, &addr, origin).await {
+            Err(e) => return Err(e).context("Contact::add_or_lookup() failed"),
+            Ok((ContactId::SELF, _)) => return Ok(ContactId::SELF),
+            Ok(val) => val,
+        };
+    if modified != Modifier::None {
+        context.emit_event(EventType::ContactsChanged(Some(id)));
+    }
+    let key = contact.key.as_ref().and_then(|k| {
+        SignedPublicKey::from_base64(k)
+            .with_context(|| {
+                format!(
+                    "import_vcard_contact: Cannot decode key for {}",
+                    contact.addr
+                )
+            })
+            .log_err(context)
+            .ok()
+    });
+    if let Some(public_key) = key {
+        let timestamp = contact
+            .timestamp
+            .as_ref()
+            .map_or(0, |&t| min(t, smeared_time(context)));
+        let aheader = Aheader {
+            addr: contact.addr.clone(),
+            public_key,
+            prefer_encrypt: EncryptPreference::Mutual,
+        };
+        let peerstate = match Peerstate::from_addr(context, &aheader.addr).await {
+            Err(e) => {
+                warn!(
+                    context,
+                    "import_vcard_contact: Cannot create peerstate from {}: {e:#}.", contact.addr
+                );
+                return Ok(id);
+            }
+            Ok(p) => p,
+        };
+        let peerstate = if let Some(mut p) = peerstate {
+            p.apply_gossip(&aheader, timestamp);
+            p
+        } else {
+            Peerstate::from_gossip(&aheader, timestamp)
+        };
+        if let Err(e) = peerstate.save_to_db(&context.sql).await {
+            warn!(
+                context,
+                "import_vcard_contact: Could not save peerstate for {}: {e:#}.", contact.addr
+            );
+            return Ok(id);
+        }
+        if let Err(e) = peerstate
+            .handle_fingerprint_change(context, timestamp)
+            .await
+        {
+            warn!(
+                context,
+                "import_vcard_contact: handle_fingerprint_change() failed for {}: {e:#}.",
+                contact.addr
+            );
+            return Ok(id);
+        }
+    }
+    if modified != Modifier::Created {
+        return Ok(id);
+    }
+    let path = match &contact.profile_image {
+        Some(image) => match BlobObject::store_from_base64(context, image, "avatar").await {
+            Err(e) => {
+                warn!(
+                    context,
+                    "import_vcard_contact: Could not decode and save avatar for {}: {e:#}.",
+                    contact.addr
+                );
+                None
+            }
+            Ok(path) => Some(path),
+        },
+        None => None,
+    };
+    if let Some(path) = path {
+        // Currently this value doesn't matter as we don't import the contact of self.
+        let was_encrypted = false;
+        if let Err(e) =
+            set_profile_image(context, id, &AvatarAction::Change(path), was_encrypted).await
+        {
+            warn!(
+                context,
+                "import_vcard_contact: Could not set avatar for {}: {e:#}.", contact.addr
+            );
+        }
+    }
+    Ok(id)
 }
 
 /// An object representing a single contact in memory.
@@ -348,24 +483,6 @@ pub(crate) enum Modifier {
     Created,
 }
 
-/// Verification status of the contact.
-#[derive(Debug, PartialEq, Eq, Clone, Copy, FromPrimitive)]
-#[repr(u8)]
-pub enum VerifiedStatus {
-    /// Contact is not verified.
-    Unverified = 0,
-    /// SELF has verified the fingerprint of a contact. Currently unused.
-    Verified = 1,
-    /// SELF and contact have verified their fingerprints in both directions; in the UI typically checkmarks are shown.
-    BidirectVerified = 2,
-}
-
-impl Default for VerifiedStatus {
-    fn default() -> Self {
-        Self::Unverified
-    }
-}
-
 impl Contact {
     /// Loads a single contact object from the database.
     ///
@@ -428,6 +545,10 @@ impl Contact {
         {
             if contact_id == ContactId::SELF {
                 contact.name = stock_str::self_msg(context).await;
+                contact.authname = context
+                    .get_config(Config::Displayname)
+                    .await?
+                    .unwrap_or_default();
                 contact.addr = context
                     .get_config(Config::ConfiguredAddr)
                     .await?
@@ -494,13 +615,20 @@ impl Contact {
     ///
     /// May result in a `#DC_EVENT_CONTACTS_CHANGED` event.
     pub async fn create(context: &Context, name: &str, addr: &str) -> Result<ContactId> {
-        let name = improve_single_line_input(name);
+        Self::create_ex(context, Sync, name, addr).await
+    }
 
-        let (name, addr) = sanitize_name_and_addr(&name, addr);
+    pub(crate) async fn create_ex(
+        context: &Context,
+        sync: sync::Sync,
+        name: &str,
+        addr: &str,
+    ) -> Result<ContactId> {
+        let (name, addr) = sanitize_name_and_addr(name, addr);
         let addr = ContactAddress::new(&addr)?;
 
         let (contact_id, sth_modified) =
-            Contact::add_or_lookup(context, &name, addr, Origin::ManuallyCreated)
+            Contact::add_or_lookup(context, &name, &addr, Origin::ManuallyCreated)
                 .await
                 .context("add_or_lookup")?;
         let blocked = Contact::is_blocked_load(context, contact_id).await?;
@@ -514,6 +642,16 @@ impl Contact {
             set_blocked(context, Nosync, contact_id, false).await?;
         }
 
+        if sync.into() {
+            chat::sync(
+                context,
+                chat::SyncId::ContactAddr(addr.to_string()),
+                chat::SyncAction::Rename(name.to_string()),
+            )
+            .await
+            .log_err(context)
+            .ok();
+        }
         Ok(contact_id)
     }
 
@@ -565,7 +703,7 @@ impl Contact {
 
         let addr_normalized = addr_normalize(addr);
 
-        if context.is_self_addr(addr_normalized).await? {
+        if context.is_self_addr(&addr_normalized).await? {
             return Ok(Some(ContactId::SELF));
         }
 
@@ -615,7 +753,7 @@ impl Contact {
     pub(crate) async fn add_or_lookup(
         context: &Context,
         name: &str,
-        addr: ContactAddress<'_>,
+        addr: &ContactAddress,
         mut origin: Origin,
     ) -> Result<(ContactId, Modifier)> {
         let mut sth_modified = Modifier::None;
@@ -623,11 +761,11 @@ impl Contact {
         ensure!(!addr.is_empty(), "Can not add_or_lookup empty address");
         ensure!(origin != Origin::Unknown, "Missing valid origin");
 
-        if context.is_self_addr(&addr).await? {
+        if context.is_self_addr(addr).await? {
             return Ok((ContactId::SELF, sth_modified));
         }
 
-        let mut name = strip_rtlo_characters(name);
+        let mut name = sanitize_name(name);
         #[allow(clippy::collapsible_if)]
         if origin <= Origin::OutgoingTo {
             // The user may accidentally have written to a "noreply" address with another MUA:
@@ -759,6 +897,7 @@ impl Contact {
                             if count > 0 {
                                 // Chat name updated
                                 context.emit_event(EventType::ChatModified(chat_id));
+                                chatlist_events::emit_chatlist_items_changed_for_contact(context, contact_id);
                             }
                         }
                     }
@@ -778,7 +917,7 @@ impl Contact {
                             } else {
                                 "".to_string()
                             },
-                            addr,
+                            &addr,
                             origin,
                             if update_authname {
                                 name.to_string()
@@ -790,12 +929,14 @@ impl Contact {
 
                 sth_modified = Modifier::Created;
                 row_id = u32::try_from(transaction.last_insert_rowid())?;
-                info!(context, "added contact id={} addr={}", row_id, &addr);
+                info!(context, "Added contact id={row_id} addr={addr}.");
             }
             Ok(row_id)
         }).await?;
 
-        Ok((ContactId::new(row_id), sth_modified))
+        let contact_id = ContactId::new(row_id);
+
+        Ok((contact_id, sth_modified))
     }
 
     /// Add a number of contacts.
@@ -820,10 +961,9 @@ impl Contact {
 
         for (name, addr) in split_address_book(addr_book) {
             let (name, addr) = sanitize_name_and_addr(name, addr);
-            let name = normalize_name(&name);
             match ContactAddress::new(&addr) {
                 Ok(addr) => {
-                    match Contact::add_or_lookup(context, &name, addr, Origin::AddressBook).await {
+                    match Contact::add_or_lookup(context, &name, &addr, Origin::AddressBook).await {
                         Ok((_, modified)) => {
                             if modified != Modifier::None {
                                 modify_cnt += 1
@@ -1050,57 +1190,52 @@ impl Contact {
             "Can not provide encryption info for special contact"
         );
 
-        let mut ret = String::new();
-        if let Ok(contact) = Contact::get_by_id(context, contact_id).await {
-            let loginparam = LoginParam::load_configured_params(context).await?;
-            let peerstate = Peerstate::from_addr(context, &contact.addr).await?;
+        let contact = Contact::get_by_id(context, contact_id).await?;
+        let loginparam = LoginParam::load_configured_params(context).await?;
+        let peerstate = Peerstate::from_addr(context, &contact.addr).await?;
 
-            if let Some(peerstate) = peerstate.filter(|peerstate| {
-                peerstate
-                    .peek_key(PeerstateVerifiedStatus::Unverified)
-                    .is_some()
-            }) {
-                let stock_message = match peerstate.prefer_encrypt {
-                    EncryptPreference::Mutual => stock_str::e2e_preferred(context).await,
-                    EncryptPreference::NoPreference => stock_str::e2e_available(context).await,
-                    EncryptPreference::Reset => stock_str::encr_none(context).await,
-                };
+        let Some(peerstate) = peerstate.filter(|peerstate| peerstate.peek_key(false).is_some())
+        else {
+            return Ok(stock_str::encr_none(context).await);
+        };
 
-                let finger_prints = stock_str::finger_prints(context).await;
-                ret += &format!("{stock_message}.\n{finger_prints}:");
+        let stock_message = match peerstate.prefer_encrypt {
+            EncryptPreference::Mutual => stock_str::e2e_preferred(context).await,
+            EncryptPreference::NoPreference => stock_str::e2e_available(context).await,
+            EncryptPreference::Reset => stock_str::encr_none(context).await,
+        };
 
-                let fingerprint_self = load_self_public_key(context)
-                    .await?
-                    .fingerprint()
-                    .to_string();
-                let fingerprint_other_verified = peerstate
-                    .peek_key(PeerstateVerifiedStatus::BidirectVerified)
-                    .map(|k| k.fingerprint().to_string())
-                    .unwrap_or_default();
-                let fingerprint_other_unverified = peerstate
-                    .peek_key(PeerstateVerifiedStatus::Unverified)
-                    .map(|k| k.fingerprint().to_string())
-                    .unwrap_or_default();
-                if loginparam.addr < peerstate.addr {
-                    cat_fingerprint(&mut ret, &loginparam.addr, &fingerprint_self, "");
-                    cat_fingerprint(
-                        &mut ret,
-                        &peerstate.addr,
-                        &fingerprint_other_verified,
-                        &fingerprint_other_unverified,
-                    );
-                } else {
-                    cat_fingerprint(
-                        &mut ret,
-                        &peerstate.addr,
-                        &fingerprint_other_verified,
-                        &fingerprint_other_unverified,
-                    );
-                    cat_fingerprint(&mut ret, &loginparam.addr, &fingerprint_self, "");
-                }
-            } else {
-                ret += &stock_str::encr_none(context).await;
-            }
+        let finger_prints = stock_str::finger_prints(context).await;
+        let mut ret = format!("{stock_message}.\n{finger_prints}:");
+
+        let fingerprint_self = load_self_public_key(context)
+            .await?
+            .fingerprint()
+            .to_string();
+        let fingerprint_other_verified = peerstate
+            .peek_key(true)
+            .map(|k| k.fingerprint().to_string())
+            .unwrap_or_default();
+        let fingerprint_other_unverified = peerstate
+            .peek_key(false)
+            .map(|k| k.fingerprint().to_string())
+            .unwrap_or_default();
+        if loginparam.addr < peerstate.addr {
+            cat_fingerprint(&mut ret, &loginparam.addr, &fingerprint_self, "");
+            cat_fingerprint(
+                &mut ret,
+                &peerstate.addr,
+                &fingerprint_other_verified,
+                &fingerprint_other_unverified,
+            );
+        } else {
+            cat_fingerprint(
+                &mut ret,
+                &peerstate.addr,
+                &fingerprint_other_verified,
+                &fingerprint_other_unverified,
+            );
+            cat_fingerprint(&mut ret, &loginparam.addr, &fingerprint_self, "");
         }
 
         Ok(ret)
@@ -1281,20 +1416,37 @@ impl Contact {
     /// otherwise use is_chat_protected().
     /// Use [Self::get_verifier_id] to display the verifier contact
     /// in the info section of the contact profile.
-    pub async fn is_verified(&self, context: &Context) -> Result<VerifiedStatus> {
+    pub async fn is_verified(&self, context: &Context) -> Result<bool> {
         // We're always sort of secured-verified as we could verify the key on this device any time with the key
         // on this device
         if self.id == ContactId::SELF {
-            return Ok(VerifiedStatus::BidirectVerified);
+            return Ok(true);
         }
 
-        if let Some(peerstate) = Peerstate::from_addr(context, &self.addr).await? {
-            if peerstate.is_using_verified_key() {
-                return Ok(VerifiedStatus::BidirectVerified);
-            }
+        let Some(peerstate) = Peerstate::from_addr(context, &self.addr).await? else {
+            return Ok(false);
+        };
+
+        let forward_verified = peerstate.is_using_verified_key();
+        let backward_verified = peerstate.is_backward_verified(context).await?;
+        Ok(forward_verified && backward_verified)
+    }
+
+    /// Returns true if we have a verified key for the contact
+    /// and it is the same as Autocrypt key.
+    /// This is enough to send messages to the contact in verified chat
+    /// and verify received messages, but not enough to display green checkmark
+    /// or add the contact to verified groups.
+    pub async fn is_forward_verified(&self, context: &Context) -> Result<bool> {
+        if self.id == ContactId::SELF {
+            return Ok(true);
         }
 
-        Ok(VerifiedStatus::Unverified)
+        let Some(peerstate) = Peerstate::from_addr(context, &self.addr).await? else {
+            return Ok(false);
+        };
+
+        Ok(peerstate.is_using_verified_key())
     }
 
     /// Returns the `ContactId` that verified the contact.
@@ -1317,7 +1469,7 @@ impl Contact {
             return Ok(None);
         };
 
-        if verifier_addr == self.addr {
+        if addr_cmp(&verifier_addr, &self.addr) {
             // Contact is directly verified via QR code.
             return Ok(Some(ContactId::SELF));
         }
@@ -1345,11 +1497,13 @@ impl Contact {
     pub async fn is_profile_verified(&self, context: &Context) -> Result<bool> {
         let contact_id = self.id;
 
-        if let Some(chat_id) = ChatId::lookup_by_contact(context, contact_id).await? {
+        if let Some(ChatIdBlocked { id: chat_id, .. }) =
+            ChatIdBlocked::lookup_by_contact(context, contact_id).await?
+        {
             Ok(chat_id.is_protected(context).await? == ProtectionStatus::Protected)
         } else {
             // 1:1 chat does not exist.
-            Ok(self.is_verified(context).await? == VerifiedStatus::BidirectVerified)
+            Ok(self.is_verified(context).await?)
         }
     }
 
@@ -1380,61 +1534,6 @@ impl Contact {
             .exists("SELECT COUNT(*) FROM contacts WHERE id=?;", (contact_id,))
             .await?;
         Ok(exists)
-    }
-
-    /// Updates the origin of the contact, but only if new origin is higher than the current one.
-    pub async fn scaleup_origin_by_id(
-        context: &Context,
-        contact_id: ContactId,
-        origin: Origin,
-    ) -> Result<()> {
-        context
-            .sql
-            .execute(
-                "UPDATE contacts SET origin=? WHERE id=? AND origin<?;",
-                (origin, contact_id, origin),
-            )
-            .await?;
-        Ok(())
-    }
-}
-
-/// Returns false if addr is an invalid address, otherwise true.
-pub fn may_be_valid_addr(addr: &str) -> bool {
-    let res = EmailAddress::new(addr);
-    res.is_ok()
-}
-
-/// Returns address with whitespace trimmed and `mailto:` prefix removed.
-pub fn addr_normalize(addr: &str) -> &str {
-    let norm = addr.trim();
-
-    if norm.starts_with("mailto:") {
-        norm.get(7..).unwrap_or(norm)
-    } else {
-        norm
-    }
-}
-
-fn sanitize_name_and_addr(name: &str, addr: &str) -> (String, String) {
-    static ADDR_WITH_NAME_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new("(.*)<(.*)>").unwrap());
-    if let Some(captures) = ADDR_WITH_NAME_REGEX.captures(addr.as_ref()) {
-        (
-            if name.is_empty() {
-                strip_rtlo_characters(
-                    &captures
-                        .get(1)
-                        .map_or("".to_string(), |m| normalize_name(m.as_str())),
-                )
-            } else {
-                strip_rtlo_characters(name)
-            },
-            captures
-                .get(2)
-                .map_or("".to_string(), |m| m.as_str().to_string()),
-        )
-    } else {
-        (strip_rtlo_characters(name), addr.to_string())
     }
 }
 
@@ -1499,16 +1598,18 @@ WHERE type=? AND id IN (
                 true => chat::SyncAction::Block,
                 false => chat::SyncAction::Unblock,
             };
-            context
-                .add_sync_item(SyncData::AlterChat {
-                    id: chat::SyncId::ContactAddr(contact.addr.clone()),
-                    action,
-                })
-                .await?;
-            context.send_sync_msg().await?;
+            chat::sync(
+                context,
+                chat::SyncId::ContactAddr(contact.addr.clone()),
+                action,
+            )
+            .await
+            .log_err(context)
+            .ok();
         }
     }
 
+    chatlist_events::emit_chatlist_changed(context);
     Ok(())
 }
 
@@ -1518,7 +1619,7 @@ WHERE type=? AND id IN (
 /// as profile images can be set only by receiving messages, this should be always the case, however.
 ///
 /// For contact SELF, the image is not saved in the contact-database but as Config::Selfavatar;
-/// this typically happens if we see message with our own profile image, sent from another device.
+/// this typically happens if we see message with our own profile image.
 pub(crate) async fn set_profile_image(
     context: &Context,
     contact_id: ContactId,
@@ -1531,7 +1632,7 @@ pub(crate) async fn set_profile_image(
             if contact_id == ContactId::SELF {
                 if was_encrypted {
                     context
-                        .set_config(Config::Selfavatar, Some(profile_image))
+                        .set_config_ex(Nosync, Config::Selfavatar, Some(profile_image))
                         .await?;
                 } else {
                     info!(context, "Do not use unencrypted selfavatar.");
@@ -1544,7 +1645,9 @@ pub(crate) async fn set_profile_image(
         AvatarAction::Delete => {
             if contact_id == ContactId::SELF {
                 if was_encrypted {
-                    context.set_config(Config::Selfavatar, None).await?;
+                    context
+                        .set_config_ex(Nosync, Config::Selfavatar, None)
+                        .await?;
                 } else {
                     info!(context, "Do not use unencrypted selfavatar deletion.");
                 }
@@ -1557,6 +1660,7 @@ pub(crate) async fn set_profile_image(
     if changed {
         contact.update_param(context).await?;
         context.emit_event(EventType::ContactsChanged(Some(contact_id)));
+        chatlist_events::emit_chatlist_item_changed_for_contact_chat(context, contact_id).await;
     }
     Ok(())
 }
@@ -1576,7 +1680,7 @@ pub(crate) async fn set_status(
     if contact_id == ContactId::SELF {
         if encrypted && has_chat_version {
             context
-                .set_config(Config::Selfstatus, Some(&status))
+                .set_config_ex(Nosync, Config::Selfstatus, Some(&status))
                 .await?;
         }
     } else {
@@ -1612,32 +1716,13 @@ pub(crate) async fn update_last_seen(
         > 0
         && timestamp > time() - SEEN_RECENTLY_SECONDS
     {
+        context.emit_event(EventType::ContactsChanged(Some(contact_id)));
         context
             .scheduler
             .interrupt_recently_seen(contact_id, timestamp)
             .await;
     }
     Ok(())
-}
-
-/// Normalize a name.
-///
-/// - Remove quotes (come from some bad MUA implementations)
-/// - Trims the resulting string
-///
-/// Typically, this function is not needed as it is called implicitly by `Contact::add_address_book`.
-pub fn normalize_name(full_name: &str) -> String {
-    let full_name = full_name.trim();
-    if full_name.is_empty() {
-        return full_name.into();
-    }
-
-    match full_name.as_bytes() {
-        [b'\'', .., b'\''] | [b'\"', .., b'\"'] | [b'<', .., b'>'] => full_name
-            .get(1..full_name.len() - 1)
-            .map_or("".to_string(), |s| s.trim().to_string()),
-        _ => full_name.to_string(),
-    }
 }
 
 fn cat_fingerprint(
@@ -1661,14 +1746,6 @@ fn cat_fingerprint(
     {
         *ret += &format!("\n\n{addr} (alternative):\n{fingerprint_unverified}");
     }
-}
-
-/// Compares two email addresses, normalizing them beforehand.
-pub fn addr_cmp(addr1: &str, addr2: &str) -> bool {
-    let norm1 = addr_normalize(addr1).to_lowercase();
-    let norm2 = addr_normalize(addr2).to_lowercase();
-
-    norm1 == norm2
 }
 
 fn split_address_book(book: &str) -> Vec<(&str, &str)> {
@@ -1711,6 +1788,12 @@ impl RecentlySeenLoop {
     async fn run(context: Context, interrupt: Receiver<RecentlySeenInterrupt>) {
         type MyHeapElem = (Reverse<i64>, ContactId);
 
+        let now = SystemTime::now();
+        let now_ts = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
         // Priority contains all recently seen sorted by the timestamp
         // when they become not recently seen.
         //
@@ -1721,7 +1804,7 @@ impl RecentlySeenLoop {
             .query_map(
                 "SELECT id, last_seen FROM contacts
                  WHERE last_seen > ?",
-                (time() - SEEN_RECENTLY_SECONDS,),
+                (now_ts - SEEN_RECENTLY_SECONDS,),
                 |row| {
                     let contact_id: ContactId = row.get("id")?;
                     let last_seen: i64 = row.get("last_seen")?;
@@ -1737,7 +1820,6 @@ impl RecentlySeenLoop {
 
         loop {
             let now = SystemTime::now();
-
             let (until, contact_id) =
                 if let Some((Reverse(timestamp), contact_id)) = unseen_queue.peek() {
                     (
@@ -1763,6 +1845,11 @@ impl RecentlySeenLoop {
                         // Timeout, notify about contact.
                         if let Some(contact_id) = contact_id {
                             context.emit_event(EventType::ContactsChanged(Some(*contact_id)));
+                            chatlist_events::emit_chatlist_item_changed_for_contact_chat(
+                                &context,
+                                *contact_id,
+                            )
+                            .await;
                             unseen_queue.pop();
                         }
                     }
@@ -1780,7 +1867,10 @@ impl RecentlySeenLoop {
                         timestamp,
                     })) => {
                         // Received an interrupt.
-                        unseen_queue.push((Reverse(timestamp + SEEN_RECENTLY_SECONDS), contact_id));
+                        if contact_id != ContactId::UNDEFINED {
+                            unseen_queue
+                                .push((Reverse(timestamp + SEEN_RECENTLY_SECONDS), contact_id));
+                        }
                     }
                 }
             } else {
@@ -1792,19 +1882,35 @@ impl RecentlySeenLoop {
                 // Event is already in the past.
                 if let Some(contact_id) = contact_id {
                     context.emit_event(EventType::ContactsChanged(Some(*contact_id)));
+                    chatlist_events::emit_chatlist_item_changed_for_contact_chat(
+                        &context,
+                        *contact_id,
+                    )
+                    .await;
                 }
                 unseen_queue.pop();
             }
         }
     }
 
-    pub(crate) fn interrupt(&self, contact_id: ContactId, timestamp: i64) {
+    pub(crate) fn try_interrupt(&self, contact_id: ContactId, timestamp: i64) {
         self.interrupt_send
             .try_send(RecentlySeenInterrupt {
                 contact_id,
                 timestamp,
             })
             .ok();
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn interrupt(&self, contact_id: ContactId, timestamp: i64) {
+        self.interrupt_send
+            .send(RecentlySeenInterrupt {
+                contact_id,
+                timestamp,
+            })
+            .await
+            .unwrap();
     }
 
     pub(crate) fn abort(self) {
@@ -1814,6 +1920,8 @@ impl RecentlySeenLoop {
 
 #[cfg(test)]
 mod tests {
+    use deltachat_contact_tools::may_be_valid_addr;
+
     use super::*;
     use crate::chat::{get_chat_contacts, send_text_msg, Chat};
     use crate::chatlist::Chatlist;
@@ -1852,22 +1960,10 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_name() {
-        assert_eq!(&normalize_name(" hello world   "), "hello world");
-        assert_eq!(&normalize_name("<"), "<");
-        assert_eq!(&normalize_name(">"), ">");
-        assert_eq!(&normalize_name("'"), "'");
-        assert_eq!(&normalize_name("\""), "\"");
-    }
-
-    #[test]
     fn test_normalize_addr() {
         assert_eq!(addr_normalize("mailto:john@doe.com"), "john@doe.com");
         assert_eq!(addr_normalize("  hello@world.com   "), "hello@world.com");
-
-        // normalisation preserves case to allow user-defined spelling.
-        // however, case is ignored on addr_cmp()
-        assert_ne!(addr_normalize("John@Doe.com"), "john@doe.com");
+        assert_eq!(addr_normalize("John@Doe.com"), "john@doe.com");
     }
 
     #[test]
@@ -1893,7 +1989,7 @@ mod tests {
         let (id, _modified) = Contact::add_or_lookup(
             &context.ctx,
             "bob",
-            ContactAddress::new("user@example.org")?,
+            &ContactAddress::new("user@example.org")?,
             Origin::IncomingReplyTo,
         )
         .await?;
@@ -1907,12 +2003,12 @@ mod tests {
         // Search by name.
         let contacts = Contact::get_all(&context.ctx, 0, Some("bob")).await?;
         assert_eq!(contacts.len(), 1);
-        assert_eq!(contacts.get(0), Some(&id));
+        assert_eq!(contacts.first(), Some(&id));
 
         // Search by address.
         let contacts = Contact::get_all(&context.ctx, 0, Some("user")).await?;
         assert_eq!(contacts.len(), 1);
-        assert_eq!(contacts.get(0), Some(&id));
+        assert_eq!(contacts.first(), Some(&id));
 
         let contacts = Contact::get_all(&context.ctx, 0, Some("alice")).await?;
         assert_eq!(contacts.len(), 0);
@@ -1921,7 +2017,7 @@ mod tests {
         let (contact_bob_id, modified) = Contact::add_or_lookup(
             &context.ctx,
             "someone",
-            ContactAddress::new("user@example.org")?,
+            &ContactAddress::new("user@example.org")?,
             Origin::ManuallyCreated,
         )
         .await?;
@@ -1939,7 +2035,7 @@ mod tests {
         // Search by display name (same as manually set name).
         let contacts = Contact::get_all(&context.ctx, 0, Some("someone")).await?;
         assert_eq!(contacts.len(), 1);
-        assert_eq!(contacts.get(0), Some(&id));
+        assert_eq!(contacts.first(), Some(&id));
 
         Ok(())
     }
@@ -1952,18 +2048,6 @@ mod tests {
         t.configure_addr("you@you.net").await;
         assert_eq!(t.is_self_addr("me@me.org").await?, false);
         assert_eq!(t.is_self_addr("you@you.net").await?, true);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_contact_address() -> Result<()> {
-        let alice_addr = "alice@example.org";
-        let contact_address = ContactAddress::new(alice_addr)?;
-        assert_eq!(contact_address.as_ref(), alice_addr);
-
-        let invalid_addr = "<> foobar";
-        assert!(ContactAddress::new(invalid_addr).is_err());
 
         Ok(())
     }
@@ -1986,7 +2070,7 @@ mod tests {
         let (contact_id, sth_modified) = Contact::add_or_lookup(
             &t,
             "bla foo",
-            ContactAddress::new("one@eins.org").unwrap(),
+            &ContactAddress::new("one@eins.org").unwrap(),
             Origin::IncomingUnknownTo,
         )
         .await
@@ -2005,7 +2089,7 @@ mod tests {
         let (contact_id_test, sth_modified) = Contact::add_or_lookup(
             &t,
             "Real one",
-            ContactAddress::new(" one@eins.org  ").unwrap(),
+            &ContactAddress::new(" one@eins.org  ").unwrap(),
             Origin::ManuallyCreated,
         )
         .await
@@ -2021,7 +2105,7 @@ mod tests {
         let (contact_id, sth_modified) = Contact::add_or_lookup(
             &t,
             "",
-            ContactAddress::new("three@drei.sam").unwrap(),
+            &ContactAddress::new("three@drei.sam").unwrap(),
             Origin::IncomingUnknownTo,
         )
         .await
@@ -2038,7 +2122,7 @@ mod tests {
         let (contact_id_test, sth_modified) = Contact::add_or_lookup(
             &t,
             "m. serious",
-            ContactAddress::new("three@drei.sam").unwrap(),
+            &ContactAddress::new("three@drei.sam").unwrap(),
             Origin::IncomingUnknownFrom,
         )
         .await
@@ -2053,7 +2137,7 @@ mod tests {
         let (contact_id_test, sth_modified) = Contact::add_or_lookup(
             &t,
             "schnucki",
-            ContactAddress::new("three@drei.sam").unwrap(),
+            &ContactAddress::new("three@drei.sam").unwrap(),
             Origin::ManuallyCreated,
         )
         .await
@@ -2069,7 +2153,7 @@ mod tests {
         let (contact_id, sth_modified) = Contact::add_or_lookup(
             &t,
             "",
-            ContactAddress::new("alice@w.de").unwrap(),
+            &ContactAddress::new("alice@w.de").unwrap(),
             Origin::IncomingUnknownTo,
         )
         .await
@@ -2211,7 +2295,7 @@ mod tests {
         let (contact_id, _) = Contact::add_or_lookup(
             &alice,
             "Bob",
-            ContactAddress::new("bob@example.net")?,
+            &ContactAddress::new("bob@example.net")?,
             Origin::ManuallyCreated,
         )
         .await?;
@@ -2290,7 +2374,7 @@ mod tests {
         let (contact_id, sth_modified) = Contact::add_or_lookup(
             &t,
             "bob1",
-            ContactAddress::new("bob@example.org").unwrap(),
+            &ContactAddress::new("bob@example.org").unwrap(),
             Origin::IncomingUnknownFrom,
         )
         .await
@@ -2306,7 +2390,7 @@ mod tests {
         let (contact_id, sth_modified) = Contact::add_or_lookup(
             &t,
             "bob2",
-            ContactAddress::new("bob@example.org").unwrap(),
+            &ContactAddress::new("bob@example.org").unwrap(),
             Origin::IncomingUnknownFrom,
         )
         .await
@@ -2332,7 +2416,7 @@ mod tests {
         let (contact_id, sth_modified) = Contact::add_or_lookup(
             &t,
             "bob4",
-            ContactAddress::new("bob@example.org").unwrap(),
+            &ContactAddress::new("bob@example.org").unwrap(),
             Origin::IncomingUnknownFrom,
         )
         .await
@@ -2361,7 +2445,7 @@ mod tests {
         let (contact_id_same, sth_modified) = Contact::add_or_lookup(
             &t,
             "claire1",
-            ContactAddress::new("claire@example.org").unwrap(),
+            &ContactAddress::new("claire@example.org").unwrap(),
             Origin::IncomingUnknownFrom,
         )
         .await
@@ -2377,7 +2461,7 @@ mod tests {
         let (contact_id_same, sth_modified) = Contact::add_or_lookup(
             &t,
             "claire2",
-            ContactAddress::new("claire@example.org").unwrap(),
+            &ContactAddress::new("claire@example.org").unwrap(),
             Origin::IncomingUnknownFrom,
         )
         .await
@@ -2402,7 +2486,7 @@ mod tests {
         let (contact_id, sth_modified) = Contact::add_or_lookup(
             &t,
             "Bob",
-            ContactAddress::new("bob@example.org")?,
+            &ContactAddress::new("bob@example.org")?,
             Origin::IncomingUnknownFrom,
         )
         .await?;
@@ -2414,7 +2498,7 @@ mod tests {
         let (contact_id_same, sth_modified) = Contact::add_or_lookup(
             &t,
             "Not Bob",
-            ContactAddress::new("bob@example.org")?,
+            &ContactAddress::new("bob@example.org")?,
             Origin::IncomingUnknownTo,
         )
         .await?;
@@ -2427,7 +2511,7 @@ mod tests {
         let (contact_id_same, sth_modified) = Contact::add_or_lookup(
             &t,
             "Bob",
-            ContactAddress::new("bob@example.org")?,
+            &ContactAddress::new("bob@example.org")?,
             Origin::IncomingUnknownFrom,
         )
         .await?;
@@ -2456,7 +2540,7 @@ mod tests {
         Contact::add_or_lookup(
             &t,
             "dave2",
-            ContactAddress::new("dave@example.org").unwrap(),
+            &ContactAddress::new("dave@example.org").unwrap(),
             Origin::IncomingUnknownFrom,
         )
         .await
@@ -2577,7 +2661,7 @@ mod tests {
         let (contact_bob_id, _modified) = Contact::add_or_lookup(
             &alice,
             "Bob",
-            ContactAddress::new("bob@example.net")?,
+            &ContactAddress::new("bob@example.net")?,
             Origin::ManuallyCreated,
         )
         .await?;
@@ -2740,7 +2824,7 @@ CCCB 5AA9 F6E1 141C 9431
         let (contact_id, _) = Contact::add_or_lookup(
             &alice,
             "Bob",
-            ContactAddress::new("bob@example.net")?,
+            &ContactAddress::new("bob@example.net")?,
             Origin::ManuallyCreated,
         )
         .await?;
@@ -2783,11 +2867,61 @@ Hi."#;
 
         bob.recv_msg(&sent_msg).await;
         let contact = Contact::get_by_id(&bob, *contacts.first().unwrap()).await?;
-        assert!(contact.was_seen_recently());
+
+        let green = ansi_term::Color::Green.normal();
+        assert!(
+            contact.was_seen_recently(),
+            "{}",
+            green.paint(
+                "\nNOTE: This test failure is probably a false-positive, caused by tests running in parallel.
+The issue is that `SystemTime::shift()` (a utility function for tests) changes the time for all threads doing tests, and not only for the running test.
+Until the false-positive is fixed:
+- Use `cargo test -- --test-threads 1` instead of `cargo test`
+- Or use `cargo nextest run` (install with `cargo install cargo-nextest --locked`)\n"
+            )
+        );
 
         let self_contact = Contact::get_by_id(&bob, ContactId::SELF).await?;
         assert!(!self_contact.was_seen_recently());
 
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_was_seen_recently_event() -> Result<()> {
+        let mut tcm = TestContextManager::new();
+        let alice = tcm.alice().await;
+        let bob = tcm.bob().await;
+        let recently_seen_loop = RecentlySeenLoop::new(bob.ctx.clone());
+        let chat = bob.create_chat(&alice).await;
+        let contacts = chat::get_chat_contacts(&bob, chat.id).await?;
+
+        for _ in 0..2 {
+            let chat = alice.create_chat(&bob).await;
+            let sent_msg = alice.send_text(chat.id, "moin").await;
+            let contact = Contact::get_by_id(&bob, *contacts.first().unwrap()).await?;
+            assert!(!contact.was_seen_recently());
+            bob.evtracker.clear_events();
+            bob.recv_msg(&sent_msg).await;
+            let contact = Contact::get_by_id(&bob, *contacts.first().unwrap()).await?;
+            assert!(contact.was_seen_recently());
+            bob.evtracker
+                .get_matching(|evt| matches!(evt, EventType::ContactsChanged { .. }))
+                .await;
+            recently_seen_loop
+                .interrupt(contact.id, contact.last_seen)
+                .await;
+
+            // Wait for `was_seen_recently()` to turn off.
+            bob.evtracker.clear_events();
+            SystemTime::shift(Duration::from_secs(SEEN_RECENTLY_SECONDS as u64 * 2));
+            recently_seen_loop.interrupt(ContactId::UNDEFINED, 0).await;
+            let contact = Contact::get_by_id(&bob, *contacts.first().unwrap()).await?;
+            assert!(!contact.was_seen_recently());
+            bob.evtracker
+                .get_matching(|evt| matches!(evt, EventType::ContactsChanged { .. }))
+                .await;
+        }
         Ok(())
     }
 
@@ -2808,6 +2942,188 @@ Hi."#;
 
         let contact = Contact::get_by_id(&alice, contact_id).await?;
         assert!(contact.get_verifier_id(&alice).await?.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_sync_create() -> Result<()> {
+        let alice0 = &TestContext::new_alice().await;
+        let alice1 = &TestContext::new_alice().await;
+        for a in [alice0, alice1] {
+            a.set_config_bool(Config::SyncMsgs, true).await?;
+        }
+
+        Contact::create(alice0, "Bob", "bob@example.net").await?;
+        test_utils::sync(alice0, alice1).await;
+        let a1b_contact_id =
+            Contact::lookup_id_by_addr(alice1, "bob@example.net", Origin::ManuallyCreated)
+                .await?
+                .unwrap();
+        let a1b_contact = Contact::get_by_id(alice1, a1b_contact_id).await?;
+        assert_eq!(a1b_contact.name, "Bob");
+
+        Contact::create(alice0, "Bob Renamed", "bob@example.net").await?;
+        test_utils::sync(alice0, alice1).await;
+        let id = Contact::lookup_id_by_addr(alice1, "bob@example.net", Origin::ManuallyCreated)
+            .await?
+            .unwrap();
+        assert_eq!(id, a1b_contact_id);
+        let a1b_contact = Contact::get_by_id(alice1, a1b_contact_id).await?;
+        assert_eq!(a1b_contact.name, "Bob Renamed");
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_make_n_import_vcard() -> Result<()> {
+        let alice = &TestContext::new_alice().await;
+        let bob = &TestContext::new_bob().await;
+        bob.set_config(Config::Displayname, Some("Bob")).await?;
+        let avatar_path = bob.dir.path().join("avatar.png");
+        let avatar_bytes = include_bytes!("../test-data/image/avatar64x64.png");
+        let avatar_base64 = base64::engine::general_purpose::STANDARD.encode(avatar_bytes);
+        tokio::fs::write(&avatar_path, avatar_bytes).await?;
+        bob.set_config(Config::Selfavatar, Some(avatar_path.to_str().unwrap()))
+            .await?;
+        let bob_addr = bob.get_config(Config::Addr).await?.unwrap();
+        let chat = bob.create_chat(alice).await;
+        let sent_msg = bob.send_text(chat.id, "moin").await;
+        alice.recv_msg(&sent_msg).await;
+        let bob_id = Contact::create(alice, "Some Bob", &bob_addr).await?;
+        let key_base64 = Peerstate::from_addr(alice, &bob_addr)
+            .await?
+            .unwrap()
+            .peek_key(false)
+            .unwrap()
+            .to_base64();
+        let fiona_id = Contact::create(alice, "Fiona", "fiona@example.net").await?;
+
+        assert_eq!(make_vcard(alice, &[]).await?, "".to_string());
+
+        let t0 = time();
+        let vcard = make_vcard(alice, &[bob_id, fiona_id]).await?;
+        let t1 = time();
+        // Just test that it's parsed as expected, `deltachat_contact_tools` crate has tests on the
+        // exact format.
+        let contacts = contact_tools::parse_vcard(&vcard);
+        assert_eq!(contacts.len(), 2);
+        assert_eq!(contacts[0].addr, bob_addr);
+        assert_eq!(contacts[0].authname, "Bob".to_string());
+        assert_eq!(*contacts[0].key.as_ref().unwrap(), key_base64);
+        assert_eq!(*contacts[0].profile_image.as_ref().unwrap(), avatar_base64);
+        let timestamp = *contacts[0].timestamp.as_ref().unwrap();
+        assert!(t0 <= timestamp && timestamp <= t1);
+        assert_eq!(contacts[1].addr, "fiona@example.net".to_string());
+        assert_eq!(contacts[1].authname, "".to_string());
+        assert_eq!(contacts[1].key, None);
+        assert_eq!(contacts[1].profile_image, None);
+        let timestamp = *contacts[1].timestamp.as_ref().unwrap();
+        assert!(t0 <= timestamp && timestamp <= t1);
+
+        let alice = &TestContext::new_alice().await;
+        alice.evtracker.clear_events();
+        let contact_ids = import_vcard(alice, &vcard).await?;
+        assert_eq!(contact_ids.len(), 2);
+        for _ in 0..contact_ids.len() {
+            alice
+                .evtracker
+                .get_matching(|evt| matches!(evt, EventType::ContactsChanged(Some(_))))
+                .await;
+        }
+
+        let vcard = make_vcard(alice, &[contact_ids[0], contact_ids[1]]).await?;
+        // This should be the same vCard except timestamps, check that roughly.
+        let contacts = contact_tools::parse_vcard(&vcard);
+        assert_eq!(contacts.len(), 2);
+        assert_eq!(contacts[0].addr, bob_addr);
+        assert_eq!(contacts[0].authname, "Bob".to_string());
+        assert_eq!(*contacts[0].key.as_ref().unwrap(), key_base64);
+        assert_eq!(*contacts[0].profile_image.as_ref().unwrap(), avatar_base64);
+        assert!(contacts[0].timestamp.is_ok());
+        assert_eq!(contacts[1].addr, "fiona@example.net".to_string());
+
+        let chat_id = ChatId::create_for_contact(alice, contact_ids[0]).await?;
+        let sent_msg = alice.send_text(chat_id, "moin").await;
+        let msg = bob.recv_msg(&sent_msg).await;
+        assert!(msg.get_showpadlock());
+
+        // Bob only actually imports Fiona, though `ContactId::SELF` is also returned.
+        bob.evtracker.clear_events();
+        let contact_ids = import_vcard(bob, &vcard).await?;
+        bob.emit_event(EventType::Test);
+        assert_eq!(contact_ids.len(), 2);
+        assert_eq!(contact_ids[0], ContactId::SELF);
+        let ev = bob
+            .evtracker
+            .get_matching(|evt| matches!(evt, EventType::ContactsChanged { .. }))
+            .await;
+        assert_eq!(ev, EventType::ContactsChanged(Some(contact_ids[1])));
+        let ev = bob
+            .evtracker
+            .get_matching(|evt| matches!(evt, EventType::ContactsChanged { .. } | EventType::Test))
+            .await;
+        assert_eq!(ev, EventType::Test);
+        let vcard = make_vcard(bob, &[contact_ids[1]]).await?;
+        let contacts = contact_tools::parse_vcard(&vcard);
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].addr, "fiona@example.net");
+        assert_eq!(contacts[0].authname, "".to_string());
+        assert_eq!(contacts[0].key, None);
+        assert_eq!(contacts[0].profile_image, None);
+        assert!(contacts[0].timestamp.is_ok());
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_import_vcard_updates_only_key() -> Result<()> {
+        let alice = &TestContext::new_alice().await;
+        let bob = &TestContext::new_bob().await;
+        let bob_addr = &bob.get_config(Config::Addr).await?.unwrap();
+        bob.set_config(Config::Displayname, Some("Bob")).await?;
+        let vcard = make_vcard(bob, &[ContactId::SELF]).await?;
+        alice.evtracker.clear_events();
+        let alice_bob_id = import_vcard(alice, &vcard).await?[0];
+        let ev = alice
+            .evtracker
+            .get_matching(|evt| matches!(evt, EventType::ContactsChanged { .. }))
+            .await;
+        assert_eq!(ev, EventType::ContactsChanged(Some(alice_bob_id)));
+        let chat_id = ChatId::create_for_contact(alice, alice_bob_id).await?;
+        let sent_msg = alice.send_text(chat_id, "moin").await;
+        let msg = bob.recv_msg(&sent_msg).await;
+        assert!(msg.get_showpadlock());
+
+        let bob = &TestContext::new().await;
+        bob.configure_addr(bob_addr).await;
+        bob.set_config(Config::Displayname, Some("Not Bob")).await?;
+        let avatar_path = bob.dir.path().join("avatar.png");
+        let avatar_bytes = include_bytes!("../test-data/image/avatar64x64.png");
+        tokio::fs::write(&avatar_path, avatar_bytes).await?;
+        bob.set_config(Config::Selfavatar, Some(avatar_path.to_str().unwrap()))
+            .await?;
+        SystemTime::shift(Duration::from_secs(1));
+        let vcard1 = make_vcard(bob, &[ContactId::SELF]).await?;
+        assert_eq!(import_vcard(alice, &vcard1).await?, vec![alice_bob_id]);
+        let alice_bob_contact = Contact::get_by_id(alice, alice_bob_id).await?;
+        assert_eq!(alice_bob_contact.get_authname(), "Bob");
+        assert_eq!(alice_bob_contact.get_profile_image(alice).await?, None);
+        let msg = alice.get_last_msg_in(chat_id).await;
+        assert!(msg.is_info());
+        assert_eq!(
+            msg.get_text(),
+            stock_str::contact_setup_changed(alice, bob_addr).await
+        );
+        let sent_msg = alice.send_text(chat_id, "moin").await;
+        let msg = bob.recv_msg(&sent_msg).await;
+        assert!(msg.get_showpadlock());
+
+        // The old vCard is imported, but doesn't change Bob's key for Alice.
+        import_vcard(alice, &vcard).await?.first().unwrap();
+        let sent_msg = alice.send_text(chat_id, "moin").await;
+        let msg = bob.recv_msg(&sent_msg).await;
+        assert!(msg.get_showpadlock());
 
         Ok(())
     }

@@ -4,16 +4,27 @@
 #![allow(missing_docs)]
 
 use std::borrow::Cow;
-use std::fmt;
 use std::io::{Cursor, Write};
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::str::from_utf8;
-use std::time::{Duration, SystemTime};
+// If a time value doesn't need to be sent to another host, saved to the db or otherwise used across
+// program restarts, a monotonically nondecreasing clock (`Instant`) should be used. But as
+// `Instant` may use `libc::clock_gettime(CLOCK_MONOTONIC)`, e.g. on Android, and does not advance
+// while being in deep sleep mode, we use `SystemTime` instead, but add an alias for it to document
+// why `Instant` isn't used in those places. Also this can help to switch to another clock impl if
+// we find any.
+use std::time::Duration;
+pub use std::time::SystemTime as Time;
+#[cfg(not(test))]
+pub use std::time::SystemTime;
 
 use anyhow::{bail, Context as _, Result};
 use base64::Engine as _;
 use chrono::{Local, NaiveDateTime, NaiveTime, TimeZone};
+use deltachat_contact_tools::EmailAddress;
+#[cfg(test)]
+pub use deltachat_time::SystemTimeTools as SystemTime;
 use futures::{StreamExt, TryStreamExt};
 use mailparse::dateparse;
 use mailparse::headers::Headers;
@@ -170,6 +181,7 @@ pub fn get_release_timestamp() -> i64 {
         *crate::release::DATE,
         NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
     )
+    .and_utc()
     .timestamp_millis()
         / 1_000
 }
@@ -194,7 +206,7 @@ async fn maybe_warn_on_bad_time(context: &Context, now: i64, known_past_timestam
             ),
         )
         .await;
-        if let Some(timestamp) = chrono::NaiveDateTime::from_timestamp_opt(now, 0) {
+        if let Some(timestamp) = chrono::DateTime::<chrono::Utc>::from_timestamp(now, 0) {
             add_device_msg_with_importance(
                 context,
                 Some(
@@ -221,7 +233,7 @@ async fn maybe_warn_on_outdated(context: &Context, now: i64, approx_compile_time
     if now > approx_compile_time + DC_OUTDATED_WARNING_DAYS * 24 * 60 * 60 {
         let mut msg = Message::new(Viewtype::Text);
         msg.text = stock_str::update_reminder_msg_body(context).await;
-        if let Some(timestamp) = chrono::NaiveDateTime::from_timestamp_opt(now, 0) {
+        if let Some(timestamp) = chrono::DateTime::<chrono::Utc>::from_timestamp(now, 0) {
             add_device_msg(
                 context,
                 Some(
@@ -266,44 +278,20 @@ pub(crate) fn create_id() -> String {
         .collect()
 }
 
+/// Returns true if given string is a valid ID.
+///
+/// All IDs generated with `create_id()` should be considered valid.
+pub(crate) fn validate_id(s: &str) -> bool {
+    let alphabet = base64::alphabet::URL_SAFE.as_str();
+    s.chars().all(|c| alphabet.contains(c)) && s.len() > 10 && s.len() <= 32
+}
+
 /// Function generates a Message-ID that can be used for a new outgoing message.
 /// - this function is called for all outgoing messages.
 /// - the message ID should be globally unique
 /// - do not add a counter or any private data as this leaks information unnecessarily
-pub(crate) fn create_outgoing_rfc724_mid(grpid: Option<&str>, from_addr: &str) -> String {
-    let hostname = from_addr
-        .find('@')
-        .and_then(|k| from_addr.get(k..))
-        .unwrap_or("@nohost");
-    match grpid {
-        Some(grpid) => format!("Gr.{}.{}{}", grpid, create_id(), hostname),
-        None => format!("Mr.{}.{}{}", create_id(), create_id(), hostname),
-    }
-}
-
-/// Extract the group id (grpid) from a message id (mid)
-///
-/// # Arguments
-///
-/// * `mid` - A string that holds the message id.  Leading/Trailing <>
-/// characters are automatically stripped.
-pub(crate) fn extract_grpid_from_rfc724_mid(mid: &str) -> Option<&str> {
-    let mid = mid.trim_start_matches('<').trim_end_matches('>');
-
-    if mid.len() < 9 || !mid.starts_with("Gr.") {
-        return None;
-    }
-
-    if let Some(mid_without_offset) = mid.get(3..) {
-        if let Some(grpid_len) = mid_without_offset.find('.') {
-            /* strict length comparison, the 'Gr.' magic is weak enough */
-            if grpid_len == 11 || grpid_len == 16 {
-                return Some(mid_without_offset.get(0..grpid_len).unwrap());
-            }
-        }
-    }
-
-    None
+pub(crate) fn create_outgoing_rfc724_mid() -> String {
+    format!("Mr.{}.{}@localhost", create_id(), create_id())
 }
 
 // the returned suffix is lower-case
@@ -482,6 +470,10 @@ pub(crate) fn time() -> i64 {
         .as_secs() as i64
 }
 
+pub(crate) fn time_elapsed(time: &Time) -> Duration {
+    time.elapsed().unwrap_or_default()
+}
+
 /// Struct containing all mailto information
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct MailTo {
@@ -517,87 +509,6 @@ pub fn parse_mailto(mailto_url: &str) -> Option<MailTo> {
     } else {
         None
     }
-}
-
-///
-/// Represents an email address, right now just the `name@domain` portion.
-///
-/// # Example
-///
-/// ```
-/// use deltachat::tools::EmailAddress;
-/// let email = match EmailAddress::new("someone@example.com") {
-///     Ok(addr) => addr,
-///     Err(e) => panic!("Error parsing address, error was {}", e),
-/// };
-/// assert_eq!(&email.local, "someone");
-/// assert_eq!(&email.domain, "example.com");
-/// assert_eq!(email.to_string(), "someone@example.com");
-/// ```
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub struct EmailAddress {
-    /// Local part of the email address.
-    pub local: String,
-
-    /// Email address domain.
-    pub domain: String,
-}
-
-impl fmt::Display for EmailAddress {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}@{}", self.local, self.domain)
-    }
-}
-
-impl EmailAddress {
-    /// Performs a dead-simple parse of an email address.
-    pub fn new(input: &str) -> Result<EmailAddress> {
-        if input.is_empty() {
-            bail!("empty string is not valid");
-        }
-        let parts: Vec<&str> = input.rsplitn(2, '@').collect();
-
-        if input
-            .chars()
-            .any(|c| c.is_whitespace() || c == '<' || c == '>')
-        {
-            bail!("Email {:?} must not contain whitespaces, '>' or '<'", input);
-        }
-
-        match &parts[..] {
-            [domain, local] => {
-                if local.is_empty() {
-                    bail!("empty string is not valid for local part in {:?}", input);
-                }
-                if domain.is_empty() {
-                    bail!("missing domain after '@' in {:?}", input);
-                }
-                if domain.ends_with('.') {
-                    bail!("Domain {domain:?} should not contain the dot in the end");
-                }
-                Ok(EmailAddress {
-                    local: (*local).to_string(),
-                    domain: (*domain).to_string(),
-                })
-            }
-            _ => bail!("Email {:?} must contain '@' character", input),
-        }
-    }
-}
-
-impl rusqlite::types::ToSql for EmailAddress {
-    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput> {
-        let val = rusqlite::types::Value::Text(self.to_string());
-        let out = rusqlite::types::ToSqlOutput::Owned(val);
-        Ok(out)
-    }
-}
-
-/// Sanitizes user input
-/// - strip newlines
-/// - strip malicious bidi characters
-pub(crate) fn improve_single_line_input(input: &str) -> String {
-    strip_rtlo_characters(input.replace(['\n', '\r'], " ").trim())
 }
 
 pub(crate) trait IsNoneOrEmpty<T> {
@@ -736,18 +647,16 @@ pub(crate) fn buf_decompress(buf: &[u8]) -> Result<Vec<u8>> {
     Ok(mem::take(decompressor.get_mut()))
 }
 
-const RTLO_CHARACTERS: [char; 5] = ['\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}'];
-/// This method strips all occurrences of the RTLO Unicode character.
-/// [Why is this needed](https://github.com/deltachat/deltachat-core-rust/issues/3479)?
-pub(crate) fn strip_rtlo_characters(input_str: &str) -> String {
-    input_str.replace(|char| RTLO_CHARACTERS.contains(&char), "")
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::indexing_slicing)]
 
+    use chrono::NaiveDate;
+    use proptest::prelude::*;
+
     use super::*;
+    use crate::chatlist::Chatlist;
+    use crate::{chat, test_utils};
     use crate::{receive_imf::receive_imf, test_utils::TestContext};
 
     #[test]
@@ -794,7 +703,7 @@ Message-ID: 2dfdbde7@example.org
 Hop: From: localhost; By: hq5.merlinux.eu; Date: Sat, 14 Sep 2019 17:00:22 +0000
 Hop: From: hq5.merlinux.eu; By: hq5.merlinux.eu; Date: Sat, 14 Sep 2019 17:00:25 +0000
 
-DKIM Results: Passed=true, Works=true, Allow_Keychange=true";
+DKIM Results: Passed=true";
         check_parse_receive_headers_integration(raw, expected).await;
 
         let raw = include_bytes!("../test-data/message/encrypted_with_received_headers.eml");
@@ -813,7 +722,7 @@ Hop: From: [127.0.0.1]; By: mail.example.org; Date: Mon, 27 Dec 2021 11:21:21 +0
 Hop: From: mout.example.org; By: hq5.example.org; Date: Mon, 27 Dec 2021 11:21:22 +0000
 Hop: From: hq5.example.org; By: hq5.example.org; Date: Mon, 27 Dec 2021 11:21:22 +0000
 
-DKIM Results: Passed=true, Works=true, Allow_Keychange=true";
+DKIM Results: Passed=true";
         check_parse_receive_headers_integration(raw, expected).await;
     }
 
@@ -955,6 +864,27 @@ DKIM Results: Passed=true, Works=true, Allow_Keychange=true";
     }
 
     #[test]
+    fn test_validate_id() {
+        for _ in 0..10 {
+            assert!(validate_id(&create_id()));
+        }
+
+        assert_eq!(validate_id("aaaaaaaaaaaa"), true);
+        assert_eq!(validate_id("aa-aa_aaaXaa"), true);
+
+        // ID cannot contain whitespace.
+        assert_eq!(validate_id("aaaaa aaaaaa"), false);
+        assert_eq!(validate_id("aaaaa\naaaaaa"), false);
+
+        // ID cannot contain "/", "+".
+        assert_eq!(validate_id("aaaaa/aaaaaa"), false);
+        assert_eq!(validate_id("aaaaaaaa+aaa"), false);
+
+        // Too long ID.
+        assert_eq!(validate_id("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), false);
+    }
+
+    #[test]
     fn test_create_id_invalid_chars() {
         for _ in 1..1000 {
             let buf = create_id();
@@ -964,96 +894,11 @@ DKIM Results: Passed=true, Works=true, Allow_Keychange=true";
     }
 
     #[test]
-    fn test_extract_grpid_from_rfc724_mid() {
-        // Should return None if we pass invalid mid
-        let mid = "foobar";
-        let grpid = extract_grpid_from_rfc724_mid(mid);
-        assert_eq!(grpid, None);
-
-        // Should return None if grpid has a length which is not 11 or 16
-        let mid = "Gr.12345678.morerandom@domain.de";
-        let grpid = extract_grpid_from_rfc724_mid(mid);
-        assert_eq!(grpid, None);
-
-        // Should return extracted grpid for grpid with length of 11
-        let mid = "Gr.12345678901.morerandom@domain.de";
-        let grpid = extract_grpid_from_rfc724_mid(mid);
-        assert_eq!(grpid, Some("12345678901"));
-
-        // Should return extracted grpid for grpid with length of 11
-        let mid = "Gr.1234567890123456.morerandom@domain.de";
-        let grpid = extract_grpid_from_rfc724_mid(mid);
-        assert_eq!(grpid, Some("1234567890123456"));
-
-        // Should return extracted grpid for grpid with length of 11
-        let mid = "<Gr.12345678901.morerandom@domain.de>";
-        let grpid = extract_grpid_from_rfc724_mid(mid);
-        assert_eq!(grpid, Some("12345678901"));
-
-        // Should return extracted grpid for grpid with length of 11
-        let mid = "<Gr.1234567890123456.morerandom@domain.de>";
-        let grpid = extract_grpid_from_rfc724_mid(mid);
-        assert_eq!(grpid, Some("1234567890123456"));
-    }
-
-    #[test]
     fn test_create_outgoing_rfc724_mid() {
-        // create a normal message-id
-        let mid = create_outgoing_rfc724_mid(None, "foo@bar.de");
+        let mid = create_outgoing_rfc724_mid();
         assert!(mid.starts_with("Mr."));
-        assert!(mid.ends_with("bar.de"));
-        assert!(extract_grpid_from_rfc724_mid(mid.as_str()).is_none());
-
-        // create a message-id containing a group-id
-        let grpid = create_id();
-        let mid = create_outgoing_rfc724_mid(Some(&grpid), "foo@bar.de");
-        assert!(mid.starts_with("Gr."));
-        assert!(mid.ends_with("bar.de"));
-        assert_eq!(
-            extract_grpid_from_rfc724_mid(mid.as_str()),
-            Some(grpid.as_str())
-        );
+        assert!(mid.ends_with("@localhost"));
     }
-
-    #[test]
-    fn test_emailaddress_parse() {
-        assert_eq!(EmailAddress::new("").is_ok(), false);
-        assert_eq!(
-            EmailAddress::new("user@domain.tld").unwrap(),
-            EmailAddress {
-                local: "user".into(),
-                domain: "domain.tld".into(),
-            }
-        );
-        assert_eq!(
-            EmailAddress::new("user@localhost").unwrap(),
-            EmailAddress {
-                local: "user".into(),
-                domain: "localhost".into()
-            }
-        );
-        assert_eq!(EmailAddress::new("uuu").is_ok(), false);
-        assert_eq!(EmailAddress::new("dd.tt").is_ok(), false);
-        assert!(EmailAddress::new("tt.dd@uu").is_ok());
-        assert!(EmailAddress::new("u@d").is_ok());
-        assert!(EmailAddress::new("u@d.").is_err());
-        assert!(EmailAddress::new("u@d.t").is_ok());
-        assert_eq!(
-            EmailAddress::new("u@d.tt").unwrap(),
-            EmailAddress {
-                local: "u".into(),
-                domain: "d.tt".into(),
-            }
-        );
-        assert!(EmailAddress::new("u@tt").is_ok());
-        assert_eq!(EmailAddress::new("@d.tt").is_ok(), false);
-    }
-
-    use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
-    use proptest::prelude::*;
-
-    use crate::chatlist::Chatlist;
-    use crate::{chat, test_utils};
 
     proptest! {
         #[test]
@@ -1173,12 +1018,6 @@ DKIM Results: Passed=true, Works=true, Allow_Keychange=true";
         assert_eq!(h, 50);
     }
 
-    #[test]
-    fn test_improve_single_line_input() {
-        assert_eq!(improve_single_line_input("Hi\naiae "), "Hi aiae");
-        assert_eq!(improve_single_line_input("\r\nahte\n\r"), "ahte");
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_maybe_warn_on_bad_time() {
         let t = TestContext::new().await;
@@ -1188,6 +1027,7 @@ DKIM Results: Passed=true, Works=true, Allow_Keychange=true";
             NaiveDate::from_ymd_opt(2020, 9, 1).unwrap(),
             NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
         )
+        .and_utc()
         .timestamp_millis()
             / 1_000;
 
@@ -1303,6 +1143,7 @@ DKIM Results: Passed=true, Works=true, Allow_Keychange=true";
             NaiveDate::from_ymd_opt(2020, 9, 9).unwrap(),
             NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
         )
+        .and_utc()
         .timestamp_millis()
             / 1_000;
         assert!(get_release_timestamp() <= time());
