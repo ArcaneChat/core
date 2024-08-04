@@ -1,6 +1,6 @@
 [package]
 name = "deltachat_ffi"
-version = "1.141.1"
+version = "1.142.3"
 description = "Deltachat FFI"
 edition = "2018"
 readme = "README.md"
@@ -14,8 +14,8 @@ name = "deltachat"
 crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
-deltachat = { path = "../", default-features = false }
-deltachat-jsonrpc = { path = "../deltachat-jsonrpc", optional = true }
+deltachat = { workspace = true, default-features = false }
+deltachat-jsonrpc = { workspace = true, optional = true }
 libc = { workspace = true }
 human-panic = { version = "2", default-features = false }
 num-traits = { workspace = true }
@@ -29,6 +29,6 @@ yerpc = { workspace = true, features = ["anyhow_expose"] }
 
 [features]
 default = ["vendored"]
-vendored = ["deltachat/vendored"]
+vendored = ["deltachat/vendored", "deltachat-jsonrpc/vendored"]
 jsonrpc = ["dep:deltachat-jsonrpc"]
 

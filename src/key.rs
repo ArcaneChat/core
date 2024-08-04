@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Cursor;
 
-use anyhow::{ensure, Context as _, Result};
+use anyhow::{bail, ensure, Context as _, Result};
 use base64::Engine as _;
 use deltachat_contact_tools::EmailAddress;
 use num_traits::FromPrimitive;
@@ -46,7 +46,26 @@ pub(crate) trait DcKey: Serialize + Deserializable + KeyTrait + Clone {
     /// the ASCII-armored representation.
     fn from_asc(data: &str) -> Result<(Self, BTreeMap<String, String>)> {
         let bytes = data.as_bytes();
-        Self::from_armor_single(Cursor::new(bytes)).context("rPGP error")
+        let res = Self::from_armor_single(Cursor::new(bytes));
+        let (key, headers) = match res {
+            Err(pgp::errors::Error::NoMatchingPacket) => match Self::is_private() {
+                true => bail!("No private key packet found"),
+                false => bail!("No public key packet found"),
+            },
+            _ => res.context("rPGP error")?,
+        };
+        let headers = headers
+            .into_iter()
+            .map(|(key, values)| {
+                (
+                    key.trim().to_lowercase(),
+                    values
+                        .last()
+                        .map_or_else(String::new, |s| s.trim().to_string()),
+                )
+            })
+            .collect();
+        Ok((key, headers))
     }
 
     /// Serialise the key as bytes.
@@ -77,6 +96,8 @@ pub(crate) trait DcKey: Serialize + Deserializable + KeyTrait + Clone {
     fn fingerprint(&self) -> Fingerprint {
         Fingerprint::new(KeyTrait::fingerprint(self))
     }
+
+    fn is_private() -> bool;
 }
 
 pub(crate) async fn load_self_public_key(context: &Context) -> Result<SignedPublicKey> {
@@ -168,15 +189,16 @@ impl DcKey for SignedPublicKey {
         // safe to ignore this error.
         // Because we write to a Vec<u8> the io::Write impls never
         // fail and we can hide this error.
-        let headers = header.map(|(key, value)| {
-            let mut m = BTreeMap::new();
-            m.insert(key.to_string(), value.to_string());
-            m
-        });
+        let headers =
+            header.map(|(key, value)| BTreeMap::from([(key.to_string(), vec![value.to_string()])]));
         let mut buf = Vec::new();
-        self.to_armored_writer(&mut buf, headers.as_ref())
+        self.to_armored_writer(&mut buf, headers.as_ref().into())
             .unwrap_or_default();
         std::string::String::from_utf8(buf).unwrap_or_default()
+    }
+
+    fn is_private() -> bool {
+        false
     }
 }
 
@@ -186,15 +208,16 @@ impl DcKey for SignedSecretKey {
         // safe to do these unwraps.
         // Because we write to a Vec<u8> the io::Write impls never
         // fail and we can hide this error.  The string is always ASCII.
-        let headers = header.map(|(key, value)| {
-            let mut m = BTreeMap::new();
-            m.insert(key.to_string(), value.to_string());
-            m
-        });
+        let headers =
+            header.map(|(key, value)| BTreeMap::from([(key.to_string(), vec![value.to_string()])]));
         let mut buf = Vec::new();
-        self.to_armored_writer(&mut buf, headers.as_ref())
+        self.to_armored_writer(&mut buf, headers.as_ref().into())
             .unwrap_or_default();
         std::string::String::from_utf8(buf).unwrap_or_default()
+    }
+
+    fn is_private() -> bool {
+        true
     }
 }
 

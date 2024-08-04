@@ -25,6 +25,7 @@
 
 use anyhow::{anyhow, Context as _, Result};
 use email::Header;
+use futures_lite::StreamExt;
 use iroh_gossip::net::{Gossip, JoinTopicFut, GOSSIP_ALPN};
 use iroh_gossip::proto::{Event as IrohEvent, TopicId};
 use iroh_net::key::{PublicKey, SecretKey};
@@ -83,7 +84,9 @@ impl Iroh {
         ctx: &Context,
         msg_id: MsgId,
     ) -> Result<Option<JoinTopicFut>> {
-        let topic = get_iroh_topic_for_msg(ctx, msg_id).await?;
+        let topic = get_iroh_topic_for_msg(ctx, msg_id)
+            .await?
+            .with_context(|| format!("Message {msg_id} has no gossip topic"))?;
 
         // Take exclusive lock to make sure
         // no other thread can create a second gossip subscription
@@ -101,21 +104,22 @@ impl Iroh {
         };
 
         let peers = get_iroh_gossip_peers(ctx, msg_id).await?;
+        let node_ids = peers.iter().map(|p| p.node_id).collect::<Vec<_>>();
+
         info!(
             ctx,
-            "IROH_REALTIME: Joining gossip with peers: {:?}",
-            peers.iter().map(|p| p.node_id).collect::<Vec<_>>()
+            "IROH_REALTIME: Joining gossip with peers: {:?}", node_ids,
         );
 
-        // Connect to all peers
-        for peer in &peers {
-            self.endpoint.add_node_addr(peer.clone())?;
+        // Inform iroh of potentially new node addresses
+        for node_addr in &peers {
+            if !node_addr.info.is_empty() {
+                self.endpoint.add_node_addr(node_addr.clone())?;
+            }
         }
 
-        let connect_future = self
-            .gossip
-            .join(topic, peers.into_iter().map(|addr| addr.node_id).collect())
-            .await?;
+        // Connect to all peers
+        let connect_future = self.gossip.join(topic, node_ids).await?;
 
         let ctx = ctx.clone();
         let gossip = self.gossip.clone();
@@ -152,7 +156,9 @@ impl Iroh {
         msg_id: MsgId,
         mut data: Vec<u8>,
     ) -> Result<()> {
-        let topic = get_iroh_topic_for_msg(ctx, msg_id).await?;
+        let topic = get_iroh_topic_for_msg(ctx, msg_id)
+            .await?
+            .with_context(|| format!("Message {msg_id} has no gossip topic"))?;
         self.join_and_subscribe_gossip(ctx, msg_id).await?;
 
         let seq_num = self.get_and_incr(&topic).await;
@@ -179,7 +185,7 @@ impl Iroh {
 
     /// Get the iroh [NodeAddr] without direct IP addresses.
     pub(crate) async fn get_node_addr(&self) -> Result<NodeAddr> {
-        let mut addr = self.endpoint.my_addr().await?;
+        let mut addr = self.endpoint.node_addr().await?;
         addr.info.direct_addresses = BTreeSet::new();
         Ok(addr)
     }
@@ -215,7 +221,7 @@ impl ChannelState {
 }
 
 impl Context {
-    /// Create magic endpoint and gossip.
+    /// Create iroh endpoint and gossip.
     async fn init_peer_channels(&self) -> Result<Iroh> {
         let secret_key = SecretKey::generate();
         let public_key = secret_key.public();
@@ -242,7 +248,7 @@ impl Context {
             .await?;
 
         // create gossip
-        let my_addr = endpoint.my_addr().await?;
+        let my_addr = endpoint.node_addr().await?;
         let gossip = Gossip::from_endpoint(endpoint.clone(), Default::default(), &my_addr.info);
 
         // spawn endpoint loop that forwards incoming connections to the gossiper
@@ -250,6 +256,7 @@ impl Context {
 
         // Shuts down on deltachat shutdown
         tokio::spawn(endpoint_loop(context, endpoint.clone(), gossip.clone()));
+        tokio::spawn(gossip_direct_address_loop(endpoint.clone(), gossip.clone()));
 
         Ok(Iroh {
             endpoint,
@@ -266,6 +273,15 @@ impl Context {
             .get_or_try_init(|| async { ctx.init_peer_channels().await })
             .await
     }
+}
+
+/// Loop to update direct addresses of the gossip.
+async fn gossip_direct_address_loop(endpoint: Endpoint, gossip: Gossip) -> Result<()> {
+    let mut stream = endpoint.direct_addresses();
+    while let Some(addrs) = stream.next().await {
+        gossip.update_direct_addresses(&addrs)?;
+    }
+    Ok(())
 }
 
 /// Cache a peers [NodeId] for one topic.
@@ -325,16 +341,28 @@ async fn get_iroh_gossip_peers(ctx: &Context, msg_id: MsgId) -> Result<Vec<NodeA
 }
 
 /// Get the topic for a given [MsgId].
-pub(crate) async fn get_iroh_topic_for_msg(ctx: &Context, msg_id: MsgId) -> Result<TopicId> {
-    let bytes: Vec<u8> = ctx
+pub(crate) async fn get_iroh_topic_for_msg(
+    ctx: &Context,
+    msg_id: MsgId,
+) -> Result<Option<TopicId>> {
+    if let Some(bytes) = ctx
         .sql
-        .query_get_value(
+        .query_get_value::<Vec<u8>>(
             "SELECT topic FROM iroh_gossip_peers WHERE msg_id = ? LIMIT 1",
             (msg_id,),
         )
-        .await?
-        .context("couldn't restore topic from db")?;
-    Ok(TopicId::from_bytes(bytes.try_into().unwrap()))
+        .await
+        .context("Couldn't restore topic from db")?
+    {
+        let topic_id = TopicId::from_bytes(
+            bytes
+                .try_into()
+                .map_err(|_| anyhow!("Could not convert stored topic ID"))?,
+        );
+        Ok(Some(topic_id))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Send a gossip advertisement to the chat that [MsgId] belongs to.
@@ -376,10 +404,11 @@ pub async fn leave_webxdc_realtime(ctx: &Context, msg_id: MsgId) -> Result<()> {
     if !ctx.get_config_bool(Config::WebxdcRealtimeEnabled).await? {
         return Ok(());
     }
-
+    let topic = get_iroh_topic_for_msg(ctx, msg_id)
+        .await?
+        .with_context(|| format!("Message {msg_id} has no gossip topic"))?;
     let iroh = ctx.get_or_try_init_peer_channel().await?;
-    iroh.leave_realtime(get_iroh_topic_for_msg(ctx, msg_id).await?)
-        .await?;
+    iroh.leave_realtime(topic).await?;
     info!(ctx, "IROH_REALTIME: Left gossip for message {msg_id}");
 
     Ok(())
@@ -423,11 +452,11 @@ async fn handle_connection(
     let conn = conn.await?;
     let peer_id = iroh_net::endpoint::get_remote_node_id(&conn)?;
 
-    match alpn.as_bytes() {
+    match alpn.as_slice() {
         GOSSIP_ALPN => gossip
             .handle_connection(conn)
             .await
-            .context(format!("Connection to {peer_id} with ALPN {alpn} failed"))?,
+            .context(format!("Gossip connection to {peer_id} failed"))?,
         _ => warn!(
             context,
             "Ignoring connection from {peer_id}: unsupported ALPN protocol"
@@ -752,6 +781,7 @@ mod tests {
         leave_webxdc_realtime(alice, alice_webxdc.id).await.unwrap();
         let topic = get_iroh_topic_for_msg(alice, alice_webxdc.id)
             .await
+            .unwrap()
             .unwrap();
         assert!(if let Some(state) = alice
             .iroh

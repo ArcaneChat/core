@@ -646,7 +646,7 @@ impl Contact {
             set_blocked(context, Nosync, contact_id, false).await?;
         }
 
-        if sync.into() {
+        if sync.into() && sth_modified != Modifier::None {
             chat::sync(
                 context,
                 chat::SyncId::ContactAddr(addr.to_string()),
@@ -751,7 +751,7 @@ impl Contact {
     /// - "name": name passed as function argument, belonging to the given origin
     /// - "row_name": current name used in the database, typically set to "name"
     /// - "row_authname": name as authorized from a contact, set only through a From-header
-    /// Depending on the origin, both, "row_name" and "row_authname" are updated from "name".
+    ///   Depending on the origin, both, "row_name" and "row_authname" are updated from "name".
     ///
     /// Returns the contact_id and a `Modifier` value indicating if a modification occurred.
     pub(crate) async fn add_or_lookup(
@@ -1001,7 +1001,7 @@ impl Contact {
     /// - if the flag DC_GCL_ADD_SELF is set, SELF is added to the list unless filtered by other parameters
     /// - if the flag DC_GCL_VERIFIED_ONLY is set, only verified contacts are returned.
     ///   if DC_GCL_VERIFIED_ONLY is not set, verified and unverified contacts are returned.
-    /// `query` is a string to filter the list.
+    ///   `query` is a string to filter the list.
     pub async fn get_all(
         context: &Context,
         listflags: u32,
@@ -1917,8 +1917,13 @@ impl RecentlySeenLoop {
             .unwrap();
     }
 
-    pub(crate) fn abort(self) {
+    pub(crate) async fn abort(self) {
         self.handle.abort();
+
+        // Await aborted task to ensure the `Future` is dropped
+        // with all resources moved inside such as the `Context`
+        // reference to `InnerContext`.
+        self.handle.await.ok();
     }
 }
 

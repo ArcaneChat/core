@@ -2095,6 +2095,18 @@ Message content",
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_no_unencrypted_name_in_self_chat() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let bob = &tcm.bob().await;
+    bob.set_config(Config::Displayname, Some("Bob Smith"))
+        .await?;
+    let chat_id = bob.get_self_chat().await.id;
+    let msg = bob.send_text(chat_id, "Happy birthday to me").await;
+    assert_eq!(msg.payload.contains("Bob Smith"), false);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_outgoing_classic_mail_creates_chat() {
     let alice = TestContext::new_alice().await;
 
@@ -3548,6 +3560,39 @@ async fn test_prefer_encrypt_mutual_if_encrypted() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_forged_from_and_no_valid_signatures() -> Result<()> {
+    let t = &TestContext::new_bob().await;
+    let raw = include_bytes!("../../test-data/message/thunderbird_encrypted_signed.eml");
+    let received_msg = receive_imf(t, raw, false).await?.unwrap();
+    assert!(!received_msg.from_is_signed);
+    let msg = t.get_last_msg().await;
+    assert!(!msg.chat_id.is_trash());
+    assert!(!msg.get_showpadlock());
+
+    let t = &TestContext::new_bob().await;
+    let raw = String::from_utf8(raw.to_vec())?.replace("alice@example.org", "clarice@example.org");
+    let received_msg = receive_imf(t, raw.as_bytes(), false).await?.unwrap();
+    assert!(received_msg.chat_id.is_trash());
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_wrong_from_name_and_no_valid_signatures() -> Result<()> {
+    let t = &TestContext::new_bob().await;
+    let raw = include_bytes!("../../test-data/message/thunderbird_encrypted_signed.eml");
+    let raw = String::from_utf8(raw.to_vec())?.replace("From: Alice", "From: A");
+    let received_msg = receive_imf(t, raw.as_bytes(), false).await?.unwrap();
+    assert!(!received_msg.from_is_signed);
+    let msg = t.get_last_msg().await;
+    assert!(!msg.chat_id.is_trash());
+    assert!(!msg.get_showpadlock());
+    let contact = Contact::get_by_id(t, msg.from_id).await?;
+    assert_eq!(contact.get_authname(), "Alice");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_thunderbird_autocrypt_unencrypted() -> Result<()> {
     let t = TestContext::new_bob().await;
 
@@ -4643,6 +4688,67 @@ async fn test_protected_group_add_remove_member_missing_key() -> Result<()> {
         stock_str::msg_del_member_local(alice, &bob_addr, ContactId::SELF,).await
     );
     assert!(msg.error().is_some());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_dont_create_adhoc_group_on_member_removal() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let bob = &tcm.bob().await;
+    async fn get_chat_cnt(ctx: &Context) -> Result<usize> {
+        ctx.sql
+            .count("SELECT COUNT(*) FROM chats WHERE id>9", ())
+            .await
+    }
+    let chat_cnt = get_chat_cnt(bob).await?;
+    receive_imf(
+        bob,
+        b"From: Alice <alice@example.org>\n\
+To: <bob@example.net>, <charlie@example.com>\n\
+Chat-Version: 1.0\n\
+Subject: subject\n\
+Message-ID: <first@example.org>\n\
+Date: Sun, 14 Nov 2021 00:10:00 +0000\
+Content-Type: text/plain
+Chat-Group-Member-Removed: charlie@example.com",
+        false,
+    )
+    .await?;
+    assert_eq!(get_chat_cnt(bob).await?, chat_cnt);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_unarchive_on_member_removal() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+    let bob_id = Contact::create(alice, "", "bob@example.net").await?;
+    let fiona_id = Contact::create(alice, "", "fiona@example.net").await?;
+    let alice_chat_id = create_group_chat(alice, ProtectionStatus::Unprotected, "foos").await?;
+    add_contact_to_chat(alice, alice_chat_id, bob_id).await?;
+    add_contact_to_chat(alice, alice_chat_id, fiona_id).await?;
+
+    send_text_msg(alice, alice_chat_id, "populate".to_string()).await?;
+    let msg = alice.pop_sent_msg().await;
+    bob.recv_msg(&msg).await;
+    let bob_chat_id = bob.get_last_msg().await.chat_id;
+    bob_chat_id
+        .set_visibility(bob, ChatVisibility::Archived)
+        .await?;
+
+    remove_contact_from_chat(alice, alice_chat_id, fiona_id).await?;
+    let msg = alice.pop_sent_msg().await;
+    bob.recv_msg(&msg).await;
+    let bob_chat = Chat::load_from_db(bob, bob_chat_id).await?;
+    assert_eq!(bob_chat.get_visibility(), ChatVisibility::Archived);
+
+    remove_contact_from_chat(alice, alice_chat_id, bob_id).await?;
+    let msg = alice.pop_sent_msg().await;
+    bob.recv_msg(&msg).await;
+    let bob_chat = Chat::load_from_db(bob, bob_chat_id).await?;
+    assert_eq!(bob_chat.get_visibility(), ChatVisibility::Normal);
+
     Ok(())
 }
 

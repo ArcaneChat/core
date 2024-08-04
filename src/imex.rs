@@ -1,41 +1,35 @@
 //! # Import/export module.
 
-use std::any::Any;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use ::pgp::types::KeyTrait;
 use anyhow::{bail, ensure, format_err, Context as _, Result};
 use deltachat_contact_tools::EmailAddress;
-use futures::StreamExt;
+use futures::TryStreamExt;
 use futures_lite::FutureExt;
-use rand::{thread_rng, Rng};
+
 use tokio::fs::{self, File};
 use tokio_tar::Archive;
 
-use crate::blob::{BlobDirContents, BlobObject};
-use crate::chat::{self, delete_and_reset_all_device_msgs, ChatId};
-use crate::config::Config;
-use crate::contact::ContactId;
+use crate::blob::BlobDirContents;
+use crate::chat::{self, delete_and_reset_all_device_msgs};
 use crate::context::Context;
 use crate::e2ee;
 use crate::events::EventType;
-use crate::key::{
-    self, load_self_secret_key, DcKey, DcSecretKey, SignedPublicKey, SignedSecretKey,
-};
+use crate::key::{self, DcKey, DcSecretKey, SignedPublicKey, SignedSecretKey};
 use crate::log::LogExt;
-use crate::message::{Message, MsgId, Viewtype};
-use crate::mimeparser::SystemMessage;
-use crate::param::Param;
+use crate::message::{Message, Viewtype};
 use crate::pgp;
 use crate::sql;
-use crate::stock_str;
 use crate::tools::{
-    create_folder, delete_file, get_filesuffix_lc, open_file_std, read_file, time, write_file,
+    create_folder, delete_file, get_filesuffix_lc, read_file, time, write_file, TempPathGuard,
 };
 
+mod key_transfer;
 mod transfer;
 
+pub use key_transfer::{continue_key_transfer, initiate_key_transfer};
 pub use transfer::{get_backup, BackupProvider};
 
 // Name of the database file in the backup.
@@ -47,12 +41,13 @@ pub(crate) const BLOBS_BACKUP_NAME: &str = "blobs_backup";
 #[repr(u32)]
 pub enum ImexMode {
     /// Export all private keys and all public keys of the user to the
-    /// directory given as `path`.  The default key is written to the files `public-key-default.asc`
-    /// and `private-key-default.asc`, if there are more keys, they are written to files as
-    /// `public-key-<id>.asc` and `private-key-<id>.asc`
+    /// directory given as `path`. The default key is written to the files
+    /// `{public,private}-key-<addr>-default-<fingerprint>.asc`, if there are more keys, they are
+    /// written to files as `{public,private}-key-<addr>-<id>-<fingerprint>.asc`.
     ExportSelfKeys = 1,
 
-    /// Import private keys found in the directory given as `path`.
+    /// Import private keys found in `path` if it is a directory, otherwise import a private key
+    /// from `path`.
     /// The last imported key is made the default keys unless its name contains the string `legacy`.
     /// Public keys are not imported.
     ImportSelfKeys = 2,
@@ -141,117 +136,6 @@ pub async fn has_backup(_context: &Context, dir_name: &Path) -> Result<String> {
     }
 }
 
-/// Initiates key transfer via Autocrypt Setup Message.
-///
-/// Returns setup code.
-pub async fn initiate_key_transfer(context: &Context) -> Result<String> {
-    let setup_code = create_setup_code(context);
-    /* this may require a keypair to be created. this may take a second ... */
-    let setup_file_content = render_setup_file(context, &setup_code).await?;
-    /* encrypting may also take a while ... */
-    let setup_file_blob = BlobObject::create(
-        context,
-        "autocrypt-setup-message.html",
-        setup_file_content.as_bytes(),
-    )
-    .await?;
-
-    let chat_id = ChatId::create_for_contact(context, ContactId::SELF).await?;
-    let mut msg = Message {
-        viewtype: Viewtype::File,
-        ..Default::default()
-    };
-    msg.param.set(Param::File, setup_file_blob.as_name());
-    msg.subject = stock_str::ac_setup_msg_subject(context).await;
-    msg.param
-        .set(Param::MimeType, "application/autocrypt-setup");
-    msg.param.set_cmd(SystemMessage::AutocryptSetupMessage);
-    msg.force_plaintext();
-    msg.param.set_int(Param::SkipAutocrypt, 1);
-
-    chat::send_msg(context, chat_id, &mut msg).await?;
-    // no maybe_add_bcc_self_device_msg() here.
-    // the ui shows the dialog with the setup code on this device,
-    // it would be too much noise to have two things popping up at the same time.
-    // maybe_add_bcc_self_device_msg() is called on the other device
-    // once the transfer is completed.
-    Ok(setup_code)
-}
-
-/// Renders HTML body of a setup file message.
-///
-/// The `passphrase` must be at least 2 characters long.
-pub async fn render_setup_file(context: &Context, passphrase: &str) -> Result<String> {
-    let passphrase_begin = if let Some(passphrase_begin) = passphrase.get(..2) {
-        passphrase_begin
-    } else {
-        bail!("Passphrase must be at least 2 chars long.");
-    };
-    let private_key = load_self_secret_key(context).await?;
-    let ac_headers = match context.get_config_bool(Config::E2eeEnabled).await? {
-        false => None,
-        true => Some(("Autocrypt-Prefer-Encrypt", "mutual")),
-    };
-    let private_key_asc = private_key.to_asc(ac_headers);
-    let encr = pgp::symm_encrypt(passphrase, private_key_asc.as_bytes())
-        .await?
-        .replace('\n', "\r\n");
-
-    let replacement = format!(
-        concat!(
-            "-----BEGIN PGP MESSAGE-----\r\n",
-            "Passphrase-Format: numeric9x4\r\n",
-            "Passphrase-Begin: {}"
-        ),
-        passphrase_begin
-    );
-    let pgp_msg = encr.replace("-----BEGIN PGP MESSAGE-----", &replacement);
-
-    let msg_subj = stock_str::ac_setup_msg_subject(context).await;
-    let msg_body = stock_str::ac_setup_msg_body(context).await;
-    let msg_body_html = msg_body.replace('\r', "").replace('\n', "<br>");
-    Ok(format!(
-        concat!(
-            "<!DOCTYPE html>\r\n",
-            "<html>\r\n",
-            "  <head>\r\n",
-            "    <title>{}</title>\r\n",
-            "  </head>\r\n",
-            "  <body>\r\n",
-            "    <h1>{}</h1>\r\n",
-            "    <p>{}</p>\r\n",
-            "    <pre>\r\n{}\r\n</pre>\r\n",
-            "  </body>\r\n",
-            "</html>\r\n"
-        ),
-        msg_subj, msg_subj, msg_body_html, pgp_msg
-    ))
-}
-
-/// Creates a new setup code for Autocrypt Setup Message.
-pub fn create_setup_code(_context: &Context) -> String {
-    let mut random_val: u16;
-    let mut rng = thread_rng();
-    let mut ret = String::new();
-
-    for i in 0..9 {
-        loop {
-            random_val = rng.gen();
-            if random_val as usize <= 60000 {
-                break;
-            }
-        }
-        random_val = (random_val as usize % 10000) as u16;
-        ret += &format!(
-            "{}{:04}",
-            if 0 != i { "-" } else { "" },
-            random_val as usize
-        );
-    }
-
-    ret
-}
-
 async fn maybe_add_bcc_self_device_msg(context: &Context) -> Result<()> {
     if !context.sql.get_raw_config_bool("bcc_self").await? {
         let mut msg = Message::new(Viewtype::Text);
@@ -263,36 +147,6 @@ async fn maybe_add_bcc_self_device_msg(context: &Context) -> Result<()> {
         chat::add_device_msg(context, Some("bcc-self-hint"), Some(&mut msg)).await?;
     }
     Ok(())
-}
-
-/// Continue key transfer via Autocrypt Setup Message.
-///
-/// `msg_id` is the ID of the received Autocrypt Setup Message.
-/// `setup_code` is the code entered by the user.
-pub async fn continue_key_transfer(
-    context: &Context,
-    msg_id: MsgId,
-    setup_code: &str,
-) -> Result<()> {
-    ensure!(!msg_id.is_special(), "wrong id");
-
-    let msg = Message::load_from_db(context, msg_id).await?;
-    ensure!(
-        msg.is_setupmessage(),
-        "Message is no Autocrypt Setup Message."
-    );
-
-    if let Some(filename) = msg.get_file(context) {
-        let file = open_file_std(context, filename)?;
-        let sc = normalize_setup_code(setup_code);
-        let armored_key = decrypt_setup_file(&sc, file).await?;
-        set_self_key(context, &armored_key, true).await?;
-        maybe_add_bcc_self_device_msg(context).await?;
-
-        Ok(())
-    } else {
-        bail!("Message is no Autocrypt Setup Message.");
-    }
 }
 
 async fn set_self_key(context: &Context, armored: &str, set_default: bool) -> Result<()> {
@@ -343,29 +197,6 @@ async fn set_self_key(context: &Context, armored: &str, set_default: bool) -> Re
 
     info!(context, "stored self key: {:?}", keypair.secret.key_id());
     Ok(())
-}
-
-async fn decrypt_setup_file<T: std::io::Read + std::io::Seek>(
-    passphrase: &str,
-    file: T,
-) -> Result<String> {
-    let plain_bytes = pgp::symm_decrypt(passphrase, file).await?;
-    let plain_text = std::string::String::from_utf8(plain_bytes)?;
-
-    Ok(plain_text)
-}
-
-fn normalize_setup_code(s: &str) -> String {
-    let mut out = String::new();
-    for c in s.chars() {
-        if c.is_ascii_digit() {
-            out.push(c);
-            if let 4 | 9 | 14 | 19 | 24 | 29 | 34 | 39 = out.len() {
-                out += "-"
-            }
-        }
-    }
-    out
 }
 
 async fn imex_inner(
@@ -438,51 +269,126 @@ async fn import_backup(
         context.get_dbfile().display()
     );
 
+    import_backup_stream(context, backup_file, file_size, passphrase).await?;
+    Ok(())
+}
+
+/// Imports backup by reading a tar file from a stream.
+///
+/// `file_size` is used to calculate the progress
+/// and emit progress events.
+/// Ideally it is the sum of the entry
+/// sizes without the header overhead,
+/// but can be estimated as tar file size
+/// in which case the progress is underestimated
+/// and may not reach 99.9% by the end of import.
+/// Underestimating is better than
+/// overestimating because the progress
+/// jumps to 100% instead of getting stuck at 99.9%
+/// for some time.
+pub(crate) async fn import_backup_stream<R: tokio::io::AsyncRead + Unpin>(
+    context: &Context,
+    backup_file: R,
+    file_size: u64,
+    passphrase: String,
+) -> Result<()> {
+    import_backup_stream_inner(context, backup_file, file_size, passphrase)
+        .await
+        .0
+}
+
+async fn import_backup_stream_inner<R: tokio::io::AsyncRead + Unpin>(
+    context: &Context,
+    backup_file: R,
+    file_size: u64,
+    passphrase: String,
+) -> (Result<()>,) {
     let mut archive = Archive::new(backup_file);
 
-    let mut entries = archive.entries()?;
-    let mut last_progress = 0;
-    while let Some(file) = entries.next().await {
-        let f = &mut file?;
-
-        let current_pos = f.raw_file_position();
-        let progress = 1000 * current_pos / file_size;
-        if progress != last_progress && progress > 10 && progress < 1000 {
-            // We already emitted ImexProgress(10) above
+    let mut entries = match archive.entries() {
+        Ok(entries) => entries,
+        Err(e) => return (Err(e).context("Failed to get archive entries"),),
+    };
+    let mut blobs = Vec::new();
+    // We already emitted ImexProgress(10) above
+    let mut last_progress = 10;
+    const PROGRESS_MIGRATIONS: u128 = 999;
+    let mut total_size: u64 = 0;
+    let mut res: Result<()> = loop {
+        let mut f = match entries.try_next().await {
+            Ok(Some(f)) => f,
+            Ok(None) => break Ok(()),
+            Err(e) => break Err(e).context("Failed to get next entry"),
+        };
+        total_size += match f.header().entry_size() {
+            Ok(size) => size,
+            Err(e) => break Err(e).context("Failed to get entry size"),
+        };
+        let max = PROGRESS_MIGRATIONS - 1;
+        let progress = std::cmp::min(
+            max * u128::from(total_size) / std::cmp::max(u128::from(file_size), 1),
+            max,
+        );
+        if progress > last_progress {
             context.emit_event(EventType::ImexProgress(progress as usize));
             last_progress = progress;
         }
 
-        if f.path()?.file_name() == Some(OsStr::new(DBFILE_BACKUP_NAME)) {
-            // async_tar can't unpack to a specified file name, so we just unpack to the blobdir and then move the unpacked file.
-            f.unpack_in(context.get_blobdir()).await?;
-            let unpacked_database = context.get_blobdir().join(DBFILE_BACKUP_NAME);
-            context
-                .sql
-                .import(&unpacked_database, passphrase.clone())
-                .await
-                .context("cannot import unpacked database")?;
-            fs::remove_file(unpacked_database)
-                .await
-                .context("cannot remove unpacked database")?;
-        } else {
-            // async_tar will unpack to blobdir/BLOBS_BACKUP_NAME, so we move the file afterwards.
-            f.unpack_in(context.get_blobdir()).await?;
-            let from_path = context.get_blobdir().join(f.path()?);
-            if from_path.is_file() {
-                if let Some(name) = from_path.file_name() {
-                    fs::rename(&from_path, context.get_blobdir().join(name)).await?;
-                } else {
-                    warn!(context, "No file name");
+        let path = match f.path() {
+            Ok(path) => path.to_path_buf(),
+            Err(e) => break Err(e).context("Failed to get entry path"),
+        };
+        if let Err(e) = f.unpack_in(context.get_blobdir()).await {
+            break Err(e).context("Failed to unpack file");
+        }
+        if path.file_name() == Some(OsStr::new(DBFILE_BACKUP_NAME)) {
+            continue;
+        }
+        // async_tar unpacked to $BLOBDIR/BLOBS_BACKUP_NAME/, so we move the file afterwards.
+        let from_path = context.get_blobdir().join(&path);
+        if from_path.is_file() {
+            if let Some(name) = from_path.file_name() {
+                let to_path = context.get_blobdir().join(name);
+                if let Err(e) = fs::rename(&from_path, &to_path).await {
+                    blobs.push(from_path);
+                    break Err(e).context("Failed to move file to blobdir");
                 }
+                blobs.push(to_path);
+            } else {
+                warn!(context, "No file name");
             }
+        }
+    };
+    if res.is_err() {
+        for blob in blobs {
+            fs::remove_file(&blob).await.log_err(context).ok();
         }
     }
 
-    context.sql.run_migrations(context).await?;
-    delete_and_reset_all_device_msgs(context).await?;
-
-    Ok(())
+    let unpacked_database = context.get_blobdir().join(DBFILE_BACKUP_NAME);
+    if res.is_ok() {
+        res = context
+            .sql
+            .import(&unpacked_database, passphrase.clone())
+            .await
+            .context("cannot import unpacked database");
+    }
+    fs::remove_file(unpacked_database)
+        .await
+        .context("cannot remove unpacked database")
+        .log_err(context)
+        .ok();
+    if res.is_ok() {
+        context.emit_event(EventType::ImexProgress(PROGRESS_MIGRATIONS as usize));
+        res = context.sql.run_migrations(context).await;
+    }
+    if res.is_ok() {
+        delete_and_reset_all_device_msgs(context)
+            .await
+            .log_err(context)
+            .ok();
+    }
+    (res,)
 }
 
 /*******************************************************************************
@@ -530,8 +436,8 @@ async fn export_backup(context: &Context, dir: &Path, passphrase: String) -> Res
     let now = time();
     let self_addr = context.get_primary_self_addr().await?;
     let (temp_db_path, temp_path, dest_path) = get_next_backup_path(dir, &self_addr, now)?;
-    let _d1 = DeleteOnDrop(temp_db_path.clone());
-    let _d2 = DeleteOnDrop(temp_path.clone());
+    let temp_db_path = TempPathGuard::new(temp_db_path);
+    let temp_path = TempPathGuard::new(temp_path);
 
     export_database(context, &temp_db_path, passphrase, now)
         .await
@@ -544,52 +450,40 @@ async fn export_backup(context: &Context, dir: &Path, passphrase: String) -> Res
         dest_path.display(),
     );
 
-    let res = export_backup_inner(context, &temp_db_path, &temp_path).await;
-
-    match &res {
-        Ok(_) => {
-            fs::rename(temp_path, &dest_path).await?;
-            context.emit_event(EventType::ImexFileWritten(dest_path));
-        }
-        Err(e) => {
-            error!(context, "backup failed: {}", e);
-        }
-    }
-
-    res
-}
-struct DeleteOnDrop(PathBuf);
-impl Drop for DeleteOnDrop {
-    fn drop(&mut self) {
-        let file = self.0.clone();
-        // Not using `tools::delete_file` here because it would send a DeletedBlobFile event
-        // Hack to avoid panic in nested runtime calls of tokio
-        std::fs::remove_file(file).ok();
-    }
+    let file = File::create(&temp_path).await?;
+    let blobdir = BlobDirContents::new(context).await?;
+    export_backup_stream(context, &temp_db_path, blobdir, file)
+        .await
+        .context("Exporting backup to file failed")?;
+    fs::rename(temp_path, &dest_path).await?;
+    context.emit_event(EventType::ImexFileWritten(dest_path));
+    Ok(())
 }
 
-async fn export_backup_inner(
-    context: &Context,
+/// Exports the database and blobs into a stream.
+pub(crate) async fn export_backup_stream<'a, W>(
+    context: &'a Context,
     temp_db_path: &Path,
-    temp_path: &Path,
-) -> Result<()> {
-    let file = File::create(temp_path).await?;
-
-    let mut builder = tokio_tar::Builder::new(file);
+    blobdir: BlobDirContents<'a>,
+    writer: W,
+) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + tokio::io::AsyncWriteExt + Unpin + Send + 'static,
+{
+    let mut builder = tokio_tar::Builder::new(writer);
 
     builder
         .append_path_with_name(temp_db_path, DBFILE_BACKUP_NAME)
         .await?;
 
-    let blobdir = BlobDirContents::new(context).await?;
-    let mut last_progress = 0;
+    let mut last_progress = 10;
 
     for (i, blob) in blobdir.iter().enumerate() {
         let mut file = File::open(blob.to_abs_path()).await?;
         let path_in_archive = PathBuf::from(BLOBS_BACKUP_NAME).join(blob.as_name());
         builder.append_file(path_in_archive, &mut file).await?;
-        let progress = 1000 * i / blobdir.len();
-        if progress != last_progress && progress > 10 && progress < 1000 {
+        let progress = std::cmp::min(1000 * i / blobdir.len(), 999);
+        if progress > last_progress {
             context.emit_event(EventType::ImexProgress(progress));
             last_progress = progress;
         }
@@ -695,12 +589,12 @@ async fn export_self_keys(context: &Context, dir: &Path) -> Result<()> {
             },
         )
         .await?;
-
+    let self_addr = context.get_primary_self_addr().await?;
     for (id, public_key, private_key, is_default) in keys {
         let id = Some(id).filter(|_| is_default == 0);
 
         if let Ok(key) = public_key {
-            if let Err(err) = export_key_to_asc_file(context, dir, id, &key).await {
+            if let Err(err) = export_key_to_asc_file(context, dir, &self_addr, id, &key).await {
                 error!(context, "Failed to export public key: {:#}.", err);
                 export_errors += 1;
             }
@@ -708,7 +602,7 @@ async fn export_self_keys(context: &Context, dir: &Path) -> Result<()> {
             export_errors += 1;
         }
         if let Ok(key) = private_key {
-            if let Err(err) = export_key_to_asc_file(context, dir, id, &key).await {
+            if let Err(err) = export_key_to_asc_file(context, dir, &self_addr, id, &key).await {
                 error!(context, "Failed to export private key: {:#}.", err);
                 export_errors += 1;
             }
@@ -721,46 +615,43 @@ async fn export_self_keys(context: &Context, dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/*******************************************************************************
- * Classic key export
- ******************************************************************************/
+/// Returns the exported key file name inside `dir`.
 async fn export_key_to_asc_file<T>(
     context: &Context,
     dir: &Path,
+    addr: &str,
     id: Option<i64>,
     key: &T,
-) -> Result<()>
+) -> Result<String>
 where
-    T: DcKey + Any,
+    T: DcKey,
 {
     let file_name = {
-        let any_key = key as &dyn Any;
-        let kind = if any_key.downcast_ref::<SignedPublicKey>().is_some() {
-            "public"
-        } else if any_key.downcast_ref::<SignedSecretKey>().is_some() {
-            "private"
-        } else {
-            "unknown"
+        let kind = match T::is_private() {
+            false => "public",
+            true => "private",
         };
         let id = id.map_or("default".into(), |i| i.to_string());
-        dir.join(format!("{}-key-{}.asc", kind, &id))
+        let fp = DcKey::fingerprint(key).hex();
+        format!("{kind}-key-{addr}-{id}-{fp}.asc")
     };
+    let path = dir.join(&file_name);
     info!(
         context,
-        "Exporting key {:?} to {}",
+        "Exporting key {:?} to {}.",
         key.key_id(),
-        file_name.display()
+        path.display()
     );
 
     // Delete the file if it already exists.
-    delete_file(context, &file_name).await.ok();
+    delete_file(context, &path).await.ok();
 
     let content = key.to_asc(None).into_bytes();
-    write_file(context, &file_name, &content)
+    write_file(context, &path, &content)
         .await
-        .with_context(|| format!("cannot write key to {}", file_name.display()))?;
-    context.emit_event(EventType::ImexFileWritten(file_name));
-    Ok(())
+        .with_context(|| format!("cannot write key to {}", path.display()))?;
+    context.emit_event(EventType::ImexFileWritten(path));
+    Ok(file_name)
 }
 
 /// Exports the database to *dest*, encrypted using *passphrase*.
@@ -819,92 +710,57 @@ async fn export_database(
 mod tests {
     use std::time::Duration;
 
-    use ::pgp::armor::BlockType;
     use tokio::task;
 
     use super::*;
-    use crate::pgp::{split_armored_data, HEADER_AUTOCRYPT, HEADER_SETUPCODE};
-    use crate::receive_imf::receive_imf;
-    use crate::stock_str::StockMessage;
-    use crate::test_utils::{alice_keypair, TestContext, TestContextManager};
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_render_setup_file() {
-        let t = TestContext::new_alice().await;
-        let msg = render_setup_file(&t, "hello").await.unwrap();
-        println!("{}", &msg);
-        // Check some substrings, indicating things got substituted.
-        assert!(msg.contains("<title>Autocrypt Setup Message</title"));
-        assert!(msg.contains("<h1>Autocrypt Setup Message</h1>"));
-        assert!(msg.contains("<p>This is the Autocrypt Setup Message used to"));
-        assert!(msg.contains("-----BEGIN PGP MESSAGE-----\r\n"));
-        assert!(msg.contains("Passphrase-Format: numeric9x4\r\n"));
-        assert!(msg.contains("Passphrase-Begin: he\r\n"));
-        assert!(msg.contains("-----END PGP MESSAGE-----\r\n"));
-
-        for line in msg.rsplit_terminator('\n') {
-            assert!(line.ends_with('\r'));
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_render_setup_file_newline_replace() {
-        let t = TestContext::new_alice().await;
-        t.set_stock_translation(StockMessage::AcSetupMsgBody, "hello\r\nthere".to_string())
-            .await
-            .unwrap();
-        let msg = render_setup_file(&t, "pw").await.unwrap();
-        println!("{}", &msg);
-        assert!(msg.contains("<p>hello<br>there</p>"));
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_create_setup_code() {
-        let t = TestContext::new().await;
-        let setupcode = create_setup_code(&t);
-        assert_eq!(setupcode.len(), 44);
-        assert_eq!(setupcode.chars().nth(4).unwrap(), '-');
-        assert_eq!(setupcode.chars().nth(9).unwrap(), '-');
-        assert_eq!(setupcode.chars().nth(14).unwrap(), '-');
-        assert_eq!(setupcode.chars().nth(19).unwrap(), '-');
-        assert_eq!(setupcode.chars().nth(24).unwrap(), '-');
-        assert_eq!(setupcode.chars().nth(29).unwrap(), '-');
-        assert_eq!(setupcode.chars().nth(34).unwrap(), '-');
-        assert_eq!(setupcode.chars().nth(39).unwrap(), '-');
-    }
+    use crate::config::Config;
+    use crate::test_utils::{alice_keypair, TestContext};
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_export_public_key_to_asc_file() {
         let context = TestContext::new().await;
         let key = alice_keypair().public;
         let blobdir = Path::new("$BLOBDIR");
-        assert!(export_key_to_asc_file(&context.ctx, blobdir, None, &key)
+        let filename = export_key_to_asc_file(&context.ctx, blobdir, "a@b", None, &key)
             .await
-            .is_ok());
+            .unwrap();
+        assert!(filename.starts_with("public-key-a@b-default-"));
+        assert!(filename.ends_with(".asc"));
         let blobdir = context.ctx.get_blobdir().to_str().unwrap();
-        let filename = format!("{blobdir}/public-key-default.asc");
+        let filename = format!("{blobdir}/{filename}");
         let bytes = tokio::fs::read(&filename).await.unwrap();
 
         assert_eq!(bytes, key.to_asc(None).into_bytes());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_export_private_key_to_asc_file() {
+    async fn test_import_private_key_exported_to_asc_file() {
         let context = TestContext::new().await;
         let key = alice_keypair().secret;
         let blobdir = Path::new("$BLOBDIR");
-        assert!(export_key_to_asc_file(&context.ctx, blobdir, None, &key)
+        let filename = export_key_to_asc_file(&context.ctx, blobdir, "a@b", None, &key)
             .await
-            .is_ok());
+            .unwrap();
+        let fingerprint = filename
+            .strip_prefix("private-key-a@b-default-")
+            .unwrap()
+            .strip_suffix(".asc")
+            .unwrap();
+        assert_eq!(fingerprint, DcKey::fingerprint(&key).hex());
         let blobdir = context.ctx.get_blobdir().to_str().unwrap();
-        let filename = format!("{blobdir}/private-key-default.asc");
+        let filename = format!("{blobdir}/{filename}");
         let bytes = tokio::fs::read(&filename).await.unwrap();
 
         assert_eq!(bytes, key.to_asc(None).into_bytes());
+
+        let alice = &TestContext::new_alice().await;
+        if let Err(err) = imex(alice, ImexMode::ImportSelfKeys, Path::new(&filename), None).await {
+            panic!("got error on import: {err:#}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_export_and_import_key() {
+    async fn test_export_and_import_key_from_dir() {
         let export_dir = tempfile::tempdir().unwrap();
 
         let context = TestContext::new_alice().await;
@@ -928,12 +784,6 @@ mod tests {
         )
         .await
         {
-            panic!("got error on import: {err:#}");
-        }
-
-        let keyfile = export_dir.path().join("private-key-default.asc");
-        let context3 = TestContext::new_alice().await;
-        if let Err(err) = imex(&context3.ctx, ImexMode::ImportSelfKeys, &keyfile, None).await {
             panic!("got error on import: {err:#}");
         }
     }
@@ -1077,139 +927,6 @@ mod tests {
 
         // Assert that the config cache has the new value now.
         assert!(context2.is_configured().await?);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_normalize_setup_code() {
-        let norm = normalize_setup_code("123422343234423452346234723482349234");
-        assert_eq!(norm, "1234-2234-3234-4234-5234-6234-7234-8234-9234");
-
-        let norm =
-            normalize_setup_code("\t1 2 3422343234- foo bar-- 423-45 2 34 6234723482349234      ");
-        assert_eq!(norm, "1234-2234-3234-4234-5234-6234-7234-8234-9234");
-    }
-
-    /* S_EM_SETUPFILE is a AES-256 symm. encrypted setup message created by Enigmail
-    with an "encrypted session key", see RFC 4880.  The code is in S_EM_SETUPCODE */
-    const S_EM_SETUPCODE: &str = "1742-0185-6197-1303-7016-8412-3581-4441-0597";
-    const S_EM_SETUPFILE: &str = include_str!("../test-data/message/stress.txt");
-
-    // Autocrypt Setup Message payload "encrypted" with plaintext algorithm.
-    const S_PLAINTEXT_SETUPFILE: &str =
-        include_str!("../test-data/message/plaintext-autocrypt-setup.txt");
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_split_and_decrypt() {
-        let buf_1 = S_EM_SETUPFILE.as_bytes().to_vec();
-        let (typ, headers, base64) = split_armored_data(&buf_1).unwrap();
-        assert_eq!(typ, BlockType::Message);
-        assert!(S_EM_SETUPCODE.starts_with(headers.get(HEADER_SETUPCODE).unwrap()));
-        assert!(!headers.contains_key(HEADER_AUTOCRYPT));
-
-        assert!(!base64.is_empty());
-
-        let setup_file = S_EM_SETUPFILE.to_string();
-        let decrypted =
-            decrypt_setup_file(S_EM_SETUPCODE, std::io::Cursor::new(setup_file.as_bytes()))
-                .await
-                .unwrap();
-
-        let (typ, headers, _base64) = split_armored_data(decrypted.as_bytes()).unwrap();
-
-        assert_eq!(typ, BlockType::PrivateKey);
-        assert_eq!(headers.get(HEADER_AUTOCRYPT), Some(&"mutual".to_string()));
-        assert!(!headers.contains_key(HEADER_SETUPCODE));
-    }
-
-    /// Tests that Autocrypt Setup Message encrypted with "plaintext" algorithm cannot be
-    /// decrypted.
-    ///
-    /// According to <https://datatracker.ietf.org/doc/html/rfc4880#section-13.4>
-    /// "Implementations MUST NOT use plaintext in Symmetrically Encrypted Data packets".
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_decrypt_plaintext_autocrypt_setup_message() {
-        let setup_file = S_PLAINTEXT_SETUPFILE.to_string();
-        let incorrect_setupcode = "0000-0000-0000-0000-0000-0000-0000-0000-0000";
-        assert!(decrypt_setup_file(
-            incorrect_setupcode,
-            std::io::Cursor::new(setup_file.as_bytes()),
-        )
-        .await
-        .is_err());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_key_transfer() -> Result<()> {
-        let alice = TestContext::new_alice().await;
-
-        let setup_code = initiate_key_transfer(&alice).await?;
-
-        // Get Autocrypt Setup Message.
-        let sent = alice.pop_sent_msg().await;
-
-        // Alice sets up a second device.
-        let alice2 = TestContext::new().await;
-        alice2.set_name("alice2");
-        alice2.configure_addr("alice@example.org").await;
-        alice2.recv_msg(&sent).await;
-        let msg = alice2.get_last_msg().await;
-        assert!(msg.is_setupmessage());
-
-        // Send a message that cannot be decrypted because the keys are
-        // not synchronized yet.
-        let sent = alice2.send_text(msg.chat_id, "Test").await;
-        let trashed_message = alice.recv_msg_opt(&sent).await;
-        assert!(trashed_message.is_none());
-        assert_ne!(alice.get_last_msg().await.get_text(), "Test");
-
-        // Transfer the key.
-        continue_key_transfer(&alice2, msg.id, &setup_code).await?;
-
-        // Alice sends a message to self from the new device.
-        let sent = alice2.send_text(msg.chat_id, "Test").await;
-        alice.recv_msg(&sent).await;
-        assert_eq!(alice.get_last_msg().await.get_text(), "Test");
-
-        Ok(())
-    }
-
-    /// Tests that Autocrypt Setup Messages is only clickable if it is self-sent.
-    /// This prevents Bob from tricking Alice into changing the key
-    /// by sending her an Autocrypt Setup Message as long as Alice's server
-    /// does not allow to forge the `From:` header.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_key_transfer_non_self_sent() -> Result<()> {
-        let mut tcm = TestContextManager::new();
-        let alice = tcm.alice().await;
-        let bob = tcm.bob().await;
-
-        let _setup_code = initiate_key_transfer(&alice).await?;
-
-        // Get Autocrypt Setup Message.
-        let sent = alice.pop_sent_msg().await;
-
-        let rcvd = bob.recv_msg(&sent).await;
-        assert!(!rcvd.is_setupmessage());
-
-        Ok(())
-    }
-
-    /// Tests reception of Autocrypt Setup Message from K-9 6.802.
-    ///
-    /// Unlike Autocrypt Setup Message sent by Delta Chat,
-    /// this message does not contain `Autocrypt-Prefer-Encrypt` header.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_key_transfer_k_9() -> Result<()> {
-        let t = &TestContext::new().await;
-        t.configure_addr("autocrypt@nine.testrun.org").await;
-
-        let raw = include_bytes!("../test-data/message/k-9-autocrypt-setup-message.eml");
-        let received = receive_imf(t, raw, false).await?.unwrap();
-
-        let setup_code = "0655-9868-8252-5455-4232-5158-1237-5333-2638";
-        continue_key_transfer(t, *received.msg_ids.last().unwrap(), setup_code).await?;
 
         Ok(())
     }

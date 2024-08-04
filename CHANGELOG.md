@@ -1,5 +1,185 @@
 # Changelog
 
+## [1.142.3] - 2024-08-04
+
+### Build system
+
+- cargo: Update rusqlite and libsqlite3-sys.
+- Fix cargo warnings about default-features
+- Do not disable "vendored" feature in the workspace.
+- cargo: Bump quick-xml from 0.35.0 to 0.36.1.
+- cargo: Bump uuid from 1.9.1 to 1.10.0.
+- cargo: Bump tokio from 1.38.0 to 1.39.2.
+- cargo: Bump env_logger from 0.11.3 to 0.11.5.
+- Remove sha2 dependency.
+- Remove `backtrace` dependency.
+- Remove direct "quinn" dependency.
+
+## [1.142.2] - 2024-08-02
+
+### Features / Changes
+
+- Try only the full email address if username is unspecified.
+- Sort DNS results by successful connection timestamp ([#5818](https://github.com/deltachat/deltachat-core-rust/pull/5818)).
+
+### Fixes
+
+- Await the tasks after aborting them.
+- Do not reset is_chatmail config on failed reconfiguration.
+- Fix compilation on iOS.
+- Reset configured_provider on reconfiguration.
+
+### Refactor
+
+- Don't update message state to `OutMdnRcvd` anymore.
+
+### Build system
+
+- Use workspace dependencies to make cargo-deny 0.15.1 happy.
+- cargo: Update bytemuck from 0.14.3 to 0.16.3.
+- cargo: Bump toml from 0.8.14 to 0.8.15.
+- cargo: Bump serde_json from 1.0.120 to 1.0.122.
+- cargo: Bump human-panic from 2.0.0 to 2.0.1.
+- cargo: Bump thiserror from 1.0.61 to 1.0.63.
+- cargo: Bump syn from 2.0.68 to 2.0.72.
+- cargo: Bump quoted_printable from 0.5.0 to 0.5.1.
+- cargo: Bump serde from 1.0.203 to 1.0.204.
+
+## [1.142.1] - 2024-07-30
+
+### Features / Changes
+
+- Do not reveal sender's language in read receipts ([#5802](https://github.com/deltachat/deltachat-core-rust/pull/5802)).
+- Try next DNS resolution result if TLS setup fails.
+- Report first error instead of the last on connection failure.
+
+### Fixes
+
+- smtp: Use DNS cache for implicit TLS connections.
+- Imex::import_backup: Unpack all blobs before importing a db ([#4307](https://github.com/deltachat/deltachat-core-rust/pull/4307)).
+- Import_backup_stream: Fix progress stucking at 0.
+- Sql::import: Detach backup db if any step of the import fails.
+- Imex::import_backup: Ignore errors from delete_and_reset_all_device_msgs().
+- Explicitly close the database on account removal.
+
+### Miscellaneous Tasks
+
+- cargo: Update time from 0.3.34 to 0.3.36.
+- cargo: Update iroh from 0.20.0 to 0.21.0.
+
+### Refactor
+
+- Add net/dns submodule.
+- Pass single ALPN around instead of ALPN list.
+- Replace {IMAP,SMTP,HTTP}_TIMEOUT with a single constant.
+- smtp: Unify SMTP connection setup between TLS and STARTTLS.
+- imap: Unify IMAP connection setup in Client::connect().
+- Move DNS resolution into IMAP and SMTP connect code.
+
+### CI
+
+- Update Rust to 1.80.0.
+
+## [1.142.0] - 2024-07-23
+
+### API-Changes
+
+- deltachat-jsonrpc: Add `pinned` property to `FullChat` and `BasicChat`.
+- deltachat-jsonrpc: Allow to set message quote text without referencing quoted message ([#5695](https://github.com/deltachat/deltachat-core-rust/pull/5695)).
+
+### Features / Changes
+
+- cargo: Update iroh from 0.17 to 0.20.
+- iroh: Pass direct addresses from Endpoint to Gossip.
+- New BACKUP2 transfer protocol.
+- Use `[...]` instead of `...` for protected subject.
+- Add email address and fingerprint to exported key file names ([#5694](https://github.com/deltachat/deltachat-core-rust/pull/5694)).
+- Request `imap` ALPN for IMAP TLS connections and `smtp` ALPN for SMTP TLS connections.
+- Limit the size of aggregated WebXDC update to 100 KiB ([#4825](https://github.com/deltachat/deltachat-core-rust/pull/4825)).
+- Don't create ad-hoc group on a member removal message ([#5618](https://github.com/deltachat/deltachat-core-rust/pull/5618)).
+- Don't unarchive a group on a member removal except SELF ([#5618](https://github.com/deltachat/deltachat-core-rust/pull/5618)).
+- Use custom DNS resolver for HTTP(S).
+- Promote fallback DNS results to cached on successful use.
+- Set summary thumbnail path for WebXDCs to "webxdc-icon://last-msg-id" ([#5782](https://github.com/deltachat/deltachat-core-rust/pull/5782)).
+- Do not show the address in invite QR code SVG.
+- Report better error from DcKey::from_asc() ([#5539](https://github.com/deltachat/deltachat-core-rust/pull/5539)).
+- Contact::create_ex: Don't send sync message if nothing changed ([#5705](https://github.com/deltachat/deltachat-core-rust/pull/5705)).
+
+### Fixes
+
+- `Message::set_quote`: Don't forget to remove `Param::ProtectQuote`.
+- Randomize avatar blob filenames to work around caching.
+- Correct copy-pasted DCACCOUNT parsing errors message.
+- Call `send_sync_msg()` only from the SMTP loop ([#5780](https://github.com/deltachat/deltachat-core-rust/pull/5780)).
+- Emit MsgsChanged if the number of unnoticed archived chats could decrease ([#5768](https://github.com/deltachat/deltachat-core-rust/pull/5768)).
+- Reject message with forged From even if no valid signatures are found.
+
+### Refactor
+
+- Move key transfer into its own submodule.
+- Move TempPathGuard into `tools` and use instead of `DeleteOnDrop`.
+- Return error from export_backup() without logging.
+- Reduce boilerplate for migration version increment.
+
+### Tests
+
+- Add test for `get_http_response` JSON-RPC call.
+
+### Build system
+
+- node: Pin node-gyp to version 10.1.
+
+### Miscellaneous Tasks
+
+- cargo: Update hashlink to remove allocator-api2 dependency.
+- cargo: Update openssl to v0.10.66.
+- deps: Bump openssl from 0.10.60 to 0.10.66 in /fuzz.
+- cargo: Update `image` crate to 0.25.2.
+
+## [1.141.2] - 2024-07-09
+
+### Features / Changes
+
+- Add `is_muted` config option.
+- Parse vcards exported by protonmail ([#5723](https://github.com/deltachat/deltachat-core-rust/pull/5723)).
+- Disable sending sync messages for bots ([#5705](https://github.com/deltachat/deltachat-core-rust/pull/5705)).
+
+### Fixes
+
+- Don't fail if going to send plaintext, but some peerstate is missing.
+- Correctly sanitize input everywhere ([#5697](https://github.com/deltachat/deltachat-core-rust/pull/5697)).
+- Do not try to register non-iOS tokens for heartbeats.
+- imap: Reset new_mail if folder is ignored.
+- Use and prefer Date from signed message part ([#5716](https://github.com/deltachat/deltachat-core-rust/pull/5716)).
+- Distinguish between database errors and no gossip topic.
+- MimeFactory::verified: Return true for self-chat.
+
+### Refactor
+
+- `MimeFactory::is_e2ee_guaranteed()`: always respect `Param::ForcePlaintext`.
+- Protect from reusing migration versions ([#5719](https://github.com/deltachat/deltachat-core-rust/pull/5719)).
+- Move `quota_needs_update` calculation to a separate function ([#5683](https://github.com/deltachat/deltachat-core-rust/pull/5683)).
+
+### Documentation
+
+- Document vCards in the specification ([#5724](https://github.com/deltachat/deltachat-core-rust/pull/5724))
+
+### Miscellaneous Tasks
+
+- cargo: Bump toml from 0.8.13 to 0.8.14.
+- cargo: Bump serde_json from 1.0.117 to 1.0.120.
+- cargo: Bump syn from 2.0.66 to 2.0.68.
+- cargo: Bump async-broadcast from 0.7.0 to 0.7.1.
+- cargo: Bump url from 2.5.0 to 2.5.2.
+- cargo: Bump log from 0.4.21 to 0.4.22.
+- cargo: Bump regex from 1.10.4 to 1.10.5.
+- cargo: Bump proptest from 1.4.0 to 1.5.0.
+- cargo: Bump uuid from 1.8.0 to 1.9.1.
+- cargo: Bump backtrace from 0.3.72 to 0.3.73.
+- cargo: Bump quick-xml from 0.31.0 to 0.35.0.
+- cargo: Update yerpc to 0.6.2.
+- cargo: Update rPGP from 0.11 to 0.13.
+
 ## [1.141.1] - 2024-06-27
 
 ### Fixes
@@ -4493,3 +4673,8 @@ https://github.com/deltachat/deltachat-core-rust/pulls?q=is%3Apr+is%3Aclosed
 [1.140.2]: https://github.com/deltachat/deltachat-core-rust/compare/v1.140.1...v1.140.2
 [1.141.0]: https://github.com/deltachat/deltachat-core-rust/compare/v1.140.2...v1.141.0
 [1.141.1]: https://github.com/deltachat/deltachat-core-rust/compare/v1.141.0...v1.141.1
+[1.141.2]: https://github.com/deltachat/deltachat-core-rust/compare/v1.141.1...v1.141.2
+[1.142.0]: https://github.com/deltachat/deltachat-core-rust/compare/v1.141.2...v1.142.0
+[1.142.1]: https://github.com/deltachat/deltachat-core-rust/compare/v1.142.0...v1.142.1
+[1.142.2]: https://github.com/deltachat/deltachat-core-rust/compare/v1.142.1...v1.142.2
+[1.142.3]: https://github.com/deltachat/deltachat-core-rust/compare/v1.142.2...v1.142.3

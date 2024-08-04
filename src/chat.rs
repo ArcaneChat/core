@@ -49,6 +49,7 @@ use crate::tools::{
     create_smeared_timestamps, get_abs_path, gm2local_offset, smeared_time, time, IsNoneOrEmpty,
     SystemTime,
 };
+use crate::webxdc::StatusUpdateSerial;
 
 /// An chat item, such as a message or a marker.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -1954,7 +1955,7 @@ impl Chat {
             self.param.remove(Param::Unpromoted);
             self.update_param(context).await?;
             // send_sync_msg() is called (usually) a moment later at send_msg_to_smtp()
-            // when the group-creation message is actually sent though SMTP -
+            // when the group creation message is actually sent through SMTP --
             // this makes sure, the other devices are aware of grpid that is used in the sync-message.
             context
                 .sync_qr_code_tokens(Some(self.id))
@@ -2259,7 +2260,7 @@ pub(crate) async fn sync(context: &Context, id: SyncId, action: SyncAction) -> R
     context
         .add_sync_item(SyncData::AlterChat { id, action })
         .await?;
-    context.send_sync_msg().await?;
+    context.scheduler.interrupt_smtp().await;
     Ok(())
 }
 
@@ -3300,35 +3301,25 @@ pub async fn marknoticed_chat(context: &Context, chat_id: ChatId) -> Result<()> 
             context.emit_event(EventType::MsgsNoticed(chat_id_in_archive));
             chatlist_events::emit_chatlist_item_changed(context, chat_id_in_archive);
         }
-        chatlist_events::emit_chatlist_item_changed(context, DC_CHAT_ID_ARCHIVED_LINK);
-    } else {
-        let exists = context
-            .sql
-            .exists(
-                "SELECT COUNT(*) FROM msgs WHERE state=? AND hidden=0 AND chat_id=?;",
-                (MessageState::InFresh, chat_id),
-            )
-            .await?;
-        if !exists {
-            return Ok(());
-        }
-
-        context
-            .sql
-            .execute(
-                "UPDATE msgs
-                SET state=?
-              WHERE state=?
-                AND hidden=0
-                AND chat_id=?;",
-                (MessageState::InNoticed, MessageState::InFresh, chat_id),
-            )
-            .await?;
+    } else if context
+        .sql
+        .execute(
+            "UPDATE msgs
+            SET state=?
+          WHERE state=?
+            AND hidden=0
+            AND chat_id=?;",
+            (MessageState::InNoticed, MessageState::InFresh, chat_id),
+        )
+        .await?
+        == 0
+    {
+        return Ok(());
     }
 
     context.emit_event(EventType::MsgsNoticed(chat_id));
     chatlist_events::emit_chatlist_item_changed(context, chat_id);
-
+    context.on_archived_chats_maybe_noticed();
     Ok(())
 }
 
@@ -3391,6 +3382,7 @@ pub(crate) async fn mark_old_messages_as_noticed(
             context,
             "Marking chats as noticed because there are newer outgoing messages: {changed_chats:?}."
         );
+        context.on_archived_chats_maybe_noticed();
     }
 
     for c in changed_chats {
@@ -3764,12 +3756,14 @@ pub(crate) async fn add_contact_to_chat_ex(
     if from_handshake && chat.param.get_int(Param::Unpromoted).unwrap_or_default() == 1 {
         chat.param.remove(Param::Unpromoted);
         chat.update_param(context).await?;
-        let _ = context
+        if context
             .sync_qr_code_tokens(Some(chat_id))
             .await
             .log_err(context)
             .is_ok()
-            && context.send_sync_msg().await.log_err(context).is_ok();
+        {
+            context.scheduler.interrupt_smtp().await;
+        }
     }
 
     if context.is_self_addr(contact.get_addr()).await? {
@@ -4331,9 +4325,39 @@ pub async fn resend_msgs(context: &Context, msg_ids: &[MsgId]) -> Result<()> {
         msg.timestamp_sort = create_smeared_timestamp(context);
         // note(treefit): only matters if it is the last message in chat (but probably to expensive to check, debounce also solves it)
         chatlist_events::emit_chatlist_item_changed(context, msg.chat_id);
-        if !create_send_msg_jobs(context, &mut msg).await?.is_empty() {
-            context.scheduler.interrupt_smtp().await;
+        if create_send_msg_jobs(context, &mut msg).await?.is_empty() {
+            continue;
         }
+        if msg.viewtype == Viewtype::Webxdc {
+            let conn_fn = |conn: &mut rusqlite::Connection| {
+                let range = conn.query_row(
+                    "SELECT IFNULL(min(id), 1), IFNULL(max(id), 0) \
+                     FROM msgs_status_updates WHERE msg_id=?",
+                    (msg.id,),
+                    |row| {
+                        let min_id: StatusUpdateSerial = row.get(0)?;
+                        let max_id: StatusUpdateSerial = row.get(1)?;
+                        Ok((min_id, max_id))
+                    },
+                )?;
+                if range.0 > range.1 {
+                    return Ok(());
+                };
+                // `first_serial` must be decreased, otherwise if `Context::flush_status_updates()`
+                // runs in parallel, it would miss the race and instead of resending just remove the
+                // updates thinking that they have been already sent.
+                conn.execute(
+                    "INSERT INTO smtp_status_updates (msg_id, first_serial, last_serial, descr) \
+                     VALUES(?, ?, ?, '') \
+                     ON CONFLICT(msg_id) \
+                     DO UPDATE SET first_serial=min(first_serial - 1, excluded.first_serial)",
+                    (msg.id, range.0, range.1),
+                )?;
+                Ok(())
+            };
+            context.sql.call_write(conn_fn).await?;
+        }
+        context.scheduler.interrupt_smtp().await;
     }
     Ok(())
 }
@@ -4725,6 +4749,14 @@ impl Context {
             SyncAction::Rename(to) => if is_community && Chat::load_from_db(self, chat_id).await?.typ == Chattype::Broadcast { Ok(()) } else {rename_ex(self, Nosync, chat_id, to).await},
             SyncAction::SetContacts(addrs) => set_contacts_by_addrs(self, chat_id, addrs).await,
         }
+    }
+
+    /// Emits the appropriate `MsgsChanged` event. Should be called if the number of unnoticed
+    /// archived chats could decrease. In general we don't want to make an extra db query to know if
+    /// a noticied chat is archived. Emitting events should be cheap, a false-positive `MsgsChanged`
+    /// is ok.
+    pub(crate) fn on_archived_chats_maybe_noticed(&self) {
+        self.emit_msgs_changed(DC_CHAT_ID_ARCHIVED_LINK, MsgId::new(0));
     }
 }
 
@@ -5897,7 +5929,27 @@ mod tests {
         assert_eq!(DC_CHAT_ID_ARCHIVED_LINK.get_fresh_msg_cnt(&t).await?, 2);
 
         // mark one of the archived+muted chats as noticed: check that the archive-link counter is changed as well
+        t.evtracker.clear_events();
         marknoticed_chat(&t, claire_chat_id).await?;
+        let ev = t
+            .evtracker
+            .get_matching(|ev| {
+                matches!(
+                    ev,
+                    EventType::MsgsChanged {
+                        chat_id: DC_CHAT_ID_ARCHIVED_LINK,
+                        ..
+                    }
+                )
+            })
+            .await;
+        assert_eq!(
+            ev,
+            EventType::MsgsChanged {
+                chat_id: DC_CHAT_ID_ARCHIVED_LINK,
+                msg_id: MsgId::new(0),
+            }
+        );
         assert_eq!(bob_chat_id.get_fresh_msg_cnt(&t).await?, 2);
         assert_eq!(claire_chat_id.get_fresh_msg_cnt(&t).await?, 0);
         assert_eq!(DC_CHAT_ID_ARCHIVED_LINK.get_fresh_msg_cnt(&t).await?, 1);

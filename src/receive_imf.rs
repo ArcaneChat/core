@@ -633,9 +633,9 @@ pub(crate) async fn receive_imf_inner(
 /// Also returns whether it is blocked or not and its origin.
 ///
 /// * `prevent_rename`: if true, the display_name of this contact will not be changed. Useful for
-/// mailing lists: In some mailing lists, many users write from the same address but with different
-/// display names. We don't want the display name to change every time the user gets a new email from
-/// a mailing list.
+///   mailing lists: In some mailing lists, many users write from the same address but with different
+///   display names. We don't want the display name to change every time the user gets a new email from
+///   a mailing list.
 ///
 /// Returns `None` if From field does not contain a valid contact address.
 pub async fn from_field_to_contact_id(
@@ -1488,12 +1488,19 @@ async fn add_parts(
             Ok(node_addr) => {
                 info!(context, "Adding iroh peer with address {node_addr:?}.");
                 let instance_id = parent.context("Failed to get parent message")?.id;
-                let node_id = node_addr.node_id;
-                let relay_server = node_addr.relay_url().map(|relay| relay.as_str());
-                let topic = get_iroh_topic_for_msg(context, instance_id).await?;
-                iroh_add_peer_for_topic(context, instance_id, topic, node_id, relay_server).await?;
-                let iroh = context.get_or_try_init_peer_channel().await?;
-                iroh.maybe_add_gossip_peers(topic, vec![node_addr]).await?;
+                if let Some(topic) = get_iroh_topic_for_msg(context, instance_id).await? {
+                    let node_id = node_addr.node_id;
+                    let relay_server = node_addr.relay_url().map(|relay| relay.as_str());
+                    iroh_add_peer_for_topic(context, instance_id, topic, node_id, relay_server)
+                        .await?;
+                    let iroh = context.get_or_try_init_peer_channel().await?;
+                    iroh.maybe_add_gossip_peers(topic, vec![node_addr]).await?;
+                } else {
+                    warn!(
+                        context,
+                        "Could not add iroh peer because {instance_id} has no topic"
+                    );
+                }
                 chat_id = DC_CHAT_ID_TRASH;
             }
             Err(err) => {
@@ -1701,7 +1708,13 @@ RETURNING id
         replace_msg_id.trash(context, on_server).await?;
     }
 
-    chat_id.unarchive_if_not_muted(context, state).await?;
+    let unarchive = match mime_parser.get_header(HeaderDef::ChatGroupMemberRemoved) {
+        Some(addr) => context.is_self_addr(addr).await?,
+        None => true,
+    };
+    if unarchive {
+        chat_id.unarchive_if_not_muted(context, state).await?;
+    }
 
     info!(
         context,
@@ -1861,7 +1874,7 @@ async fn lookup_chat_or_create_adhoc_group(
         Ok(Some((new_chat_id, new_chat_id_blocked)))
     } else if allow_creation {
         // Try to create an ad hoc group.
-        if let Some(new_chat_id) = create_adhoc_group(
+        create_adhoc_group(
             context,
             mime_parser,
             create_blocked,
@@ -1870,12 +1883,7 @@ async fn lookup_chat_or_create_adhoc_group(
             is_partial_download,
         )
         .await
-        .context("Could not create ad hoc group")?
-        {
-            Ok(Some((new_chat_id, create_blocked)))
-        } else {
-            Ok(None)
-        }
+        .context("Could not create ad hoc group")
     } else {
         Ok(None)
     }
@@ -2554,7 +2562,7 @@ async fn create_adhoc_group(
     from_id: ContactId,
     to_ids: &[ContactId],
     is_partial_download: bool,
-) -> Result<Option<ChatId>> {
+) -> Result<Option<(ChatId, Blocked)>> {
     if is_partial_download {
         // Partial download may be an encrypted message with protected Subject header.
         //
@@ -2593,7 +2601,16 @@ async fn create_adhoc_group(
         );
         return Ok(None);
     }
-
+    if mime_parser
+        .get_header(HeaderDef::ChatGroupMemberRemoved)
+        .is_some()
+    {
+        info!(
+            context,
+            "Message removes member from unknown ad-hoc group (TRASH)."
+        );
+        return Ok(Some((DC_CHAT_ID_TRASH, Blocked::Not)));
+    }
     if member_ids.len() < 3 {
         return Ok(None);
     }
@@ -2625,7 +2642,7 @@ async fn create_adhoc_group(
     chatlist_events::emit_chatlist_changed(context);
     chatlist_events::emit_chatlist_item_changed(context, new_chat_id);
 
-    Ok(Some(new_chat_id))
+    Ok(Some((new_chat_id, create_blocked)))
 }
 
 #[derive(Debug, PartialEq, Eq)]

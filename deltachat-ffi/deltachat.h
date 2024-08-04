@@ -519,6 +519,11 @@ char*           dc_get_blobdir               (const dc_context_t* context);
  *                    1=After the key changed, `dc_chat_can_send()` returns false and `dc_chat_is_protection_broken()` returns true
  *                    until `dc_accept_chat()` is called.
  * - `is_chatmail` = 1 if the the server is a chatmail server, 0 otherwise.
+ * - `is_muted`     = Whether a context is muted by the user.
+ *                    Muted contexts should not sound, vibrate or show notifications.
+ *                    In contrast to `dc_set_chat_mute_duration()`,
+ *                    fresh message and badge counters are not changed by this setting,
+ *                    but should be tuned down where appropriate.
  * - `ui.*`         = All keys prefixed by `ui.` can be used by the user-interfaces for system-specific purposes.
  *                    The prefix should be followed by the system and maybe subsystem,
  *                    e.g. `ui.desktop.foo`, `ui.desktop.linux.bar`, `ui.android.foo`, `ui.dc40.bar`, `ui.bot.simplebot.baz`.
@@ -2499,6 +2504,7 @@ void            dc_stop_ongoing_process      (dc_context_t* context);
 #define         DC_QR_FPR_WITHOUT_ADDR       230 // test1=formatted fingerprint
 #define         DC_QR_ACCOUNT                250 // text1=domain
 #define         DC_QR_BACKUP                 251
+#define         DC_QR_BACKUP2                252
 #define         DC_QR_WEBRTC_INSTANCE        260 // text1=domain, text2=instance pattern
 #define         DC_QR_ADDR                   320 // id=contact
 #define         DC_QR_TEXT                   330 // text1=text
@@ -2545,6 +2551,7 @@ void            dc_stop_ongoing_process      (dc_context_t* context);
  *   if so, call dc_set_config_from_qr() and then dc_configure().
  *
  * - DC_QR_BACKUP:
+ * - DC_QR_BACKUP2:
  *   ask the user if they want to set up a new device.
  *   If so, pass the qr-code to dc_receive_backup().
  *
@@ -6651,6 +6658,8 @@ void dc_event_unref(dc_event_t* event);
 /// "Message opened"
 ///
 /// Used in subjects of outgoing read receipts.
+///
+/// @deprecated Deprecated 2024-07-26
 #define DC_STR_READRCPT                   31
 
 /// "The message '%1$s' you sent was displayed on the screen of the recipient."
@@ -6658,7 +6667,7 @@ void dc_event_unref(dc_event_t* event);
 /// Used as message text of outgoing read receipts.
 /// - %1$s will be replaced by the subject of the displayed message
 ///
-/// @deprecated Deprecated 2024-06-23, use DC_STR_READRCPT_MAILBODY2 instead.
+/// @deprecated Deprecated 2024-06-23
 #define DC_STR_READRCPT_MAILBODY          32
 
 /// @deprecated Deprecated, this string is no longer needed.
@@ -7376,11 +7385,6 @@ void dc_event_unref(dc_event_t* event);
 ///
 /// Used as info message.
 #define DC_STR_SECUREJOIN_WAIT_TIMEOUT 191
-
-/// "The message is a receipt notification."
-///
-/// Used as message text of outgoing read receipts.
-#define DC_STR_READRCPT_MAILBODY2 192
 
 /// "Contact". Deprecated, currently unused.
 #define DC_STR_CONTACT 200

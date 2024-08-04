@@ -1,206 +1,88 @@
 //! # Common network utilities.
-use std::net::{IpAddr, SocketAddr};
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::SocketAddr;
 use std::pin::Pin;
-use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::{format_err, Context as _, Result};
-use tokio::net::{lookup_host, TcpStream};
+use async_native_tls::TlsStream;
+use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_io_timeout::TimeoutStream;
 
 use crate::context::Context;
 use crate::tools::time;
 
+pub(crate) mod dns;
 pub(crate) mod http;
 pub(crate) mod session;
 pub(crate) mod tls;
 
+use dns::lookup_host_with_cache;
 pub use http::{read_url, read_url_blob, Response as HttpResponse};
+use tls::wrap_tls;
 
-async fn connect_tcp_inner(addr: SocketAddr, timeout_val: Duration) -> Result<TcpStream> {
-    let tcp_stream = timeout(timeout_val, TcpStream::connect(addr))
-        .await
-        .context("connection timeout")?
-        .context("connection failure")?;
-    Ok(tcp_stream)
-}
-
-async fn lookup_host_with_timeout(
-    hostname: &str,
-    port: u16,
-    timeout_val: Duration,
-) -> Result<Vec<SocketAddr>> {
-    let res = timeout(timeout_val, lookup_host((hostname, port)))
-        .await
-        .context("DNS lookup timeout")?
-        .context("DNS lookup failure")?;
-    Ok(res.collect())
-}
-
-/// Looks up hostname and port using DNS and updates the address resolution cache.
+/// Connection, write and read timeout.
 ///
-/// If `load_cache` is true, appends cached results not older than 30 days to the end
-/// or entries from fallback cache if there are no cached addresses.
-async fn lookup_host_with_cache(
-    context: &Context,
-    hostname: &str,
-    port: u16,
-    timeout_val: Duration,
-    load_cache: bool,
-) -> Result<Vec<SocketAddr>> {
+/// This constant should be more than the largest expected RTT.
+pub(crate) const TIMEOUT: Duration = Duration::from_secs(60);
+
+/// TTL for caches in seconds.
+pub(crate) const CACHE_TTL: u64 = 30 * 24 * 60 * 60;
+
+/// Removes connection history entries after `CACHE_TTL`.
+pub(crate) async fn prune_connection_history(context: &Context) -> Result<()> {
     let now = time();
-    let mut resolved_addrs = match lookup_host_with_timeout(hostname, port, timeout_val).await {
-        Ok(res) => res,
-        Err(err) => {
-            warn!(
-                context,
-                "DNS resolution for {}:{} failed: {:#}.", hostname, port, err
-            );
-            Vec::new()
-        }
-    };
+    context
+        .sql
+        .execute(
+            "DELETE FROM connection_history
+             WHERE ? > timestamp + ?",
+            (now, CACHE_TTL),
+        )
+        .await?;
+    Ok(())
+}
 
-    for addr in &resolved_addrs {
-        let ip_string = addr.ip().to_string();
-        if ip_string == hostname {
-            // IP address resolved into itself, not interesting to cache.
-            continue;
-        }
+pub(crate) async fn update_connection_history(
+    context: &Context,
+    alpn: &str,
+    host: &str,
+    port: u16,
+    addr: &str,
+    now: i64,
+) -> Result<()> {
+    context
+        .sql
+        .execute(
+            "INSERT INTO connection_history (host, port, alpn, addr, timestamp)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT (host, port, alpn, addr)
+             DO UPDATE SET timestamp=excluded.timestamp",
+            (host, port, alpn, addr, now),
+        )
+        .await?;
+    Ok(())
+}
 
-        info!(context, "Resolved {}:{} into {}.", hostname, port, &addr);
-
-        // Update the cache.
-        context
-            .sql
-            .execute(
-                "INSERT INTO dns_cache
-                 (hostname, address, timestamp)
-                 VALUES (?, ?, ?)
-                 ON CONFLICT (hostname, address)
-                 DO UPDATE SET timestamp=excluded.timestamp",
-                (hostname, ip_string, now),
-            )
-            .await?;
-    }
-
-    if load_cache {
-        for cached_address in context
-            .sql
-            .query_map(
-                "SELECT address
-                 FROM dns_cache
-                 WHERE hostname = ?
-                 AND ? < timestamp + 30 * 24 * 3600
-                 ORDER BY timestamp DESC",
-                (hostname, now),
-                |row| {
-                    let address: String = row.get(0)?;
-                    Ok(address)
-                },
-                |rows| {
-                    rows.collect::<std::result::Result<Vec<_>, _>>()
-                        .map_err(Into::into)
-                },
-            )
-            .await?
-        {
-            match IpAddr::from_str(&cached_address) {
-                Ok(ip_addr) => {
-                    let addr = SocketAddr::new(ip_addr, port);
-                    if !resolved_addrs.contains(&addr) {
-                        resolved_addrs.push(addr);
-                    }
-                }
-                Err(err) => {
-                    warn!(
-                        context,
-                        "Failed to parse cached address {:?}: {:#}.", cached_address, err
-                    );
-                }
-            }
-        }
-
-        if resolved_addrs.is_empty() {
-            // Load hardcoded cache if everything else fails.
-            //
-            // See <https://support.delta.chat/t/no-dns-resolution-result/2778> and
-            // <https://github.com/deltachat/deltachat-core-rust/issues/4920> for reasons.
-            //
-            // In the future we may pre-resolve all provider database addresses
-            // and build them in.
-            match hostname {
-                "mail.sangham.net" => {
-                    resolved_addrs.push(SocketAddr::new(
-                        IpAddr::V6(Ipv6Addr::new(0x2a01, 0x4f8, 0xc17, 0x798c, 0, 0, 0, 1)),
-                        port,
-                    ));
-                    resolved_addrs.push(SocketAddr::new(
-                        IpAddr::V4(Ipv4Addr::new(159, 69, 186, 85)),
-                        port,
-                    ));
-                }
-                "nine.testrun.org" => {
-                    resolved_addrs.push(SocketAddr::new(
-                        IpAddr::V6(Ipv6Addr::new(0x2a01, 0x4f8, 0x241, 0x4ce8, 0, 0, 0, 2)),
-                        port,
-                    ));
-                    resolved_addrs.push(SocketAddr::new(
-                        IpAddr::V4(Ipv4Addr::new(116, 202, 233, 236)),
-                        port,
-                    ));
-                }
-                "disroot.org" => {
-                    resolved_addrs.push(SocketAddr::new(
-                        IpAddr::V4(Ipv4Addr::new(178, 21, 23, 139)),
-                        port,
-                    ));
-                }
-                "mail.riseup.net" => {
-                    resolved_addrs.push(SocketAddr::new(
-                        IpAddr::V4(Ipv4Addr::new(198, 252, 153, 70)),
-                        port,
-                    ));
-                    resolved_addrs.push(SocketAddr::new(
-                        IpAddr::V4(Ipv4Addr::new(198, 252, 153, 71)),
-                        port,
-                    ));
-                }
-                "imap.gmail.com" => {
-                    resolved_addrs.push(SocketAddr::new(
-                        IpAddr::V6(Ipv6Addr::new(0x2a00, 0x1450, 0x400c, 0xc1f, 0, 0, 0, 0x6c)),
-                        port,
-                    ));
-                    resolved_addrs.push(SocketAddr::new(
-                        IpAddr::V6(Ipv6Addr::new(0x2a00, 0x1450, 0x400c, 0xc1f, 0, 0, 0, 0x6d)),
-                        port,
-                    ));
-                    resolved_addrs.push(SocketAddr::new(
-                        IpAddr::V4(Ipv4Addr::new(142, 250, 110, 109)),
-                        port,
-                    ));
-                    resolved_addrs.push(SocketAddr::new(
-                        IpAddr::V4(Ipv4Addr::new(142, 250, 110, 108)),
-                        port,
-                    ));
-                }
-                "smtp.gmail.com" => {
-                    resolved_addrs.push(SocketAddr::new(
-                        IpAddr::V6(Ipv6Addr::new(0x2a00, 0x1450, 0x4013, 0xc04, 0, 0, 0, 0x6c)),
-                        port,
-                    ));
-                    resolved_addrs.push(SocketAddr::new(
-                        IpAddr::V4(Ipv4Addr::new(142, 250, 110, 109)),
-                        port,
-                    ));
-                }
-                _ => {}
-            }
-        }
-    }
-
-    Ok(resolved_addrs)
+pub(crate) async fn load_connection_timestamp(
+    context: &Context,
+    alpn: &str,
+    host: &str,
+    port: u16,
+    addr: &str,
+) -> Result<Option<i64>> {
+    let timestamp = context
+        .sql
+        .query_get_value(
+            "SELECT timestamp FROM connection_history
+             WHERE host = ?
+               AND port = ?
+               AND alpn = ?
+               AND addr = ?",
+            (host, port, alpn, addr),
+        )
+        .await?;
+    Ok(timestamp)
 }
 
 /// Returns a TCP connection stream with read/write timeouts set
@@ -208,7 +90,37 @@ async fn lookup_host_with_cache(
 ///
 /// `TCP_NODELAY` ensures writing to the stream always results in immediate sending of the packet
 /// to the network, which is important to reduce the latency of interactive protocols such as IMAP.
-///
+pub(crate) async fn connect_tcp_inner(
+    addr: SocketAddr,
+) -> Result<Pin<Box<TimeoutStream<TcpStream>>>> {
+    let tcp_stream = timeout(TIMEOUT, TcpStream::connect(addr))
+        .await
+        .context("connection timeout")?
+        .context("connection failure")?;
+
+    // Disable Nagle's algorithm.
+    tcp_stream.set_nodelay(true)?;
+
+    let mut timeout_stream = TimeoutStream::new(tcp_stream);
+    timeout_stream.set_write_timeout(Some(TIMEOUT));
+    timeout_stream.set_read_timeout(Some(TIMEOUT));
+
+    Ok(Box::pin(timeout_stream))
+}
+
+/// Attempts to establish TLS connection
+/// given the result of the hostname to address resolution.
+pub(crate) async fn connect_tls_inner(
+    addr: SocketAddr,
+    host: &str,
+    strict_tls: bool,
+    alpn: &str,
+) -> Result<TlsStream<Pin<Box<TimeoutStream<TcpStream>>>>> {
+    let tcp_stream = connect_tcp_inner(addr).await?;
+    let tls_stream = wrap_tls(strict_tls, host, alpn, tcp_stream).await?;
+    Ok(tls_stream)
+}
+
 /// If `load_cache` is true, may use cached DNS results.
 /// Because the cache may be poisoned with incorrect results by networks hijacking DNS requests,
 /// this option should only be used when connection is authenticated,
@@ -219,57 +131,24 @@ pub(crate) async fn connect_tcp(
     context: &Context,
     host: &str,
     port: u16,
-    timeout_val: Duration,
     load_cache: bool,
 ) -> Result<Pin<Box<TimeoutStream<TcpStream>>>> {
-    let mut tcp_stream = None;
-    let mut last_error = None;
+    let mut first_error = None;
 
-    for resolved_addr in
-        lookup_host_with_cache(context, host, port, timeout_val, load_cache).await?
-    {
-        match connect_tcp_inner(resolved_addr, timeout_val).await {
+    for resolved_addr in lookup_host_with_cache(context, host, port, "", load_cache).await? {
+        match connect_tcp_inner(resolved_addr).await {
             Ok(stream) => {
-                tcp_stream = Some(stream);
-
-                // Maximize priority of this cached entry.
-                context
-                    .sql
-                    .execute(
-                        "UPDATE dns_cache
-                         SET timestamp = ?
-                         WHERE address = ?",
-                        (time(), resolved_addr.ip().to_string()),
-                    )
-                    .await?;
-                break;
+                return Ok(stream);
             }
             Err(err) => {
                 warn!(
                     context,
                     "Failed to connect to {}: {:#}.", resolved_addr, err
                 );
-                last_error = Some(err);
+                first_error.get_or_insert(err);
             }
         }
     }
 
-    let tcp_stream = match tcp_stream {
-        Some(tcp_stream) => tcp_stream,
-        None => {
-            return Err(
-                last_error.unwrap_or_else(|| format_err!("no DNS resolution results for {host}"))
-            );
-        }
-    };
-
-    // Disable Nagle's algorithm.
-    tcp_stream.set_nodelay(true)?;
-
-    let mut timeout_stream = TimeoutStream::new(tcp_stream);
-    timeout_stream.set_write_timeout(Some(timeout_val));
-    timeout_stream.set_read_timeout(Some(timeout_val));
-    let pinned_stream = Box::pin(timeout_stream);
-
-    Ok(pinned_stream)
+    Err(first_error.unwrap_or_else(|| format_err!("no DNS resolution results for {host}")))
 }

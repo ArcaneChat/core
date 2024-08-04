@@ -1,24 +1,23 @@
-use std::{
-    ops::{Deref, DerefMut},
-    time::Duration,
-};
+use std::net::SocketAddr;
+use std::ops::{Deref, DerefMut};
 
-use anyhow::{Context as _, Result};
+use anyhow::{bail, format_err, Context as _, Result};
 use async_imap::Client as ImapClient;
 use async_imap::Session as ImapSession;
+use fast_socks5::client::Socks5Stream;
 use tokio::io::BufWriter;
 
 use super::capabilities::Capabilities;
 use super::session::Session;
 use crate::context::Context;
-use crate::net::connect_tcp;
+use crate::net::dns::{lookup_host_with_cache, update_connect_timestamp};
 use crate::net::session::SessionStream;
 use crate::net::tls::wrap_tls;
+use crate::net::update_connection_history;
+use crate::net::{connect_tcp_inner, connect_tls_inner};
+use crate::provider::Socket;
 use crate::socks::Socks5Config;
-use fast_socks5::client::Socks5Stream;
-
-/// IMAP connection, write and read timeout.
-pub(crate) const IMAP_TIMEOUT: Duration = Duration::from_secs(60);
+use crate::tools::time;
 
 #[derive(Debug)]
 pub(crate) struct Client {
@@ -98,14 +97,67 @@ impl Client {
         Ok(Session::new(session, capabilities))
     }
 
-    pub async fn connect_secure(
+    pub async fn connect(
         context: &Context,
-        hostname: &str,
+        host: &str,
         port: u16,
         strict_tls: bool,
+        socks5_config: Option<Socks5Config>,
+        security: Socket,
     ) -> Result<Self> {
-        let tcp_stream = connect_tcp(context, hostname, port, IMAP_TIMEOUT, strict_tls).await?;
-        let tls_stream = wrap_tls(strict_tls, hostname, tcp_stream).await?;
+        if let Some(socks5_config) = socks5_config {
+            let client = match security {
+                Socket::Automatic => bail!("IMAP port security is not configured"),
+                Socket::Ssl => {
+                    Client::connect_secure_socks5(context, host, port, strict_tls, socks5_config)
+                        .await?
+                }
+                Socket::Starttls => {
+                    Client::connect_starttls_socks5(context, host, port, socks5_config, strict_tls)
+                        .await?
+                }
+                Socket::Plain => {
+                    Client::connect_insecure_socks5(context, host, port, socks5_config).await?
+                }
+            };
+            Ok(client)
+        } else {
+            let mut first_error = None;
+            let load_cache =
+                strict_tls && (security == Socket::Ssl || security == Socket::Starttls);
+            for resolved_addr in
+                lookup_host_with_cache(context, host, port, "imap", load_cache).await?
+            {
+                let res = match security {
+                    Socket::Automatic => bail!("IMAP port security is not configured"),
+                    Socket::Ssl => Client::connect_secure(resolved_addr, host, strict_tls).await,
+                    Socket::Starttls => {
+                        Client::connect_starttls(resolved_addr, host, strict_tls).await
+                    }
+                    Socket::Plain => Client::connect_insecure(resolved_addr).await,
+                };
+                match res {
+                    Ok(client) => {
+                        let ip_addr = resolved_addr.ip().to_string();
+                        if load_cache {
+                            update_connect_timestamp(context, host, &ip_addr).await?;
+                        }
+                        update_connection_history(context, "imap", host, port, &ip_addr, time())
+                            .await?;
+                        return Ok(client);
+                    }
+                    Err(err) => {
+                        warn!(context, "Failed to connect to {resolved_addr}: {err:#}.");
+                        first_error.get_or_insert(err);
+                    }
+                }
+            }
+            Err(first_error.unwrap_or_else(|| format_err!("no DNS resolution results for {host}")))
+        }
+    }
+
+    async fn connect_secure(addr: SocketAddr, hostname: &str, strict_tls: bool) -> Result<Self> {
+        let tls_stream = connect_tls_inner(addr, hostname, strict_tls, "imap").await?;
         let buffered_stream = BufWriter::new(tls_stream);
         let session_stream: Box<dyn SessionStream> = Box::new(buffered_stream);
         let mut client = Client::new(session_stream);
@@ -116,8 +168,8 @@ impl Client {
         Ok(client)
     }
 
-    pub async fn connect_insecure(context: &Context, hostname: &str, port: u16) -> Result<Self> {
-        let tcp_stream = connect_tcp(context, hostname, port, IMAP_TIMEOUT, false).await?;
+    async fn connect_insecure(addr: SocketAddr) -> Result<Self> {
+        let tcp_stream = connect_tcp_inner(addr).await?;
         let buffered_stream = BufWriter::new(tcp_stream);
         let session_stream: Box<dyn SessionStream> = Box::new(buffered_stream);
         let mut client = Client::new(session_stream);
@@ -128,17 +180,12 @@ impl Client {
         Ok(client)
     }
 
-    pub async fn connect_starttls(
-        context: &Context,
-        hostname: &str,
-        port: u16,
-        strict_tls: bool,
-    ) -> Result<Self> {
-        let tcp_stream = connect_tcp(context, hostname, port, IMAP_TIMEOUT, strict_tls).await?;
+    async fn connect_starttls(addr: SocketAddr, host: &str, strict_tls: bool) -> Result<Self> {
+        let tcp_stream = connect_tcp_inner(addr).await?;
 
         // Run STARTTLS command and convert the client back into a stream.
         let buffered_tcp_stream = BufWriter::new(tcp_stream);
-        let mut client = ImapClient::new(buffered_tcp_stream);
+        let mut client = async_imap::Client::new(buffered_tcp_stream);
         let _greeting = client
             .read_response()
             .await
@@ -150,7 +197,7 @@ impl Client {
         let buffered_tcp_stream = client.into_inner();
         let tcp_stream = buffered_tcp_stream.into_inner();
 
-        let tls_stream = wrap_tls(strict_tls, hostname, tcp_stream)
+        let tls_stream = wrap_tls(strict_tls, host, "imap", tcp_stream)
             .await
             .context("STARTTLS upgrade failed")?;
 
@@ -160,7 +207,7 @@ impl Client {
         Ok(client)
     }
 
-    pub async fn connect_secure_socks5(
+    async fn connect_secure_socks5(
         context: &Context,
         domain: &str,
         port: u16,
@@ -168,9 +215,9 @@ impl Client {
         socks5_config: Socks5Config,
     ) -> Result<Self> {
         let socks5_stream = socks5_config
-            .connect(context, domain, port, IMAP_TIMEOUT, strict_tls)
+            .connect(context, domain, port, strict_tls)
             .await?;
-        let tls_stream = wrap_tls(strict_tls, domain, socks5_stream).await?;
+        let tls_stream = wrap_tls(strict_tls, domain, "imap", socks5_stream).await?;
         let buffered_stream = BufWriter::new(tls_stream);
         let session_stream: Box<dyn SessionStream> = Box::new(buffered_stream);
         let mut client = Client::new(session_stream);
@@ -181,15 +228,13 @@ impl Client {
         Ok(client)
     }
 
-    pub async fn connect_insecure_socks5(
+    async fn connect_insecure_socks5(
         context: &Context,
         domain: &str,
         port: u16,
         socks5_config: Socks5Config,
     ) -> Result<Self> {
-        let socks5_stream = socks5_config
-            .connect(context, domain, port, IMAP_TIMEOUT, false)
-            .await?;
+        let socks5_stream = socks5_config.connect(context, domain, port, false).await?;
         let buffered_stream = BufWriter::new(socks5_stream);
         let session_stream: Box<dyn SessionStream> = Box::new(buffered_stream);
         let mut client = Client::new(session_stream);
@@ -200,7 +245,7 @@ impl Client {
         Ok(client)
     }
 
-    pub async fn connect_starttls_socks5(
+    async fn connect_starttls_socks5(
         context: &Context,
         hostname: &str,
         port: u16,
@@ -208,7 +253,7 @@ impl Client {
         strict_tls: bool,
     ) -> Result<Self> {
         let socks5_stream = socks5_config
-            .connect(context, hostname, port, IMAP_TIMEOUT, strict_tls)
+            .connect(context, hostname, port, strict_tls)
             .await?;
 
         // Run STARTTLS command and convert the client back into a stream.
@@ -225,7 +270,7 @@ impl Client {
         let buffered_socks5_stream = client.into_inner();
         let socks5_stream: Socks5Stream<_> = buffered_socks5_stream.into_inner();
 
-        let tls_stream = wrap_tls(strict_tls, hostname, socks5_stream)
+        let tls_stream = wrap_tls(strict_tls, hostname, "imap", socks5_stream)
             .await
             .context("STARTTLS upgrade failed")?;
         let buffered_stream = BufWriter::new(tls_stream);

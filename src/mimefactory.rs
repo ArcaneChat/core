@@ -31,6 +31,7 @@ use crate::tools::IsNoneOrEmpty;
 use crate::tools::{
     create_outgoing_rfc724_mid, create_smeared_timestamp, remove_subject_prefix, time,
 };
+use crate::webxdc::StatusUpdateSerial;
 use crate::{location, peer_channels};
 
 // attachments of 25 mb brutto should work on the majority of providers
@@ -299,19 +300,12 @@ impl MimeFactory {
     fn verified(&self) -> bool {
         match &self.loaded {
             Loaded::Message { chat, msg } => {
-                if chat.is_protected() {
-                    if msg.get_info_type() == SystemMessage::SecurejoinMessage {
-                        // Securejoin messages are supposed to verify a key.
-                        // In order to do this, it is necessary that they can be sent
-                        // to a key that is not yet verified.
-                        // This has to work independently of whether the chat is protected right now.
-                        false
-                    } else {
-                        true
-                    }
-                } else {
-                    false
-                }
+                chat.is_self_talk() ||
+                    // Securejoin messages are supposed to verify a key.
+                    // In order to do this, it is necessary that they can be sent
+                    // to a key that is not yet verified.
+                    // This has to work independently of whether the chat is protected right now.
+                    chat.is_protected() && msg.get_info_type() != SystemMessage::SecurejoinMessage
             }
             Loaded::Mdn { .. } => false,
         }
@@ -460,7 +454,7 @@ impl MimeFactory {
                 };
                 stock_str::subject_for_new_contact(context, self_name).await
             }
-            Loaded::Mdn { .. } => stock_str::read_rcpt(context).await,
+            Loaded::Mdn { .. } => "Receipt Notification".to_string(), // untranslated to no reveal sender's language
         };
 
         Ok(subject)
@@ -671,7 +665,7 @@ impl MimeFactory {
                         })
                 }
             }
-            Loaded::Mdn { .. } => self.render_mdn(context).await?,
+            Loaded::Mdn { .. } => self.render_mdn()?,
         };
 
         let get_content_type_directives_header = || {
@@ -773,7 +767,7 @@ impl MimeFactory {
 
                 match header_name.as_str() {
                     "subject" => {
-                        unprotected_headers.push(Header::new(header.name, "...".to_string()));
+                        unprotected_headers.push(Header::new(header.name, "[...]".to_string()));
                     }
                     "date"
                     | "in-reply-to"
@@ -1369,8 +1363,13 @@ impl MimeFactory {
         } else if msg.viewtype == Viewtype::Webxdc {
             let topic = peer_channels::create_random_topic();
             headers.push(create_iroh_header(context, topic, msg.id).await?);
-            if let Some(json) = context
-                .render_webxdc_status_update_object(msg.id, None)
+            if let (Some(json), _) = context
+                .render_webxdc_status_update_object(
+                    msg.id,
+                    StatusUpdateSerial::MIN,
+                    StatusUpdateSerial::MAX,
+                    None,
+                )
                 .await?
             {
                 parts.push(context.build_status_update_part(&json));
@@ -1394,7 +1393,7 @@ impl MimeFactory {
     }
 
     /// Render an MDN
-    async fn render_mdn(&mut self, context: &Context) -> Result<PartBuilder> {
+    fn render_mdn(&mut self) -> Result<PartBuilder> {
         // RFC 6522, this also requires the `report-type` parameter which is equal
         // to the MIME subtype of the second body part of the multipart/report
         //
@@ -1420,16 +1419,15 @@ impl MimeFactory {
             "multipart/report; report-type=disposition-notification".to_string(),
         ));
 
-        // first body part: always human-readable, always REQUIRED by RFC 6522
-        let message_text = format!(
-            "{}\r\n",
-            format_flowed(&stock_str::read_rcpt_mail_body(context).await)
-        );
+        // first body part: always human-readable, always REQUIRED by RFC 6522.
+        // untranslated to no reveal sender's language.
+        // moreover, translations in unknown languages are confusing, and clients may not display them at all
         let text_part = PartBuilder::new().header((
             "Content-Type".to_string(),
             "text/plain; charset=utf-8; format=flowed; delsp=no".to_string(),
         ));
-        let text_part = self.add_message_text(text_part, message_text);
+        let text_part =
+            self.add_message_text(text_part, "This is a receipt notification.\r\n".to_string());
         message = message.child(text_part.build());
 
         // second body part: machine-readable, always REQUIRED by RFC 6522
@@ -2505,6 +2503,7 @@ mod tests {
             .await?;
         let sent = bob.send_msg(chat, &mut msg).await;
         assert!(msg.get_showpadlock());
+        assert!(sent.payload.contains("\r\nSubject: [...]\r\n"));
 
         let mime = MimeMessage::from_bytes(&alice, sent.payload.as_bytes(), None).await?;
         let mut payload = str::from_utf8(&mime.decoded_data)?.splitn(2, "\r\n\r\n");

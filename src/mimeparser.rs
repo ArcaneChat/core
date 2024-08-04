@@ -11,6 +11,7 @@ use deltachat_derive::{FromSql, ToSql};
 use format_flowed::unformat_flowed;
 use lettre_email::mime::Mime;
 use mailparse::{addrparse_header, DispositionType, MailHeader, MailHeaderMap, SingleInfo};
+use rand::distributions::{Alphanumeric, DistString};
 
 use crate::aheader::{Aheader, EncryptPreference};
 use crate::blob::BlobObject;
@@ -27,10 +28,7 @@ use crate::dehtml::dehtml;
 use crate::events::EventType;
 use crate::headerdef::{HeaderDef, HeaderDefMap};
 use crate::key::{self, load_self_secret_keyring, DcKey, Fingerprint, SignedPublicKey};
-use crate::message::{
-    self, get_vcard_summary, set_msg_failed, update_msg_state, Message, MessageState, MsgId,
-    Viewtype,
-};
+use crate::message::{self, get_vcard_summary, set_msg_failed, Message, MsgId, Viewtype};
 use crate::param::{Param, Params};
 use crate::peerstate::Peerstate;
 use crate::simplify::{simplify, SimplifiedText};
@@ -395,13 +393,10 @@ impl MimeMessage {
                 &mail.headers,
             );
 
-            if let (Some(inner_from), true) = (inner_from, !signatures.is_empty()) {
-                if addr_cmp(&inner_from.addr, &from.addr) {
-                    from_is_signed = true;
-                    from = inner_from;
-                } else {
-                    // There is a From: header in the encrypted &
-                    // signed part, but it doesn't match the outer one.
+            if let Some(inner_from) = inner_from {
+                if !addr_cmp(&inner_from.addr, &from.addr) {
+                    // There is a From: header in the encrypted
+                    // part, but it doesn't match the outer one.
                     // This _might_ be because the sender's mail server
                     // replaced the sending address, e.g. in a mailing list.
                     // Or it's because someone is doing some replay attack.
@@ -410,7 +405,7 @@ impl MimeMessage {
                     // so we return an error below.
                     warn!(
                         context,
-                        "From header in signed part doesn't match the outer one",
+                        "From header in encrypted part doesn't match the outer one",
                     );
 
                     // Return an error from the parser.
@@ -419,6 +414,8 @@ impl MimeMessage {
                     // as if the MIME structure is broken.
                     bail!("From header is forged");
                 }
+                from = inner_from;
+                from_is_signed = !signatures.is_empty();
             }
         }
         if signatures.is_empty() {
@@ -783,7 +780,15 @@ impl MimeMessage {
             .collect::<String>()
             .strip_prefix("base64:")
         {
-            match BlobObject::store_from_base64(context, base64, "avatar").await {
+            // Add random suffix to the filename
+            // to prevent the UI from accidentally using
+            // cached "avatar.jpg".
+            let suffix = Alphanumeric
+                .sample_string(&mut rand::thread_rng(), 7)
+                .to_lowercase();
+
+            match BlobObject::store_from_base64(context, base64, &format!("avatar-{suffix}")).await
+            {
                 Ok(path) => Some(AvatarAction::Change(path)),
                 Err(err) => {
                     warn!(
@@ -2146,24 +2151,32 @@ async fn handle_mdn(
         return Ok(());
     }
 
-    let Some((msg_id, chat_id, msg_state)) = context
+    let Some((msg_id, chat_id, has_mdns, is_dup)) = context
         .sql
         .query_row_optional(
             concat!(
                 "SELECT",
                 "    m.id AS msg_id,",
                 "    c.id AS chat_id,",
-                "    m.state AS state",
-                " FROM msgs m LEFT JOIN chats c ON m.chat_id=c.id",
+                "    mdns.contact_id AS mdn_contact",
+                " FROM msgs m ",
+                " LEFT JOIN chats c ON m.chat_id=c.id",
+                " LEFT JOIN msgs_mdns mdns ON mdns.msg_id=m.id",
                 " WHERE rfc724_mid=? AND from_id=1",
-                " ORDER BY m.id"
+                " ORDER BY msg_id DESC, mdn_contact=? DESC",
+                " LIMIT 1",
             ),
-            (&rfc724_mid,),
+            (&rfc724_mid, from_id),
             |row| {
                 let msg_id: MsgId = row.get("msg_id")?;
                 let chat_id: ChatId = row.get("chat_id")?;
-                let msg_state: MessageState = row.get("state")?;
-                Ok((msg_id, chat_id, msg_state))
+                let mdn_contact: Option<ContactId> = row.get("mdn_contact")?;
+                Ok((
+                    msg_id,
+                    chat_id,
+                    mdn_contact.is_some(),
+                    mdn_contact == Some(from_id),
+                ))
             },
         )
         .await?
@@ -2175,28 +2188,17 @@ async fn handle_mdn(
         return Ok(());
     };
 
-    if !context
-        .sql
-        .exists(
-            "SELECT COUNT(*) FROM msgs_mdns WHERE msg_id=? AND contact_id=?",
-            (msg_id, from_id),
-        )
-        .await?
-    {
-        context
-            .sql
-            .execute(
-                "INSERT INTO msgs_mdns (msg_id, contact_id, timestamp_sent) VALUES (?, ?, ?)",
-                (msg_id, from_id, timestamp_sent),
-            )
-            .await?;
+    if is_dup {
+        return Ok(());
     }
-
-    if msg_state == MessageState::OutPreparing
-        || msg_state == MessageState::OutPending
-        || msg_state == MessageState::OutDelivered
-    {
-        update_msg_state(context, msg_id, MessageState::OutMdnRcvd).await?;
+    context
+        .sql
+        .execute(
+            "INSERT INTO msgs_mdns (msg_id, contact_id, timestamp_sent) VALUES (?, ?, ?)",
+            (msg_id, from_id, timestamp_sent),
+        )
+        .await?;
+    if !has_mdns {
         context.emit_event(EventType::MsgRead { chat_id, msg_id });
         // note(treefit): only matters if it is the last message in chat (but probably too expensive to check, debounce also solves it)
         chatlist_events::emit_chatlist_item_changed(context, chat_id);
@@ -2304,7 +2306,7 @@ mod tests {
         chat,
         chatlist::Chatlist,
         constants::{Blocked, DC_DESIRED_TEXT_LEN, DC_ELLIPSIS},
-        message::MessengerMessage,
+        message::{MessageState, MessengerMessage},
         receive_imf::receive_imf,
         test_utils::{TestContext, TestContextManager},
         tools::time,

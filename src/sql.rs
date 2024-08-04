@@ -18,6 +18,8 @@ use crate::imex::BLOBS_BACKUP_NAME;
 use crate::location::delete_orphaned_poi_locations;
 use crate::log::LogExt;
 use crate::message::{Message, MsgId, Viewtype};
+use crate::net::dns::prune_dns_cache;
+use crate::net::prune_connection_history;
 use crate::param::{Param, Params};
 use crate::peerstate::Peerstate;
 use crate::stock_str;
@@ -103,9 +105,11 @@ impl Sql {
 
         // Test that the key is correct using a single connection.
         let connection = Connection::open(&self.dbfile)?;
-        connection
-            .pragma_update(None, "key", &passphrase)
-            .context("failed to set PRAGMA key")?;
+        if !passphrase.is_empty() {
+            connection
+                .pragma_update(None, "key", &passphrase)
+                .context("Failed to set PRAGMA key")?;
+        }
         let key_is_correct = connection
             .query_row("SELECT count(*) FROM sqlite_master", [], |_row| Ok(()))
             .is_ok();
@@ -126,7 +130,7 @@ impl Sql {
     }
 
     /// Closes all underlying Sqlite connections.
-    async fn close(&self) {
+    pub(crate) async fn close(&self) {
         let _ = self.pool.write().await.take();
         // drop closes the connection
     }
@@ -137,46 +141,50 @@ impl Sql {
             .to_str()
             .with_context(|| format!("path {path:?} is not valid unicode"))?
             .to_string();
-        let res = self
-            .call_write(move |conn| {
-                // Check that backup passphrase is correct before resetting our database.
-                conn.execute("ATTACH DATABASE ? AS backup KEY ?", (path_str, passphrase))
-                    .context("failed to attach backup database")?;
-                if let Err(err) = conn
-                    .query_row("SELECT count(*) FROM sqlite_master", [], |_row| Ok(()))
-                    .context("backup passphrase is not correct")
-                {
-                    conn.execute("DETACH DATABASE backup", [])
-                        .context("failed to detach backup database")?;
-                    return Err(err);
-                }
 
-                // Reset the database without reopening it. We don't want to reopen the database because we
-                // don't have main database passphrase at this point.
-                // See <https://sqlite.org/c3ref/c_dbconfig_enable_fkey.html> for documentation.
-                // Without resetting import may fail due to existing tables.
+        // Keep `config_cache` locked all the time the db is imported so that nobody can use invalid
+        // values from there. And clear it immediately so as not to forget in case of errors.
+        let mut config_cache = self.config_cache.write().await;
+        config_cache.clear();
+
+        self.call_write(move |conn| {
+            // Check that backup passphrase is correct before resetting our database.
+            conn.execute("ATTACH DATABASE ? AS backup KEY ?", (path_str, passphrase))
+                .context("failed to attach backup database")?;
+            let res = conn
+                .query_row("SELECT count(*) FROM sqlite_master", [], |_row| Ok(()))
+                .context("backup passphrase is not correct");
+
+            // Reset the database without reopening it. We don't want to reopen the database because we
+            // don't have main database passphrase at this point.
+            // See <https://sqlite.org/c3ref/c_dbconfig_enable_fkey.html> for documentation.
+            // Without resetting import may fail due to existing tables.
+            let res = res.and_then(|_| {
                 conn.set_db_config(DbConfig::SQLITE_DBCONFIG_RESET_DATABASE, true)
-                    .context("failed to set SQLITE_DBCONFIG_RESET_DATABASE")?;
+                    .context("failed to set SQLITE_DBCONFIG_RESET_DATABASE")
+            });
+            let res = res.and_then(|_| {
                 conn.execute("VACUUM", [])
-                    .context("failed to vacuum the database")?;
+                    .context("failed to vacuum the database")
+            });
+            let res = res.and(
                 conn.set_db_config(DbConfig::SQLITE_DBCONFIG_RESET_DATABASE, false)
-                    .context("failed to unset SQLITE_DBCONFIG_RESET_DATABASE")?;
-                let res = conn
-                    .query_row("SELECT sqlcipher_export('main', 'backup')", [], |_row| {
-                        Ok(())
-                    })
-                    .context("failed to import from attached backup database");
+                    .context("failed to unset SQLITE_DBCONFIG_RESET_DATABASE"),
+            );
+            let res = res.and_then(|_| {
+                conn.query_row("SELECT sqlcipher_export('main', 'backup')", [], |_row| {
+                    Ok(())
+                })
+                .context("failed to import from attached backup database")
+            });
+            let res = res.and(
                 conn.execute("DETACH DATABASE backup", [])
-                    .context("failed to detach backup database")?;
-                res?;
-                Ok(())
-            })
-            .await;
-
-        // The config cache is wrong now that we have a different database
-        self.config_cache.write().await.clear();
-
-        res
+                    .context("failed to detach backup database"),
+            );
+            res?;
+            Ok(())
+        })
+        .await
     }
 
     /// Creates a new connection pool.
@@ -318,8 +326,10 @@ impl Sql {
 
         let pool = lock.take().context("SQL connection pool is not open")?;
         let conn = pool.get().await?;
-        conn.pragma_update(None, "rekey", passphrase.clone())
-            .context("failed to set PRAGMA rekey")?;
+        if !passphrase.is_empty() {
+            conn.pragma_update(None, "rekey", passphrase.clone())
+                .context("Failed to set PRAGMA rekey")?;
+        }
         drop(pool);
 
         *lock = Some(Self::new_pool(&self.dbfile, passphrase.to_string())?);
@@ -350,12 +360,12 @@ impl Sql {
     ///
     /// 1. As mentioned above, SQLite's locking mechanism is non-async and sleeps in a loop.
     /// 2. If there are other write transactions, we block the db connection until
-    ///   upgraded. If some reader comes then, it has to get the next, less used connection with a
-    ///   worse per-connection page cache (SQLite allows one write and any number of reads in parallel).
+    ///    upgraded. If some reader comes then, it has to get the next, less used connection with a
+    ///    worse per-connection page cache (SQLite allows one write and any number of reads in parallel).
     /// 3. If a transaction is blocked for more than `busy_timeout`, it fails with SQLITE_BUSY.
     /// 4. If upon a successful upgrade to a write transaction the db has been modified,
-    ///   the transaction has to be rolled back and retried, which means extra work in terms of
-    ///   CPU/battery.
+    ///    the transaction has to be rolled back and retried, which means extra work in terms of
+    ///    CPU/battery.
     ///
     /// The only pro of making write transactions DEFERRED w/o the external locking would be some
     /// parallelism between them.
@@ -691,7 +701,9 @@ fn new_connection(path: &Path, passphrase: &str) -> Result<Connection> {
         conn.pragma_update(None, "temp_store", "memory")?;
     }
 
-    conn.pragma_update(None, "key", passphrase)?;
+    if !passphrase.is_empty() {
+        conn.pragma_update(None, "key", passphrase)?;
+    }
     // Try to enable auto_vacuum. This will only be
     // applied if the database is new or after successful
     // VACUUM, which usually happens before backup export.
@@ -780,6 +792,17 @@ pub async fn housekeeping(context: &Context) -> Result<()> {
         )
         .await
         .context("failed to remove old webxdc status updates")
+        .log_err(context)
+        .ok();
+
+    prune_connection_history(context)
+        .await
+        .context("Failed to prune connection history")
+        .log_err(context)
+        .ok();
+    prune_dns_cache(context)
+        .await
+        .context("Failed to prune DNS cache")
         .log_err(context)
         .ok();
 

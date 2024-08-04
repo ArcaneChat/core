@@ -80,9 +80,6 @@ pub enum StockMessage {
     #[strum(props(fallback = "Fingerprints"))]
     FingerPrints = 30,
 
-    #[strum(props(fallback = "Return receipt"))]
-    ReadRcpt = 31,
-
     #[strum(props(fallback = "End-to-end encryption preferred"))]
     E2ePreferred = 34,
 
@@ -440,9 +437,6 @@ pub enum StockMessage {
         fallback = "Could not yet establish guaranteed end-to-end encryption, but you may already send a message."
     ))]
     SecurejoinWaitTimeout = 191,
-
-    #[strum(props(fallback = "This message is a receipt notification."))]
-    ReadRcptMailBody = 192,
 }
 
 impl StockMessage {
@@ -795,16 +789,6 @@ pub(crate) async fn finger_prints(context: &Context) -> String {
     translated(context, StockMessage::FingerPrints).await
 }
 
-/// Stock string: `Return receipt`.
-pub(crate) async fn read_rcpt(context: &Context) -> String {
-    translated(context, StockMessage::ReadRcpt).await
-}
-
-/// Stock string: `This message is a receipt notification.`.
-pub(crate) async fn read_rcpt_mail_body(context: &Context) -> String {
-    translated(context, StockMessage::ReadRcptMailBody).await
-}
-
 /// Stock string: `Group image deleted.`.
 pub(crate) async fn msg_grp_img_deleted(context: &Context, by_contact: ContactId) -> String {
     if by_contact == ContactId::SELF {
@@ -859,10 +843,10 @@ pub(crate) async fn setup_contact_qr_description(
     display_name: &str,
     addr: &str,
 ) -> String {
-    let name = if display_name == addr {
+    let name = if display_name.is_empty() {
         addr.to_owned()
     } else {
-        format!("{display_name} ({addr})")
+        display_name.to_owned()
     };
     translated(context, StockMessage::SetupContactQRDescription)
         .await

@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{fs, io};
 
 use crate::blob::BlobObject;
-use crate::chat::{Chat, ChatId, ChatIdBlocked};
+use crate::chat::{Chat, ChatId, ChatIdBlocked, ChatVisibility};
 use crate::chatlist_events;
 use crate::config::Config;
 use crate::constants::{
@@ -81,7 +81,20 @@ impl MsgId {
     pub async fn get_state(self, context: &Context) -> Result<MessageState> {
         let result = context
             .sql
-            .query_get_value("SELECT state FROM msgs WHERE id=?", (self,))
+            .query_row_optional(
+                concat!(
+                    "SELECT m.state, mdns.msg_id",
+                    " FROM msgs m LEFT JOIN msgs_mdns mdns ON mdns.msg_id=m.id",
+                    " WHERE id=?",
+                    " LIMIT 1",
+                ),
+                (self,),
+                |row| {
+                    let state: MessageState = row.get(0)?;
+                    let mdn_msg_id: Option<MsgId> = row.get(1)?;
+                    Ok(state.with_mdns(mdn_msg_id.is_some()))
+                },
+            )
             .await?
             .unwrap_or_default();
         Ok(result)
@@ -519,6 +532,7 @@ impl Message {
                     "    m.ephemeral_timestamp AS ephemeral_timestamp,",
                     "    m.type AS type,",
                     "    m.state AS state,",
+                    "    mdns.msg_id AS mdn_msg_id,",
                     "    m.download_state AS download_state,",
                     "    m.error AS error,",
                     "    m.msgrmsg AS msgrmsg,",
@@ -529,11 +543,16 @@ impl Message {
                     "    m.hidden AS hidden,",
                     "    m.location_id AS location,",
                     "    c.blocked AS blocked",
-                    " FROM msgs m LEFT JOIN chats c ON c.id=m.chat_id",
-                    " WHERE m.id=? AND chat_id!=3;"
+                    " FROM msgs m",
+                    " LEFT JOIN chats c ON c.id=m.chat_id",
+                    " LEFT JOIN msgs_mdns mdns ON mdns.msg_id=m.id",
+                    " WHERE m.id=? AND chat_id!=3",
+                    " LIMIT 1",
                 ),
                 (id,),
                 |row| {
+                    let state: MessageState = row.get("state")?;
+                    let mdn_msg_id: Option<MsgId> = row.get("mdn_msg_id")?;
                     let text = match row.get_ref("txt")? {
                         rusqlite::types::ValueRef::Text(buf) => {
                             match String::from_utf8(buf.to_vec()) {
@@ -568,7 +587,7 @@ impl Message {
                         ephemeral_timer: row.get("ephemeral_timer")?,
                         ephemeral_timestamp: row.get("ephemeral_timestamp")?,
                         viewtype: row.get("type")?,
-                        state: row.get("state")?,
+                        state: state.with_mdns(mdn_msg_id.is_some()),
                         download_state: row.get("download_state")?,
                         error: Some(row.get::<_, String>("error")?)
                             .filter(|error| !error.is_empty()),
@@ -1157,6 +1176,27 @@ impl Message {
         Ok(())
     }
 
+    /// Sets message quote text.
+    ///
+    /// If `text` is `Some((text_str, protect))`, `protect` specifies whether `text_str` should only
+    /// be sent encrypted. If it should, but the message is unencrypted, `text_str` is replaced with
+    /// "...".
+    pub fn set_quote_text(&mut self, text: Option<(String, bool)>) {
+        let Some((text, protect)) = text else {
+            self.param.remove(Param::Quote);
+            self.param.remove(Param::ProtectQuote);
+            return;
+        };
+        self.param.set(Param::Quote, text);
+        self.param.set_optional(
+            Param::ProtectQuote,
+            match protect {
+                true => Some("1"),
+                false => None,
+            },
+        );
+    }
+
     /// Sets message quote.
     ///
     /// Message-Id is used to set Reply-To field, message text is used for quote.
@@ -1173,31 +1213,27 @@ impl Message {
             );
             self.in_reply_to = Some(quote.rfc724_mid.clone());
 
-            if quote
-                .param
-                .get_bool(Param::GuaranteeE2ee)
-                .unwrap_or_default()
-            {
-                self.param.set(Param::ProtectQuote, "1");
-            }
-
             let text = quote.get_text();
-            self.param.set(
-                Param::Quote,
-                if text.is_empty() {
-                    // Use summary, similar to "Image" to avoid sending empty quote.
-                    quote
-                        .get_summary(context, None)
-                        .await?
-                        .truncated_text(500)
-                        .to_string()
-                } else {
-                    text
-                },
-            );
+            let text = if text.is_empty() {
+                // Use summary, similar to "Image" to avoid sending empty quote.
+                quote
+                    .get_summary(context, None)
+                    .await?
+                    .truncated_text(500)
+                    .to_string()
+            } else {
+                text
+            };
+            self.set_quote_text(Some((
+                text,
+                quote
+                    .param
+                    .get_bool(Param::GuaranteeE2ee)
+                    .unwrap_or_default(),
+            )));
         } else {
             self.in_reply_to = None;
-            self.param.remove(Param::Quote);
+            self.set_quote_text(None);
         }
 
         Ok(())
@@ -1336,7 +1372,7 @@ pub enum MessageState {
     OutDelivered = 26,
 
     /// Outgoing message read by the recipient (two checkmarks; this
-    /// requires goodwill on the receiver's side)
+    /// requires goodwill on the receiver's side). Not used in the db for new messages.
     OutMdnRcvd = 28,
 }
 
@@ -1378,6 +1414,14 @@ impl MessageState {
             self,
             OutPreparing | OutDraft | OutPending | OutFailed | OutDelivered | OutMdnRcvd
         )
+    }
+
+    /// Returns adjusted message state if the message has MDNs.
+    pub(crate) fn with_mdns(self, has_mdns: bool) -> Self {
+        if self == MessageState::OutDelivered && has_mdns {
+            return MessageState::OutMdnRcvd;
+        }
+        self
     }
 }
 
@@ -1647,6 +1691,7 @@ pub async fn markseen_msgs(context: &Context, msg_ids: Vec<MsgId>) -> Result<()>
                     m.param AS param,
                     m.from_id AS from_id,
                     m.rfc724_mid AS rfc724_mid,
+                    c.archived AS archived,
                     c.blocked AS blocked
                  FROM msgs m LEFT JOIN chats c ON c.id=m.chat_id
                  WHERE m.id IN ({}) AND m.chat_id>9",
@@ -1660,16 +1705,20 @@ pub async fn markseen_msgs(context: &Context, msg_ids: Vec<MsgId>) -> Result<()>
                 let param: Params = row.get::<_, String>("param")?.parse().unwrap_or_default();
                 let from_id: ContactId = row.get("from_id")?;
                 let rfc724_mid: String = row.get("rfc724_mid")?;
+                let visibility: ChatVisibility = row.get("archived")?;
                 let blocked: Option<Blocked> = row.get("blocked")?;
                 let ephemeral_timer: EphemeralTimer = row.get("ephemeral_timer")?;
                 Ok((
-                    id,
-                    chat_id,
-                    state,
-                    param,
-                    from_id,
-                    rfc724_mid,
-                    blocked.unwrap_or_default(),
+                    (
+                        id,
+                        chat_id,
+                        state,
+                        param,
+                        from_id,
+                        rfc724_mid,
+                        visibility,
+                        blocked.unwrap_or_default(),
+                    ),
                     ephemeral_timer,
                 ))
             },
@@ -1677,25 +1726,28 @@ pub async fn markseen_msgs(context: &Context, msg_ids: Vec<MsgId>) -> Result<()>
         )
         .await?;
 
-    if msgs.iter().any(
-        |(_id, _chat_id, _state, _param, _from_id, _rfc724_mid, _blocked, ephemeral_timer)| {
-            *ephemeral_timer != EphemeralTimer::Disabled
-        },
-    ) {
+    if msgs
+        .iter()
+        .any(|(_, ephemeral_timer)| *ephemeral_timer != EphemeralTimer::Disabled)
+    {
         start_ephemeral_timers_msgids(context, &msg_ids)
             .await
             .context("failed to start ephemeral timers")?;
     }
 
     let mut updated_chat_ids = BTreeSet::new();
+    let mut archived_chats_maybe_noticed = false;
     for (
-        id,
-        curr_chat_id,
-        curr_state,
-        curr_param,
-        curr_from_id,
-        curr_rfc724_mid,
-        curr_blocked,
+        (
+            id,
+            curr_chat_id,
+            curr_state,
+            curr_param,
+            curr_from_id,
+            curr_rfc724_mid,
+            curr_visibility,
+            curr_blocked,
+        ),
         _curr_ephemeral_timer,
     ) in msgs
     {
@@ -1733,11 +1785,16 @@ pub async fn markseen_msgs(context: &Context, msg_ids: Vec<MsgId>) -> Result<()>
             }
             updated_chat_ids.insert(curr_chat_id);
         }
+        archived_chats_maybe_noticed |=
+            curr_state == MessageState::InFresh && curr_visibility == ChatVisibility::Archived;
     }
 
     for updated_chat_id in updated_chat_ids {
         context.emit_event(EventType::MsgsNoticed(updated_chat_id));
         chatlist_events::emit_chatlist_item_changed(context, updated_chat_id);
+    }
+    if archived_chats_maybe_noticed {
+        context.on_archived_chats_maybe_noticed();
     }
 
     Ok(())
@@ -1748,6 +1805,10 @@ pub(crate) async fn update_msg_state(
     msg_id: MsgId,
     state: MessageState,
 ) -> Result<()> {
+    ensure!(
+        state != MessageState::OutMdnRcvd,
+        "Update msgs_mdns table instead!"
+    );
     ensure!(state != MessageState::OutFailed, "use set_msg_failed()!");
     let error_subst = match state >= MessageState::OutPending {
         true => ", error=''",
@@ -2325,10 +2386,21 @@ mod tests {
         // Alice quotes encrypted message in unencrypted chat.
         let mut msg = Message::new(Viewtype::Text);
         msg.set_quote(alice, Some(&alice_received_message)).await?;
+        msg.set_text("unencrypted".to_string());
         chat::send_msg(alice, alice_group, &mut msg).await?;
 
         let bob_received_message = bob.recv_msg(&alice.pop_sent_msg().await).await;
         assert_eq!(bob_received_message.quoted_text().unwrap(), "...");
+        assert_eq!(bob_received_message.get_showpadlock(), false);
+
+        // Alice replaces a quote of encrypted message with a quote of unencrypted one.
+        let mut msg1 = Message::new(Viewtype::Text);
+        msg1.set_quote(alice, Some(&alice_received_message)).await?;
+        msg1.set_quote(alice, Some(&msg)).await?;
+        chat::send_msg(alice, alice_group, &mut msg1).await?;
+
+        let bob_received_message = bob.recv_msg(&alice.pop_sent_msg().await).await;
+        assert_eq!(bob_received_message.quoted_text().unwrap(), "unencrypted");
         assert_eq!(bob_received_message.get_showpadlock(), false);
 
         Ok(())
@@ -2523,9 +2595,6 @@ mod tests {
 
         let payload = alice.pop_sent_msg().await;
         assert_state(&alice, alice_msg.id, MessageState::OutDelivered).await;
-
-        update_msg_state(&alice, alice_msg.id, MessageState::OutMdnRcvd).await?;
-        assert_state(&alice, alice_msg.id, MessageState::OutMdnRcvd).await;
 
         set_msg_failed(&alice, &mut alice_msg, "badly failed").await?;
         assert_state(&alice, alice_msg.id, MessageState::OutFailed).await;

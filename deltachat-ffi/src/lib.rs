@@ -4425,7 +4425,7 @@ pub unsafe extern "C" fn dc_backup_provider_wait(provider: *mut dc_backup_provid
     let ctx = &*ffi_provider.context;
     let provider = &mut ffi_provider.provider;
     block_on(provider)
-        .context("Failed to await BackupProvider")
+        .context("Failed to await backup provider")
         .log_err(ctx)
         .set_last_error(ctx)
         .ok();
@@ -4479,7 +4479,7 @@ trait ResultExt<T, E> {
     /// Like `log_err()`, but:
     /// - returns the default value instead of an Err value.
     /// - emits an error instead of a warning for an [Err] result. This means
-    /// that the error will be shown to the user in a small pop-up.
+    ///   that the error will be shown to the user in a small pop-up.
     fn unwrap_or_log_default(self, context: &context::Context, message: &str) -> T;
 }
 

@@ -20,7 +20,6 @@ use crate::events::EventType;
 use crate::key::Fingerprint;
 use crate::message::Message;
 use crate::peerstate::Peerstate;
-use crate::socks::Socks5Config;
 use crate::token;
 use crate::tools::validate_id;
 use iroh_old as iroh;
@@ -37,7 +36,12 @@ const VCARD_SCHEME: &str = "BEGIN:VCARD";
 const SMTP_SCHEME: &str = "SMTP:";
 const HTTP_SCHEME: &str = "http://";
 const HTTPS_SCHEME: &str = "https://";
+
+/// Legacy backup transfer based on iroh 0.4.
 pub(crate) const DCBACKUP_SCHEME: &str = "DCBACKUP:";
+
+/// Backup transfer based on iroh-net.
+pub(crate) const DCBACKUP2_SCHEME: &str = "DCBACKUP2:";
 
 /// Scanned QR code.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,7 +110,7 @@ pub enum Qr {
         domain: String,
     },
 
-    /// Provides a backup that can be retrieve.
+    /// Provides a backup that can be retrieved using legacy iroh 0.4.
     ///
     /// This contains all the data needed to connect to a device and download a backup from
     /// it to configure the receiving device with the same account.
@@ -118,6 +122,15 @@ pub enum Qr {
         ///
         /// The format is somewhat opaque, but `sendme` can deserialise this.
         ticket: iroh::provider::Ticket,
+    },
+
+    /// Provides a backup that can be retrieved using iroh-net based backup transfer protocol.
+    Backup2 {
+        /// Iroh node address.
+        node_addr: iroh_net::NodeAddr,
+
+        /// Authentication token.
+        auth_token: String,
     },
 
     /// Ask the user if they want to use the given service for video chats.
@@ -266,6 +279,8 @@ pub async fn check_qr(context: &Context, qr: &str) -> Result<Qr> {
         decode_webrtc_instance(context, qr)?
     } else if starts_with_ignore_case(qr, DCBACKUP_SCHEME) {
         decode_backup(qr)?
+    } else if starts_with_ignore_case(qr, DCBACKUP2_SCHEME) {
+        decode_backup2(qr)?
     } else if qr.starts_with(MAILTO_SCHEME) {
         decode_mailto(context, qr).await?
     } else if qr.starts_with(SMTP_SCHEME) {
@@ -295,6 +310,13 @@ pub async fn check_qr(context: &Context, qr: &str) -> Result<Qr> {
 pub fn format_backup(qr: &Qr) -> Result<String> {
     match qr {
         Qr::Backup { ref ticket } => Ok(format!("{DCBACKUP_SCHEME}{ticket}")),
+        Qr::Backup2 {
+            ref node_addr,
+            ref auth_token,
+        } => {
+            let node_addr = serde_json::to_string(node_addr)?;
+            Ok(format!("{DCBACKUP2_SCHEME}{auth_token}&{node_addr}"))
+        }
         _ => Err(anyhow!("Not a backup QR code")),
     }
 }
@@ -487,7 +509,7 @@ fn decode_account(qr: &str) -> Result<Qr> {
         Ok(Qr::Account {
             domain: url
                 .host_str()
-                .context("can't extract WebRTC instance domain")?
+                .context("can't extract account setup domain")?
                 .to_string(),
         })
     } else {
@@ -529,6 +551,24 @@ fn decode_backup(qr: &str) -> Result<Qr> {
     Ok(Qr::Backup { ticket })
 }
 
+/// Decodes a [`DCBACKUP2_SCHEME`] QR code.
+fn decode_backup2(qr: &str) -> Result<Qr> {
+    let payload = qr
+        .strip_prefix(DCBACKUP2_SCHEME)
+        .ok_or_else(|| anyhow!("invalid DCBACKUP scheme"))?;
+    let (auth_token, node_addr) = payload
+        .split_once('&')
+        .context("Backup QR code has no separator")?;
+    let auth_token = auth_token.to_string();
+    let node_addr = serde_json::from_str::<iroh_net::NodeAddr>(node_addr)
+        .context("Invalid node addr in backup QR code")?;
+
+    Ok(Qr::Backup2 {
+        node_addr,
+        auth_token,
+    })
+}
+
 #[derive(Debug, Deserialize)]
 struct CreateAccountSuccessResponse {
     /// Email address.
@@ -549,8 +589,16 @@ struct CreateAccountErrorResponse {
 #[allow(clippy::indexing_slicing)]
 async fn set_account_from_qr(context: &Context, qr: &str) -> Result<()> {
     let url_str = &qr[DCACCOUNT_SCHEME.len()..];
-    let socks5_config = Socks5Config::from_database(&context.sql).await?;
-    let response = crate::net::http::get_client(socks5_config)?
+
+    if !url_str.starts_with(HTTPS_SCHEME) {
+        bail!("DCACCOUNT QR codes must use HTTPS scheme");
+    }
+
+    // As only HTTPS is used, it is safe to load DNS cache.
+    let load_cache = true;
+
+    let response = crate::net::http::get_client(context, load_cache)
+        .await?
         .post(url_str)
         .send()
         .await?;
@@ -611,7 +659,6 @@ pub async fn set_config_from_qr(context: &Context, qr: &str) -> Result<()> {
             context
                 .sync_qr_code_token_deletion(invitenumber, authcode)
                 .await?;
-            context.send_sync_msg().await?;
         }
         Qr::WithdrawVerifyGroup {
             invitenumber,
@@ -623,7 +670,6 @@ pub async fn set_config_from_qr(context: &Context, qr: &str) -> Result<()> {
             context
                 .sync_qr_code_token_deletion(invitenumber, authcode)
                 .await?;
-            context.send_sync_msg().await?;
         }
         Qr::ReviveVerifyContact {
             invitenumber,
@@ -633,7 +679,7 @@ pub async fn set_config_from_qr(context: &Context, qr: &str) -> Result<()> {
             token::save(context, token::Namespace::InviteNumber, None, &invitenumber).await?;
             token::save(context, token::Namespace::Auth, None, &authcode).await?;
             context.sync_qr_code_tokens(None).await?;
-            context.send_sync_msg().await?;
+            context.scheduler.interrupt_smtp().await;
         }
         Qr::ReviveVerifyGroup {
             invitenumber,
@@ -653,7 +699,7 @@ pub async fn set_config_from_qr(context: &Context, qr: &str) -> Result<()> {
             .await?;
             token::save(context, token::Namespace::Auth, chat_id, &authcode).await?;
             context.sync_qr_code_tokens(chat_id).await?;
-            context.send_sync_msg().await?;
+            context.scheduler.interrupt_smtp().await;
         }
         Qr::Login { address, options } => {
             configure_from_login_qr(context, &address, options).await?
