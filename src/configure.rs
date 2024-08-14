@@ -27,7 +27,7 @@ use crate::config::{self, Config};
 use crate::context::Context;
 use crate::imap::{session::Session as ImapSession, Imap};
 use crate::log::LogExt;
-use crate::login_param::{CertificateChecks, LoginParam, ServerLoginParam};
+use crate::login_param::{LoginParam, ServerLoginParam};
 use crate::message::{Message, Viewtype};
 use crate::oauth2::get_oauth2_addr;
 use crate::provider::{Protocol, Socket, UsernamePattern};
@@ -189,10 +189,8 @@ async fn configure(ctx: &Context, param: &mut LoginParam) -> Result<()> {
 
     // Step 1: Load the parameters and check email-address and password
 
-    // Do oauth2 only if socks5 is disabled. As soon as we have a http library that can do
-    // socks5 requests, this can work with socks5 too.  OAuth is always set either for both
-    // IMAP and SMTP or not at all.
-    if param.imap.oauth2 && !socks5_enabled {
+    // OAuth is always set either for both IMAP and SMTP or not at all.
+    if param.imap.oauth2 {
         // the used oauth2 addr may differ, check this.
         // if get_oauth2_addr() is not available in the oauth2 implementation, just use the given one.
         progress!(ctx, 10);
@@ -212,7 +210,6 @@ async fn configure(ctx: &Context, param: &mut LoginParam) -> Result<()> {
 
     let parsed = EmailAddress::new(&param.addr).context("Bad email-address")?;
     let param_domain = parsed.domain;
-    let param_addr_urlencoded = utf8_percent_encode(&param.addr, NON_ALPHANUMERIC).to_string();
 
     // Step 2: Autoconfig
     progress!(ctx, 200);
@@ -263,7 +260,6 @@ async fn configure(ctx: &Context, param: &mut LoginParam) -> Result<()> {
                                         }
                                     }
                                 },
-                                strict_tls: Some(provider.opt.strict_tls),
                             })
                             .collect();
 
@@ -278,18 +274,13 @@ async fn configure(ctx: &Context, param: &mut LoginParam) -> Result<()> {
         } else {
             // Try receiving autoconfig
             info!(ctx, "no offline autoconfig found");
-            param_autoconfig = if socks5_enabled {
-                // Currently we can't do http requests through socks5, to not leak
-                // the ip, just don't do online autoconfig
-                info!(ctx, "socks5 enabled, skipping autoconfig");
-                None
-            } else {
-                get_autoconfig(ctx, param, &param_domain, &param_addr_urlencoded).await
-            }
+            param_autoconfig = get_autoconfig(ctx, param, &param_domain).await;
         }
     } else {
         param_autoconfig = None;
     }
+
+    let strict_tls = param.strict_tls();
 
     progress!(ctx, 500);
 
@@ -304,7 +295,6 @@ async fn configure(ctx: &Context, param: &mut LoginParam) -> Result<()> {
             port: param.imap.port,
             socket: param.imap.security,
             username: param.imap.user.clone(),
-            strict_tls: None,
         })
     }
     if !servers
@@ -317,22 +307,7 @@ async fn configure(ctx: &Context, param: &mut LoginParam) -> Result<()> {
             port: param.smtp.port,
             socket: param.smtp.security,
             username: param.smtp.user.clone(),
-            strict_tls: None,
         })
-    }
-
-    // respect certificate setting from function parameters
-    for server in &mut servers {
-        let certificate_checks = match server.protocol {
-            Protocol::Imap => param.imap.certificate_checks,
-            Protocol::Smtp => param.smtp.certificate_checks,
-        };
-        server.strict_tls = match certificate_checks {
-            CertificateChecks::AcceptInvalidCertificates
-            | CertificateChecks::AcceptInvalidCertificates2 => Some(false),
-            CertificateChecks::Strict => Some(true),
-            CertificateChecks::Automatic => server.strict_tls,
-        };
     }
 
     let servers = expand_param_vector(servers, &param.addr, &param_domain);
@@ -350,9 +325,6 @@ async fn configure(ctx: &Context, param: &mut LoginParam) -> Result<()> {
         .filter(|params| params.protocol == Protocol::Smtp)
         .cloned()
         .collect();
-    let provider_strict_tls = param
-        .provider
-        .map_or(socks5_config.is_some(), |provider| provider.opt.strict_tls);
 
     let smtp_config_task = task::spawn(async move {
         let mut smtp_configured = false;
@@ -362,18 +334,13 @@ async fn configure(ctx: &Context, param: &mut LoginParam) -> Result<()> {
             smtp_param.server.clone_from(&smtp_server.hostname);
             smtp_param.port = smtp_server.port;
             smtp_param.security = smtp_server.socket;
-            smtp_param.certificate_checks = match smtp_server.strict_tls {
-                Some(true) => CertificateChecks::Strict,
-                Some(false) => CertificateChecks::AcceptInvalidCertificates,
-                None => CertificateChecks::Automatic,
-            };
 
             match try_smtp_one_param(
                 &context_smtp,
                 &smtp_param,
                 &socks5_config,
                 &smtp_addr,
-                provider_strict_tls,
+                strict_tls,
                 &mut smtp,
             )
             .await
@@ -409,18 +376,13 @@ async fn configure(ctx: &Context, param: &mut LoginParam) -> Result<()> {
         param.imap.server.clone_from(&imap_server.hostname);
         param.imap.port = imap_server.port;
         param.imap.security = imap_server.socket;
-        param.imap.certificate_checks = match imap_server.strict_tls {
-            Some(true) => CertificateChecks::Strict,
-            Some(false) => CertificateChecks::AcceptInvalidCertificates,
-            None => CertificateChecks::Automatic,
-        };
 
         match try_imap_one_param(
             ctx,
             &param.imap,
             &param.socks5_config,
             &param.addr,
-            provider_strict_tls,
+            strict_tls,
         )
         .await
         {
@@ -528,14 +490,15 @@ async fn get_autoconfig(
     ctx: &Context,
     param: &LoginParam,
     param_domain: &str,
-    param_addr_urlencoded: &str,
 ) -> Option<Vec<ServerParams>> {
+    let param_addr_urlencoded = utf8_percent_encode(&param.addr, NON_ALPHANUMERIC).to_string();
+
     if let Ok(res) = moz_autoconfigure(
         ctx,
         &format!(
             "https://autoconfig.{param_domain}/mail/config-v1.1.xml?emailaddress={param_addr_urlencoded}"
         ),
-        param,
+        &param.addr,
     )
     .await
     {
@@ -550,7 +513,7 @@ async fn get_autoconfig(
             "https://{}/.well-known/autoconfig/mail/config-v1.1.xml?emailaddress={}",
             &param_domain, &param_addr_urlencoded
         ),
-        param,
+        &param.addr,
     )
     .await
     {
@@ -586,7 +549,7 @@ async fn get_autoconfig(
     if let Ok(res) = moz_autoconfigure(
         ctx,
         &format!("https://autoconfig.thunderbird.net/v1.1/{}", &param_domain),
-        param,
+        &param.addr,
     )
     .await
     {
@@ -601,15 +564,15 @@ async fn try_imap_one_param(
     param: &ServerLoginParam,
     socks5_config: &Option<Socks5Config>,
     addr: &str,
-    provider_strict_tls: bool,
+    strict_tls: bool,
 ) -> Result<(Imap, ImapSession), ConfigurationError> {
     let inf = format!(
-        "imap: {}@{}:{} security={} certificate_checks={} oauth2={} socks5_config={}",
+        "imap: {}@{}:{} security={} strict_tls={} oauth2={} socks5_config={}",
         param.user,
         param.server,
         param.port,
         param.security,
-        param.certificate_checks,
+        strict_tls,
         param.oauth2,
         if let Some(socks5_config) = socks5_config {
             socks5_config.to_string()
@@ -621,7 +584,7 @@ async fn try_imap_one_param(
 
     let (_s, r) = async_channel::bounded(1);
 
-    let mut imap = match Imap::new(param, socks5_config.clone(), addr, provider_strict_tls, r) {
+    let mut imap = match Imap::new(param, socks5_config.clone(), addr, strict_tls, r) {
         Err(err) => {
             info!(context, "failure: {:#}", err);
             return Err(ConfigurationError {
@@ -652,16 +615,16 @@ async fn try_smtp_one_param(
     param: &ServerLoginParam,
     socks5_config: &Option<Socks5Config>,
     addr: &str,
-    provider_strict_tls: bool,
+    strict_tls: bool,
     smtp: &mut Smtp,
 ) -> Result<(), ConfigurationError> {
     let inf = format!(
-        "smtp: {}@{}:{} security={} certificate_checks={} oauth2={} socks5_config={}",
+        "smtp: {}@{}:{} security={} strict_tls={} oauth2={} socks5_config={}",
         param.user,
         param.server,
         param.port,
         param.security,
-        param.certificate_checks,
+        strict_tls,
         param.oauth2,
         if let Some(socks5_config) = socks5_config {
             socks5_config.to_string()
@@ -672,7 +635,7 @@ async fn try_smtp_one_param(
     info!(context, "Trying: {}", inf);
 
     if let Err(err) = smtp
-        .connect(context, param, socks5_config, addr, provider_strict_tls)
+        .connect(context, param, socks5_config, addr, strict_tls)
         .await
     {
         info!(context, "SMTP failure: {err:#}.");

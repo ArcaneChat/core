@@ -13,7 +13,7 @@ use crate::config::Config;
 use crate::contact::{Contact, ContactId};
 use crate::context::Context;
 use crate::events::EventType;
-use crate::login_param::{CertificateChecks, LoginParam, ServerLoginParam};
+use crate::login_param::{LoginParam, ServerLoginParam};
 use crate::message::Message;
 use crate::message::{self, MsgId};
 use crate::mimefactory::MimeFactory;
@@ -94,9 +94,7 @@ impl Smtp {
             &lp.smtp,
             &lp.socks5_config,
             &lp.addr,
-            lp.provider.map_or(lp.socks5_config.is_some(), |provider| {
-                provider.opt.strict_tls
-            }),
+            lp.strict_tls(),
         )
         .await
     }
@@ -108,7 +106,7 @@ impl Smtp {
         lp: &ServerLoginParam,
         socks5_config: &Option<Socks5Config>,
         addr: &str,
-        provider_strict_tls: bool,
+        strict_tls: bool,
     ) -> Result<()> {
         if self.is_connected() {
             warn!(context, "SMTP already connected.");
@@ -126,13 +124,6 @@ impl Smtp {
 
         let domain = &lp.server;
         let port = lp.port;
-
-        let strict_tls = match lp.certificate_checks {
-            CertificateChecks::Automatic => provider_strict_tls,
-            CertificateChecks::Strict => true,
-            CertificateChecks::AcceptInvalidCertificates
-            | CertificateChecks::AcceptInvalidCertificates2 => false,
-        };
 
         let session_stream = connect::connect_stream(
             context,
@@ -640,9 +631,7 @@ async fn send_mdn_rfc724_mid(
 
 /// Tries to send a single MDN. Returns true if more MDNs should be sent.
 async fn send_mdn(context: &Context, smtp: &mut Smtp) -> Result<bool> {
-    let mdns_enabled = context.get_config_bool(Config::MdnsEnabled).await?;
-    if !mdns_enabled {
-        // User has disabled MDNs.
+    if !context.should_send_mdns().await? {
         context.sql.execute("DELETE FROM smtp_mdns", []).await?;
         return Ok(false);
     }

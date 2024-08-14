@@ -32,7 +32,7 @@ use crate::contact::{Contact, ContactId, Modifier, Origin};
 use crate::context::Context;
 use crate::events::EventType;
 use crate::headerdef::{HeaderDef, HeaderDefMap};
-use crate::login_param::{CertificateChecks, LoginParam, ServerLoginParam};
+use crate::login_param::{LoginParam, ServerLoginParam};
 use crate::message::{self, Message, MessageState, MessengerMessage, MsgId, Viewtype};
 use crate::mimeparser;
 use crate::oauth2::get_oauth2_access_token;
@@ -231,19 +231,12 @@ impl Imap {
         lp: &ServerLoginParam,
         socks5_config: Option<Socks5Config>,
         addr: &str,
-        provider_strict_tls: bool,
+        strict_tls: bool,
         idle_interrupt_receiver: Receiver<()>,
     ) -> Result<Self> {
         if lp.server.is_empty() || lp.user.is_empty() || lp.password.is_empty() {
             bail!("Incomplete IMAP connection parameters");
         }
-
-        let strict_tls = match lp.certificate_checks {
-            CertificateChecks::Automatic => provider_strict_tls,
-            CertificateChecks::Strict => true,
-            CertificateChecks::AcceptInvalidCertificates
-            | CertificateChecks::AcceptInvalidCertificates2 => false,
-        };
 
         let imap = Imap {
             idle_interrupt_receiver,
@@ -272,17 +265,11 @@ impl Imap {
         }
 
         let param = LoginParam::load_configured_params(context).await?;
-        // the trailing underscore is correct
-
         let imap = Self::new(
             &param.imap,
             param.socks5_config.clone(),
             &param.addr,
-            param
-                .provider
-                .map_or(param.socks5_config.is_some(), |provider| {
-                    provider.opt.strict_tls
-                }),
+            param.strict_tls(),
             idle_interrupt_receiver,
         )?;
         Ok(imap)
@@ -1058,18 +1045,12 @@ impl Session {
             .await?;
 
         for (folder, rowid_set, uid_set) in UidGrouper::from(rows) {
-            self.select_with_uidvalidity(context, &folder)
-                .await
-                .context("failed to select folder")?;
-
-            if let Err(err) = self.add_flag_finalized_with_set(&uid_set, "\\Seen").await {
+            if let Err(err) = self.select_with_uidvalidity(context, &folder).await {
+                warn!(context, "store_seen_flags_on_imap: Failed to select {folder}, will retry later: {err:#}.");
+            } else if let Err(err) = self.add_flag_finalized_with_set(&uid_set, "\\Seen").await {
                 warn!(
                     context,
-                    "Cannot mark messages {} in folder {} as seen, will retry later: {}.",
-                    uid_set,
-                    folder,
-                    err
-                );
+                    "Cannot mark messages {uid_set} in {folder} as seen, will retry later: {err:#}.");
             } else {
                 info!(
                     context,
@@ -1526,8 +1507,8 @@ impl Session {
 
     /// Attempts to configure mvbox.
     ///
-    /// Tries to find any folder in the given list of `folders`. If none is found, tries to create
-    /// `folders[0]`. This method does not use LIST command to ensure that
+    /// Tries to find any folder examining `folders` in the order they go. If none is found, tries
+    /// to create any folder in the same order. This method does not use LIST command to ensure that
     /// configuration works even if mailbox lookup is forbidden via Access Control List (see
     /// <https://datatracker.ietf.org/doc/html/rfc4314>).
     ///
@@ -1561,16 +1542,17 @@ impl Session {
         if !create_mvbox {
             return Ok(None);
         }
-        let Some(folder) = folders.first() else {
-            return Ok(None);
-        };
-        match self.select_with_uidvalidity(context, folder).await {
-            Ok(_) => {
-                info!(context, "MVBOX-folder {} created.", folder);
-                return Ok(Some(folder));
-            }
-            Err(err) => {
-                warn!(context, "Cannot create MVBOX-folder {:?}: {}", folder, err);
+        // Some servers require namespace-style folder names like "INBOX.DeltaChat", so we try all
+        // the variants here.
+        for folder in folders {
+            match self.select_with_uidvalidity(context, folder).await {
+                Ok(_) => {
+                    info!(context, "MVBOX-folder {} created.", folder);
+                    return Ok(Some(folder));
+                }
+                Err(err) => {
+                    warn!(context, "Cannot create MVBOX-folder {:?}: {}", folder, err);
+                }
             }
         }
         Ok(None)

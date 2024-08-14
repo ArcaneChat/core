@@ -59,7 +59,10 @@ pub enum Config {
     /// IMAP server security (e.g. TLS, STARTTLS).
     MailSecurity,
 
-    /// How to check IMAP server TLS certificates.
+    /// How to check TLS certificates.
+    ///
+    /// "IMAP" in the name is for compatibility,
+    /// this actually applies to both IMAP and SMTP connections.
     ImapCertificateChecks,
 
     /// SMTP server hostname.
@@ -77,7 +80,9 @@ pub enum Config {
     /// SMTP server security (e.g. TLS, STARTTLS).
     SendSecurity,
 
-    /// How to check SMTP server TLS certificates.
+    /// Deprecated option for backwards compatibilty.
+    ///
+    /// Certificate checks for SMTP are actually controlled by `imap_certificate_checks` config.
     SmtpCertificateChecks,
 
     /// Whether to use OAuth 2.
@@ -124,7 +129,6 @@ pub enum Config {
 
     /// True if Message Delivery Notifications (read receipts) should
     /// be sent and requested.
-    #[strum(props(default = "1"))]
     MdnsEnabled,
 
     /// True if "Sent" folder should be watched for changes.
@@ -210,7 +214,12 @@ pub enum Config {
     /// Configured IMAP server security (e.g. TLS, STARTTLS).
     ConfiguredMailSecurity,
 
-    /// How to check IMAP server TLS certificates.
+    /// Configured TLS certificate checks.
+    /// This option is saved on successful configuration
+    /// and should not be modified manually.
+    ///
+    /// This actually applies to both IMAP and SMTP connections,
+    /// but has "IMAP" in the name for backwards compatibility.
     ConfiguredImapCertificateChecks,
 
     /// Configured SMTP server hostname.
@@ -225,7 +234,9 @@ pub enum Config {
     /// Configured SMTP server port.
     ConfiguredSendPort,
 
-    /// How to check SMTP server TLS certificates.
+    /// Deprecated, stored for backwards compatibility.
+    ///
+    /// ConfiguredImapCertificateChecks is actually used.
     ConfiguredSmtpCertificateChecks,
 
     /// Whether OAuth 2 is used with configured provider.
@@ -506,6 +517,22 @@ impl Context {
         Ok(self.get_config_bool(Config::SyncMsgs).await?
             && self.get_config_bool(Config::BccSelf).await?
             && !self.get_config_bool(Config::Bot).await?)
+    }
+
+    /// Returns whether MDNs should be requested.
+    pub(crate) async fn should_request_mdns(&self) -> Result<bool> {
+        match self.get_config_bool_opt(Config::MdnsEnabled).await? {
+            Some(val) => Ok(val),
+            None => Ok(!self.get_config_bool(Config::Bot).await?),
+        }
+    }
+
+    /// Returns whether MDNs should be sent.
+    pub(crate) async fn should_send_mdns(&self) -> Result<bool> {
+        Ok(self
+            .get_config_bool_opt(Config::MdnsEnabled)
+            .await?
+            .unwrap_or(true))
     }
 
     /// Gets configured "delete_server_after" value.
@@ -958,6 +985,17 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_mdns_default_behaviour() -> Result<()> {
+        let t = &TestContext::new_alice().await;
+        assert!(t.should_request_mdns().await?);
+        assert!(t.should_send_mdns().await?);
+        t.set_config_bool(Config::Bot, true).await?;
+        assert!(!t.should_request_mdns().await?);
+        assert!(t.should_send_mdns().await?);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_sync() -> Result<()> {
         let alice0 = TestContext::new_alice().await;
         let alice1 = TestContext::new_alice().await;
@@ -983,7 +1021,6 @@ mod tests {
         // Reset to default. Test that it's not synced because defaults may differ across client
         // versions.
         alice0.set_config(Config::MdnsEnabled, None).await?;
-        assert_eq!(alice0.get_config_bool(Config::MdnsEnabled).await?, true);
         alice0.set_config_bool(Config::MdnsEnabled, false).await?;
         sync(&alice0, &alice1).await;
         assert_eq!(alice1.get_config_bool(Config::MdnsEnabled).await?, false);
