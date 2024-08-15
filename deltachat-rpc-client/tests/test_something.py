@@ -3,11 +3,13 @@ import concurrent.futures
 import json
 import logging
 import os
+import socket
 import subprocess
 import time
 from unittest.mock import MagicMock
 
 import pytest
+
 from deltachat_rpc_client import Contact, EventType, Message, events
 from deltachat_rpc_client.const import DownloadState, MessageState
 from deltachat_rpc_client.direct_imap import DirectImap
@@ -67,6 +69,18 @@ def test_configure_starttls(acfactory) -> None:
     account.set_config("send_security", "2")
     account.configure()
     assert account.is_configured()
+
+
+def test_configure_ip(acfactory) -> None:
+    account = acfactory.new_preconfigured_account()
+
+    domain = account.get_config("addr").rsplit("@")[-1]
+    ip_address = socket.gethostbyname(domain)
+
+    # This should fail TLS check.
+    account.set_config("mail_server", ip_address)
+    with pytest.raises(JsonRpcError):
+        account.configure()
 
 
 def test_account(acfactory) -> None:
