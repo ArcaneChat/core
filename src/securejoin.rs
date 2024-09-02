@@ -369,60 +369,42 @@ pub(crate) async fn handle_securejoin_handshake(
             ==========================================================*/
 
             // verify that Secure-Join-Fingerprint:-header matches the fingerprint of Bob
-            let fingerprint: Fingerprint =
-                match mime_message.get_header(HeaderDef::SecureJoinFingerprint) {
-                    Some(fp) => fp.parse()?,
-                    None => {
-                        could_not_establish_secure_connection(
-                            context,
-                            contact_id,
-                            info_chat_id(context, contact_id).await?,
-                            "Fingerprint not provided.",
-                        )
-                        .await?;
-                        return Ok(HandshakeMessage::Ignore);
-                    }
-                };
-            if !encrypted_and_signed(context, mime_message, Some(&fingerprint)) {
-                could_not_establish_secure_connection(
+            let Some(fp) = mime_message.get_header(HeaderDef::SecureJoinFingerprint) else {
+                warn!(
                     context,
-                    contact_id,
-                    info_chat_id(context, contact_id).await?,
-                    "Auth not encrypted.",
-                )
-                .await?;
+                    "Ignoring {step} message because fingerprint is not provided."
+                );
+                return Ok(HandshakeMessage::Ignore);
+            };
+            let fingerprint: Fingerprint = fp.parse()?;
+            if !encrypted_and_signed(context, mime_message, Some(&fingerprint)) {
+                warn!(
+                    context,
+                    "Ignoring {step} message because the message is not encrypted."
+                );
                 return Ok(HandshakeMessage::Ignore);
             }
             if !verify_sender_by_fingerprint(context, &fingerprint, contact_id).await? {
-                could_not_establish_secure_connection(
+                warn!(
                     context,
-                    contact_id,
-                    info_chat_id(context, contact_id).await?,
-                    "Fingerprint mismatch on inviter-side.",
-                )
-                .await?;
+                    "Ignoring {step} message because of fingerprint mismatch."
+                );
                 return Ok(HandshakeMessage::Ignore);
             }
             info!(context, "Fingerprint verified.",);
             // verify that the `Secure-Join-Auth:`-header matches the secret written to the QR code
             let Some(auth) = mime_message.get_header(HeaderDef::SecureJoinAuth) else {
-                could_not_establish_secure_connection(
+                warn!(
                     context,
-                    contact_id,
-                    info_chat_id(context, contact_id).await?,
-                    "Auth not provided.",
-                )
-                .await?;
+                    "Ignoring {step} message because of missing auth code."
+                );
                 return Ok(HandshakeMessage::Ignore);
             };
             let Some(group_chat_id) = token::auth_chat_id(context, auth).await? else {
-                could_not_establish_secure_connection(
+                warn!(
                     context,
-                    contact_id,
-                    info_chat_id(context, contact_id).await?,
-                    "Auth invalid.",
-                )
-                .await?;
+                    "Ignoring {step} message because of invalid auth code."
+                );
                 return Ok(HandshakeMessage::Ignore);
             };
 
@@ -439,13 +421,10 @@ pub(crate) async fn handle_securejoin_handshake(
             )
             .await?;
             if !fingerprint_found {
-                could_not_establish_secure_connection(
+                warn!(
                     context,
-                    contact_id,
-                    info_chat_id(context, contact_id).await?,
-                    "Fingerprint mismatch on inviter-side.",
-                )
-                .await?;
+                    "Ignoring {step} message because of the failure to find matching peerstate."
+                );
                 return Ok(HandshakeMessage::Ignore);
             }
             contact_id.regossip_keys(context).await?;
@@ -781,6 +760,7 @@ mod tests {
         CheckProtectionTimestamp,
         WrongAliceGossip,
         SecurejoinWaitTimeout,
+        AliceIsBot,
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -803,6 +783,11 @@ mod tests {
         test_setup_contact_ex(SetupContactCase::SecurejoinWaitTimeout).await
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_setup_contact_alice_is_bot() {
+        test_setup_contact_ex(SetupContactCase::AliceIsBot).await
+    }
+
     async fn test_setup_contact_ex(case: SetupContactCase) {
         let mut tcm = TestContextManager::new();
         let alice = tcm.alice().await;
@@ -811,13 +796,19 @@ mod tests {
         bob.set_config(Config::Displayname, Some("Bob Examplenet"))
             .await
             .unwrap();
-        alice
-            .set_config(Config::VerifiedOneOnOneChats, Some("1"))
-            .await
-            .unwrap();
-        bob.set_config(Config::VerifiedOneOnOneChats, Some("1"))
-            .await
-            .unwrap();
+        let alice_auto_submitted_hdr;
+        match case {
+            SetupContactCase::AliceIsBot => {
+                alice.set_config_bool(Config::Bot, true).await.unwrap();
+                alice_auto_submitted_hdr = "Auto-Submitted: auto-generated";
+            }
+            _ => alice_auto_submitted_hdr = "Auto-Submitted: auto-replied",
+        };
+        for t in [&alice, &bob] {
+            t.set_config_bool(Config::VerifiedOneOnOneChats, true)
+                .await
+                .unwrap();
+        }
 
         assert_eq!(
             Chatlist::try_load(&alice, 0, None, None)
@@ -866,7 +857,7 @@ mod tests {
         );
 
         let sent = alice.pop_sent_msg().await;
-        assert!(sent.payload.contains("Auto-Submitted: auto-replied"));
+        assert!(sent.payload.contains(alice_auto_submitted_hdr));
         assert!(!sent.payload.contains("Alice Exampleorg"));
         let msg = bob.parse_msg(&sent).await;
         assert!(msg.was_encrypted());
@@ -979,6 +970,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(contact_bob.get_authname(), "Bob Examplenet");
+        assert_eq!(contact_bob.is_bot(), false);
 
         // exactly one one-to-one chat should be visible for both now
         // (check this before calling alice.create_chat() explicitly below)
@@ -1018,7 +1010,7 @@ mod tests {
 
         // Check Alice sent the right message to Bob.
         let sent = alice.pop_sent_msg().await;
-        assert!(sent.payload.contains("Auto-Submitted: auto-replied"));
+        assert!(sent.payload.contains(alice_auto_submitted_hdr));
         assert!(!sent.payload.contains("Alice Exampleorg"));
         let msg = bob.parse_msg(&sent).await;
         assert!(msg.was_encrypted());
@@ -1037,6 +1029,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(contact_alice.get_authname(), "Alice Exampleorg");
+        assert_eq!(contact_alice.is_bot(), case == SetupContactCase::AliceIsBot);
 
         if case != SetupContactCase::SecurejoinWaitTimeout {
             // Later we check that the timeout message isn't added to the already protected chat.
@@ -1462,13 +1455,11 @@ First thread."#;
         let mut tcm = TestContextManager::new();
         let alice = tcm.alice().await;
         let bob = tcm.bob().await;
-        alice
-            .set_config(Config::VerifiedOneOnOneChats, Some("1"))
-            .await
-            .unwrap();
-        bob.set_config(Config::VerifiedOneOnOneChats, Some("1"))
-            .await
-            .unwrap();
+        for t in [&alice, &bob] {
+            t.set_config_bool(Config::VerifiedOneOnOneChats, true)
+                .await
+                .unwrap();
+        }
 
         let qr = get_securejoin_qr(&alice.ctx, None).await.unwrap();
         join_securejoin(&bob.ctx, &qr).await.unwrap();
