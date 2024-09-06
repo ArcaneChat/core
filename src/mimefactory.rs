@@ -500,14 +500,21 @@ impl MimeFactory {
                 Loaded::Mdn { .. } => None,
             };
 
-            for (_name, addr) in &self.recipients {
+            for (name, addr) in &self.recipients {
                 if let Some(email_to_remove) = email_to_remove {
                     if email_to_remove == addr {
                         continue;
                     }
                 }
 
-                to.push(Address::new_mailbox(addr.clone()));
+                if name.is_empty() {
+                    to.push(Address::new_mailbox(addr.clone()));
+                } else {
+                    to.push(Address::new_mailbox_with_name(
+                        name.to_string(),
+                        addr.clone(),
+                    ));
+                }
             }
 
             if to.is_empty() {
