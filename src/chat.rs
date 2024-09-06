@@ -279,9 +279,10 @@ impl ChatId {
     ) -> Result<Self> {
         let chat_id = match ChatIdBlocked::lookup_by_contact(context, contact_id).await? {
             Some(chat) => {
-                if create_blocked == Blocked::Not && chat.blocked != Blocked::Not {
-                    chat.id.set_blocked(context, Blocked::Not).await?;
+                if create_blocked != Blocked::Not || chat.blocked == Blocked::Not {
+                    return Ok(chat.id);
                 }
+                chat.id.set_blocked(context, Blocked::Not).await?;
                 chat.id
             }
             None => {
@@ -1954,8 +1955,8 @@ impl Chat {
             msg.param.set_int(Param::AttachGroupImage, 1);
             self.param.remove(Param::Unpromoted);
             self.update_param(context).await?;
-            // send_sync_msg() is called (usually) a moment later at send_msg_to_smtp()
-            // when the group creation message is actually sent through SMTP --
+            // send_sync_msg() is called a moment later at `smtp::send_smtp_messages()`
+            // when the group creation message is already in the `smtp` table --
             // this makes sure, the other devices are aware of grpid that is used in the sync-message.
             context
                 .sync_qr_code_tokens(Some(self.id))
@@ -3753,17 +3754,13 @@ pub(crate) async fn add_contact_to_chat_ex(
         bail!("can not add contact because the account is not part of the group/broadcast");
     }
 
+    let sync_qr_code_tokens;
     if from_handshake && chat.param.get_int(Param::Unpromoted).unwrap_or_default() == 1 {
         chat.param.remove(Param::Unpromoted);
         chat.update_param(context).await?;
-        if context
-            .sync_qr_code_tokens(Some(chat_id))
-            .await
-            .log_err(context)
-            .is_ok()
-        {
-            context.scheduler.interrupt_smtp().await;
-        }
+        sync_qr_code_tokens = true;
+    } else {
+        sync_qr_code_tokens = false;
     }
 
     if context.is_self_addr(contact.get_addr()).await? {
@@ -3807,6 +3804,15 @@ pub(crate) async fn add_contact_to_chat_ex(
             return Err(e);
         }
         sync = Nosync;
+        if sync_qr_code_tokens
+            && context
+                .sync_qr_code_tokens(Some(chat_id))
+                .await
+                .log_err(context)
+                .is_ok()
+        {
+            context.scheduler.interrupt_smtp().await;
+        }
     }
     context.emit_event(EventType::ChatModified(chat_id));
     if sync.into() {
