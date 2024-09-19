@@ -91,21 +91,43 @@ pub enum Config {
     /// Should not be extended in the future, create new config keys instead.
     ServerFlags,
 
+    /// True if proxy is enabled.
+    ///
+    /// Can be used to disable proxy without erasing known URLs.
+    ProxyEnabled,
+
+    /// Proxy URL.
+    ///
+    /// Supported URLs schemes are `socks5://` (SOCKS5) and `ss://` (Shadowsocks).
+    ///
+    /// May contain multiple URLs separated by newline, in which case the first one is used.
+    ProxyUrl,
+
     /// True if SOCKS5 is enabled.
     ///
     /// Can be used to disable SOCKS5 without erasing SOCKS5 configuration.
+    ///
+    /// Deprecated in favor of `ProxyEnabled`.
     Socks5Enabled,
 
     /// SOCKS5 proxy server hostname or address.
+    ///
+    /// Deprecated in favor of `ProxyUrl`.
     Socks5Host,
 
     /// SOCKS5 proxy server port.
+    ///
+    /// Deprecated in favor of `ProxyUrl`.
     Socks5Port,
 
     /// SOCKS5 proxy server username.
+    ///
+    /// Deprecated in favor of `ProxyUrl`.
     Socks5User,
 
     /// SOCKS5 proxy server password.
+    ///
+    /// Deprecated in favor of `ProxyUrl`.
     Socks5Password,
 
     /// Own name to use in the `From:` field when sending messages.
@@ -174,12 +196,12 @@ pub enum Config {
     /// Timer in seconds after which the message is deleted from the
     /// server.
     ///
-    /// Equals to 0 by default, which means the message is never
-    /// deleted.
+    /// 0 means messages are never deleted by Delta Chat.
     ///
     /// Value 1 is treated as "delete at once": messages are deleted
     /// immediately, without moving to DeltaChat folder.
-    #[strum(props(default = "0"))]
+    ///
+    /// Default is 1 for chatmail accounts before a backup export, 0 otherwise.
     DeleteServerAfter,
 
     /// Timer in seconds after which the message is deleted from the
@@ -443,13 +465,16 @@ impl Config {
 }
 
 impl Context {
-    /// Returns true if configuration value is set for the given key.
-    pub async fn config_exists(&self, key: Config) -> Result<bool> {
+    /// Returns true if configuration value is set in the db for the given key.
+    ///
+    /// NB: Don't use this to check if the key is configured because this doesn't look into
+    /// environment. The proper use of this function is e.g. checking a key before setting it.
+    pub(crate) async fn config_exists(&self, key: Config) -> Result<bool> {
         Ok(self.sql.get_raw_config(key.as_ref()).await?.is_some())
     }
 
-    /// Get a configuration key. Returns `None` if no value is set, and no default value found.
-    pub async fn get_config(&self, key: Config) -> Result<Option<String>> {
+    /// Get a config key value. Returns `None` if no value is set.
+    pub(crate) async fn get_config_opt(&self, key: Config) -> Result<Option<String>> {
         let env_key = format!("DELTACHAT_{}", key.as_ref().to_uppercase());
         if let Ok(value) = env::var(env_key) {
             return Ok(Some(value));
@@ -469,19 +494,38 @@ impl Context {
             Config::SysConfigKeys => Some(get_config_keys_string()),
             _ => self.sql.get_raw_config(key.as_ref()).await?,
         };
+        Ok(value)
+    }
 
+    /// Get a config key value if set, or a default value. Returns `None` if no value exists.
+    pub async fn get_config(&self, key: Config) -> Result<Option<String>> {
+        let value = self.get_config_opt(key).await?;
         if value.is_some() {
             return Ok(value);
         }
 
         // Default values
-        match key {
-            Config::ConfiguredInboxFolder => Ok(Some("INBOX".to_owned())),
-            _ => Ok(key.get_str("default").map(|s| s.to_string())),
-        }
+        let val = match key {
+            Config::ConfiguredInboxFolder => Some("INBOX"),
+            Config::DeleteServerAfter => match Box::pin(self.is_chatmail()).await? {
+                false => Some("0"),
+                true => Some("1"),
+            },
+            _ => key.get_str("default"),
+        };
+        Ok(val.map(|s| s.to_string()))
     }
 
-    /// Returns Some(T) if a value for the given key exists and was successfully parsed.
+    /// Returns Some(T) if a value for the given key is set and was successfully parsed.
+    /// Returns None if could not parse.
+    pub(crate) async fn get_config_opt_parsed<T: FromStr>(&self, key: Config) -> Result<Option<T>> {
+        self.get_config_opt(key)
+            .await
+            .map(|s: Option<String>| s.and_then(|s| s.parse().ok()))
+    }
+
+    /// Returns Some(T) if a value for the given key exists (incl. default value) and was
+    /// successfully parsed.
     /// Returns None if could not parse.
     pub async fn get_config_parsed<T: FromStr>(&self, key: Config) -> Result<Option<T>> {
         self.get_config(key)
@@ -509,14 +553,21 @@ impl Context {
         Ok(self.get_config_parsed(key).await?.unwrap_or_default())
     }
 
-    /// Returns boolean configuration value (if any) for the given key.
-    pub async fn get_config_bool_opt(&self, key: Config) -> Result<Option<bool>> {
-        Ok(self.get_config_parsed::<i32>(key).await?.map(|x| x != 0))
+    /// Returns boolean configuration value (if set) for the given key.
+    pub(crate) async fn get_config_bool_opt(&self, key: Config) -> Result<Option<bool>> {
+        Ok(self
+            .get_config_opt_parsed::<i32>(key)
+            .await?
+            .map(|x| x != 0))
     }
 
     /// Returns boolean configuration value for the given key.
     pub async fn get_config_bool(&self, key: Config) -> Result<bool> {
-        Ok(self.get_config_bool_opt(key).await?.unwrap_or_default())
+        Ok(self
+            .get_config_parsed::<i32>(key)
+            .await?
+            .map(|x| x != 0)
+            .unwrap_or_default())
     }
 
     /// Returns true if movebox ("DeltaChat" folder) should be watched.
@@ -544,9 +595,9 @@ impl Context {
 
     /// Returns whether MDNs should be requested.
     pub(crate) async fn should_request_mdns(&self) -> Result<bool> {
-        match self.config_exists(Config::MdnsEnabled).await? {
-            true => self.get_config_bool(Config::MdnsEnabled).await,
-            false => Ok(!self.get_config_bool(Config::Bot).await?),
+        match self.get_config_bool_opt(Config::MdnsEnabled).await? {
+            Some(val) => Ok(val),
+            None => Ok(!self.get_config_bool(Config::Bot).await?),
         }
     }
 
@@ -560,11 +611,16 @@ impl Context {
     /// `None` means never delete the message, `Some(0)` means delete
     /// at once, `Some(x)` means delete after `x` seconds.
     pub async fn get_config_delete_server_after(&self) -> Result<Option<i64>> {
-        match self.get_config_int(Config::DeleteServerAfter).await? {
-            0 => Ok(None),
-            1 => Ok(Some(0)),
-            x => Ok(Some(i64::from(x))),
-        }
+        let val = match self
+            .get_config_parsed::<i64>(Config::DeleteServerAfter)
+            .await?
+            .unwrap_or(0)
+        {
+            0 => None,
+            1 => Some(0),
+            x => Some(x),
+        };
+        Ok(val)
     }
 
     /// Gets the configured provider, as saved in the `configured_provider` value.
@@ -609,6 +665,7 @@ impl Context {
     fn check_config(key: Config, value: Option<&str>) -> Result<()> {
         match key {
             Config::Socks5Enabled
+            | Config::ProxyEnabled
             | Config::BccSelf
             | Config::E2eeEnabled
             | Config::MdnsEnabled
@@ -1009,12 +1066,14 @@ mod tests {
         let t = &TestContext::new_alice().await;
         assert!(t.should_request_mdns().await?);
         assert!(t.should_send_mdns().await?);
+        assert!(t.get_config_bool_opt(Config::MdnsEnabled).await?.is_none());
         // The setting should be displayed correctly.
         assert!(t.get_config_bool(Config::MdnsEnabled).await?);
 
         t.set_config_bool(Config::Bot, true).await?;
         assert!(!t.should_request_mdns().await?);
         assert!(t.should_send_mdns().await?);
+        assert!(t.get_config_bool_opt(Config::MdnsEnabled).await?.is_none());
         assert!(t.get_config_bool(Config::MdnsEnabled).await?);
         Ok(())
     }
