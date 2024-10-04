@@ -864,13 +864,10 @@ void            dc_maybe_network             (dc_context_t* context);
  *
  * @memberof dc_context_t
  * @param context The context as created by dc_context_new().
- * @param addr The e-mail address of the user. This must match the
- *    configured_addr setting of the context as well as the UID of the key.
- * @param public_data Ignored, actual public key is extracted from secret_data.
  * @param secret_data ASCII armored secret key.
  * @return 1 on success, 0 on failure.
  */
-int             dc_preconfigure_keypair        (dc_context_t* context, const char *addr, const char *public_data, const char *secret_data);
+int             dc_preconfigure_keypair        (dc_context_t* context, const char *secret_data);
 
 
 // handle chatlists
@@ -2504,7 +2501,7 @@ void            dc_stop_ongoing_process      (dc_context_t* context);
 #define         DC_QR_BACKUP                 251
 #define         DC_QR_BACKUP2                252
 #define         DC_QR_WEBRTC_INSTANCE        260 // text1=domain, text2=instance pattern
-#define         DC_QR_SOCKS5_PROXY           270 // text1=host, text2=port
+#define         DC_QR_PROXY                  271 // text1=address (e.g. "127.0.0.1:9050")
 #define         DC_QR_ADDR                   320 // id=contact
 #define         DC_QR_TEXT                   330 // text1=text
 #define         DC_QR_URL                    332 // text1=URL

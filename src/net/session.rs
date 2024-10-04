@@ -1,5 +1,3 @@
-use crate::net::proxy::ShadowsocksStream;
-use async_native_tls::TlsStream;
 use fast_socks5::client::Socks5Stream;
 use std::pin::Pin;
 use std::time::Duration;
@@ -18,9 +16,14 @@ impl SessionStream for Box<dyn SessionStream> {
         self.as_mut().set_read_timeout(timeout);
     }
 }
-impl<T: SessionStream> SessionStream for TlsStream<T> {
+impl<T: SessionStream> SessionStream for async_native_tls::TlsStream<T> {
     fn set_read_timeout(&mut self, timeout: Option<Duration>) {
         self.get_mut().set_read_timeout(timeout);
+    }
+}
+impl<T: SessionStream> SessionStream for tokio_rustls::client::TlsStream<T> {
+    fn set_read_timeout(&mut self, timeout: Option<Duration>) {
+        self.get_mut().0.set_read_timeout(timeout);
     }
 }
 impl<T: SessionStream> SessionStream for BufStream<T> {
@@ -45,9 +48,9 @@ impl<T: SessionStream> SessionStream for Socks5Stream<T> {
         self.get_socket_mut().set_read_timeout(timeout)
     }
 }
-impl<T: SessionStream> SessionStream for ShadowsocksStream<T> {
+impl<T: SessionStream> SessionStream for shadowsocks::ProxyClientStream<T> {
     fn set_read_timeout(&mut self, timeout: Option<Duration>) {
-        self.stream.get_mut().set_read_timeout(timeout)
+        self.get_mut().set_read_timeout(timeout)
     }
 }
 

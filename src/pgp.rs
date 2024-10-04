@@ -14,9 +14,7 @@ use pgp::composed::{
 use pgp::crypto::ecc_curve::ECCCurve;
 use pgp::crypto::hash::HashAlgorithm;
 use pgp::crypto::sym::SymmetricKeyAlgorithm;
-use pgp::types::{
-    CompressionAlgorithm, KeyTrait, Mpi, PublicKeyTrait, SecretKeyTrait, StringToKey,
-};
+use pgp::types::{CompressionAlgorithm, KeyTrait, Mpi, PublicKeyTrait, StringToKey};
 use rand::{thread_rng, CryptoRng, Rng};
 use tokio::runtime::Handle;
 
@@ -135,14 +133,23 @@ pub fn split_armored_data(buf: &[u8]) -> Result<(BlockType, BTreeMap<String, Str
 /// keys together as they are one unit.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct KeyPair {
-    /// Email address.
-    pub addr: EmailAddress,
-
     /// Public key.
     pub public: SignedPublicKey,
 
     /// Secret key.
     pub secret: SignedSecretKey,
+}
+
+impl KeyPair {
+    /// Creates new keypair from a secret key.
+    ///
+    /// Public key is split off the secret key.
+    pub fn new(secret: SignedSecretKey) -> Result<Self> {
+        use crate::key::DcSecretKey;
+
+        let public = secret.split_public_key()?;
+        Ok(Self { public, secret })
+    }
 }
 
 /// Create a new key pair.
@@ -201,19 +208,12 @@ pub(crate) fn create_keypair(addr: EmailAddress, keygen_type: KeyGenType) -> Res
         .verify()
         .context("invalid secret key generated")?;
 
-    let public_key = secret_key
-        .public_key()
-        .sign(&secret_key, || "".into())
-        .context("failed to sign public key")?;
-    public_key
+    let key_pair = KeyPair::new(secret_key)?;
+    key_pair
+        .public
         .verify()
         .context("invalid public key generated")?;
-
-    Ok(KeyPair {
-        addr,
-        public: public_key,
-        secret: secret_key,
-    })
+    Ok(key_pair)
 }
 
 /// Select public key or subkey to use for encryption.

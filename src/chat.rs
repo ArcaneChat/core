@@ -46,8 +46,8 @@ use crate::stock_str;
 use crate::sync::{self, Sync::*, SyncData};
 use crate::tools::{
     buf_compress, create_id, create_outgoing_rfc724_mid, create_smeared_timestamp,
-    create_smeared_timestamps, get_abs_path, gm2local_offset, smeared_time, time, IsNoneOrEmpty,
-    SystemTime,
+    create_smeared_timestamps, get_abs_path, gm2local_offset, smeared_time, time,
+    truncate_msg_text, IsNoneOrEmpty, SystemTime,
 };
 use crate::webxdc::StatusUpdateSerial;
 
@@ -1955,11 +1955,13 @@ impl Chat {
             msg.param.set_int(Param::AttachGroupImage, 1);
             self.param.remove(Param::Unpromoted);
             self.update_param(context).await?;
-            // send_sync_msg() is called a moment later at `smtp::send_smtp_messages()`
-            // when the group creation message is already in the `smtp` table --
-            // this makes sure, the other devices are aware of grpid that is used in the sync-message.
+            // TODO: Remove this compat code needed because Core <= v1.143:
+            // - doesn't accept synchronization of QR code tokens for unpromoted groups, so we also
+            //   send them when the group is promoted.
+            // - doesn't sync QR code tokens for unpromoted groups and the group might be created
+            //   before an upgrade.
             context
-                .sync_qr_code_tokens(Some(self.id))
+                .sync_qr_code_tokens(Some(self.grpid.as_str()))
                 .await
                 .log_err(context)
                 .ok();
@@ -2092,6 +2094,8 @@ impl Chat {
         msg.from_id = ContactId::SELF;
         msg.rfc724_mid = new_rfc724_mid;
         msg.timestamp_sort = timestamp;
+        let (msg_text, was_truncated) = truncate_msg_text(context, msg.text.clone()).await?;
+        let mime_modified = new_mime_headers.is_some() | was_truncated;
 
         // add message to the database
         if let Some(update_msg_id) = update_msg_id {
@@ -2113,14 +2117,14 @@ impl Chat {
                         msg.timestamp_sort,
                         msg.viewtype,
                         msg.state,
-                        msg.text,
-                        message::normalize_text(&msg.text),
+                        msg_text,
+                        message::normalize_text(&msg_text),
                         &msg.subject,
                         msg.param.to_string(),
                         msg.hidden,
                         msg.in_reply_to.as_deref().unwrap_or_default(),
                         new_references,
-                        new_mime_headers.is_some(),
+                        mime_modified,
                         new_mime_headers.unwrap_or_default(),
                         location_id as i32,
                         ephemeral_timer,
@@ -2164,14 +2168,14 @@ impl Chat {
                         msg.timestamp_sort,
                         msg.viewtype,
                         msg.state,
-                        msg.text,
-                        message::normalize_text(&msg.text),
+                        msg_text,
+                        message::normalize_text(&msg_text),
                         &msg.subject,
                         msg.param.to_string(),
                         msg.hidden,
                         msg.in_reply_to.as_deref().unwrap_or_default(),
                         new_references,
-                        new_mime_headers.is_some(),
+                        mime_modified,
                         new_mime_headers.unwrap_or_default(),
                         location_id as i32,
                         ephemeral_timer,
@@ -2261,7 +2265,7 @@ pub(crate) async fn sync(context: &Context, id: SyncId, action: SyncAction) -> R
     context
         .add_sync_item(SyncData::AlterChat { id, action })
         .await?;
-    context.scheduler.interrupt_smtp().await;
+    context.scheduler.interrupt_inbox().await;
     Ok(())
 }
 
@@ -2922,10 +2926,9 @@ async fn prepare_send_msg(
     create_send_msg_jobs(context, msg).await
 }
 
-/// Constructs jobs for sending a message and inserts them into the `smtp` table.
+/// Constructs jobs for sending a message and inserts them into the appropriate table.
 ///
-/// Returns row ids if jobs were created or an empty `Vec` otherwise, e.g. when sending to a
-/// group with only self and no BCC-to-self configured.
+/// Returns row ids if `smtp` table jobs were created or an empty `Vec` otherwise.
 ///
 /// The caller has to interrupt SMTP loop or otherwise process new rows.
 pub(crate) async fn create_send_msg_jobs(context: &Context, msg: &mut Message) -> Result<Vec<i64>> {
@@ -3032,12 +3035,6 @@ pub(crate) async fn create_send_msg_jobs(context: &Context, msg: &mut Message) -
         }
     }
 
-    if let Some(sync_ids) = rendered_msg.sync_ids_to_delete {
-        if let Err(err) = context.delete_sync_ids(sync_ids).await {
-            error!(context, "Failed to delete sync ids: {err:#}.");
-        }
-    }
-
     if attach_selfavatar {
         if let Err(err) = msg.chat_id.set_selfavatar_timestamp(context, now).await {
             error!(context, "Failed to set selfavatar timestamp: {err:#}.");
@@ -3054,19 +3051,30 @@ pub(crate) async fn create_send_msg_jobs(context: &Context, msg: &mut Message) -
     let chunk_size = context.get_max_smtp_rcpt_to().await?;
     let trans_fn = |t: &mut rusqlite::Transaction| {
         let mut row_ids = Vec::<i64>::new();
-        for recipients_chunk in recipients.chunks(chunk_size) {
-            let recipients_chunk = recipients_chunk.join(" ");
-            let row_id = t.execute(
-                "INSERT INTO smtp (rfc724_mid, recipients, mime, msg_id) \
-                VALUES            (?1,         ?2,         ?3,   ?4)",
-                (
-                    &rendered_msg.rfc724_mid,
-                    recipients_chunk,
-                    &rendered_msg.message,
-                    msg.id,
-                ),
+        if let Some(sync_ids) = rendered_msg.sync_ids_to_delete {
+            t.execute(
+                &format!("DELETE FROM multi_device_sync WHERE id IN ({sync_ids})"),
+                (),
             )?;
-            row_ids.push(row_id.try_into()?);
+            t.execute(
+                "INSERT INTO imap_send (mime, msg_id) VALUES (?, ?)",
+                (&rendered_msg.message, msg.id),
+            )?;
+        } else {
+            for recipients_chunk in recipients.chunks(chunk_size) {
+                let recipients_chunk = recipients_chunk.join(" ");
+                let row_id = t.execute(
+                    "INSERT INTO smtp (rfc724_mid, recipients, mime, msg_id) \
+                    VALUES            (?1,         ?2,         ?3,   ?4)",
+                    (
+                        &rendered_msg.rfc724_mid,
+                        recipients_chunk,
+                        &rendered_msg.message,
+                        msg.id,
+                    ),
+                )?;
+                row_ids.push(row_id.try_into()?);
+            }
         }
         Ok(row_ids)
     };
@@ -3804,14 +3812,19 @@ pub(crate) async fn add_contact_to_chat_ex(
             return Err(e);
         }
         sync = Nosync;
+        // TODO: Remove this compat code needed because Core <= v1.143:
+        // - doesn't accept synchronization of QR code tokens for unpromoted groups, so we also send
+        //   them when the group is promoted.
+        // - doesn't sync QR code tokens for unpromoted groups and the group might be created before
+        //   an upgrade.
         if sync_qr_code_tokens
             && context
-                .sync_qr_code_tokens(Some(chat_id))
+                .sync_qr_code_tokens(Some(chat.grpid.as_str()))
                 .await
                 .log_err(context)
                 .is_ok()
         {
-            context.scheduler.interrupt_smtp().await;
+            context.scheduler.interrupt_inbox().await;
         }
     }
     context.emit_event(EventType::ChatModified(chat_id));
@@ -4319,10 +4332,14 @@ pub async fn resend_msgs(context: &Context, msg_ids: &[MsgId]) -> Result<()> {
             msg.update_param(context).await?;
         }
         match msg.get_state() {
-            MessageState::OutFailed | MessageState::OutDelivered | MessageState::OutMdnRcvd => {
+            // `get_state()` may return an outdated `OutPending`, so update anyway.
+            MessageState::OutPending
+            | MessageState::OutFailed
+            | MessageState::OutDelivered
+            | MessageState::OutMdnRcvd => {
                 message::update_msg_state(context, msg.id, MessageState::OutPending).await?
             }
-            _ => bail!("unexpected message state"),
+            msg_state => bail!("Unexpected message state {msg_state}"),
         }
         context.emit_event(EventType::MsgsChanged {
             chat_id: msg.chat_id,
@@ -6337,11 +6354,10 @@ mod tests {
         // Alice has an SMTP-server replacing the `Message-ID:`-header (as done eg. by outlook.com).
         let sent_msg = alice.pop_sent_msg().await;
         let msg = sent_msg.payload();
-        assert_eq!(msg.match_indices("Message-ID: <Mr.").count(), 2);
-        assert_eq!(msg.match_indices("References: <Mr.").count(), 1);
-        let msg = msg.replace("Message-ID: <Mr.", "Message-ID: <XXX");
-        assert_eq!(msg.match_indices("Message-ID: <Mr.").count(), 0);
-        assert_eq!(msg.match_indices("References: <Mr.").count(), 1);
+        assert_eq!(msg.match_indices("Message-ID: <").count(), 2);
+        assert_eq!(msg.match_indices("References: <").count(), 1);
+        let msg = msg.replace("Message-ID: <", "Message-ID: <X.X");
+        assert_eq!(msg.match_indices("References: <").count(), 1);
 
         // Bob receives this message, he may detect group by `References:`- or `Chat-Group:`-header
         receive_imf(&bob, msg.as_bytes(), false).await.unwrap();
@@ -6358,7 +6374,7 @@ mod tests {
         send_text_msg(&bob, bob_chat.id, "ho!".to_string()).await?;
         let sent_msg = bob.pop_sent_msg().await;
         let msg = sent_msg.payload();
-        let msg = msg.replace("Message-ID: <Mr.", "Message-ID: <XXX");
+        let msg = msg.replace("Message-ID: <", "Message-ID: <X.X");
         let msg = msg.replace("Chat-", "XXXX-");
         assert_eq!(msg.match_indices("Chat-").count(), 0);
 
@@ -6908,8 +6924,29 @@ mod tests {
         )
         .await?;
         let sent2 = alice.pop_sent_msg().await;
-        resend_msgs(&alice, &[sent1.sender_msg_id]).await?;
+        let resent_msg_id = sent1.sender_msg_id;
+        resend_msgs(&alice, &[resent_msg_id]).await?;
+        assert_eq!(
+            resent_msg_id.get_state(&alice).await?,
+            MessageState::OutPending
+        );
+        resend_msgs(&alice, &[resent_msg_id]).await?;
+        // Message can be re-sent multiple times.
+        assert_eq!(
+            resent_msg_id.get_state(&alice).await?,
+            MessageState::OutPending
+        );
+        alice.pop_sent_msg().await;
+        // There's still one more pending SMTP job.
+        assert_eq!(
+            resent_msg_id.get_state(&alice).await?,
+            MessageState::OutPending
+        );
         let sent3 = alice.pop_sent_msg().await;
+        assert_eq!(
+            resent_msg_id.get_state(&alice).await?,
+            MessageState::OutDelivered
+        );
 
         // Bob receives all messages
         let bob = TestContext::new_bob().await;

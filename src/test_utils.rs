@@ -256,19 +256,28 @@ impl TestContextBuilder {
 
     /// Builds the [`TestContext`].
     pub async fn build(self) -> TestContext {
-        let name = self.key_pair.as_ref().map(|key| key.addr.local.clone());
-
-        let test_context = TestContext::new_internal(name, self.log_sink).await;
-
         if let Some(key_pair) = self.key_pair {
-            test_context
-                .configure_addr(&key_pair.addr.to_string())
-                .await;
+            let userid = {
+                let public_key = &key_pair.public;
+                let id_bstr = public_key.details.users.first().unwrap().id.id();
+                String::from_utf8(id_bstr.to_vec()).unwrap()
+            };
+            let addr = mailparse::addrparse(&userid)
+                .unwrap()
+                .extract_single_info()
+                .unwrap()
+                .addr;
+            let name = EmailAddress::new(&addr).unwrap().local;
+
+            let test_context = TestContext::new_internal(Some(name), self.log_sink).await;
+            test_context.configure_addr(&addr).await;
             key::store_self_keypair(&test_context, &key_pair, KeyPairUse::Default)
                 .await
                 .expect("Failed to save key");
+            test_context
+        } else {
+            TestContext::new_internal(None, self.log_sink).await
         }
-        test_context
     }
 }
 
@@ -429,7 +438,7 @@ impl TestContext {
     /// Retrieves a sent message from the jobs table.
     ///
     /// This retrieves and removes a message which has been scheduled to send from the jobs
-    /// table.  Messages are returned in the order they have been sent.
+    /// table. Messages are returned in the reverse order of sending.
     ///
     /// Panics if there is no message or on any error.
     pub async fn pop_sent_msg(&self) -> SentMessage<'_> {
@@ -474,9 +483,17 @@ impl TestContext {
             .execute("DELETE FROM smtp WHERE id=?;", (rowid,))
             .await
             .expect("failed to remove job");
-        update_msg_state(&self.ctx, msg_id, MessageState::OutDelivered)
+        if !self
+            .ctx
+            .sql
+            .exists("SELECT COUNT(*) FROM smtp WHERE msg_id=?", (msg_id,))
             .await
-            .expect("failed to update message state");
+            .expect("Failed to check for more jobs")
+        {
+            update_msg_state(&self.ctx, msg_id, MessageState::OutDelivered)
+                .await
+                .expect("failed to update message state");
+        }
 
         let payload_headers = payload.split("\r\n\r\n").next().unwrap().lines();
         let payload_header_names: Vec<_> = payload_headers
@@ -513,6 +530,46 @@ impl TestContext {
             sender_context: &self.ctx,
             recipients,
         })
+    }
+
+    /// Retrieves a sent sync message from the db.
+    ///
+    /// This retrieves and removes a sync message which has been scheduled to send from the jobs
+    /// table. Messages are returned in the order they have been sent.
+    ///
+    /// Panics if there is no message or on any error.
+    pub async fn pop_sent_sync_msg(&self) -> SentMessage<'_> {
+        let (id, msg_id, payload) = self
+            .ctx
+            .sql
+            .query_row(
+                "SELECT id, msg_id, mime \
+                FROM imap_send \
+                ORDER BY id",
+                (),
+                |row| {
+                    let rowid: i64 = row.get(0)?;
+                    let msg_id: MsgId = row.get(1)?;
+                    let mime: String = row.get(2)?;
+                    Ok((rowid, msg_id, mime))
+                },
+            )
+            .await
+            .expect("query_row failed");
+        self.ctx
+            .sql
+            .execute("DELETE FROM imap_send WHERE id=?", (id,))
+            .await
+            .expect("failed to remove job");
+        update_msg_state(&self.ctx, msg_id, MessageState::OutDelivered)
+            .await
+            .expect("failed to update message state");
+        SentMessage {
+            payload,
+            sender_msg_id: msg_id,
+            sender_context: &self.ctx,
+            recipients: self.get_primary_self_addr().await.unwrap(),
+        }
     }
 
     /// Parses a message.
@@ -971,55 +1028,39 @@ impl SentMessage<'_> {
 ///
 /// The keypair was created using the crate::key::tests::gen_key test.
 pub fn alice_keypair() -> KeyPair {
-    let addr = EmailAddress::new("alice@example.org").unwrap();
-
     let public = key::SignedPublicKey::from_asc(include_str!("../test-data/key/alice-public.asc"))
         .unwrap()
         .0;
     let secret = key::SignedSecretKey::from_asc(include_str!("../test-data/key/alice-secret.asc"))
         .unwrap()
         .0;
-    KeyPair {
-        addr,
-        public,
-        secret,
-    }
+    KeyPair { public, secret }
 }
 
 /// Load a pre-generated keypair for bob@example.net from disk.
 ///
 /// Like [alice_keypair] but a different key and identity.
 pub fn bob_keypair() -> KeyPair {
-    let addr = EmailAddress::new("bob@example.net").unwrap();
     let public = key::SignedPublicKey::from_asc(include_str!("../test-data/key/bob-public.asc"))
         .unwrap()
         .0;
     let secret = key::SignedSecretKey::from_asc(include_str!("../test-data/key/bob-secret.asc"))
         .unwrap()
         .0;
-    KeyPair {
-        addr,
-        public,
-        secret,
-    }
+    KeyPair { public, secret }
 }
 
 /// Load a pre-generated keypair for fiona@example.net from disk.
 ///
 /// Like [alice_keypair] but a different key and identity.
 pub fn fiona_keypair() -> KeyPair {
-    let addr = EmailAddress::new("fiona@example.net").unwrap();
     let public = key::SignedPublicKey::from_asc(include_str!("../test-data/key/fiona-public.asc"))
         .unwrap()
         .0;
     let secret = key::SignedSecretKey::from_asc(include_str!("../test-data/key/fiona-secret.asc"))
         .unwrap()
         .0;
-    KeyPair {
-        addr,
-        public,
-        secret,
-    }
+    KeyPair { public, secret }
 }
 
 /// Utility to help wait for and retrieve events.
@@ -1140,7 +1181,7 @@ pub(crate) async fn mark_as_verified(this: &TestContext, other: &TestContext) {
 /// alice0's side that implies sending a sync message.
 pub(crate) async fn sync(alice0: &TestContext, alice1: &TestContext) {
     alice0.send_sync_msg().await.unwrap();
-    let sync_msg = alice0.pop_sent_msg().await;
+    let sync_msg = alice0.pop_sent_sync_msg().await;
     let no_msg = alice1.recv_msg_opt(&sync_msg).await;
     assert!(no_msg.is_none());
 }

@@ -971,6 +971,72 @@ CREATE INDEX msgs_status_updates_index2 ON msgs_status_updates (uid);
         .await?;
     }
 
+    inc_and_check(&mut migration_version, 118)?;
+    if dbversion < migration_version {
+        sql.execute_migration(
+            "CREATE TABLE tokens_new (
+                id INTEGER PRIMARY KEY,
+                namespc INTEGER DEFAULT 0,
+                foreign_key TEXT DEFAULT '',
+                token TEXT DEFAULT '',
+                timestamp INTEGER DEFAULT 0
+            ) STRICT;
+            INSERT INTO tokens_new
+                SELECT t.id, t.namespc, IFNULL(c.grpid, ''), t.token, t.timestamp
+                FROM tokens t LEFT JOIN chats c ON t.foreign_id=c.id;
+            DROP TABLE tokens;
+            ALTER TABLE tokens_new RENAME TO tokens;",
+            migration_version,
+        )
+        .await?;
+    }
+
+    inc_and_check(&mut migration_version, 119)?;
+    if dbversion < migration_version {
+        sql.execute_migration(
+            "CREATE TABLE imap_send (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                mime TEXT NOT NULL, -- Message content
+                msg_id INTEGER NOT NULL, -- ID of the message in the `msgs` table
+                attempts INTEGER NOT NULL DEFAULT 0 -- Number of failed attempts to send the message
+            )",
+            migration_version,
+        )
+        .await?;
+    }
+
+    inc_and_check(&mut migration_version, 120)?;
+    if dbversion < migration_version {
+        // Core 1.143.0 changed the default for `delete_server_after`
+        // to delete immediately (`1`) for chatmail accounts that don't have multidevice
+        // and updating to `0` when backup is exported.
+        //
+        // Since we don't know if existing configurations
+        // are multidevice, we set `delete_server_after` for them
+        // to the old default of `0`, so only new configurations are
+        // affected by the default change.
+        //
+        // `INSERT OR IGNORE` works
+        // because `keyname` was made UNIQUE in migration 106.
+        sql.execute_migration(
+            "INSERT OR IGNORE INTO config (keyname, value)
+             SELECT 'delete_server_after', '0'
+             FROM config WHERE keyname='configured'
+            ",
+            migration_version,
+        )
+        .await?;
+    }
+
+    inc_and_check(&mut migration_version, 121)?;
+    if dbversion < migration_version {
+        sql.execute_migration(
+            "CREATE INDEX chats_index4 ON chats (name)",
+            migration_version,
+        )
+        .await?;
+    }
+
     let new_version = sql
         .get_raw_config_int(VERSION_CFG)
         .await?
