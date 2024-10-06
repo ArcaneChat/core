@@ -528,6 +528,11 @@ impl Context {
             return Ok(());
         }
 
+        let enabled = self.get_ui_config("ui.enabled").await?;
+        if enabled.unwrap_or_default() == "0" {
+            return Ok(());
+        }
+
         let address = self.get_primary_self_addr().await?;
         let time_start = tools::Time::now();
         info!(self, "background_fetch started fetching {address}");
