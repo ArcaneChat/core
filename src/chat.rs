@@ -1062,7 +1062,13 @@ impl ChatId {
     pub(crate) async fn get_timestamp(self, context: &Context) -> Result<Option<i64>> {
         let timestamp = context
             .sql
-            .query_get_value("SELECT MAX(timestamp) FROM msgs WHERE chat_id=?", (self,))
+            .query_get_value(
+                "SELECT MAX(timestamp)
+                 FROM msgs
+                 WHERE chat_id=?
+                 HAVING COUNT(*) > 0",
+                (self,),
+            )
             .await?;
         Ok(timestamp)
     }
@@ -1248,6 +1254,7 @@ impl ChatId {
              AND ((state BETWEEN {} AND {}) OR (state >= {})) \
              AND NOT hidden \
              AND download_state={} \
+             AND from_id != {} \
              ORDER BY timestamp DESC, id DESC \
              LIMIT 1;",
             MessageState::InFresh as u32,
@@ -1256,6 +1263,9 @@ impl ChatId {
             // Do not reply to not fully downloaded messages. Such a message could be a group chat
             // message that we assigned to 1:1 chat.
             DownloadState::Done as u32,
+            // Do not reference info messages, they are not actually sent out
+            // and have Message-IDs unknown to other chat members.
+            ContactId::INFO.to_u32(),
         );
         sql.query_row_optional(&query, (self,), f).await
     }
@@ -1267,7 +1277,7 @@ impl ChatId {
     ) -> Result<Option<(String, String, String)>> {
         self.parent_query(
             context,
-            "rfc724_mid, mime_in_reply_to, mime_references",
+            "rfc724_mid, mime_in_reply_to, IFNULL(mime_references, '')",
             state_out_min,
             |row: &rusqlite::Row| {
                 let rfc724_mid: String = row.get(0)?;
@@ -1421,7 +1431,10 @@ impl ChatId {
             context
                 .sql
                 .query_get_value(
-                    "SELECT MAX(timestamp) FROM msgs WHERE chat_id=? AND state!=?",
+                    "SELECT MAX(timestamp)
+                     FROM msgs
+                     WHERE chat_id=? AND state!=?
+                     HAVING COUNT(*) > 0",
                     (self, MessageState::OutDraft),
                 )
                 .await?
@@ -1437,7 +1450,10 @@ impl ChatId {
             context
                 .sql
                 .query_get_value(
-                    "SELECT MAX(timestamp) FROM msgs WHERE chat_id=? AND hidden=0 AND state>?",
+                    "SELECT MAX(timestamp)
+                     FROM msgs
+                     WHERE chat_id=? AND hidden=0 AND state>?
+                     HAVING COUNT(*) > 0",
                     (self, MessageState::InFresh),
                 )
                 .await?
@@ -3449,65 +3465,6 @@ pub async fn get_chat_media(
     Ok(list)
 }
 
-/// Indicates the direction over which to iterate.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[repr(i32)]
-pub enum Direction {
-    /// Search forward.
-    Forward = 1,
-
-    /// Search backward.
-    Backward = -1,
-}
-
-/// Searches next/previous message based on the given message and list of types.
-///
-/// Deprecated since 2023-10-03.
-#[deprecated(note = "use `get_chat_media` instead")]
-pub async fn get_next_media(
-    context: &Context,
-    curr_msg_id: MsgId,
-    direction: Direction,
-    msg_type: Viewtype,
-    msg_type2: Viewtype,
-    msg_type3: Viewtype,
-) -> Result<Option<MsgId>> {
-    let mut ret: Option<MsgId> = None;
-
-    if let Ok(msg) = Message::load_from_db(context, curr_msg_id).await {
-        let list: Vec<MsgId> = get_chat_media(
-            context,
-            Some(msg.chat_id),
-            if msg_type != Viewtype::Unknown {
-                msg_type
-            } else {
-                msg.viewtype
-            },
-            msg_type2,
-            msg_type3,
-        )
-        .await?;
-        for (i, msg_id) in list.iter().enumerate() {
-            if curr_msg_id == *msg_id {
-                match direction {
-                    Direction::Forward => {
-                        if i + 1 < list.len() {
-                            ret = list.get(i + 1).copied();
-                        }
-                    }
-                    Direction::Backward => {
-                        if i >= 1 {
-                            ret = list.get(i - 1).copied();
-                        }
-                    }
-                }
-                break;
-            }
-        }
-    }
-    Ok(ret)
-}
-
 /// Returns a vector of contact IDs for given chat ID.
 pub async fn get_chat_contacts(context: &Context, chat_id: ChatId) -> Result<Vec<ContactId>> {
     // Normal chats do not include SELF.  Group chats do (as it may happen that one is deleted from a
@@ -4459,7 +4416,10 @@ pub async fn add_device_msg_with_importance(
         if let Some(last_msg_time) = context
             .sql
             .query_get_value(
-                "SELECT MAX(timestamp) FROM msgs WHERE chat_id=?",
+                "SELECT MAX(timestamp)
+                 FROM msgs
+                 WHERE chat_id=?
+                 HAVING COUNT(*) > 0",
                 (chat_id,),
             )
             .await?
@@ -4788,6 +4748,7 @@ mod tests {
     use super::*;
     use crate::chatlist::get_archived_cnt;
     use crate::constants::{DC_GCL_ARCHIVED_ONLY, DC_GCL_NO_SPECIALS};
+    use crate::headerdef::HeaderDef;
     use crate::message::delete_msgs;
     use crate::receive_imf::receive_imf;
     use crate::test_utils::{sync, TestContext, TestContextManager};
@@ -7740,6 +7701,31 @@ mod tests {
         let alice_chat = alice.create_chat(&bob).await;
         let sent_msg = alice.send_msg(alice_chat.get_id(), &mut msg).await;
         let _msg = bob.recv_msg(&sent_msg).await;
+
+        Ok(())
+    }
+
+    /// Tests that info message is ignored when constructing `In-Reply-To`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_info_not_referenced() -> Result<()> {
+        let mut tcm = TestContextManager::new();
+        let alice = &tcm.alice().await;
+        let bob = &tcm.bob().await;
+
+        let bob_received_message = tcm.send_recv_accept(alice, bob, "Hi!").await;
+        let bob_chat_id = bob_received_message.chat_id;
+        add_info_msg(bob, bob_chat_id, "Some info", create_smeared_timestamp(bob)).await?;
+
+        // Bob sends a message.
+        // This message should reference Alice's "Hi!" message and not the info message.
+        let sent = bob.send_text(bob_chat_id, "Hi hi!").await;
+        let mime_message = alice.parse_msg(&sent).await;
+
+        let in_reply_to = mime_message.get_header(HeaderDef::InReplyTo).unwrap();
+        assert_eq!(
+            in_reply_to,
+            format!("<{}>", bob_received_message.rfc724_mid)
+        );
 
         Ok(())
     }

@@ -31,7 +31,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Poll;
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{bail, format_err, Context as _, Result};
+use futures_lite::FutureExt;
 use iroh_net::relay::RelayMode;
 use iroh_net::Endpoint;
 use tokio::fs;
@@ -108,6 +109,7 @@ impl BackupProvider {
             .get_blobdir()
             .parent()
             .context("Context dir not found")?;
+
         let dbfile = context_dir.join(DBFILE_BACKUP_NAME);
         if fs::metadata(&dbfile).await.is_ok() {
             fs::remove_file(&dbfile).await?;
@@ -123,7 +125,6 @@ impl BackupProvider {
         export_database(context, &dbfile, passphrase, time())
             .await
             .context("Database export failed")?;
-        context.emit_event(EventType::ImexProgress(300));
 
         let drop_token = CancellationToken::new();
         let handle = {
@@ -177,6 +178,7 @@ impl BackupProvider {
         }
 
         info!(context, "Received valid backup authentication token.");
+        context.emit_event(EventType::ImexProgress(1));
 
         let blobdir = BlobDirContents::new(&context).await?;
 
@@ -188,7 +190,7 @@ impl BackupProvider {
 
         send_stream.write_all(&file_size.to_be_bytes()).await?;
 
-        export_backup_stream(&context, &dbfile, blobdir, send_stream)
+        export_backup_stream(&context, &dbfile, blobdir, send_stream, file_size)
             .await
             .context("Failed to write backup into QUIC stream")?;
         info!(context, "Finished writing backup into QUIC stream.");
@@ -231,8 +233,20 @@ impl BackupProvider {
                         let context = context.clone();
                         let auth_token = auth_token.clone();
                         let dbfile = dbfile.clone();
-                        if let Err(err) = Self::handle_connection(context.clone(), conn, auth_token, dbfile).await {
+                        if let Err(err) = Self::handle_connection(context.clone(), conn, auth_token, dbfile).race(
+                            async {
+                                cancel_token.recv().await.ok();
+                                Err(format_err!("Backup transfer cancelled"))
+                            }
+                        ).race(
+                            async {
+                                drop_token.cancelled().await;
+                                Err(format_err!("Backup provider dropped"))
+                            }
+                        ).await {
                             warn!(context, "Error while handling backup connection: {err:#}.");
+                            context.emit_event(EventType::ImexProgress(0));
+                            break;
                         } else {
                             info!(context, "Backup transfer finished successfully.");
                             break;
@@ -242,10 +256,12 @@ impl BackupProvider {
                     }
                 },
                 _ = cancel_token.recv() => {
+                    info!(context, "Backup transfer cancelled by the user, stopping accept loop.");
                     context.emit_event(EventType::ImexProgress(0));
                     break;
                 }
                 _ = drop_token.cancelled() => {
+                    info!(context, "Backup transfer cancelled by dropping the provider, stopping accept loop.");
                     context.emit_event(EventType::ImexProgress(0));
                     break;
                 }
@@ -329,7 +345,20 @@ pub async fn get_backup(context: &Context, qr: Qr) -> Result<()> {
         Qr::Backup2 {
             node_addr,
             auth_token,
-        } => get_backup2(context, node_addr, auth_token).await?,
+        } => {
+            let cancel_token = context.alloc_ongoing().await?;
+            let res = get_backup2(context, node_addr, auth_token)
+                .race(async {
+                    cancel_token.recv().await.ok();
+                    Err(format_err!("Backup reception cancelled"))
+                })
+                .await;
+            if res.is_err() {
+                context.emit_event(EventType::ImexProgress(0));
+            }
+            context.free_ongoing().await;
+            res?;
+        }
         _ => bail!("QR code for backup must be of type DCBACKUP2"),
     }
     Ok(())
