@@ -1498,12 +1498,18 @@ async fn add_parts(
                     let relay_server = node_addr.relay_url().map(|relay| relay.as_str());
                     iroh_add_peer_for_topic(context, instance_id, topic, node_id, relay_server)
                         .await?;
-                    let iroh = context.get_or_try_init_peer_channel().await?;
-                    iroh.maybe_add_gossip_peers(topic, vec![node_addr]).await?;
+                    if context
+                        .get_config_bool(Config::WebxdcRealtimeEnabled)
+                        .await?
+                    {
+                        let iroh = context.get_or_try_init_peer_channel().await?;
+                        iroh.maybe_add_gossip_peers(topic, vec![node_addr]).await?;
+                    }
+                    info!(context, "Added iroh peer to the topic of {instance_id}.");
                 } else {
                     warn!(
                         context,
-                        "Could not add iroh peer because {instance_id} has no topic"
+                        "Could not add iroh peer because {instance_id} has no topic."
                     );
                 }
                 chat_id = DC_CHAT_ID_TRASH;
