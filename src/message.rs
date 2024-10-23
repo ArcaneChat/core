@@ -148,21 +148,6 @@ impl MsgId {
         Ok(())
     }
 
-    /// Deletes a message, corresponding MDNs and unsent SMTP messages from the database.
-    pub(crate) async fn delete_from_db(self, context: &Context) -> Result<()> {
-        context
-            .sql
-            .transaction(move |transaction| {
-                transaction.execute("DELETE FROM smtp WHERE msg_id=?", (self,))?;
-                transaction.execute("DELETE FROM msgs_mdns WHERE msg_id=?", (self,))?;
-                transaction.execute("DELETE FROM msgs_status_updates WHERE msg_id=?", (self,))?;
-                transaction.execute("DELETE FROM msgs WHERE id=?", (self,))?;
-                Ok(())
-            })
-            .await?;
-        Ok(())
-    }
-
     pub(crate) async fn set_delivered(self, context: &Context) -> Result<()> {
         update_msg_state(context, self, MessageState::OutDelivered).await?;
         let chat_id: ChatId = context
@@ -1826,8 +1811,8 @@ pub(crate) async fn update_msg_state(
     context
         .sql
         .execute(
-            &format!("UPDATE msgs SET state=?1 {error_subst} WHERE id=?2 AND (?1!=?3 OR state<?3)"),
-            (state, msg_id, MessageState::OutDelivered),
+            &format!("UPDATE msgs SET state=? {error_subst} WHERE id=?"),
+            (state, msg_id),
         )
         .await?;
     Ok(())
@@ -1915,6 +1900,7 @@ pub async fn get_request_msg_cnt(context: &Context) -> usize {
 
 /// Estimates the number of messages that will be deleted
 /// by the options `delete_device_after` or `delete_server_after`.
+///
 /// This is typically used to show the estimated impact to the user
 /// before actually enabling deletion of old messages.
 ///

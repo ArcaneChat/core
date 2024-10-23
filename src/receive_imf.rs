@@ -1299,11 +1299,13 @@ async fn add_parts(
 
     let in_fresh = state == MessageState::InFresh;
     let sort_to_bottom = false;
+    let received = true;
     let sort_timestamp = chat_id
         .calc_sort_timestamp(
             context,
             mime_parser.timestamp_sent,
             sort_to_bottom,
+            received,
             mime_parser.incoming,
         )
         .await?;
@@ -1488,6 +1490,9 @@ async fn add_parts(
             Ok(node_addr) => {
                 info!(context, "Adding iroh peer with address {node_addr:?}.");
                 let instance_id = parent.context("Failed to get parent message")?.id;
+                context.emit_event(EventType::WebxdcRealtimeAdvertisementReceived {
+                    msg_id: instance_id,
+                });
                 if let Some(topic) = get_iroh_topic_for_msg(context, instance_id).await? {
                     let node_id = node_addr.node_id;
                     let relay_server = node_addr.relay_url().map(|relay| relay.as_str());
@@ -1512,6 +1517,7 @@ async fn add_parts(
     for part in &mime_parser.parts {
         if part.is_reaction {
             let reaction_str = simplify::remove_footers(part.msg.as_str());
+            let is_incoming_fresh = mime_parser.incoming && !seen && !fetching_existing_messages;
             set_msg_reaction(
                 context,
                 mime_in_reply_to,
@@ -1519,6 +1525,7 @@ async fn add_parts(
                 from_id,
                 sort_timestamp,
                 Reaction::from(reaction_str.as_str()),
+                is_incoming_fresh,
             )
             .await?;
         }

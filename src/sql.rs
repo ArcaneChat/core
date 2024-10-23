@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context as _, Result};
 use rusqlite::{config::DbConfig, types::ValueRef, Connection, OpenFlags, Row};
-use tokio::sync::{Mutex, MutexGuard, RwLock};
+use tokio::sync::RwLock;
 
 use crate::blob::BlobObject;
 use crate::chat::{self, add_device_msg, update_device_icon, update_saved_messages_icon};
@@ -60,11 +60,6 @@ pub struct Sql {
     /// Database file path
     pub(crate) dbfile: PathBuf,
 
-    /// Write transactions mutex.
-    ///
-    /// See [`Self::write_lock`].
-    write_mtx: Mutex<()>,
-
     /// SQL connection pool.
     pool: RwLock<Option<Pool>>,
 
@@ -81,7 +76,6 @@ impl Sql {
     pub fn new(dbfile: PathBuf) -> Sql {
         Self {
             dbfile,
-            write_mtx: Mutex::new(()),
             pool: Default::default(),
             is_encrypted: Default::default(),
             config_cache: Default::default(),
@@ -147,7 +141,8 @@ impl Sql {
         let mut config_cache = self.config_cache.write().await;
         config_cache.clear();
 
-        self.call_write(move |conn| {
+        let query_only = false;
+        self.call(query_only, move |conn| {
             // Check that backup passphrase is correct before resetting our database.
             conn.execute("ATTACH DATABASE ? AS backup KEY ?", (path_str, passphrase))
                 .context("failed to attach backup database")?;
@@ -325,7 +320,8 @@ impl Sql {
         let mut lock = self.pool.write().await;
 
         let pool = lock.take().context("SQL connection pool is not open")?;
-        let conn = pool.get().await?;
+        let query_only = false;
+        let conn = pool.get(query_only).await?;
         if !passphrase.is_empty() {
             conn.pragma_update(None, "rekey", passphrase.clone())
                 .context("Failed to set PRAGMA rekey")?;
@@ -337,59 +333,20 @@ impl Sql {
         Ok(())
     }
 
-    /// Locks the write transactions mutex in order to make sure that there never are
-    /// multiple write transactions at once.
+    /// Allocates a connection and calls `function` with the connection.
     ///
-    /// Doing the locking ourselves instead of relying on SQLite has these reasons:
-    ///
-    /// - SQLite's locking mechanism is non-async, blocking a thread
-    /// - SQLite's locking mechanism just sleeps in a loop, which is really inefficient
-    ///
-    /// ---
-    ///
-    /// More considerations on alternatives to the current approach:
-    ///
-    /// We use [DEFERRED](https://www.sqlite.org/lang_transaction.html#deferred_immediate_and_exclusive_transactions) transactions.
-    ///
-    /// In order to never get concurrency issues, we could make all transactions IMMEDIATE,
-    /// but this would mean that there can never be two simultaneous transactions.
-    ///
-    /// Read transactions can simply be made DEFERRED to run in parallel w/o any drawbacks.
-    ///
-    /// DEFERRED write transactions without doing the locking ourselves would have these drawbacks:
-    ///
-    /// 1. As mentioned above, SQLite's locking mechanism is non-async and sleeps in a loop.
-    /// 2. If there are other write transactions, we block the db connection until
-    ///    upgraded. If some reader comes then, it has to get the next, less used connection with a
-    ///    worse per-connection page cache (SQLite allows one write and any number of reads in parallel).
-    /// 3. If a transaction is blocked for more than `busy_timeout`, it fails with SQLITE_BUSY.
-    /// 4. If upon a successful upgrade to a write transaction the db has been modified,
-    ///    the transaction has to be rolled back and retried, which means extra work in terms of
-    ///    CPU/battery.
-    ///
-    /// The only pro of making write transactions DEFERRED w/o the external locking would be some
-    /// parallelism between them.
-    ///
-    /// Another option would be to make write transactions IMMEDIATE, also
-    /// w/o the external locking. But then cons 1. - 3. above would still be valid.
-    pub async fn write_lock(&self) -> MutexGuard<'_, ()> {
-        self.write_mtx.lock().await
-    }
-
-    /// Allocates a connection and calls `function` with the connection. If `function` does write
-    /// queries,
-    /// - either first take a lock using `write_lock()`
-    /// - or use `call_write()` instead.
+    /// If `query_only` is true, allocates read-only connection,
+    /// otherwise allocates write connection.
     ///
     /// Returns the result of the function.
-    async fn call<'a, F, R>(&'a self, function: F) -> Result<R>
+    async fn call<'a, F, R>(&'a self, query_only: bool, function: F) -> Result<R>
     where
         F: 'a + FnOnce(&mut Connection) -> Result<R> + Send,
         R: Send + 'static,
     {
         let lock = self.pool.read().await;
         let pool = lock.as_ref().context("no SQL connection")?;
-        let mut conn = pool.get().await?;
+        let mut conn = pool.get(query_only).await?;
         let res = tokio::task::block_in_place(move || function(&mut conn))?;
         Ok(res)
     }
@@ -403,8 +360,8 @@ impl Sql {
         F: 'a + FnOnce(&mut Connection) -> Result<R> + Send,
         R: Send + 'static,
     {
-        let _lock = self.write_lock().await;
-        self.call(function).await
+        let query_only = false;
+        self.call(query_only, function).await
     }
 
     /// Execute `query` assuming it is a write query, returning the number of affected rows.
@@ -444,7 +401,8 @@ impl Sql {
         G: Send + FnMut(rusqlite::MappedRows<F>) -> Result<H>,
         H: Send + 'static,
     {
-        self.call(move |conn| {
+        let query_only = true;
+        self.call(query_only, move |conn| {
             let mut stmt = conn.prepare(sql)?;
             let res = stmt.query_map(params, f)?;
             g(res)
@@ -476,7 +434,8 @@ impl Sql {
         F: FnOnce(&rusqlite::Row) -> rusqlite::Result<T> + Send,
         T: Send + 'static,
     {
-        self.call(move |conn| {
+        let query_only = true;
+        self.call(query_only, move |conn| {
             let res = conn.query_row(query, params, f)?;
             Ok(res)
         })
@@ -512,7 +471,8 @@ impl Sql {
 
     /// Query the database if the requested table already exists.
     pub async fn table_exists(&self, name: &str) -> Result<bool> {
-        self.call(move |conn| {
+        let query_only = true;
+        self.call(query_only, move |conn| {
             let mut exists = false;
             conn.pragma(None, "table_info", name.to_string(), |_row| {
                 // will only be executed if the info was found
@@ -527,7 +487,8 @@ impl Sql {
 
     /// Check if a column exists in a given table.
     pub async fn col_exists(&self, table_name: &str, col_name: &str) -> Result<bool> {
-        self.call(move |conn| {
+        let query_only = true;
+        self.call(query_only, move |conn| {
             let mut exists = false;
             // `PRAGMA table_info` returns one row per column,
             // each row containing 0=cid, 1=name, 2=type, 3=notnull, 4=dflt_value
@@ -555,10 +516,13 @@ impl Sql {
         F: Send + FnOnce(&rusqlite::Row) -> rusqlite::Result<T>,
         T: Send + 'static,
     {
-        self.call(move |conn| match conn.query_row(sql.as_ref(), params, f) {
-            Ok(res) => Ok(Some(res)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(err) => Err(err.into()),
+        let query_only = true;
+        self.call(query_only, move |conn| {
+            match conn.query_row(sql.as_ref(), params, f) {
+                Ok(res) => Ok(Some(res)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(err) => Err(err.into()),
+            }
         })
         .await
     }
@@ -717,6 +681,36 @@ fn new_connection(path: &Path, passphrase: &str) -> Result<Connection> {
     Ok(conn)
 }
 
+// Tries to clear the freelist to free some space on the disk.
+//
+// This only works if auto_vacuum is enabled.
+async fn incremental_vacuum(context: &Context) -> Result<()> {
+    context
+        .sql
+        .call_write(move |conn| {
+            let mut stmt = conn
+                .prepare("PRAGMA incremental_vacuum")
+                .context("Failed to prepare incremental_vacuum statement")?;
+
+            // It is important to step the statement until it returns no more rows.
+            // Otherwise it will not free as many pages as it can:
+            // <https://stackoverflow.com/questions/53746807/sqlite-incremental-vacuum-removing-only-one-free-page>.
+            let mut rows = stmt
+                .query(())
+                .context("Failed to run incremental_vacuum statement")?;
+            let mut row_count = 0;
+            while let Some(_row) = rows
+                .next()
+                .context("Failed to step incremental_vacuum statement")?
+            {
+                row_count += 1;
+            }
+            info!(context, "Incremental vacuum freed {row_count} pages.");
+            Ok(())
+        })
+        .await
+}
+
 /// Cleanup the account to restore some storage and optimize the database.
 pub async fn housekeeping(context: &Context) -> Result<()> {
     // Setting `Config::LastHousekeeping` at the beginning avoids endless loops when things do not
@@ -749,24 +743,8 @@ pub async fn housekeeping(context: &Context) -> Result<()> {
         );
     }
 
-    // Try to clear the freelist to free some space on the disk. This
-    // only works if auto_vacuum is enabled.
-    match context
-        .sql
-        .query_row_optional("PRAGMA incremental_vacuum", (), |_row| Ok(()))
-        .await
-    {
-        Err(err) => {
-            warn!(context, "Failed to run incremental vacuum: {err:#}.");
-        }
-        Ok(Some(())) => {
-            // Incremental vacuum returns a zero-column result if it did anything.
-            info!(context, "Successfully ran incremental vacuum.");
-        }
-        Ok(None) => {
-            // Incremental vacuum returned `SQLITE_DONE` immediately,
-            // there were no pages to remove.
-        }
+    if let Err(err) = incremental_vacuum(context).await {
+        warn!(context, "Failed to run incremental vacuum: {err:#}.");
     }
 
     context
@@ -1092,9 +1070,10 @@ mod tests {
     async fn test_auto_vacuum() -> Result<()> {
         let t = TestContext::new().await;
 
+        let query_only = true;
         let auto_vacuum = t
             .sql
-            .call(|conn| {
+            .call(query_only, |conn| {
                 let auto_vacuum = conn.pragma_query_value(None, "auto_vacuum", |row| {
                     let auto_vacuum: i32 = row.get(0)?;
                     Ok(auto_vacuum)
@@ -1320,8 +1299,9 @@ mod tests {
         {
             let lock = sql.pool.read().await;
             let pool = lock.as_ref().unwrap();
-            let conn1 = pool.get().await?;
-            let conn2 = pool.get().await?;
+            let query_only = true;
+            let conn1 = pool.get(query_only).await?;
+            let conn2 = pool.get(query_only).await?;
             conn1
                 .query_row("SELECT count(*) FROM sqlite_master", [], |_row| Ok(()))
                 .unwrap();
@@ -1343,6 +1323,74 @@ mod tests {
             .await
             .context("failed to open the database third time")?;
         sql.close().await;
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_query_only() -> Result<()> {
+        let t = TestContext::new().await;
+
+        // `query_row` does not acquire write lock
+        // and operates on read-only connection.
+        // Using it to `INSERT` should fail.
+        let res = t
+            .sql
+            .query_row(
+                "INSERT INTO config (keyname, value) VALUES (?, ?) RETURNING 1",
+                ("xyz", "ijk"),
+                |row| {
+                    let res: u32 = row.get(0)?;
+                    Ok(res)
+                },
+            )
+            .await;
+        assert!(res.is_err());
+
+        // If you want to `INSERT` and get value via `RETURNING`,
+        // use `call_write` or `transaction`.
+
+        let res: Result<u32> = t
+            .sql
+            .call_write(|conn| {
+                let val = conn.query_row(
+                    "INSERT INTO config (keyname, value) VALUES (?, ?) RETURNING 2",
+                    ("foo", "bar"),
+                    |row| {
+                        let res: u32 = row.get(0)?;
+                        Ok(res)
+                    },
+                )?;
+                Ok(val)
+            })
+            .await;
+        assert_eq!(res.unwrap(), 2);
+
+        let res = t
+            .sql
+            .transaction(|t| {
+                let val = t.query_row(
+                    "INSERT INTO config (keyname, value) VALUES (?, ?) RETURNING 3",
+                    ("abc", "def"),
+                    |row| {
+                        let res: u32 = row.get(0)?;
+                        Ok(res)
+                    },
+                )?;
+                Ok(val)
+            })
+            .await;
+        assert_eq!(res.unwrap(), 3);
+
+        Ok(())
+    }
+
+    /// Tests that incremental_vacuum does not fail.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_incremental_vacuum() -> Result<()> {
+        let t = TestContext::new().await;
+
+        incremental_vacuum(&t).await?;
 
         Ok(())
     }

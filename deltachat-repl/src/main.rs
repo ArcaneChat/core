@@ -9,8 +9,6 @@
 extern crate deltachat;
 
 use std::borrow::Cow::{self, Borrowed, Owned};
-use std::io::{self, Write};
-use std::process::Command;
 
 use anyhow::{bail, Error};
 use deltachat::chat::ChatId;
@@ -242,12 +240,13 @@ const CONTACT_COMMANDS: [&str; 9] = [
     "unblock",
     "listblocked",
 ];
-const MISC_COMMANDS: [&str; 11] = [
+const MISC_COMMANDS: [&str; 12] = [
     "getqr",
     "getqrsvg",
     "getbadqr",
     "checkqr",
     "joinqr",
+    "createqrsvg",
     "fileinfo",
     "clear",
     "exit",
@@ -450,12 +449,7 @@ async fn handle_cmd(
                     qr.replace_range(12..22, "0000000000")
                 }
                 println!("{qr}");
-                let output = Command::new("qrencode")
-                    .args(["-t", "ansiutf8", qr.as_str(), "-o", "-"])
-                    .output()
-                    .expect("failed to execute process");
-                io::stdout().write_all(&output.stdout).unwrap();
-                io::stderr().write_all(&output.stderr).unwrap();
+                qr2term::print_qr(qr.as_str())?;
             }
         }
         "getqrsvg" => {

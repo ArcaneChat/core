@@ -30,7 +30,7 @@ use deltachat::ephemeral::Timer as EphemeralTimer;
 use deltachat::imex::BackupProvider;
 use deltachat::key::preconfigure_keypair;
 use deltachat::message::MsgId;
-use deltachat::qr_code_generator::{generate_backup_qr, get_securejoin_qr_svg};
+use deltachat::qr_code_generator::{create_qr_svg, generate_backup_qr, get_securejoin_qr_svg};
 use deltachat::stock_str::StockMessage;
 use deltachat::webxdc::StatusUpdateSerial;
 use deltachat::*;
@@ -541,6 +541,7 @@ pub unsafe extern "C" fn dc_event_get_id(event: *mut dc_event_t) -> libc::c_int 
         EventType::ErrorSelfNotInGroup(_) => 410,
         EventType::MsgsChanged { .. } => 2000,
         EventType::ReactionsChanged { .. } => 2001,
+        EventType::IncomingReaction { .. } => 2002,
         EventType::IncomingMsg { .. } => 2005,
         EventType::IncomingMsgBunch { .. } => 2006,
         EventType::MsgsNoticed { .. } => 2008,
@@ -563,10 +564,14 @@ pub unsafe extern "C" fn dc_event_get_id(event: *mut dc_event_t) -> libc::c_int 
         EventType::WebxdcStatusUpdate { .. } => 2120,
         EventType::WebxdcInstanceDeleted { .. } => 2121,
         EventType::WebxdcRealtimeData { .. } => 2150,
+        EventType::WebxdcRealtimeAdvertisementReceived { .. } => 2151,
         EventType::AccountsBackgroundFetchDone => 2200,
         EventType::ChatlistChanged => 2300,
         EventType::ChatlistItemChanged { .. } => 2301,
         EventType::EventChannelOverflow { .. } => 2400,
+        #[allow(unreachable_patterns)]
+        #[cfg(test)]
+        _ => unreachable!("This is just to silence a rust_analyzer false-positive"),
     }
 }
 
@@ -597,6 +602,7 @@ pub unsafe extern "C" fn dc_event_get_data1_int(event: *mut dc_event_t) -> libc:
         | EventType::ErrorSelfNotInGroup(_)
         | EventType::AccountsBackgroundFetchDone => 0,
         EventType::ChatlistChanged => 0,
+        EventType::IncomingReaction { contact_id, .. } => contact_id.to_u32() as libc::c_int,
         EventType::MsgsChanged { chat_id, .. }
         | EventType::ReactionsChanged { chat_id, .. }
         | EventType::IncomingMsg { chat_id, .. }
@@ -621,11 +627,15 @@ pub unsafe extern "C" fn dc_event_get_data1_int(event: *mut dc_event_t) -> libc:
         }
         EventType::WebxdcRealtimeData { msg_id, .. }
         | EventType::WebxdcStatusUpdate { msg_id, .. }
+        | EventType::WebxdcRealtimeAdvertisementReceived { msg_id }
         | EventType::WebxdcInstanceDeleted { msg_id, .. } => msg_id.to_u32() as libc::c_int,
         EventType::ChatlistItemChanged { chat_id } => {
             chat_id.unwrap_or_default().to_u32() as libc::c_int
         }
         EventType::EventChannelOverflow { n } => *n as libc::c_int,
+        #[allow(unreachable_patterns)]
+        #[cfg(test)]
+        _ => unreachable!("This is just to silence a rust_analyzer false-positive"),
     }
 }
 
@@ -666,9 +676,11 @@ pub unsafe extern "C" fn dc_event_get_data2_int(event: *mut dc_event_t) -> libc:
         | EventType::ChatlistItemChanged { .. }
         | EventType::ConfigSynced { .. }
         | EventType::ChatModified(_)
+        | EventType::WebxdcRealtimeAdvertisementReceived { .. }
         | EventType::EventChannelOverflow { .. } => 0,
         EventType::MsgsChanged { msg_id, .. }
         | EventType::ReactionsChanged { msg_id, .. }
+        | EventType::IncomingReaction { msg_id, .. }
         | EventType::IncomingMsg { msg_id, .. }
         | EventType::MsgDelivered { msg_id, .. }
         | EventType::MsgFailed { msg_id, .. }
@@ -682,6 +694,9 @@ pub unsafe extern "C" fn dc_event_get_data2_int(event: *mut dc_event_t) -> libc:
             ..
         } => status_update_serial.to_u32() as libc::c_int,
         EventType::WebxdcRealtimeData { data, .. } => data.len() as libc::c_int,
+        #[allow(unreachable_patterns)]
+        #[cfg(test)]
+        _ => unreachable!("This is just to silence a rust_analyzer false-positive"),
     }
 }
 
@@ -733,6 +748,7 @@ pub unsafe extern "C" fn dc_event_get_data2_str(event: *mut dc_event_t) -> *mut 
         | EventType::IncomingMsgBunch { .. }
         | EventType::ChatlistItemChanged { .. }
         | EventType::ChatlistChanged
+        | EventType::WebxdcRealtimeAdvertisementReceived { .. }
         | EventType::EventChannelOverflow { .. } => ptr::null_mut(),
         EventType::ConfigureProgress { comment, .. } => {
             if let Some(comment) = comment {
@@ -754,6 +770,14 @@ pub unsafe extern "C" fn dc_event_get_data2_str(event: *mut dc_event_t) -> *mut 
             libc::memcpy(ptr, data.as_ptr() as *mut libc::c_void, data.len());
             ptr as *mut libc::c_char
         }
+        EventType::IncomingReaction { reaction, .. } => reaction
+            .as_str()
+            .to_c_string()
+            .unwrap_or_default()
+            .into_raw(),
+        #[allow(unreachable_patterns)]
+        #[cfg(test)]
+        _ => unreachable!("This is just to silence a rust_analyzer false-positive"),
     }
 }
 
@@ -2568,6 +2592,18 @@ pub unsafe extern "C" fn dc_delete_all_locations(context: *mut dc_context_t) {
             .log_err(ctx)
             .ok()
     });
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_create_qr_svg(payload: *const libc::c_char) -> *mut libc::c_char {
+    if payload.is_null() {
+        eprintln!("ignoring careless call to dc_create_qr_svg()");
+        return "".strdup();
+    }
+
+    create_qr_svg(&to_string_lossy(payload))
+        .unwrap_or_else(|_| "".to_string())
+        .strdup()
 }
 
 #[no_mangle]

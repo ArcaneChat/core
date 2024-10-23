@@ -1,4 +1,5 @@
 import logging
+import time
 
 import pytest
 
@@ -43,13 +44,6 @@ def test_qr_setup_contact_svg(acfactory) -> None:
     _, _, domain = alice.get_config("addr").rpartition("@")
 
     _qr_code, svg = alice.get_qr_code_svg()
-
-    # Test that email address is in SVG
-    # when we have no display name.
-    # Check only the domain name, because
-    # long address may be split over multiple lines
-    # and not matched.
-    assert domain in svg
 
     alice.set_config("displayname", "Alice")
 
@@ -332,7 +326,6 @@ def test_verified_group_member_added_recovery(acfactory) -> None:
 
     ac3_contact_ac2 = ac3.get_contact_by_addr(ac2.get_config("addr"))
     ac3_chat.remove_contact(ac3_contact_ac2)
-    ac3_chat.add_contact(ac3_contact_ac2)
 
     msg_id = ac2.wait_for_incoming_msg_event().msg_id
     message = ac2.get_message_by_id(msg_id)
@@ -341,6 +334,8 @@ def test_verified_group_member_added_recovery(acfactory) -> None:
 
     snapshot = ac1.get_message_by_id(ac1.wait_for_incoming_msg_event().msg_id).get_snapshot()
     assert "removed" in snapshot.text
+
+    ac3_chat.add_contact(ac3_contact_ac2)
 
     event = ac2.wait_for_incoming_msg_event()
     msg_id = event.msg_id
@@ -465,7 +460,10 @@ def test_qr_new_group_unblocked(acfactory):
 
 def test_aeap_flow_verified(acfactory):
     """Test that a new address is added to a contact when it changes its address."""
-    ac1, ac2, ac1new = acfactory.get_online_accounts(3)
+    ac1, ac2 = acfactory.get_online_accounts(2)
+
+    # ac1new is only used to get a new address.
+    ac1new = acfactory.new_preconfigured_account()
 
     logging.info("ac1: create verified-group QR, ac2 scans and joins")
     chat = ac1.create_group("hello", protect=True)
@@ -474,6 +472,7 @@ def test_aeap_flow_verified(acfactory):
     logging.info("ac2: start QR-code based join-group protocol")
     ac2.secure_join(qr_code)
     ac1.wait_for_securejoin_inviter_success()
+    ac2.wait_for_securejoin_joiner_success()
 
     logging.info("sending first message")
     msg_out = chat.send_text("old address").get_snapshot()
@@ -571,6 +570,7 @@ def test_securejoin_after_contact_resetup(acfactory) -> None:
 
     # ac1 waits for member added message and creates a QR code.
     snapshot = ac1.get_message_by_id(ac1.wait_for_incoming_msg_event().msg_id).get_snapshot()
+    assert snapshot.text == "Member Me ({}) added by {}.".format(ac1.get_config("addr"), ac3.get_config("addr"))
     ac1_qr_code = snapshot.chat.get_qr_code()
 
     # ac2 verifies ac1
@@ -585,17 +585,29 @@ def test_securejoin_after_contact_resetup(acfactory) -> None:
     # ac1 resetups the account.
     ac1 = acfactory.resetup_account(ac1)
 
-    # ac1 sends a message to ac2.
-    ac1_contact_ac2 = ac1.create_contact(ac2.get_config("addr"), "")
-    ac1_chat_ac2 = ac1_contact_ac2.create_chat()
-    ac1_chat_ac2.send_text("Hello!")
+    # Loop sending message from ac1 to ac2
+    # until ac2 accepts new ac1 key.
+    #
+    # This may not happen immediately because resetup of ac1
+    # rewinds "smeared timestamp" so Date: header for messages
+    # sent by new ac1 are in the past compared to the last Date:
+    # header sent by old ac1.
+    while True:
+        # ac1 sends a message to ac2.
+        ac1_contact_ac2 = ac1.create_contact(ac2.get_config("addr"), "")
+        ac1_chat_ac2 = ac1_contact_ac2.create_chat()
+        ac1_chat_ac2.send_text("Hello!")
 
-    # ac2 receives a message.
-    snapshot = ac2.get_message_by_id(ac2.wait_for_incoming_msg_event().msg_id).get_snapshot()
-    assert snapshot.text == "Hello!"
+        # ac2 receives a message.
+        snapshot = ac2.get_message_by_id(ac2.wait_for_incoming_msg_event().msg_id).get_snapshot()
+        assert snapshot.text == "Hello!"
+        logging.info("ac2 received Hello!")
 
-    # ac1 is no longer verified for ac2 as new Autocrypt key is not the same as old verified key.
-    assert not ac2_contact_ac1.get_snapshot().is_verified
+        # ac1 is no longer verified for ac2 as new Autocrypt key is not the same as old verified key.
+        logging.info("ac2 addr={}, ac1 addr={}".format(ac2.get_config("addr"), ac1.get_config("addr")))
+        if not ac2_contact_ac1.get_snapshot().is_verified:
+            break
+        time.sleep(1)
 
     # ac1 goes offline.
     ac1.remove()

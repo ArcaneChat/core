@@ -1,9 +1,7 @@
 #![allow(clippy::format_push_string)]
 extern crate dirs;
 
-use std::io::Write;
 use std::path::Path;
-use std::process::Command;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -24,6 +22,7 @@ use deltachat::mimeparser::SystemMessage;
 use deltachat::peer_channels::{send_webxdc_realtime_advertisement, send_webxdc_realtime_data};
 use deltachat::peerstate::*;
 use deltachat::qr::*;
+use deltachat::qr_code_generator::create_qr_svg;
 use deltachat::reaction::send_reaction;
 use deltachat::receive_imf::*;
 use deltachat::sql;
@@ -427,6 +426,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
                  checkqr <qr-content>\n\
                  joinqr <qr-content>\n\
                  setqr <qr-content>\n\
+                 createqrsvg <qr-content>\n\
                  providerinfo <addr>\n\
                  fileinfo <file>\n\
                  estimatedeletion <seconds>\n\
@@ -491,12 +491,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             let provider = BackupProvider::prepare(&context).await?;
             let qr = format_backup(&provider.qr())?;
             println!("QR code: {}", qr);
-            let output = Command::new("qrencode")
-                .args(["-t", "ansiutf8", qr.as_str(), "-o", "-"])
-                .output()
-                .expect("failed to execute process");
-            std::io::stdout().write_all(&output.stdout).unwrap();
-            std::io::stderr().write_all(&output.stderr).unwrap();
+            qr2term::print_qr(qr.as_str())?;
             provider.await?;
         }
         "receive-backup" => {
@@ -1255,6 +1250,13 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
                 Ok(()) => println!("Config set from QR code, you can now call 'configure'"),
                 Err(err) => println!("Cannot set config from QR code: {err:?}"),
             }
+        }
+        "createqrsvg" => {
+            ensure!(!arg1.is_empty(), "Argument <qr-content> missing.");
+            let svg = create_qr_svg(arg1)?;
+            let file = dirs::home_dir().unwrap_or_default().join("qr.svg");
+            fs::write(&file, svg).await?;
+            println!("{file:#?} written.");
         }
         "providerinfo" => {
             ensure!(!arg1.is_empty(), "Argument <addr> missing.");

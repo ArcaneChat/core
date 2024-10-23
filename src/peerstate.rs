@@ -343,7 +343,7 @@ impl Peerstate {
     }
 
     /// Updates peerstate according to the given `Autocrypt` header.
-    pub fn apply_header(&mut self, header: &Aheader, message_time: i64) {
+    pub fn apply_header(&mut self, context: &Context, header: &Aheader, message_time: i64) {
         if !addr_cmp(&self.addr, &header.addr) {
             return;
         }
@@ -362,6 +362,13 @@ impl Peerstate {
                 self.public_key = Some(header.public_key.clone());
                 self.recalc_fingerprint();
             }
+        } else {
+            warn!(
+                context,
+                "Ignoring outdated Autocrypt header because message_time={} < last_seen={}.",
+                message_time,
+                self.last_seen
+            );
         }
     }
 
@@ -766,23 +773,65 @@ pub(crate) async fn maybe_do_aeap_transition(
 
     // If the from addr is different from the peerstate address we know,
     // we may want to do an AEAP transition.
-    if !addr_cmp(&peerstate.addr, &mime_parser.from.addr)
-            // Check if it's a chat message; we do this to avoid
-            // some accidental transitions if someone writes from multiple
-            // addresses with an MUA.
-            && mime_parser.has_chat_version()
-            // Check if the message is encrypted and signed correctly. If it's not encrypted, it's
-            // probably from a new contact sharing the same key.
-            && !mime_parser.signatures.is_empty()
-            // Check if the From: address was also in the signed part of the email.
-            // Without this check, an attacker could replay a message from Alice
-            // to Bob. Then Bob's device would do an AEAP transition from Alice's
-            // to the attacker's address, allowing for easier phishing.
-            && mime_parser.from_is_signed
-            // DC avoids sending messages with the same timestamp, that's why `>` is here unlike in
-            // `Peerstate::apply_header()`.
-            && info.message_time > peerstate.last_seen
-    {
+    if !addr_cmp(&peerstate.addr, &mime_parser.from.addr) {
+        // Check if it's a chat message; we do this to avoid
+        // some accidental transitions if someone writes from multiple
+        // addresses with an MUA.
+        if !mime_parser.has_chat_version() {
+            info!(
+                context,
+                "Not doing AEAP from {} to {} because the message is not a chat message.",
+                &peerstate.addr,
+                &mime_parser.from.addr
+            );
+            return Ok(());
+        }
+
+        // Check if the message is encrypted and signed correctly. If it's not encrypted, it's
+        // probably from a new contact sharing the same key.
+        if mime_parser.signatures.is_empty() {
+            info!(
+                context,
+                "Not doing AEAP from {} to {} because the message is not encrypted and signed.",
+                &peerstate.addr,
+                &mime_parser.from.addr
+            );
+            return Ok(());
+        }
+
+        // Check if the From: address was also in the signed part of the email.
+        // Without this check, an attacker could replay a message from Alice
+        // to Bob. Then Bob's device would do an AEAP transition from Alice's
+        // to the attacker's address, allowing for easier phishing.
+        if !mime_parser.from_is_signed {
+            info!(
+                context,
+                "Not doing AEAP from {} to {} because From: is not signed.",
+                &peerstate.addr,
+                &mime_parser.from.addr
+            );
+            return Ok(());
+        }
+
+        // DC avoids sending messages with the same timestamp, that's why messages
+        // with equal timestamps are ignored here unlike in `Peerstate::apply_header()`.
+        if info.message_time <= peerstate.last_seen {
+            info!(
+                context,
+                "Not doing AEAP from {} to {} because {} < {}.",
+                &peerstate.addr,
+                &mime_parser.from.addr,
+                info.message_time,
+                peerstate.last_seen
+            );
+            return Ok(());
+        }
+
+        info!(
+            context,
+            "Doing AEAP transition from {} to {}.", &peerstate.addr, &mime_parser.from.addr
+        );
+
         let info = &mut mime_parser.decryption_info;
         let peerstate = info.peerstate.as_mut().context("no peerstate??")?;
         // Add info messages to chats with this (verified) contact
@@ -800,7 +849,7 @@ pub(crate) async fn maybe_do_aeap_transition(
         let header = info.autocrypt_header.as_ref().context(
             "Internal error: Tried to do an AEAP transition without an autocrypt header??",
         )?;
-        peerstate.apply_header(header, info.message_time);
+        peerstate.apply_header(context, header, info.message_time);
 
         peerstate
             .save_to_db_ex(&context.sql, Some(&old_addr))
@@ -979,6 +1028,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_peerstate_degrade_reordering() {
+        let ctx = crate::test_utils::TestContext::new().await;
+
         let addr = "example@example.org";
         let pub_key = alice_keypair().public;
         let header = Aheader::new(addr.to_string(), pub_key, EncryptPreference::Mutual);
@@ -1003,7 +1054,7 @@ mod tests {
             fingerprint_changed: false,
         };
 
-        peerstate.apply_header(&header, 100);
+        peerstate.apply_header(&ctx, &header, 100);
         assert_eq!(peerstate.prefer_encrypt, EncryptPreference::Mutual);
 
         peerstate.degrade_encryption(300);
@@ -1011,11 +1062,11 @@ mod tests {
 
         // This has message time 200, while encryption was degraded at timestamp 300.
         // Because of reordering, header should not be applied.
-        peerstate.apply_header(&header, 200);
+        peerstate.apply_header(&ctx, &header, 200);
         assert_eq!(peerstate.prefer_encrypt, EncryptPreference::Reset);
 
         // Same header will be applied in the future.
-        peerstate.apply_header(&header, 300);
+        peerstate.apply_header(&ctx, &header, 300);
         assert_eq!(peerstate.prefer_encrypt, EncryptPreference::Mutual);
     }
 }

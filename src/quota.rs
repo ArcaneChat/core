@@ -25,6 +25,7 @@ pub const QUOTA_ERROR_THRESHOLD_PERCENTAGE: u64 = 95;
 
 /// if quota is below this value (again),
 /// QuotaExceeding is cleared.
+///
 /// This value should be a bit below QUOTA_WARN_THRESHOLD_PERCENTAGE to
 /// avoid jittering and lots of warnings when quota is exactly at the warning threshold.
 ///
@@ -73,7 +74,7 @@ async fn get_unique_quota_roots_and_usage(
 
 fn get_highest_usage<'t>(
     unique_quota_roots: &'t BTreeMap<String, Vec<QuotaResource>>,
-) -> Result<(u64, &'t String, &QuotaResource)> {
+) -> Result<(u64, &'t String, &'t QuotaResource)> {
     let mut highest: Option<(u64, &'t String, &QuotaResource)> = None;
     for (name, resources) in unique_quota_roots {
         for r in resources {
