@@ -143,9 +143,10 @@ impl Iroh {
                 self.endpoint.add_node_addr(peer.clone())?;
             }
 
-            self.gossip
-                .join(topic, peers.into_iter().map(|peer| peer.node_id).collect())
-                .await?;
+            self.gossip.join_with_opts(
+                topic,
+                JoinOptions::with_bootstrap(peers.into_iter().map(|peer| peer.node_id)),
+            );
         }
         Ok(())
     }
@@ -259,7 +260,14 @@ impl Context {
 
         // create gossip
         let my_addr = endpoint.node_addr().await?;
-        let gossip = Gossip::from_endpoint(endpoint.clone(), Default::default(), &my_addr.info);
+        let gossip_config = iroh_gossip::proto::topic::Config {
+            // Allow messages up to 128 KB in size.
+            // We set the limit to 128 KiB to account for internal overhead,
+            // but only guarantee 128 KB of payload to WebXDC developers.
+            max_message_size: 128 * 1024,
+            ..Default::default()
+        };
+        let gossip = Gossip::from_endpoint(endpoint.clone(), gossip_config, &my_addr.info);
 
         // spawn endpoint loop that forwards incoming connections to the gossiper
         let context = self.clone();
@@ -303,6 +311,47 @@ pub(crate) async fn iroh_add_peer_for_topic(
             (msg_id, peer.as_bytes(), topic.as_bytes(), relay_server),
         )
         .await?;
+    Ok(())
+}
+
+/// Add gossip peer from `Iroh-Node-Addr` header to WebXDC message identified by `instance_id`.
+pub async fn add_gossip_peer_from_header(
+    context: &Context,
+    instance_id: MsgId,
+    node_addr: &str,
+) -> Result<()> {
+    if !context
+        .get_config_bool(Config::WebxdcRealtimeEnabled)
+        .await?
+    {
+        return Ok(());
+    }
+
+    info!(
+        context,
+        "Adding iroh peer with address {node_addr:?} to the topic of {instance_id}."
+    );
+    let node_addr =
+        serde_json::from_str::<NodeAddr>(node_addr).context("Failed to parse node address")?;
+
+    context.emit_event(EventType::WebxdcRealtimeAdvertisementReceived {
+        msg_id: instance_id,
+    });
+
+    let Some(topic) = get_iroh_topic_for_msg(context, instance_id).await? else {
+        warn!(
+            context,
+            "Could not add iroh peer because {instance_id} has no topic."
+        );
+        return Ok(());
+    };
+
+    let node_id = node_addr.node_id;
+    let relay_server = node_addr.relay_url().map(|relay| relay.as_str());
+    iroh_add_peer_for_topic(context, instance_id, topic, node_id, relay_server).await?;
+
+    let iroh = context.get_or_try_init_peer_channel().await?;
+    iroh.maybe_add_gossip_peers(topic, vec![node_addr]).await?;
     Ok(())
 }
 
@@ -419,15 +468,15 @@ pub async fn leave_webxdc_realtime(ctx: &Context, msg_id: MsgId) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn create_random_topic() -> TopicId {
+/// Creates a new random gossip topic.
+fn create_random_topic() -> TopicId {
     TopicId::from_bytes(rand::random())
 }
 
-pub(crate) async fn create_iroh_header(
-    ctx: &Context,
-    topic: TopicId,
-    msg_id: MsgId,
-) -> Result<Header> {
+/// Creates `Iroh-Gossip-Header` with a new random topic
+/// and stores the topic for the message.
+pub(crate) async fn create_iroh_header(ctx: &Context, msg_id: MsgId) -> Result<Header> {
+    let topic = create_random_topic();
     insert_topic_stub(ctx, msg_id, topic).await?;
     Ok(Header::new(
         HeaderDef::IrohGossipTopic.get_headername().to_string(),

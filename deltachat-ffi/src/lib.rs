@@ -4929,7 +4929,7 @@ pub unsafe extern "C" fn dc_accounts_maybe_network_lost(accounts: *mut dc_accoun
     }
 
     let accounts = &*accounts;
-    block_on(async move { accounts.write().await.maybe_network_lost().await });
+    block_on(async move { accounts.read().await.maybe_network_lost().await });
 }
 
 #[no_mangle]
@@ -4943,12 +4943,12 @@ pub unsafe extern "C" fn dc_accounts_background_fetch(
     }
 
     let accounts = &*accounts;
-    block_on(async move {
-        let accounts = accounts.read().await;
-        accounts
-            .background_fetch(Duration::from_secs(timeout_in_seconds))
-            .await;
-    });
+    let background_fetch_future = {
+        let lock = block_on(accounts.read());
+        lock.background_fetch(Duration::from_secs(timeout_in_seconds))
+    };
+    // At this point account manager is not locked anymore.
+    block_on(background_fetch_future);
     1
 }
 
@@ -4966,7 +4966,7 @@ pub unsafe extern "C" fn dc_accounts_set_push_device_token(
     let token = to_string_lossy(token);
 
     block_on(async move {
-        let mut accounts = accounts.write().await;
+        let accounts = accounts.read().await;
         if let Err(err) = accounts.set_push_device_token(&token).await {
             accounts.emit_event(EventType::Error(format!(
                 "Failed to set notify token: {err:#}."

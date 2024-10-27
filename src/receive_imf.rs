@@ -30,7 +30,7 @@ use crate::message::{
 };
 use crate::mimeparser::{parse_message_ids, AvatarAction, MimeMessage, SystemMessage};
 use crate::param::{Param, Params};
-use crate::peer_channels::{get_iroh_topic_for_msg, insert_topic_stub, iroh_add_peer_for_topic};
+use crate::peer_channels::{add_gossip_peer_from_header, insert_topic_stub};
 use crate::peerstate::Peerstate;
 use crate::reaction::{set_msg_reaction, Reaction};
 use crate::securejoin::{self, handle_securejoin_handshake, observe_securejoin_on_other_device};
@@ -41,7 +41,6 @@ use crate::sync::Sync::*;
 use crate::tools::{self, buf_compress, remove_subject_prefix};
 use crate::{chatlist_events, location};
 use crate::{contact, imap};
-use iroh_net::NodeAddr;
 
 /// This is the struct that is returned after receiving one email (aka MIME message).
 ///
@@ -763,6 +762,7 @@ async fn add_parts(
     let state: MessageState;
     let mut hidden = false;
     let mut needs_delete_job = false;
+    let mut restore_protection = false;
 
     // if contact renaming is prevented (for mailinglists and bots),
     // we use name from From:-header as override name
@@ -933,15 +933,11 @@ async fn add_parts(
 
         if chat_id.is_none() {
             // try to create a normal chat
-            let create_blocked = if from_id == ContactId::SELF {
-                Blocked::Not
-            } else {
-                let contact = Contact::get_by_id(context, from_id).await?;
-                match contact.is_blocked() {
-                    true => Blocked::Yes,
-                    false if is_bot => Blocked::Not,
-                    false => Blocked::Request,
-                }
+            let contact = Contact::get_by_id(context, from_id).await?;
+            let create_blocked = match contact.is_blocked() {
+                true => Blocked::Yes,
+                false if is_bot => Blocked::Not,
+                false => Blocked::Request,
             };
 
             if let Some(chat) = test_normal_chat {
@@ -1013,6 +1009,13 @@ async fn add_parts(
                             )
                             .await?;
                     }
+                    if let Some(peerstate) = &mime_parser.decryption_info.peerstate {
+                        restore_protection = new_protection != ProtectionStatus::Protected
+                            && peerstate.prefer_encrypt == EncryptPreference::Mutual
+                            // Check that the contact still has the Autocrypt key same as the
+                            // verified key, see also `Peerstate::is_using_verified_key()`.
+                            && contact.is_verified(context).await?;
+                    }
                 }
             }
         }
@@ -1032,8 +1035,7 @@ async fn add_parts(
 
         to_id = to_ids.first().copied().unwrap_or_default();
 
-        let self_sent =
-            from_id == ContactId::SELF && to_ids.len() == 1 && to_ids.contains(&ContactId::SELF);
+        let self_sent = to_ids.len() == 1 && to_ids.contains(&ContactId::SELF);
 
         if mime_parser.sync_items.is_some() && self_sent {
             chat_id = Some(DC_CHAT_ID_TRASH);
@@ -1486,36 +1488,28 @@ async fn add_parts(
     }
 
     if let Some(node_addr) = mime_parser.get_header(HeaderDef::IrohNodeAddr) {
-        match serde_json::from_str::<NodeAddr>(node_addr).context("Failed to parse node address") {
-            Ok(node_addr) => {
-                info!(context, "Adding iroh peer with address {node_addr:?}.");
-                let instance_id = parent.context("Failed to get parent message")?.id;
-                context.emit_event(EventType::WebxdcRealtimeAdvertisementReceived {
-                    msg_id: instance_id,
-                });
-                if let Some(topic) = get_iroh_topic_for_msg(context, instance_id).await? {
-                    let node_id = node_addr.node_id;
-                    let relay_server = node_addr.relay_url().map(|relay| relay.as_str());
-                    iroh_add_peer_for_topic(context, instance_id, topic, node_id, relay_server)
-                        .await?;
-                    if context
-                        .get_config_bool(Config::WebxdcRealtimeEnabled)
-                        .await?
+        chat_id = DC_CHAT_ID_TRASH;
+        match mime_parser.get_header(HeaderDef::InReplyTo) {
+            Some(in_reply_to) => match rfc724_mid_exists(context, in_reply_to).await? {
+                Some((instance_id, _ts_sent)) => {
+                    if let Err(err) =
+                        add_gossip_peer_from_header(context, instance_id, node_addr).await
                     {
-                        let iroh = context.get_or_try_init_peer_channel().await?;
-                        iroh.maybe_add_gossip_peers(topic, vec![node_addr]).await?;
+                        warn!(context, "Failed to add iroh peer from header: {err:#}.");
                     }
-                    info!(context, "Added iroh peer to the topic of {instance_id}.");
-                } else {
+                }
+                None => {
                     warn!(
                         context,
-                        "Could not add iroh peer because {instance_id} has no topic."
+                        "Cannot add iroh peer because WebXDC instance does not exist."
                     );
                 }
-                chat_id = DC_CHAT_ID_TRASH;
-            }
-            Err(err) => {
-                warn!(context, "Couldn't parse NodeAddr: {err:#}.");
+            },
+            None => {
+                warn!(
+                    context,
+                    "Cannot add iroh peer because the message has no In-Reply-To."
+                );
             }
         }
     }
@@ -1764,7 +1758,16 @@ RETURNING id
         // delete it.
         needs_delete_job = true;
     }
-
+    if restore_protection {
+        chat_id
+            .set_protection(
+                context,
+                ProtectionStatus::Protected,
+                mime_parser.timestamp_rcvd,
+                Some(from_id),
+            )
+            .await?;
+    }
     Ok(ReceivedMsg {
         chat_id,
         state,
