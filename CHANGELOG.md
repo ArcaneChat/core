@@ -1,5 +1,95 @@
 # Changelog
 
+## [1.149.0] - 2024-11-05
+
+### Build system
+
+- Update tokio to 1.41 and Android NDK to r27.
+- `nix flake update android`.
+
+### Fixes
+
+- cargo: Update iroh to 0.28.1.
+  This fixes the problem with iroh not sending the `Host:` header and not being able to connect to relays behind nginx reverse proxy.
+
+## [1.148.7] - 2024-11-03
+
+### API-Changes
+
+- Add API to reset contact encryption.
+
+### Features / Changes
+
+- Emit chatlist events only if message still exists.
+
+### Fixes
+
+- send_msg_to_smtp: Do not fail if the message does not exist anymore.
+- Do not percent-encode dot when passing to autoconfig server.
+- Save contact name from SecureJoin QR to `authname`, not to `name` ([#6115](https://github.com/deltachat/deltachat-core-rust/pull/6115)).
+- Always exit fake IDLE after at most 60 seconds.
+- Concat NDNs ([#6129](https://github.com/deltachat/deltachat-core-rust/pull/6129)).
+
+### Refactor
+
+- Remove `has_decrypted_pgp_armor()`.
+
+### Miscellaneous Tasks
+
+- Update dependencies.
+
+## [1.148.6] - 2024-10-31
+
+### API-Changes
+
+- Add Message::new_text() ([#6123](https://github.com/deltachat/deltachat-core-rust/pull/6123)).
+- Add `MessageSearchResult.chat_id` ([#6120](https://github.com/deltachat/deltachat-core-rust/pull/6120)).
+
+### Features / Changes
+
+- Enable Webxdc realtime by default ([#6125](https://github.com/deltachat/deltachat-core-rust/pull/6125)).
+
+### Fixes
+
+- Save full text to mime_headers for long outgoing messages ([#6091](https://github.com/deltachat/deltachat-core-rust/pull/6091)).
+- Show root SMTP connection failure in connectivity view ([#6121](https://github.com/deltachat/deltachat-core-rust/pull/6121)).
+- Skip IDLE if we got unsolicited FETCH ([#6130](https://github.com/deltachat/deltachat-core-rust/pull/6130)).
+
+### Miscellaneous Tasks
+
+- Silence another rust-analyzer false-positive ([#6124](https://github.com/deltachat/deltachat-core-rust/pull/6124)).
+- cargo: Upgrade iroh to 0.26.0.
+
+### Refactor
+
+- Directly use connectives ([#6128](https://github.com/deltachat/deltachat-core-rust/pull/6128)).
+- Use Message::new_text() more ([#6127](https://github.com/deltachat/deltachat-core-rust/pull/6127)).
+
+## [1.148.5] - 2024-10-27
+
+### Fixes
+
+- Set Config::NotifyAboutWrongPw before saving configuration ([#5896](https://github.com/deltachat/deltachat-core-rust/pull/5896)).
+- Do not take write lock for maybe_network_lost() and set_push_device_token().
+- Do not lock the account manager for the whole duration of background_fetch.
+
+### Features / Changes
+
+- Auto-restore 1:1 chat protection after receiving old unverified message.
+
+### CI
+
+- Take `CHATMAIL_DOMAIN` from variables instead of secrets.
+
+### Other
+
+- Revert "build: nix flake update fenix" to fix `nix build .#deltachat-rpc-server-armeabi-v7a-android`.
+
+### Refactor
+
+- Receive_imf::add_parts: Remove excessive `from_id == ContactId::SELF` checks.
+- Factor out `add_gossip_peer_from_header()`.
+
 ## [1.148.4] - 2024-10-24
 
 ### Features / Changes
@@ -5139,3 +5229,7 @@ https://github.com/deltachat/deltachat-core-rust/pulls?q=is%3Apr+is%3Aclosed
 [1.148.2]: https://github.com/deltachat/deltachat-core-rust/compare/v1.148.1..v1.148.2
 [1.148.3]: https://github.com/deltachat/deltachat-core-rust/compare/v1.148.2..v1.148.3
 [1.148.4]: https://github.com/deltachat/deltachat-core-rust/compare/v1.148.3..v1.148.4
+[1.148.5]: https://github.com/deltachat/deltachat-core-rust/compare/v1.148.4..v1.148.5
+[1.148.6]: https://github.com/deltachat/deltachat-core-rust/compare/v1.148.5..v1.148.6
+[1.148.7]: https://github.com/deltachat/deltachat-core-rust/compare/v1.148.6..v1.148.7
+[1.149.0]: https://github.com/deltachat/deltachat-core-rust/compare/v1.148.7..v1.149.0

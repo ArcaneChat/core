@@ -19,11 +19,12 @@ use auto_outlook::outlk_autodiscover;
 use deltachat_contact_tools::EmailAddress;
 use futures::FutureExt;
 use futures_lite::FutureExt as _;
-use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+use percent_encoding::utf8_percent_encode;
 use server_params::{expand_param_vector, ServerParams};
 use tokio::task;
 
 use crate::config::{self, Config};
+use crate::constants::NON_ALPHANUMERIC_WITHOUT_DOT;
 use crate::context::Context;
 use crate::imap::Imap;
 use crate::log::LogExt;
@@ -31,7 +32,7 @@ use crate::login_param::{
     ConfiguredCertificateChecks, ConfiguredLoginParam, ConfiguredServerLoginParam,
     ConnectionCandidate, EnteredCertificateChecks, EnteredLoginParam,
 };
-use crate::message::{Message, Viewtype};
+use crate::message::Message;
 use crate::oauth2::get_oauth2_addr;
 use crate::provider::{Protocol, Socket, UsernamePattern};
 use crate::smtp::Smtp;
@@ -142,8 +143,7 @@ async fn on_configure_completed(
         }
 
         if !provider.after_login_hint.is_empty() {
-            let mut msg = Message::new(Viewtype::Text);
-            msg.text = provider.after_login_hint.to_string();
+            let mut msg = Message::new_text(provider.after_login_hint.to_string());
             if chat::add_device_msg(context, Some("core-provider-info"), Some(&mut msg))
                 .await
                 .is_err()
@@ -156,9 +156,9 @@ async fn on_configure_completed(
     if let Some(new_addr) = context.get_config(Config::ConfiguredAddr).await? {
         if let Some(old_addr) = old_addr {
             if !addr_cmp(&new_addr, &old_addr) {
-                let mut msg = Message::new(Viewtype::Text);
-                msg.text =
-                    stock_str::aeap_explanation_and_link(context, &old_addr, &new_addr).await;
+                let mut msg = Message::new_text(
+                    stock_str::aeap_explanation_and_link(context, &old_addr, &new_addr).await,
+                );
                 chat::add_device_msg(context, None, Some(&mut msg))
                     .await
                     .context("Cannot add AEAP explanation")
@@ -499,7 +499,15 @@ async fn get_autoconfig(
     param: &EnteredLoginParam,
     param_domain: &str,
 ) -> Option<Vec<ServerParams>> {
-    let param_addr_urlencoded = utf8_percent_encode(&param.addr, NON_ALPHANUMERIC).to_string();
+    // Make sure to not encode `.` as `%2E` here.
+    // Some servers like murena.io on 2024-11-01 produce incorrect autoconfig XML
+    // when address is encoded.
+    // E.g.
+    // <https://autoconfig.murena.io/mail/config-v1.1.xml?emailaddress=foobar%40example%2Eorg>
+    // produced XML file with `<username>foobar@example%2Eorg</username>`
+    // resulting in failure to log in.
+    let param_addr_urlencoded =
+        utf8_percent_encode(&param.addr, NON_ALPHANUMERIC_WITHOUT_DOT).to_string();
 
     if let Ok(res) = moz_autoconfigure(
         ctx,
