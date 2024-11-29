@@ -4,7 +4,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
-use ::pgp::types::KeyTrait;
+use ::pgp::types::PublicKeyTrait;
 use anyhow::{bail, ensure, format_err, Context as _, Result};
 use futures::TryStreamExt;
 use futures_lite::FutureExt;
@@ -426,6 +426,7 @@ async fn import_backup_stream_inner<R: tokio::io::AsyncRead + Unpin>(
     if res.is_ok() {
         context.emit_event(EventType::ImexProgress(999));
         res = context.sql.run_migrations(context).await;
+        context.emit_event(EventType::AccountsItemChanged);
     }
     if res.is_ok() {
         delete_and_reset_all_device_msgs(context)
@@ -750,7 +751,7 @@ where
             true => "private",
         };
         let id = id.map_or("default".into(), |i| i.to_string());
-        let fp = DcKey::fingerprint(key).hex();
+        let fp = key.dc_fingerprint().hex();
         format!("{kind}-key-{addr}-{id}-{fp}.asc")
     };
     let path = dir.join(&file_name);
@@ -878,7 +879,7 @@ mod tests {
             .unwrap()
             .strip_suffix(".asc")
             .unwrap();
-        assert_eq!(fingerprint, DcKey::fingerprint(&key).hex());
+        assert_eq!(fingerprint, key.dc_fingerprint().hex());
         let blobdir = context.ctx.get_blobdir().to_str().unwrap();
         let filename = format!("{blobdir}/{filename}");
         let bytes = tokio::fs::read(&filename).await.unwrap();

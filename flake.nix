@@ -363,6 +363,8 @@
           mkRustPackages "x86_64-linux" //
           mkRustPackages "armv7l-linux" //
           mkRustPackages "armv6l-linux" //
+          mkRustPackages "x86_64-darwin" //
+          mkRustPackages "aarch64-darwin" //
           mkAndroidPackages "armeabi-v7a" //
           mkAndroidPackages "arm64-v8a" //
           mkAndroidPackages "x86" //
@@ -479,8 +481,8 @@
                   pkgs.python3
                   pkgs.python3Packages.wheel
                 ];
-                buildPhase = ''python3 scripts/wheel-rpc-server.py source deltachat-rpc-server-${manifest.version}.tar.gz'';
-                installPhase = ''mkdir -p $out; cp -av deltachat-rpc-server-${manifest.version}.tar.gz $out'';
+                buildPhase = ''python3 scripts/wheel-rpc-server.py source deltachat_rpc_server-${manifest.version}.tar.gz'';
+                installPhase = ''mkdir -p $out; cp -av deltachat_rpc_server-${manifest.version}.tar.gz $out'';
               };
 
             deltachat-rpc-client =
@@ -533,28 +535,30 @@
               };
           };
 
-        devShells.default = let 
-          pkgs = import nixpkgs {
-            system = system;
-            overlays = [ fenix.overlays.default ];
-          };
-          in pkgs.mkShell {
+        devShells.default =
+          let
+            pkgs = import nixpkgs {
+              system = system;
+              overlays = [ fenix.overlays.default ];
+            };
+          in
+          pkgs.mkShell {
 
-          buildInputs = with pkgs; [
-            (fenix.packages.${system}.complete.withComponents [
-              "cargo"
-              "clippy"
-              "rust-src"
-              "rustc"
-              "rustfmt"
-            ])
-            cargo-deny
-            rust-analyzer-nightly
-            cargo-nextest
-            perl # needed to build vendored OpenSSL
-            git-cliff
-          ];
-        };
+            buildInputs = with pkgs; [
+              (fenix.packages.${system}.complete.withComponents [
+                "cargo"
+                "clippy"
+                "rust-src"
+                "rustc"
+                "rustfmt"
+              ])
+              cargo-deny
+              rust-analyzer-nightly
+              cargo-nextest
+              perl # needed to build vendored OpenSSL
+              git-cliff
+            ];
+          };
       }
     );
 }

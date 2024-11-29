@@ -41,6 +41,15 @@ pub struct WebxdcMessageInfo {
 
     /// If the webxdc is a community backup
     pub community: bool,
+
+    /// Address to be used for `window.webxdc.selfAddr` in JS land.
+    self_addr: String,
+    /// Milliseconds to wait before calling `sendUpdate()` again since the last call.
+    /// Should be exposed to `window.sendUpdateInterval` in JS land.
+    send_update_interval: usize,
+    /// Maximum number of bytes accepted for a serialized update object.
+    /// Should be exposed to `window.sendUpdateMaxSize` in JS land.
+    send_update_max_size: usize,
 }
 
 impl WebxdcMessageInfo {
@@ -58,6 +67,9 @@ impl WebxdcMessageInfo {
             internet_access,
             orientation,
             community,
+            self_addr,
+            send_update_interval,
+            send_update_max_size,
         } = message.get_webxdc_info(context).await?;
 
         Ok(Self {
@@ -69,6 +81,9 @@ impl WebxdcMessageInfo {
             internet_access,
             orientation: maybe_empty_string_to_option(orientation),
             community: community,
+            self_addr,
+            send_update_interval,
+            send_update_max_size,
         })
     }
 }

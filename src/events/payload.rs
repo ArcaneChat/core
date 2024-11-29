@@ -107,6 +107,21 @@ pub enum EventType {
         reaction: Reaction,
     },
 
+    /// A webxdc wants an info message or a changed summary to be notified.
+    IncomingWebxdcNotify {
+        /// ID of the contact sending.
+        contact_id: ContactId,
+
+        /// ID of the added info message or webxdc instance in case of summary change.
+        msg_id: MsgId,
+
+        /// Text to notify.
+        text: String,
+
+        /// Link assigned to this notification, if any.
+        href: Option<String>,
+    },
+
     /// There is a fresh message. Typically, the user will show an notification
     /// when receiving this message.
     ///
@@ -331,6 +346,20 @@ pub enum EventType {
         /// ID of the changed chat
         chat_id: Option<ChatId>,
     },
+
+    /// Inform that the list of accounts has changed (an account removed or added or (not yet implemented) the account order changes)
+    ///
+    /// This event is only emitted by the account manager
+    AccountsChanged,
+
+    /// Inform that an account property that might be shown in the account list changed, namely:
+    /// - is_configured (see [crate::context::Context::is_configured])
+    /// - displayname
+    /// - selfavatar
+    /// - private_tag
+    ///
+    /// This event is emitted from the account whose property changed.
+    AccountsItemChanged,
 
     /// Event for using in tests, e.g. as a fence between normally generated events.
     #[cfg(test)]

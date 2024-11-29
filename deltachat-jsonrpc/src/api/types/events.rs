@@ -106,6 +106,15 @@ pub enum EventType {
         reaction: String,
     },
 
+    /// Incoming webxdc info or summary update, should be notified.
+    #[serde(rename_all = "camelCase")]
+    IncomingWebxdcNotify {
+        contact_id: u32,
+        msg_id: u32,
+        text: String,
+        href: Option<String>,
+    },
+
     /// There is a fresh message. Typically, the user will show an notification
     /// when receiving this message.
     ///
@@ -277,6 +286,20 @@ pub enum EventType {
     #[serde(rename_all = "camelCase")]
     ChatlistItemChanged { chat_id: Option<u32> },
 
+    /// Inform that the list of accounts has changed (an account removed or added or (not yet implemented) the account order changes)
+    ///
+    /// This event is only emitted by the account manager
+    AccountsChanged,
+
+    /// Inform that an account property that might be shown in the account list changed, namely:
+    /// - is_configured (see is_configured())
+    /// - displayname
+    /// - selfavatar
+    /// - private_tag
+    ///
+    /// This event is emitted from the account whose property changed.
+    AccountsItemChanged,
+
     /// Inform than some events have been skipped due to event channel overflow.
     EventChannelOverflow { n: u64 },
 }
@@ -318,6 +341,17 @@ impl From<CoreEventType> for EventType {
                 contact_id: contact_id.to_u32(),
                 msg_id: msg_id.to_u32(),
                 reaction: reaction.as_str().to_string(),
+            },
+            CoreEventType::IncomingWebxdcNotify {
+                contact_id,
+                msg_id,
+                text,
+                href,
+            } => IncomingWebxdcNotify {
+                contact_id: contact_id.to_u32(),
+                msg_id: msg_id.to_u32(),
+                text,
+                href,
             },
             CoreEventType::IncomingMsg { chat_id, msg_id } => IncomingMsg {
                 chat_id: chat_id.to_u32(),
@@ -409,6 +443,8 @@ impl From<CoreEventType> for EventType {
             },
             CoreEventType::ChatlistChanged => ChatlistChanged,
             CoreEventType::EventChannelOverflow { n } => EventChannelOverflow { n },
+            CoreEventType::AccountsChanged => AccountsChanged,
+            CoreEventType::AccountsItemChanged => AccountsItemChanged,
             #[allow(unreachable_patterns)]
             #[cfg(test)]
             _ => unreachable!("This is just to silence a rust_analyzer false-positive"),

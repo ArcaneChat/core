@@ -1,7 +1,6 @@
 //! Utilities to help writing tests.
 //!
 //! This private module is only compiled for test runs.
-#![allow(clippy::indexing_slicing)]
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write;
 use std::ops::{Deref, DerefMut};
@@ -392,7 +391,7 @@ impl TestContext {
         Self {
             ctx,
             dir,
-            evtracker: EventTracker(evtracker_receiver),
+            evtracker: EventTracker::new(evtracker_receiver),
             _log_sink,
         }
     }
@@ -656,8 +655,8 @@ impl TestContext {
             .expect("failed to load msg")
     }
 
-    /// Returns the [`Contact`] for the other [`TestContext`], creating it if necessary.
-    pub async fn add_or_lookup_contact(&self, other: &TestContext) -> Contact {
+    /// Returns the [`ContactId`] for the other [`TestContext`], creating a contact if necessary.
+    pub async fn add_or_lookup_contact_id(&self, other: &TestContext) -> ContactId {
         let primary_self_addr = other.ctx.get_primary_self_addr().await.unwrap();
         let addr = ContactAddress::new(&primary_self_addr).unwrap();
         // MailinglistAddress is the lowest allowed origin, we'd prefer to not modify the
@@ -671,6 +670,12 @@ impl TestContext {
             Modifier::Modified => warn!(&self.ctx, "Contact {} modified by TestContext", &addr),
             Modifier::Created => warn!(&self.ctx, "Contact {} created by TestContext", &addr),
         }
+        contact_id
+    }
+
+    /// Returns the [`Contact`] for the other [`TestContext`], creating it if necessary.
+    pub async fn add_or_lookup_contact(&self, other: &TestContext) -> Contact {
+        let contact_id = self.add_or_lookup_contact_id(other).await;
         Contact::get_by_id(&self.ctx, contact_id).await.unwrap()
     }
 
@@ -1088,6 +1093,10 @@ impl DerefMut for EventTracker {
 }
 
 impl EventTracker {
+    pub fn new(emitter: EventEmitter) -> Self {
+        Self(emitter)
+    }
+
     /// Consumes emitted events returning the first matching one.
     ///
     /// If no matching events are ready this will wait for new events to arrive and time out

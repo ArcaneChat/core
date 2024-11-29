@@ -397,6 +397,12 @@ pub enum Config {
     /// Make all outgoing messages with Autocrypt header "multipart/signed".
     SignUnencrypted,
 
+    /// Enable header protection for `Autocrypt` header.
+    ///
+    /// This is an experimental setting not compatible to other MUAs
+    /// and older Delta Chat versions (core version <= v1.149.0).
+    ProtectAutocrypt,
+
     /// Let the core save all events to the database.
     /// This value is used internally to remember the MsgId of the logging xdc
     #[strum(props(default = "0"))]
@@ -788,6 +794,12 @@ impl Context {
             _ => {
                 self.sql.set_raw_config(key.as_ref(), value).await?;
             }
+        }
+        if matches!(
+            key,
+            Config::Displayname | Config::Selfavatar | Config::PrivateTag
+        ) {
+            self.emit_event(EventType::AccountsItemChanged);
         }
         if key.is_synced() {
             self.emit_event(EventType::ConfigSynced { key });

@@ -1068,7 +1068,7 @@ async fn test_classic_mailing_list() -> Result<()> {
     let mime = sent.payload();
 
     println!("Sent mime message is:\n\n{mime}\n\n");
-    assert!(mime.contains("Content-Type: text/plain; charset=utf-8; format=flowed; delsp=no\r\n"));
+    assert!(mime.contains("Content-Type: text/plain; charset=utf-8\r\n"));
     assert!(mime.contains("Subject: =?utf-8?q?Re=3A_=5Bdelta-dev=5D_What=27s_up=3F?=\r\n"));
     assert!(mime.contains("MIME-Version: 1.0\r\n"));
     assert!(mime.contains("In-Reply-To: <38942@posteo.org>\r\n"));
@@ -4185,9 +4185,8 @@ async fn test_recreate_contact_list_on_missing_message() -> Result<()> {
     // readd fiona
     add_contact_to_chat(&alice, chat_id, alice_fiona).await?;
 
-    alice.recv_msg(&remove_msg).await;
-
     // delayed removal of fiona shouldn't remove her
+    alice.recv_msg_trash(&remove_msg).await;
     assert_eq!(get_chat_contacts(&alice, chat_id).await?.len(), 4);
 
     Ok(())
@@ -4857,6 +4856,37 @@ async fn test_protected_group_add_remove_member_missing_key() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_protected_group_reply_from_mua() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+    let fiona = &tcm.fiona().await;
+    mark_as_verified(alice, bob).await;
+    mark_as_verified(alice, fiona).await;
+    mark_as_verified(bob, alice).await;
+    let alice_chat_id = alice
+        .create_group_with_members(ProtectionStatus::Protected, "Group", &[bob, fiona])
+        .await;
+    let sent = alice.send_text(alice_chat_id, "Hello!").await;
+    let bob_msg = bob.recv_msg(&sent).await;
+    bob_msg.chat_id.accept(bob).await?;
+    // This is hacky, but i don't know other simple way to simulate a MUA reply. It works because
+    // the message is correctly assigned to the chat by `References:`.
+    bob.sql
+        .execute(
+            "UPDATE chats SET protected=0, grpid='' WHERE id=?",
+            (bob_msg.chat_id,),
+        )
+        .await?;
+    let sent = bob
+        .send_text(bob_msg.chat_id, "/me replying from MUA")
+        .await;
+    let alice_msg = alice.recv_msg(&sent).await;
+    assert_eq!(alice_msg.chat_id, alice_chat_id);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_older_message_from_2nd_device() -> Result<()> {
     let mut tcm = TestContextManager::new();
     let alice = &tcm.alice().await;
@@ -4944,6 +4974,32 @@ async fn test_unarchive_on_member_removal() -> Result<()> {
     let bob_chat = Chat::load_from_db(bob, bob_chat_id).await?;
     assert_eq!(bob_chat.get_visibility(), ChatVisibility::Normal);
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_no_op_member_added_is_trash() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+    let alice_chat_id = alice
+        .create_group_with_members(ProtectionStatus::Unprotected, "foos", &[bob])
+        .await;
+    send_text_msg(alice, alice_chat_id, "populate".to_string()).await?;
+    let msg = alice.pop_sent_msg().await;
+    bob.recv_msg(&msg).await;
+    let bob_chat_id = bob.get_last_msg().await.chat_id;
+    bob_chat_id.accept(bob).await?;
+
+    let fiona_id = Contact::create(alice, "", "fiona@example.net").await?;
+    add_contact_to_chat(alice, alice_chat_id, fiona_id).await?;
+    let msg = alice.pop_sent_msg().await;
+
+    let fiona_id = Contact::create(bob, "", "fiona@example.net").await?;
+    add_contact_to_chat(bob, bob_chat_id, fiona_id).await?;
+    bob.recv_msg_trash(&msg).await;
+    let contacts = get_chat_contacts(bob, bob_chat_id).await?;
+    assert_eq!(contacts.len(), 3);
     Ok(())
 }
 

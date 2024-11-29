@@ -104,7 +104,7 @@ pub async fn get_securejoin_qr(context: &Context, group: Option<ChatId>) -> Resu
             context.scheduler.interrupt_inbox().await;
         }
         format!(
-            "OPENPGP4FPR:{}#a={}&g={}&x={}&i={}&s={}",
+            "https://i.delta.chat/#{}&a={}&g={}&x={}&i={}&s={}",
             fingerprint.hex(),
             self_addr_urlencoded,
             &group_name_urlencoded,
@@ -119,7 +119,7 @@ pub async fn get_securejoin_qr(context: &Context, group: Option<ChatId>) -> Resu
             context.scheduler.interrupt_inbox().await;
         }
         format!(
-            "OPENPGP4FPR:{}#a={}&n={}&i={}&s={}",
+            "https://i.delta.chat/#{}&a={}&n={}&i={}&s={}",
             fingerprint.hex(),
             self_addr_urlencoded,
             self_name_urlencoded,
@@ -136,7 +136,7 @@ async fn get_self_fingerprint(context: &Context) -> Result<Fingerprint> {
     let key = load_self_public_key(context)
         .await
         .context("Failed to load key")?;
-    Ok(key.fingerprint())
+    Ok(key.dc_fingerprint())
 }
 
 /// Take a scanned QR-code and do the setup-contact/join-group/invite handshake.
@@ -244,10 +244,10 @@ async fn verify_sender_by_fingerprint(
 
 /// What to do with a Secure-Join handshake message after it was handled.
 ///
-/// This status is returned to [`receive_imf`] which will use it to decide what to do
+/// This status is returned to [`receive_imf_inner`] which will use it to decide what to do
 /// next with this incoming setup-contact/secure-join handshake message.
 ///
-/// [`receive_imf`]: crate::receive_imf::receive_imf
+/// [`receive_imf_inner`]: crate::receive_imf::receive_imf_inner
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum HandshakeMessage {
     /// The message has been fully handled and should be removed/delete.
@@ -279,7 +279,6 @@ pub(crate) enum HandshakeMessage {
 ///
 /// When `handle_securejoin_handshake()` is called, the message is not yet filed in the
 /// database; this is done by `receive_imf()` later on as needed.
-#[allow(clippy::indexing_slicing)]
 pub(crate) async fn handle_securejoin_handshake(
     context: &Context,
     mime_message: &MimeMessage,
@@ -298,9 +297,9 @@ pub(crate) async fn handle_securejoin_handshake(
 
     if !matches!(step, "vg-request" | "vc-request") {
         let mut self_found = false;
-        let self_fingerprint = load_self_public_key(context).await?.fingerprint();
+        let self_fingerprint = load_self_public_key(context).await?.dc_fingerprint();
         for (addr, key) in &mime_message.gossiped_keys {
-            if key.fingerprint() == self_fingerprint && context.is_self_addr(addr).await? {
+            if key.dc_fingerprint() == self_fingerprint && context.is_self_addr(addr).await? {
                 self_found = true;
                 break;
             }
@@ -348,7 +347,7 @@ pub(crate) async fn handle_securejoin_handshake(
             send_alice_handshake_msg(
                 context,
                 contact_id,
-                &format!("{}-auth-required", &step[..2]),
+                &format!("{}-auth-required", &step.get(..2).unwrap_or_default()),
             )
             .await
             .context("failed sending auth-required handshake message")?;
@@ -936,7 +935,10 @@ mod tests {
             "vc-request-with-auth"
         );
         assert!(msg.get_header(HeaderDef::SecureJoinAuth).is_some());
-        let bob_fp = load_self_public_key(&bob.ctx).await.unwrap().fingerprint();
+        let bob_fp = load_self_public_key(&bob.ctx)
+            .await
+            .unwrap()
+            .dc_fingerprint();
         assert_eq!(
             *msg.get_header(HeaderDef::SecureJoinFingerprint).unwrap(),
             bob_fp.hex()
@@ -1106,10 +1108,10 @@ mod tests {
             last_seen_autocrypt: 10,
             prefer_encrypt: EncryptPreference::Mutual,
             public_key: Some(alice_pubkey.clone()),
-            public_key_fingerprint: Some(alice_pubkey.fingerprint()),
+            public_key_fingerprint: Some(alice_pubkey.dc_fingerprint()),
             gossip_key: Some(alice_pubkey.clone()),
             gossip_timestamp: 10,
-            gossip_key_fingerprint: Some(alice_pubkey.fingerprint()),
+            gossip_key_fingerprint: Some(alice_pubkey.dc_fingerprint()),
             verified_key: None,
             verified_key_fingerprint: None,
             verifier: None,
@@ -1157,7 +1159,7 @@ mod tests {
             "vc-request-with-auth"
         );
         assert!(msg.get_header(HeaderDef::SecureJoinAuth).is_some());
-        let bob_fp = load_self_public_key(&bob.ctx).await?.fingerprint();
+        let bob_fp = load_self_public_key(&bob.ctx).await?.dc_fingerprint();
         assert_eq!(
             *msg.get_header(HeaderDef::SecureJoinFingerprint).unwrap(),
             bob_fp.hex()
@@ -1320,7 +1322,7 @@ mod tests {
             "vg-request-with-auth"
         );
         assert!(msg.get_header(HeaderDef::SecureJoinAuth).is_some());
-        let bob_fp = load_self_public_key(&bob.ctx).await?.fingerprint();
+        let bob_fp = load_self_public_key(&bob.ctx).await?.dc_fingerprint();
         assert_eq!(
             *msg.get_header(HeaderDef::SecureJoinFingerprint).unwrap(),
             bob_fp.hex()

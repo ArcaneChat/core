@@ -1,6 +1,6 @@
 [package]
 name = "deltachat"
-version = "1.149.0"
+version = "1.151.2"
 edition = "2021"
 license = "MPL-2.0"
 rust-version = "1.77"
@@ -76,7 +76,7 @@ num-traits = { workspace = true }
 once_cell = { workspace = true }
 parking_lot = "0.12"
 percent-encoding = "2.3"
-pgp = { version = "0.13.2", default-features = false }
+pgp = { version = "0.14.0", default-features = false }
 pin-project = "1"
 qrcodegen = "1.7.0"
 quick-xml = "0.37"
@@ -92,6 +92,7 @@ serde_json = { workspace = true }
 serde_urlencoded = "0.7.1"
 serde = { workspace = true, features = ["derive"] }
 sha-1 = "0.10"
+sha2 = "0.10"
 shadowsocks = { version = "1.21.0", default-features = false, features = ["aead-cipher-2022"] }
 smallvec = "1.13.2"
 strum = "0.26"
