@@ -2597,12 +2597,14 @@ dc_lot_t*       dc_check_qr                  (dc_context_t* context, const char*
 
 /**
  * Get QR code text that will offer an Setup-Contact or Verified-Group invitation.
- * The QR code is compatible to the OPENPGP4FPR format
- * so that a basic fingerprint comparison also works e.g. with OpenKeychain.
  *
  * The scanning device will pass the scanned content to dc_check_qr() then;
  * if dc_check_qr() returns DC_QR_ASK_VERIFYCONTACT or DC_QR_ASK_VERIFYGROUP
  * an out-of-band-verification can be joined using dc_join_securejoin()
+ *
+ * The returned text will also work as a normal https:-link,
+ * so that the QR code is useful also without Delta Chat being installed
+ * or can be passed to contacts through other channels.
  *
  * @memberof dc_context_t
  * @param context The context object.
@@ -4199,14 +4201,13 @@ char*             dc_msg_get_webxdc_blob      (const dc_msg_t* msg, const char* 
  *   defaults to an empty string.
  *   Implementations may offer an menu or a button to open this URL.
  * - internet_access:
- *   true if the Webxdc should get full internet access, including Webrtc.
- *   currently, this is only true for encrypted Webxdc's in the self chat
- *   that have requested internet access in the manifest.
+ *   true if the Webxdc should get internet access;
+ *   this is the case i.e. for experimental maps integration.
  * - self_addr: address to be used for `window.webxdc.selfAddr` in JS land.
  * - send_update_interval: Milliseconds to wait before calling `sendUpdate()` again since the last call.
  *   Should be exposed to `webxdc.sendUpdateInterval` in JS land.
  * - send_update_max_size: Maximum number of bytes accepted for a serialized update object.
-+    Should be exposed to `webxdc.sendUpdateMaxSize` in JS land.
+ *   Should be exposed to `webxdc.sendUpdateMaxSize` in JS land.
  *
  * @memberof dc_msg_t
  * @param msg The webxdc instance.
@@ -4500,6 +4501,7 @@ int             dc_msg_is_info                (const dc_msg_t* msg);
  * - DC_INFO_INVALID_UNENCRYPTED_MAIL (13) - Info-message for "Provider requires end-to-end encryption which is not setup yet",
  *   the UI should change the corresponding string using #DC_STR_INVALID_UNENCRYPTED_MAIL
  *   and also offer a way to fix the encryption, eg. by a button offering a QR scan
+ * - DC_INFO_WEBXDC_INFO_MESSAGE (32) - Info-message created by webxdc app sending `update.info`
  *
  * Even when you display an icon,
  * you should still display the text of the informational message using dc_msg_get_text()
@@ -5794,6 +5796,23 @@ void dc_jsonrpc_unref(dc_jsonrpc_instance_t* jsonrpc_instance);
  * returns immediately and once the result is ready it can be retrieved via dc_jsonrpc_next_response()
  * the jsonrpc specification defines an invocation id that can then be used to match request and response.
  *
+ * An overview of JSON-RPC calls is available at
+ * <https://js.jsonrpc.delta.chat/classes/RawClient.html>.
+ * Note that the page describes only the rough methods.
+ * Calling convention, casing etc. does vary, this is a known flaw,
+ * and at some point we will get to improve that :)
+ *
+ * Also, note that most calls are more high-level than this CFFI, require more database calls and are slower.
+ * They're more suitable for an environment that is totally async and/or cannot use CFFI, which might not be true for native apps.
+ *
+ * Notable exceptions that exist only as JSON-RPC and probably never get a CFFI counterpart:
+ * - getMessageReactions(), sendReaction()
+ * - getHttpResponse()
+ * - draftSelfReport()
+ * - getAccountFileSize()
+ * - importVcard(), parseVcard(), makeVcard()
+ * - sendWebxdcRealtimeData, sendWebxdcRealtimeAdvertisement(), leaveWebxdcRealtime()
+ *
  * @memberof dc_jsonrpc_instance_t
  * @param jsonrpc_instance jsonrpc instance as returned from dc_jsonrpc_init().
  * @param request JSON-RPC request as string
@@ -5813,6 +5832,8 @@ char* dc_jsonrpc_next_response(dc_jsonrpc_instance_t* jsonrpc_instance);
 
 /**
  * Make a JSON-RPC call and return a response.
+ *
+ * See dc_jsonrpc_request() for an overview of possible calls and for more information.
  *
  * @memberof dc_jsonrpc_instance_t
  * @param jsonrpc_instance jsonrpc instance as returned from dc_jsonrpc_init().

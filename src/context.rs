@@ -13,7 +13,7 @@ use async_channel::{self as channel, Receiver, Sender};
 use pgp::types::PublicKeyTrait;
 use pgp::SignedPublicKey;
 use ratelimit::Ratelimit;
-use tokio::sync::{Mutex, Notify, OnceCell, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 
 use crate::aheader::EncryptPreference;
 use crate::chat::{get_chat_cnt, ChatId, ProtectionStatus};
@@ -277,7 +277,7 @@ pub struct InnerContext {
     /// The text of the last error logged and emitted as an event.
     /// If the ui wants to display an error after a failure,
     /// `last_error` should be used to avoid races with the event thread.
-    pub(crate) last_error: std::sync::RwLock<String>,
+    pub(crate) last_error: parking_lot::RwLock<String>,
 
     /// If debug logging is enabled, this contains all necessary information
     ///
@@ -293,7 +293,7 @@ pub struct InnerContext {
     pub(crate) push_subscribed: AtomicBool,
 
     /// Iroh for realtime peer channels.
-    pub(crate) iroh: OnceCell<Iroh>,
+    pub(crate) iroh: Arc<RwLock<Option<Iroh>>>,
 }
 
 /// The state of ongoing process.
@@ -452,11 +452,11 @@ impl Context {
             metadata: RwLock::new(None),
             creation_time: tools::Time::now(),
             last_full_folder_scan: Mutex::new(None),
-            last_error: std::sync::RwLock::new("".to_string()),
+            last_error: parking_lot::RwLock::new("".to_string()),
             debug_logging: std::sync::RwLock::new(None),
             push_subscriber,
             push_subscribed: AtomicBool::new(false),
-            iroh: OnceCell::new(),
+            iroh: Arc::new(RwLock::new(None)),
         };
 
         let ctx = Context {
@@ -492,6 +492,19 @@ impl Context {
     /// Stops the IO scheduler.
     pub async fn stop_io(&self) {
         self.scheduler.stop(self).await;
+        if let Some(iroh) = self.iroh.write().await.take() {
+            // Close all QUIC connections.
+
+            // Spawn into a separate task,
+            // because Iroh calls `wait_idle()` internally
+            // and it may take time, especially if the network
+            // has become unavailable.
+            tokio::spawn(async move {
+                // We do not log the error because we do not want the task
+                // to hold the reference to Context.
+                let _ = tokio::time::timeout(Duration::from_secs(60), iroh.close()).await;
+            });
+        }
     }
 
     /// Restarts the IO scheduler if it was running before
@@ -502,7 +515,7 @@ impl Context {
 
     /// Indicate that the network likely has come back.
     pub async fn maybe_network(&self) {
-        if let Some(iroh) = self.iroh.get() {
+        if let Some(ref iroh) = *self.iroh.read().await {
             iroh.network_change().await;
         }
         self.scheduler.maybe_network().await;
