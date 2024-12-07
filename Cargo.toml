@@ -1,6 +1,6 @@
 [package]
 name = "deltachat"
-version = "1.151.3"
+version = "1.151.5"
 edition = "2021"
 license = "MPL-2.0"
 rust-version = "1.77"
@@ -43,7 +43,7 @@ async-broadcast = "0.7.1"
 async-channel = { workspace = true }
 async-imap = { version = "0.10.2", default-features = false, features = ["runtime-tokio", "compress"] }
 async-native-tls = { version = "0.5", default-features = false, features = ["runtime-tokio"] }
-async-smtp = { version = "0.9", default-features = false, features = ["runtime-tokio"] }
+async-smtp = { version = "0.10", default-features = false, features = ["runtime-tokio"] }
 async_zip = { version = "0.0.17", default-features = false, features = ["deflate", "tokio-fs"] }
 base64 = { workspace = true }
 brotli = { version = "7", default-features=false, features = ["std"] }
@@ -76,7 +76,7 @@ num-traits = { workspace = true }
 once_cell = { workspace = true }
 parking_lot = "0.12"
 percent-encoding = "2.3"
-pgp = { version = "0.14.0", default-features = false }
+pgp = { version = "0.14.2", default-features = false }
 pin-project = "1"
 qrcodegen = "1.7.0"
 quick-xml = "0.37"
@@ -150,6 +150,7 @@ harness = false
 
 [[bench]]
 name = "receive_emails"
+required-features = ["internals"]
 harness = false
 
 [[bench]]

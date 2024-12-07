@@ -1419,7 +1419,7 @@ impl ChatId {
     ///
     /// `message_timestamp` should be either the message "sent" timestamp or a timestamp of the
     /// corresponding event in case of a system message (usually the current system time).
-    /// `always_sort_to_bottom` makes this ajust the returned timestamp up so that the message goes
+    /// `always_sort_to_bottom` makes this adjust the returned timestamp up so that the message goes
     /// to the chat bottom.
     /// `received` -- whether the message is received. Otherwise being sent.
     /// `incoming` -- whether the message is incoming.
@@ -2124,13 +2124,19 @@ impl Chat {
         } else {
             None
         };
+        let new_mime_headers = new_mime_headers.map(|s| new_html_mimepart(s).build().as_string());
         let new_mime_headers = new_mime_headers.or_else(|| match was_truncated {
-            true => Some(msg.text.clone()),
+            // We need to add some headers so that they are stripped before formatting HTML by
+            // `MsgId::get_html()`, not a part of the actual text. Let's add "Content-Type", it's
+            // anyway a useful metadata about the stored text.
+            true => Some(
+                "Content-Type: text/plain; charset=utf-8\r\n\r\n".to_string() + &msg.text + "\r\n",
+            ),
             false => None,
         });
         let new_mime_headers = match new_mime_headers {
             Some(h) => Some(tokio::task::block_in_place(move || {
-                buf_compress(new_html_mimepart(h).build().as_string().as_bytes())
+                buf_compress(h.as_bytes())
             })?),
             None => None,
         };
@@ -4554,7 +4560,7 @@ pub(crate) async fn delete_and_reset_all_device_msgs(context: &Context) -> Resul
         .await?;
     context.sql.execute("DELETE FROM devmsglabels;", ()).await?;
 
-    // Insert labels for welcome messages to avoid them being readded on reconfiguration.
+    // Insert labels for welcome messages to avoid them being re-added on reconfiguration.
     context
         .sql
         .execute(
@@ -4771,7 +4777,7 @@ impl Context {
 
     /// Emits the appropriate `MsgsChanged` event. Should be called if the number of unnoticed
     /// archived chats could decrease. In general we don't want to make an extra db query to know if
-    /// a noticied chat is archived. Emitting events should be cheap, a false-positive `MsgsChanged`
+    /// a noticed chat is archived. Emitting events should be cheap, a false-positive `MsgsChanged`
     /// is ok.
     pub(crate) fn on_archived_chats_maybe_noticed(&self) {
         self.emit_msgs_changed(DC_CHAT_ID_ARCHIVED_LINK, MsgId::new(0));

@@ -80,7 +80,7 @@ pub enum Config {
     /// SMTP server security (e.g. TLS, STARTTLS).
     SendSecurity,
 
-    /// Deprecated option for backwards compatibilty.
+    /// Deprecated option for backwards compatibility.
     ///
     /// Certificate checks for SMTP are actually controlled by `imap_certificate_checks` config.
     SmtpCertificateChecks,
@@ -445,6 +445,12 @@ pub enum Config {
     /// Enable webxdc realtime features.
     #[strum(props(default = "1"))]
     WebxdcRealtimeEnabled,
+
+    /// Last device token stored on the chatmail server.
+    ///
+    /// If it has not changed, we do not store
+    /// the device token again.
+    DeviceToken,
 }
 
 impl Config {
