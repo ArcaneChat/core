@@ -149,6 +149,7 @@ pub enum StockMessage {
     #[strum(props(fallback = "Message from %1$s"))]
     SubjectForNewContact = 73,
 
+    /// Unused. Was used in group chat status messages.
     #[strum(props(fallback = "Failed to send message to %1$s."))]
     FailedSendingTo = 74,
 
@@ -430,6 +431,9 @@ pub enum StockMessage {
     #[strum(props(fallback = "%1$s reacted %2$s to \"%3$s\""))]
     MsgReactedBy = 177,
 
+    #[strum(props(fallback = "Member %1$s removed."))]
+    MsgDelMember = 178,
+
     #[strum(props(fallback = "Establishing guaranteed end-to-end encryption, please wait…"))]
     SecurejoinWait = 190,
 
@@ -710,7 +714,11 @@ pub(crate) async fn msg_del_member_local(
             .unwrap_or_else(|_| addr.to_string()),
         _ => addr.to_string(),
     };
-    if by_contact == ContactId::SELF {
+    if by_contact == ContactId::UNDEFINED {
+        translated(context, StockMessage::MsgDelMember)
+            .await
+            .replace1(whom)
+    } else if by_contact == ContactId::SELF {
         translated(context, StockMessage::MsgYouDelMember)
             .await
             .replace1(whom)
@@ -978,13 +986,6 @@ pub(crate) async fn subject_for_new_contact(context: &Context, self_name: &str) 
     translated(context, StockMessage::SubjectForNewContact)
         .await
         .replace1(self_name)
-}
-
-/// Stock string: `Failed to send message to %1$s.`.
-pub(crate) async fn failed_sending_to(context: &Context, name: &str) -> String {
-    translated(context, StockMessage::FailedSendingTo)
-        .await
-        .replace1(name)
 }
 
 /// Stock string: `Message deletion timer is disabled.`.

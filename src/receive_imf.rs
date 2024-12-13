@@ -158,7 +158,7 @@ async fn insert_tombstone(context: &Context, rfc724_mid: &str) -> Result<MsgId> 
 /// If `is_partial_download` is set, it contains the full message size in bytes.
 /// Do not confuse that with `replace_msg_id` that will be set when the full message is loaded
 /// later.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) async fn receive_imf_inner(
     context: &Context,
     folder: &str,
@@ -680,7 +680,7 @@ pub async fn from_field_to_contact_id(
 /// Creates a `ReceivedMsg` from given parts which might consist of
 /// multiple messages (if there are multiple attachments).
 /// Every entry in `mime_parser.parts` produces a new row in the `msgs` table.
-#[allow(clippy::too_many_arguments, clippy::cognitive_complexity)]
+#[expect(clippy::too_many_arguments)]
 async fn add_parts(
     context: &Context,
     mime_parser: &mut MimeMessage,
@@ -1450,10 +1450,11 @@ async fn add_parts(
     // we save the full mime-message and add a flag
     // that the ui should show button to display the full message.
 
-    // a flag used to avoid adding "show full message" button to multiple parts of the message.
-    let mut save_mime_modified = mime_parser.is_mime_modified;
+    // We add "Show Full Message" button to the last message bubble (part) if this flag evaluates to
+    // `true` finally.
+    let mut save_mime_modified = false;
 
-    let mime_headers = if save_mime_headers || save_mime_modified {
+    let mime_headers = if save_mime_headers || mime_parser.is_mime_modified {
         let headers = if !mime_parser.decoded_data.is_empty() {
             mime_parser.decoded_data.clone()
         } else {
@@ -1519,7 +1520,8 @@ async fn add_parts(
         }
     }
 
-    for part in &mime_parser.parts {
+    let mut parts = mime_parser.parts.iter().peekable();
+    while let Some(part) = parts.next() {
         if part.is_reaction {
             let reaction_str = simplify::remove_footers(part.msg.as_str());
             let is_incoming_fresh = mime_parser.incoming && !seen && !fetching_existing_messages;
@@ -1563,14 +1565,11 @@ async fn add_parts(
         } else {
             (&part.msg, part.typ)
         };
-
         let part_is_empty =
             typ == Viewtype::Text && msg.is_empty() && part.param.get(Param::Quote).is_none();
-        let mime_modified = save_mime_modified && !part_is_empty;
-        if mime_modified {
-            // Avoid setting mime_modified for more than one part.
-            save_mime_modified = false;
-        }
+
+        save_mime_modified |= mime_parser.is_mime_modified && !part_is_empty && !hidden;
+        let save_mime_modified = save_mime_modified && parts.peek().is_none();
 
         if part.typ == Viewtype::Text {
             let msg_raw = part.msg_raw.as_ref().cloned().unwrap_or_default();
@@ -1590,8 +1589,7 @@ async fn add_parts(
 
         // If you change which information is skipped if the message is trashed,
         // also change `MsgId::trash()` and `delete_expired_messages()`
-        let trash =
-            chat_id.is_trash() || (is_location_kml && msg.is_empty() && typ == Viewtype::Text);
+        let trash = chat_id.is_trash() || (is_location_kml && part_is_empty && !save_mime_modified);
 
         let row_id = context
             .sql
@@ -1654,14 +1652,14 @@ RETURNING id
                     },
                     hidden,
                     part.bytes as isize,
-                    if (save_mime_headers || mime_modified) && !trash {
+                    if (save_mime_headers || save_mime_modified) && !trash {
                         mime_headers.clone()
                     } else {
                         Vec::new()
                     },
                     mime_in_reply_to,
                     mime_references,
-                    mime_modified,
+                    save_mime_modified,
                     part.error.as_deref().unwrap_or_default(),
                     ephemeral_timer,
                     ephemeral_timestamp,
@@ -1880,7 +1878,7 @@ async fn lookup_chat_by_reply(
     Ok(Some((parent_chat.id, parent_chat.blocked)))
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn lookup_chat_or_create_adhoc_group(
     context: &Context,
     mime_parser: &MimeMessage,
@@ -2015,7 +2013,7 @@ async fn is_probably_private_reply(
 /// than two members, a new ad hoc group is created.
 ///
 /// On success the function returns the created (chat_id, chat_blocked) tuple.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn create_group(
     context: &Context,
     mime_parser: &mut MimeMessage,
@@ -2135,7 +2133,6 @@ async fn create_group(
 /// just omitted.
 ///
 /// * `is_partial_download` - whether the message is not fully downloaded.
-#[allow(clippy::too_many_arguments)]
 async fn apply_group_changes(
     context: &Context,
     mime_parser: &mut MimeMessage,
@@ -2265,9 +2262,7 @@ async fn apply_group_changes(
             if let Some(contact_id) =
                 Contact::lookup_id_by_addr(context, added_addr, Origin::Unknown).await?
             {
-                if !recreate_member_list {
-                    added_id = Some(contact_id);
-                }
+                added_id = Some(contact_id);
                 is_new_member = !chat_contacts.contains(&contact_id);
             } else {
                 warn!(context, "Added {added_addr:?} has no contact id.");
@@ -2335,12 +2330,16 @@ async fn apply_group_changes(
             new_members.insert(from_id);
         }
 
+        // These are for adding info messages about implicit membership changes, so they are only
+        // filled when such messages are needed.
+        let mut added_ids = HashSet::<ContactId>::new();
+        let mut removed_ids = HashSet::<ContactId>::new();
+
         if !recreate_member_list {
-            let mut diff = HashSet::<ContactId>::new();
             if sync_member_list {
-                diff = new_members.difference(&chat_contacts).copied().collect();
+                added_ids = new_members.difference(&chat_contacts).copied().collect();
             } else if let Some(added_id) = added_id {
-                diff.insert(added_id);
+                added_ids.insert(added_id);
             }
             new_members.clone_from(&chat_contacts);
             // Don't delete any members locally, but instead add absent ones to provide group
@@ -2354,33 +2353,62 @@ async fn apply_group_changes(
             // will likely recreate the member list from the next received message. The problem
             // occurs only if that "somebody" managed to reply earlier. Really, it's a problem for
             // big groups with high message rate, but let it be for now.
-            new_members.extend(diff.clone());
-            if let Some(added_id) = added_id {
-                diff.remove(&added_id);
-            }
-            if !diff.is_empty() {
-                warn!(context, "Implicit addition of {diff:?} to chat {chat_id}.");
-            }
-            group_changes_msgs.reserve(diff.len());
-            for contact_id in diff {
-                let contact = Contact::get_by_id(context, contact_id).await?;
-                group_changes_msgs.push(
-                    stock_str::msg_add_member_local(
-                        context,
-                        contact.get_addr(),
-                        ContactId::UNDEFINED,
-                    )
-                    .await,
-                );
-            }
+            new_members.extend(added_ids.clone());
         }
         if let Some(removed_id) = removed_id {
             new_members.remove(&removed_id);
         }
         if recreate_member_list {
-            info!(
+            if self_added {
+                // ... then `better_msg` is already set.
+            } else if chat.blocked == Blocked::Request || !chat_contacts.contains(&ContactId::SELF)
+            {
+                warn!(context, "Implicit addition of SELF to chat {chat_id}.");
+                group_changes_msgs.push(
+                    stock_str::msg_add_member_local(
+                        context,
+                        &context.get_primary_self_addr().await?,
+                        ContactId::UNDEFINED,
+                    )
+                    .await,
+                );
+            } else {
+                added_ids = new_members.difference(&chat_contacts).copied().collect();
+                removed_ids = chat_contacts.difference(&new_members).copied().collect();
+            }
+        }
+
+        if let Some(added_id) = added_id {
+            added_ids.remove(&added_id);
+        }
+        if let Some(removed_id) = removed_id {
+            removed_ids.remove(&removed_id);
+        }
+        if !added_ids.is_empty() {
+            warn!(
                 context,
-                "Recreating chat {chat_id} member list with {new_members:?}.",
+                "Implicit addition of {added_ids:?} to chat {chat_id}."
+            );
+        }
+        if !removed_ids.is_empty() {
+            warn!(
+                context,
+                "Implicit removal of {removed_ids:?} from chat {chat_id}."
+            );
+        }
+        group_changes_msgs.reserve(added_ids.len() + removed_ids.len());
+        for contact_id in added_ids {
+            let contact = Contact::get_by_id(context, contact_id).await?;
+            group_changes_msgs.push(
+                stock_str::msg_add_member_local(context, contact.get_addr(), ContactId::UNDEFINED)
+                    .await,
+            );
+        }
+        for contact_id in removed_ids {
+            let contact = Contact::get_by_id(context, contact_id).await?;
+            group_changes_msgs.push(
+                stock_str::msg_del_member_local(context, contact.get_addr(), ContactId::UNDEFINED)
+                    .await,
             );
         }
 

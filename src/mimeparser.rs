@@ -17,10 +17,10 @@ use rand::distributions::{Alphanumeric, DistString};
 use crate::aheader::{Aheader, EncryptPreference};
 use crate::authres::handle_authres;
 use crate::blob::BlobObject;
-use crate::chat::{add_info_msg, ChatId};
+use crate::chat::ChatId;
 use crate::config::Config;
-use crate::constants::{self, Chattype};
-use crate::contact::{Contact, ContactId, Origin};
+use crate::constants;
+use crate::contact::ContactId;
 use crate::context::Context;
 use crate::decrypt::{
     get_autocrypt_peerstate, get_encrypted_mime, keyring_from_peerstate, try_decrypt,
@@ -36,8 +36,7 @@ use crate::peerstate::Peerstate;
 use crate::simplify::{simplify, SimplifiedText};
 use crate::sync::SyncItems;
 use crate::tools::{
-    create_smeared_timestamp, get_filemeta, parse_receive_headers, smeared_time, truncate_msg_text,
-    validate_id,
+    get_filemeta, parse_receive_headers, smeared_time, truncate_msg_text, validate_id,
 };
 use crate::{chatlist_events, location, stock_str, tools};
 
@@ -106,14 +105,12 @@ pub(crate) struct MimeMessage {
     /// received.
     pub(crate) footer: Option<String>,
 
-    // if this flag is set, the parts/text/etc. are just close to the original mime-message;
-    // clients should offer a way to view the original message in this case
+    /// If set, this is a modified MIME message; clients should offer a way to view the original
+    /// MIME message in this case.
     pub is_mime_modified: bool,
 
-    /// The decrypted, raw mime structure.
-    ///
-    /// This is non-empty iff `is_mime_modified` and the message was actually encrypted. It is used
-    /// for e.g. late-parsing HTML.
+    /// Decrypted, raw MIME structure. Nonempty iff `is_mime_modified` and the message was actually
+    /// encrypted.
     pub decoded_data: Vec<u8>,
 
     /// Hop info for debugging.
@@ -1280,7 +1277,7 @@ impl MimeMessage {
         Ok(self.parts.len() > old_part_count)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     async fn do_add_single_file_part(
         &mut self,
         context: &Context,
@@ -1663,18 +1660,8 @@ impl MimeMessage {
                 .get_header_value(HeaderDef::MessageId)
                 .and_then(|v| parse_message_id(&v).ok())
             {
-                let mut to_list =
-                    get_all_addresses_from_header(&report.headers, "x-failed-recipients");
-                let to = if to_list.len() != 1 {
-                    // We do not know which recipient failed
-                    None
-                } else {
-                    to_list.pop()
-                };
-
                 return Ok(Some(DeliveryReport {
                     rfc724_mid: original_message_id,
-                    failed_recipient: to.map(|s| s.addr),
                     failure,
                 }));
             }
@@ -1772,7 +1759,6 @@ impl MimeMessage {
                 {
                     self.delivery_report = Some(DeliveryReport {
                         rfc724_mid: original_message_id,
-                        failed_recipient: None,
                         failure: true,
                     })
                 }
@@ -1910,7 +1896,6 @@ pub(crate) struct Report {
 #[derive(Debug)]
 pub(crate) struct DeliveryReport {
     pub rfc724_mid: String,
-    pub failed_recipient: Option<String>,
     pub failure: bool,
 }
 
@@ -2275,20 +2260,12 @@ async fn handle_ndn(
     let msgs: Vec<_> = context
         .sql
         .query_map(
-            concat!(
-                "SELECT",
-                "    m.id AS msg_id,",
-                "    c.id AS chat_id,",
-                "    c.type AS type",
-                " FROM msgs m LEFT JOIN chats c ON m.chat_id=c.id",
-                " WHERE rfc724_mid=? AND from_id=1",
-            ),
+            "SELECT id FROM msgs
+                WHERE rfc724_mid=? AND from_id=1",
             (&failed.rfc724_mid,),
             |row| {
-                let msg_id: MsgId = row.get("msg_id")?;
-                let chat_id: ChatId = row.get("chat_id")?;
-                let chat_type: Chattype = row.get("type")?;
-                Ok((msg_id, chat_id, chat_type))
+                let msg_id: MsgId = row.get(0)?;
+                Ok(msg_id)
             },
             |rows| Ok(rows.collect::<Vec<_>>()),
         )
@@ -2296,16 +2273,13 @@ async fn handle_ndn(
 
     let error = if let Some(error) = error {
         error
-    } else if let Some(failed_recipient) = &failed.failed_recipient {
-        format!("Delivery to {failed_recipient} failed.").clone()
     } else {
         "Delivery to at least one recipient failed.".to_string()
     };
     let err_msg = &error;
 
-    let mut first = true;
     for msg in msgs {
-        let (msg_id, chat_id, chat_type) = msg?;
+        let msg_id = msg?;
         let mut message = Message::load_from_db(context, msg_id).await?;
         let aggregated_error = message
             .error
@@ -2317,44 +2291,8 @@ async fn handle_ndn(
             aggregated_error.as_ref().unwrap_or(err_msg),
         )
         .await?;
-        if first {
-            // Add only one info msg for all failed messages
-            ndn_maybe_add_info_msg(context, failed, chat_id, chat_type).await?;
-        }
-        first = false;
     }
 
-    Ok(())
-}
-
-async fn ndn_maybe_add_info_msg(
-    context: &Context,
-    failed: &DeliveryReport,
-    chat_id: ChatId,
-    chat_type: Chattype,
-) -> Result<()> {
-    match chat_type {
-        Chattype::Group | Chattype::Broadcast => {
-            if let Some(failed_recipient) = &failed.failed_recipient {
-                let contact_id =
-                    Contact::lookup_id_by_addr(context, failed_recipient, Origin::Unknown)
-                        .await?
-                        .context("contact ID not found")?;
-                let contact = Contact::get_by_id(context, contact_id).await?;
-                // Tell the user which of the recipients failed if we know that (because in
-                // a group, this might otherwise be unclear)
-                let text = stock_str::failed_sending_to(context, contact.get_display_name()).await;
-                add_info_msg(context, chat_id, &text, create_smeared_timestamp(context)).await?;
-                context.emit_event(EventType::ChatModified(chat_id));
-            }
-        }
-        Chattype::Mailinglist => {
-            // ndn_maybe_add_info_msg() is about the case when delivery to the group failed.
-            // If we get an NDN for the mailing list, just issue a warning.
-            warn!(context, "ignoring NDN for mailing list.");
-        }
-        Chattype::Single => {}
-    }
     Ok(())
 }
 
@@ -3148,11 +3086,7 @@ MDYyMDYxNTE1RTlDOEE4Cj4+CnN0YXJ0eHJlZgo4Mjc4CiUlRU9GCg==
 
         // Make sure the file is there even though the html is wrong:
         let param = &message.parts[0].param;
-        let blob: BlobObject = param
-            .get_blob(Param::File, &t, false)
-            .await
-            .unwrap()
-            .unwrap();
+        let blob: BlobObject = param.get_blob(Param::File, &t).await.unwrap().unwrap();
         let f = tokio::fs::File::open(blob.to_abs_path()).await.unwrap();
         let size = f.metadata().await.unwrap().len();
         assert_eq!(size, 154);

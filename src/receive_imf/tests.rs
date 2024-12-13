@@ -868,18 +868,10 @@ async fn test_parse_ndn_group_msg() -> Result<()> {
     assert_eq!(msg.state, MessageState::OutFailed);
 
     let msgs = chat::get_chat_msgs(&t, msg.chat_id).await?;
-    let msg_id = if let ChatItem::Message { msg_id } = msgs.last().unwrap() {
-        msg_id
-    } else {
+    let ChatItem::Message { msg_id } = *msgs.last().unwrap() else {
         panic!("Wrong item type");
     };
-    let last_msg = Message::load_from_db(&t, *msg_id).await?;
-
-    assert_eq!(
-        last_msg.text,
-        stock_str::failed_sending_to(&t, "assidhfaaspocwaeofi@gmail.com").await
-    );
-    assert_eq!(last_msg.from_id, ContactId::INFO);
+    assert_eq!(msg_id, msg.id);
     Ok(())
 }
 
@@ -3836,6 +3828,61 @@ async fn test_messed_up_message_id() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_big_forwarded_with_big_attachment() -> Result<()> {
+    let t = &TestContext::new_bob().await;
+
+    let raw = include_bytes!("../../test-data/message/big_forwarded_with_big_attachment.eml");
+    let rcvd = receive_imf(t, raw, false).await?.unwrap();
+    assert_eq!(rcvd.msg_ids.len(), 3);
+
+    let msg = Message::load_from_db(t, rcvd.msg_ids[0]).await?;
+    assert_eq!(msg.get_viewtype(), Viewtype::Text);
+    assert_eq!(msg.get_text(), "Hello!");
+    assert!(!msg.has_html());
+
+    let msg = Message::load_from_db(t, rcvd.msg_ids[1]).await?;
+    assert_eq!(msg.get_viewtype(), Viewtype::Text);
+    assert!(msg
+        .get_text()
+        .starts_with("this text with 42 chars is just repeated."));
+    assert!(msg.get_text().ends_with("[...]"));
+    assert!(!msg.has_html());
+
+    let msg = Message::load_from_db(t, rcvd.msg_ids[2]).await?;
+    assert_eq!(msg.get_viewtype(), Viewtype::File);
+    assert!(msg.has_html());
+    let html = msg.id.get_html(t).await?.unwrap();
+    let tail = html
+        .split_once("Hello!")
+        .unwrap()
+        .1
+        .split_once("From: AAA")
+        .unwrap()
+        .1
+        .split_once("aaa@example.org")
+        .unwrap()
+        .1
+        .split_once("To: Alice")
+        .unwrap()
+        .1
+        .split_once("alice@example.org")
+        .unwrap()
+        .1
+        .split_once("Subject: Some subject")
+        .unwrap()
+        .1
+        .split_once("Date: Fri, 2 Jun 2023 12:29:17 +0000")
+        .unwrap()
+        .1;
+    assert_eq!(
+        tail.matches("this text with 42 chars is just repeated.")
+            .count(),
+        128
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_mua_user_adds_member() -> Result<()> {
     let t = TestContext::new_alice().await;
 
@@ -4145,7 +4192,7 @@ async fn test_dont_recreate_contacts_on_add_remove() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_recreate_contact_list_on_missing_message() -> Result<()> {
+async fn test_recreate_contact_list_on_missing_messages() -> Result<()> {
     let alice = TestContext::new_alice().await;
     let bob = TestContext::new_bob().await;
     let chat_id = create_group_chat(&alice, ProtectionStatus::Unprotected, "Group").await?;
@@ -4170,25 +4217,33 @@ async fn test_recreate_contact_list_on_missing_message() -> Result<()> {
     remove_contact_from_chat(&bob, bob_chat_id, bob_contact_fiona).await?;
     let remove_msg = bob.pop_sent_msg().await;
 
-    // bob adds a new member
+    // bob adds new members
     let bob_blue = Contact::create(&bob, "blue", "blue@example.net").await?;
     add_contact_to_chat(&bob, bob_chat_id, bob_blue).await?;
-
+    bob.pop_sent_msg().await;
+    let bob_orange = Contact::create(&bob, "orange", "orange@example.net").await?;
+    add_contact_to_chat(&bob, bob_chat_id, bob_orange).await?;
     let add_msg = bob.pop_sent_msg().await;
 
-    // alice only receives the addition of the member
+    // alice only receives the second member addition
     alice.recv_msg(&add_msg).await;
 
-    // since we missed a message, a new contact list should be build
-    assert_eq!(get_chat_contacts(&alice, chat_id).await?.len(), 3);
+    // since we missed messages, a new contact list should be build
+    assert_eq!(get_chat_contacts(&alice, chat_id).await?.len(), 4);
 
     // re-add fiona
     add_contact_to_chat(&alice, chat_id, alice_fiona).await?;
 
     // delayed removal of fiona shouldn't remove her
     alice.recv_msg_trash(&remove_msg).await;
-    assert_eq!(get_chat_contacts(&alice, chat_id).await?.len(), 4);
+    assert_eq!(get_chat_contacts(&alice, chat_id).await?.len(), 5);
 
+    alice
+        .golden_test_chat(
+            chat_id,
+            "receive_imf_recreate_contact_list_on_missing_messages",
+        )
+        .await;
     Ok(())
 }
 
@@ -4455,6 +4510,20 @@ async fn test_recreate_member_list_on_missing_add_of_self() -> Result<()> {
     send_text_msg(&alice, alice_chat_id, "4th message".to_string()).await?;
     bob.recv_msg(&alice.pop_sent_msg().await).await;
     assert!(!is_contact_in_chat(&bob, bob_chat_id, ContactId::SELF).await?);
+
+    // But if Bob left a long time ago, they must recreate the member list after missing a message.
+    SystemTime::shift(Duration::from_secs(3600));
+    send_text_msg(&alice, alice_chat_id, "5th message".to_string()).await?;
+    alice.pop_sent_msg().await;
+    send_text_msg(&alice, alice_chat_id, "6th message".to_string()).await?;
+    bob.recv_msg(&alice.pop_sent_msg().await).await;
+    assert!(is_contact_in_chat(&bob, bob_chat_id, ContactId::SELF).await?);
+
+    bob.golden_test_chat(
+        bob_chat_id,
+        "receive_imf_recreate_member_list_on_missing_add_of_self",
+    )
+    .await;
     Ok(())
 }
 
