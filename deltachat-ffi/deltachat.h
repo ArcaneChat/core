@@ -4886,6 +4886,8 @@ dc_msg_t*       dc_msg_get_parent             (const dc_msg_t* msg);
  */
 void            dc_msg_force_plaintext        (dc_msg_t* msg);
 
+void            dc_msg_force_sticker          (dc_msg_t* msg);
+
 /**
  * @class dc_contact_t
  *
