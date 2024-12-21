@@ -713,6 +713,13 @@ impl Message {
         self.location_id != 0
     }
 
+    /// Returns the location metadata associated to this message as a string "latitude,longitude".
+    pub fn get_location(&self) -> String {
+        let latitude = self.param.get(Param::SetLatitude).unwrap_or_default();
+        let longitude = self.param.get(Param::SetLongitude).unwrap_or_default();
+        format!("{latitude},{longitude}")
+    }
+
     /// Set any location that should be bound to the message object.
     /// The function is useful to add a marker to the map
     /// at a position different from the self-location.
