@@ -25,6 +25,7 @@ use crate::ephemeral::{start_ephemeral_timers_msgids, Timer as EphemeralTimer};
 use crate::events::EventType;
 use crate::imap::markseen_on_imap_table;
 use crate::location::delete_poi_location;
+use crate::location::get_poi_location;
 use crate::mimeparser::{parse_message_id, SystemMessage};
 use crate::param::{Param, Params};
 use crate::pgp::split_armored_data;
@@ -714,10 +715,14 @@ impl Message {
     }
 
     /// Returns the location metadata associated to this message as a string "latitude,longitude".
-    pub fn get_location(&self) -> String {
-        let latitude = self.param.get(Param::SetLatitude).unwrap_or_default();
-        let longitude = self.param.get(Param::SetLongitude).unwrap_or_default();
-        format!("{latitude},{longitude}")
+    pub async fn get_poi_location(&self, context: &Context) -> String {
+        if !self.has_location() {
+            "".to_string()
+        } else if let Ok((latitude, longitude)) = get_poi_location(context, self.location_id).await {
+            format!("{latitude},{longitude}")
+        } else {
+            "".to_string()
+        }
     }
 
     /// Set any location that should be bound to the message object.

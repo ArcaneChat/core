@@ -3254,17 +3254,13 @@ pub unsafe extern "C" fn dc_msg_get_id(msg: *mut dc_msg_t) -> u32 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dc_msg_get_location(msg: *mut dc_msg_t) -> *mut libc::c_char {
+pub unsafe extern "C" fn dc_msg_get_poi_location(msg: *mut dc_msg_t) -> *mut libc::c_char {
     if msg.is_null() {
         eprintln!("ignoring careless call to dc_msg_get_location_str()");
         return "".strdup();
     }
     let ffi_msg = &*msg;
-    if ffi_msg.message.has_location() {
-        ffi_msg.message.get_location().strdup()
-    } else {
-        "".strdup()
-    }
+    block_on(ffi_msg.message.get_poi_location(&*ffi_msg.context)).strdup()
 }
 
 #[no_mangle]

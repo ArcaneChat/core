@@ -513,6 +513,19 @@ pub(crate) async fn delete_poi_location(context: &Context, location_id: u32) -> 
     Ok(())
 }
 
+pub(crate) async fn get_poi_location(context: &Context, location_id: u32) -> Result<(f64, f64)> {
+    context
+        .sql
+        .query_row(
+            "SELECT latitude, longitude FROM locations WHERE independent=1 AND id=?",
+            (location_id as i32,),
+            |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            },
+        )
+        .await
+}
+
 /// Deletes POI locations that don't have corresponding message anymore.
 pub(crate) async fn delete_orphaned_poi_locations(context: &Context) -> Result<()> {
     context.sql.execute("
