@@ -4049,7 +4049,7 @@ pub unsafe extern "C" fn dc_msg_force_plaintext(msg: *mut dc_msg_t) {
 #[no_mangle]
 pub unsafe extern "C" fn dc_msg_force_sticker(msg: *mut dc_msg_t) {
     if msg.is_null() {
-        eprintln!("ignoring careless call to dc_msg_force_plaintext()");
+        eprintln!("ignoring careless call to dc_msg_force_sticker()");
         return;
     }
     let ffi_msg = &mut *msg;
