@@ -28,7 +28,7 @@ use crate::contact::{self, Contact, ContactId, Origin};
 use crate::context::Context;
 use crate::debug_logging::maybe_set_logging_xdc;
 use crate::download::DownloadState;
-use crate::ephemeral::Timer as EphemeralTimer;
+use crate::ephemeral::{start_chat_ephemeral_timers, Timer as EphemeralTimer};
 use crate::events::EventType;
 use crate::html::new_html_mimepart;
 use crate::location;
@@ -707,6 +707,10 @@ impl ChatId {
                 Ok(())
             })
             .await?;
+
+        if visibility == ChatVisibility::Archived {
+            start_chat_ephemeral_timers(context, self).await?;
+        }
 
         context.emit_msgs_changed_without_ids();
         chatlist_events::emit_chatlist_changed(context);
@@ -3264,19 +3268,6 @@ pub async fn get_chat_msgs_ex(
     Ok(items)
 }
 
-pub(crate) async fn marknoticed_chat_if_older_than(
-    context: &Context,
-    chat_id: ChatId,
-    timestamp: i64,
-) -> Result<()> {
-    if let Some(chat_timestamp) = chat_id.get_timestamp(context).await? {
-        if timestamp > chat_timestamp {
-            marknoticed_chat(context, chat_id).await?;
-        }
-    }
-    Ok(())
-}
-
 /// Marks all messages in the chat as noticed.
 /// If the given chat-id is the archive-link, marks all messages in all archived chats as noticed.
 pub async fn marknoticed_chat(context: &Context, chat_id: ChatId) -> Result<()> {
@@ -3288,10 +3279,10 @@ pub async fn marknoticed_chat(context: &Context, chat_id: ChatId) -> Result<()> 
             .query_map(
                 "SELECT DISTINCT(m.chat_id) FROM msgs m
                     LEFT JOIN chats c ON m.chat_id=c.id
-                    WHERE m.state=10 AND m.hidden=0 AND m.chat_id>9 AND c.blocked=0 AND c.archived=1",
-                    (),
+                    WHERE m.state=10 AND m.hidden=0 AND m.chat_id>9 AND c.archived=1",
+                (),
                 |row| row.get::<_, ChatId>(0),
-                |ids| ids.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+                |ids| ids.collect::<Result<Vec<_>, _>>().map_err(Into::into),
             )
             .await?;
         if chat_ids_in_archive.is_empty() {
@@ -3300,32 +3291,40 @@ pub async fn marknoticed_chat(context: &Context, chat_id: ChatId) -> Result<()> 
 
         context
             .sql
-            .execute(
-                &format!(
-                    "UPDATE msgs SET state=13 WHERE state=10 AND hidden=0 AND chat_id IN ({});",
-                    sql::repeat_vars(chat_ids_in_archive.len())
-                ),
-                rusqlite::params_from_iter(&chat_ids_in_archive),
-            )
+            .transaction(|transaction| {
+                let mut stmt = transaction.prepare(
+                    "UPDATE msgs SET state=13 WHERE state=10 AND hidden=0 AND chat_id = ?",
+                )?;
+                for chat_id_in_archive in &chat_ids_in_archive {
+                    stmt.execute((chat_id_in_archive,))?;
+                }
+                Ok(())
+            })
             .await?;
+
         for chat_id_in_archive in chat_ids_in_archive {
+            start_chat_ephemeral_timers(context, chat_id_in_archive).await?;
             context.emit_event(EventType::MsgsNoticed(chat_id_in_archive));
             chatlist_events::emit_chatlist_item_changed(context, chat_id_in_archive);
         }
-    } else if context
-        .sql
-        .execute(
-            "UPDATE msgs
+    } else {
+        start_chat_ephemeral_timers(context, chat_id).await?;
+
+        if context
+            .sql
+            .execute(
+                "UPDATE msgs
             SET state=?
           WHERE state=?
             AND hidden=0
             AND chat_id=?;",
-            (MessageState::InNoticed, MessageState::InFresh, chat_id),
-        )
-        .await?
-        == 0
-    {
-        return Ok(());
+                (MessageState::InNoticed, MessageState::InFresh, chat_id),
+            )
+            .await?
+            == 0
+        {
+            return Ok(());
+        }
     }
 
     context.emit_event(EventType::MsgsNoticed(chat_id));
@@ -3397,6 +3396,7 @@ pub(crate) async fn mark_old_messages_as_noticed(
     }
 
     for c in changed_chats {
+        start_chat_ephemeral_timers(context, c).await?;
         context.emit_event(EventType::MsgsNoticed(c));
         chatlist_events::emit_chatlist_item_changed(context, c);
     }

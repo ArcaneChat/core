@@ -84,7 +84,6 @@ use crate::location;
 use crate::log::LogExt;
 use crate::message::{Message, MessageState, MsgId, Viewtype};
 use crate::mimeparser::SystemMessage;
-use crate::sql::{self, params_iter};
 use crate::stock_str;
 use crate::tools::{duration_to_str, time, SystemTime};
 
@@ -329,23 +328,44 @@ pub(crate) async fn start_ephemeral_timers_msgids(
     msg_ids: &[MsgId],
 ) -> Result<()> {
     let now = time();
-    let count = context
+    let should_interrupt =
+    context
+        .sql
+        .transaction(move |transaction| {
+            let mut should_interrupt = false;
+            let mut stmt =
+                transaction.prepare(
+                    "UPDATE msgs SET ephemeral_timestamp = ?1 + ephemeral_timer
+                     WHERE (ephemeral_timestamp == 0 OR ephemeral_timestamp > ?1 + ephemeral_timer) AND ephemeral_timer > 0
+                     AND id=?2")?;
+            for msg_id in msg_ids {
+                should_interrupt |= stmt.execute((now, msg_id))? > 0;
+            }
+            Ok(should_interrupt)
+        }).await?;
+    if should_interrupt {
+        context.scheduler.interrupt_ephemeral_task().await;
+    }
+    Ok(())
+}
+
+/// Starts ephemeral timer for all messages in the chat.
+///
+/// This should be called when chat is marked as noticed.
+pub(crate) async fn start_chat_ephemeral_timers(context: &Context, chat_id: ChatId) -> Result<()> {
+    let now = time();
+    let should_interrupt = context
         .sql
         .execute(
-            &format!(
-                "UPDATE msgs SET ephemeral_timestamp = ? + ephemeral_timer
-         WHERE (ephemeral_timestamp == 0 OR ephemeral_timestamp > ? + ephemeral_timer) AND ephemeral_timer > 0
-         AND id IN ({})",
-                sql::repeat_vars(msg_ids.len())
-            ),
-            rusqlite::params_from_iter(
-                std::iter::once(&now as &dyn crate::sql::ToSql)
-                    .chain(std::iter::once(&now as &dyn crate::sql::ToSql))
-                    .chain(params_iter(msg_ids)),
-            ),
+            "UPDATE msgs SET ephemeral_timestamp = ?1 + ephemeral_timer
+             WHERE chat_id = ?2
+             AND ephemeral_timer > 0
+             AND (ephemeral_timestamp == 0 OR ephemeral_timestamp > ?1 + ephemeral_timer)",
+            (now, chat_id),
         )
-        .await?;
-    if count > 0 {
+        .await?
+        > 0;
+    if should_interrupt {
         context.scheduler.interrupt_ephemeral_task().await;
     }
     Ok(())
@@ -695,7 +715,9 @@ pub(crate) async fn start_ephemeral_timers(context: &Context) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chat::{marknoticed_chat, set_muted, ChatVisibility, MuteDuration};
     use crate::config::Config;
+    use crate::constants::DC_CHAT_ID_ARCHIVED_LINK;
     use crate::download::DownloadState;
     use crate::location;
     use crate::message::markseen_msgs;
@@ -1419,6 +1441,79 @@ mod tests {
         let context = TestContext::new().await;
         let chat_id = ChatId::new(12345);
         assert!(chat_id.get_ephemeral_timer(&context).await.is_err());
+
+        Ok(())
+    }
+
+    /// Tests that ephemeral timer is started when the chat is noticed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_noticed_ephemeral_timer() -> Result<()> {
+        let mut tcm = TestContextManager::new();
+        let alice = &tcm.alice().await;
+        let bob = &tcm.bob().await;
+
+        let chat = alice.create_chat(bob).await;
+        let duration = 60;
+        chat.id
+            .set_ephemeral_timer(alice, Timer::Enabled { duration })
+            .await?;
+        let bob_received_message = tcm.send_recv(alice, bob, "Hello!").await;
+
+        marknoticed_chat(bob, bob_received_message.chat_id).await?;
+        SystemTime::shift(Duration::from_secs(100));
+
+        delete_expired_messages(bob, time()).await?;
+
+        assert!(Message::load_from_db_optional(bob, bob_received_message.id)
+            .await?
+            .is_none());
+        Ok(())
+    }
+
+    /// Tests that archiving the chat starts ephemeral timer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_archived_ephemeral_timer() -> Result<()> {
+        let mut tcm = TestContextManager::new();
+        let alice = &tcm.alice().await;
+        let bob = &tcm.bob().await;
+
+        let chat = alice.create_chat(bob).await;
+        let duration = 60;
+        chat.id
+            .set_ephemeral_timer(alice, Timer::Enabled { duration })
+            .await?;
+        let bob_received_message = tcm.send_recv(alice, bob, "Hello!").await;
+
+        bob_received_message
+            .chat_id
+            .set_visibility(bob, ChatVisibility::Archived)
+            .await?;
+        SystemTime::shift(Duration::from_secs(100));
+
+        delete_expired_messages(bob, time()).await?;
+
+        assert!(Message::load_from_db_optional(bob, bob_received_message.id)
+            .await?
+            .is_none());
+
+        // Bob mutes the chat so it is not unarchived.
+        set_muted(bob, bob_received_message.chat_id, MuteDuration::Forever).await?;
+
+        // Now test that for already archived chat
+        // timer is started if all archived chats are marked as noticed.
+        let bob_received_message_2 = tcm.send_recv(alice, bob, "Hello again!").await;
+        assert_eq!(bob_received_message_2.state, MessageState::InFresh);
+
+        marknoticed_chat(bob, DC_CHAT_ID_ARCHIVED_LINK).await?;
+        SystemTime::shift(Duration::from_secs(100));
+
+        delete_expired_messages(bob, time()).await?;
+
+        assert!(
+            Message::load_from_db_optional(bob, bob_received_message_2.id)
+                .await?
+                .is_none()
+        );
 
         Ok(())
     }
