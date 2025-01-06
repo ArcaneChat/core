@@ -294,13 +294,7 @@ impl MsgId {
             ret += ", Location sent";
         }
 
-        let e2ee_errors = msg.param.get_int(Param::ErroneousE2ee).unwrap_or_default();
-
-        if 0 != e2ee_errors {
-            if 0 != e2ee_errors & 0x2 {
-                ret += ", Encrypted, no valid signature";
-            }
-        } else if 0 != msg.param.get_int(Param::GuaranteeE2ee).unwrap_or_default() {
+        if 0 != msg.param.get_int(Param::GuaranteeE2ee).unwrap_or_default() {
             ret += ", Encrypted";
         }
 
@@ -1655,7 +1649,7 @@ pub async fn delete_msgs(context: &Context, msg_ids: &[MsgId]) -> Result<()> {
     res?;
 
     for modified_chat_id in modified_chat_ids {
-        context.emit_msgs_changed(modified_chat_id, MsgId::new(0));
+        context.emit_msgs_changed_without_msg_id(modified_chat_id);
         chatlist_events::emit_chatlist_item_changed(context, modified_chat_id);
     }
 
@@ -2106,6 +2100,9 @@ pub enum Viewtype {
     Gif = 21,
 
     /// Message containing a sticker, similar to image.
+    /// NB: When sending, the message viewtype may be changed to `Image` by some heuristics like
+    /// checking for transparent pixels. Use `Message::force_sticker()` to disable them.
+    ///
     /// If possible, the ui should display the image without borders in a transparent way.
     /// A click on a sticker will offer to install the sticker set in some future.
     Sticker = 23,
@@ -2721,6 +2718,29 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_is_bot() -> Result<()> {
         let alice = TestContext::new_alice().await;
+
+        // Alice receives an auto-generated non-chat message.
+        //
+        // This could be a holiday notice,
+        // in which case the message should be marked as bot-generated,
+        // but the contact should not.
+        receive_imf(
+            &alice,
+            b"From: Claire <claire@example.com>\n\
+                    To: alice@example.org\n\
+                    Message-ID: <789@example.com>\n\
+                    Auto-Submitted: auto-generated\n\
+                    Date: Fri, 29 Jan 2021 21:37:55 +0000\n\
+                    \n\
+                    hello\n",
+            false,
+        )
+        .await?;
+        let msg = alice.get_last_msg().await;
+        assert_eq!(msg.get_text(), "hello".to_string());
+        assert!(msg.is_bot());
+        let contact = Contact::get_by_id(&alice, msg.from_id).await?;
+        assert!(!contact.is_bot());
 
         // Alice receives a message from Bob the bot.
         receive_imf(

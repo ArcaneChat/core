@@ -1,6 +1,6 @@
 [package]
 name = "deltachat"
-version = "1.152.2"
+version = "1.153.0"
 edition = "2021"
 license = "MPL-2.0"
 rust-version = "1.77"
@@ -39,7 +39,7 @@ format-flowed = { path = "./format-flowed" }
 ratelimit = { path = "./deltachat-ratelimit" }
 
 anyhow = { workspace = true }
-async-broadcast = "0.7.1"
+async-broadcast = "0.7.2"
 async-channel = { workspace = true }
 async-imap = { version = "0.10.2", default-features = false, features = ["runtime-tokio", "compress"] }
 async-native-tls = { version = "0.5", default-features = false, features = ["runtime-tokio"] }
@@ -52,7 +52,7 @@ chrono = { workspace = true, features = ["alloc", "clock", "std"] }
 email = { git = "https://github.com/deltachat/rust-email", branch = "master" }
 encoded-words = { git = "https://github.com/async-email/encoded-words", branch = "master" }
 escaper = "0.1"
-fast-socks5 = "0.9"
+fast-socks5 = "0.10"
 fd-lock = "4"
 futures-lite = { workspace = true }
 futures = { workspace = true }
@@ -85,15 +85,15 @@ rand = { workspace = true }
 regex = { workspace = true }
 rusqlite = { workspace = true, features = ["sqlcipher"] }
 rust-hsluv = "0.1"
-rustls-pki-types = "1.10.0"
-rustls = { version = "0.23.19", default-features = false }
+rustls-pki-types = "1.10.1"
+rustls = { version = "0.23.20", default-features = false }
 sanitize-filename = { workspace = true }
 serde_json = { workspace = true }
 serde_urlencoded = "0.7.1"
 serde = { workspace = true, features = ["derive"] }
 sha-1 = "0.10"
 sha2 = "0.10"
-shadowsocks = { version = "1.21.0", default-features = false, features = ["aead-cipher-2022"] }
+shadowsocks = { version = "1.22.0", default-features = false, features = ["aead-cipher", "aead-cipher-2022"] }
 smallvec = "1.13.2"
 strum = "0.26"
 strum_macros = "0.26"
@@ -101,8 +101,8 @@ tagger = "4.3.4"
 textwrap = "0.16.1"
 thiserror = { workspace = true }
 tokio-io-timeout = "1.2.0"
-tokio-rustls = { version = "0.26.0", default-features = false }
-tokio-stream = { version = "0.1.16", features = ["fs"] }
+tokio-rustls = { version = "0.26.1", default-features = false }
+tokio-stream = { version = "0.1.17", features = ["fs"] }
 tokio-tar = { version = "0.3" } # TODO: integrate tokio into async-tar
 tokio-util = { workspace = true }
 tokio = { workspace = true, features = ["fs", "rt-multi-thread", "macros"] }
@@ -120,7 +120,7 @@ nu-ansi-term = { workspace = true }
 pretty_assertions = "1.4.1"
 proptest = { version = "1", default-features = false, features = ["std"] }
 tempfile = { workspace = true }
-testdir = "0.9.0"
+testdir = "0.9.3"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
 [workspace]
@@ -169,7 +169,7 @@ harness = false
 anyhow = "1"
 async-channel = "2.3.1"
 base64 = "0.22"
-chrono = { version = "0.4.38", default-features = false }
+chrono = { version = "0.4.39", default-features = false }
 deltachat-contact-tools = { path = "deltachat-contact-tools" }
 deltachat-jsonrpc = { path = "deltachat-jsonrpc", default-features = false }
 deltachat = { path = ".", default-features = false }
@@ -189,7 +189,7 @@ serde_json = "1"
 tempfile = "3.14.0"
 thiserror = "1"
 tokio = "1"
-tokio-util = "0.7.11"
+tokio-util = "0.7.13"
 tracing-subscriber = "0.3"
 yerpc = "0.6.2"
 

@@ -4242,9 +4242,6 @@ int             dc_msg_get_showpadlock        (const dc_msg_t* msg);
  */
 int             dc_msg_is_bot                 (const dc_msg_t* msg); 
 
-int             dc_msg_is_outgoing            (const dc_msg_t* msg);
-
-
 /**
  * Get a color for the overriden sender name.
  */
@@ -5404,6 +5401,8 @@ int64_t         dc_lot_get_timestamp     (const dc_lot_t* lot);
 
 /**
  * Message containing a sticker, similar to image.
+ * NB: When sending, the message viewtype may be changed to `Image` by some heuristics like checking
+ * for transparent pixels.
  * If possible, the UI should display the image without borders in a transparent way.
  * A click on a sticker will offer to install the sticker set in some future.
  */

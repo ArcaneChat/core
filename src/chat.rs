@@ -767,7 +767,7 @@ impl ChatId {
                 .await?;
             if unread_cnt == 1 {
                 // Added the first unread message in the chat.
-                context.emit_msgs_changed(DC_CHAT_ID_ARCHIVED_LINK, MsgId::new(0));
+                context.emit_msgs_changed_without_msg_id(DC_CHAT_ID_ARCHIVED_LINK);
             }
             return Ok(());
         }
@@ -782,6 +782,8 @@ impl ChatId {
     /// shown.
     pub(crate) fn emit_msg_event(self, context: &Context, msg_id: MsgId, important: bool) {
         if important {
+            debug_assert!(!msg_id.is_unset());
+
             context.emit_incoming_msg(self, msg_id);
         } else {
             context.emit_msgs_changed(self, msg_id);
@@ -843,17 +845,14 @@ impl ChatId {
         };
 
         if changed {
-            context.emit_msgs_changed(
-                self,
-                if msg.is_some() {
-                    match self.get_draft_msg_id(context).await? {
-                        Some(msg_id) => msg_id,
-                        None => MsgId::new(0),
-                    }
-                } else {
-                    MsgId::new(0)
-                },
-            );
+            if msg.is_some() {
+                match self.get_draft_msg_id(context).await? {
+                    Some(msg_id) => context.emit_msgs_changed(self, msg_id),
+                    None => context.emit_msgs_changed_without_msg_id(self),
+                }
+            } else {
+                context.emit_msgs_changed_without_msg_id(self)
+            }
         }
 
         Ok(())
@@ -2011,9 +2010,6 @@ impl Chat {
                 .ok();
         }
 
-        // reset encrypt error state eg. for forwarding
-        msg.param.remove(Param::ErroneousE2ee);
-
         let is_bot = context.get_config_bool(Config::Bot).await?;
         msg.param
             .set_optional(Param::Bot, Some("1").filter(|_| is_bot));
@@ -2712,7 +2708,10 @@ async fn prepare_msg_blob(context: &Context, msg: &mut Message) -> Result<()> {
             .with_context(|| format!("attachment missing for message of type #{}", msg.viewtype))?;
         let send_as_is = msg.viewtype == Viewtype::File;
 
-        if msg.viewtype == Viewtype::File || msg.viewtype == Viewtype::Image {
+        if msg.viewtype == Viewtype::File
+            || msg.viewtype == Viewtype::Image
+            || msg.viewtype == Viewtype::Sticker && !msg.param.exists(Param::ForceSticker)
+        {
             // Correct the type, take care not to correct already very special
             // formats as GIF or VOICE.
             //
@@ -2721,7 +2720,12 @@ async fn prepare_msg_blob(context: &Context, msg: &mut Message) -> Result<()> {
             // - from FILE/IMAGE to GIF */
             if let Some((better_type, _)) = message::guess_msgtype_from_suffix(&blob.to_abs_path())
             {
-                if better_type != Viewtype::Webxdc
+                if msg.viewtype == Viewtype::Sticker {
+                    if better_type != Viewtype::Image {
+                        // UIs don't want conversions of `Sticker` to anything other than `Image`.
+                        msg.param.set_int(Param::ForceSticker, 1);
+                    }
+                } else if better_type != Viewtype::Webxdc
                     || context
                         .ensure_sendable_webxdc_file(&blob.to_abs_path())
                         .await
@@ -2968,7 +2972,8 @@ pub(crate) async fn create_send_msg_jobs(context: &Context, msg: &mut Message) -
     // because BCC-self messages are also used to detect
     // that message was sent if SMTP server is slow to respond
     // and connection is frequently lost
-    // before receiving status line.
+    // before receiving status line. NB: This is not a problem for chatmail servers, so `BccSelf`
+    // disabled by default is fine.
     //
     // `from` must be the last addr, see `receive_imf_inner()` why.
     if context.get_config_bool(Config::BccSelf).await?
@@ -4705,7 +4710,7 @@ impl Context {
     /// a noticed chat is archived. Emitting events should be cheap, a false-positive `MsgsChanged`
     /// is ok.
     pub(crate) fn on_archived_chats_maybe_noticed(&self) {
-        self.emit_msgs_changed(DC_CHAT_ID_ARCHIVED_LINK, MsgId::new(0));
+        self.emit_msgs_changed_without_msg_id(DC_CHAT_ID_ARCHIVED_LINK);
     }
 }
 
