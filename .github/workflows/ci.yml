@@ -24,7 +24,7 @@ jobs:
     name: Lint Rust
     runs-on: ubuntu-latest
     env:
-      RUSTUP_TOOLCHAIN: 1.83.0
+      RUSTUP_TOOLCHAIN: 1.84.0
     steps:
       - uses: actions/checkout@v4
         with:
@@ -97,11 +97,11 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            rust: 1.83.0
+            rust: 1.84.0
           - os: windows-latest
-            rust: 1.83.0
+            rust: 1.84.0
           - os: macos-latest
-            rust: 1.83.0
+            rust: 1.84.0
 
           # Minimum Supported Rust Version = 1.77.0
           - os: ubuntu-latest
@@ -152,7 +152,7 @@ jobs:
         uses: swatinem/rust-cache@v2
 
       - name: Build C library
-        run: cargo build -p deltachat_ffi --features jsonrpc
+        run: cargo build -p deltachat_ffi
 
       - name: Upload C library
         uses: actions/upload-artifact@v4
@@ -223,11 +223,11 @@ jobs:
           - os: macos-latest
             python: pypy3.10
 
-          # Minimum Supported Python Version = 3.7
+          # Minimum Supported Python Version = 3.8
           # This is the minimum version for which manylinux Python wheels are
           # built. Test it with minimum supported Rust version.
           - os: ubuntu-latest
-            python: 3.7
+            python: 3.8
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -277,9 +277,9 @@ jobs:
           - os: macos-latest
             python: pypy3.10
 
-          # Minimum Supported Python Version = 3.7
+          # Minimum Supported Python Version = 3.8
           - os: ubuntu-latest
-            python: 3.7
+            python: 3.8
 
     runs-on: ${{ matrix.os }}
     steps:

@@ -3,6 +3,7 @@
 use std::cmp;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::marker::Sync;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
@@ -41,7 +42,6 @@ use crate::peerstate::Peerstate;
 use crate::receive_imf::ReceivedMsg;
 use crate::securejoin::BobState;
 use crate::smtp::send_msg_to_smtp;
-use crate::sql;
 use crate::stock_str;
 use crate::sync::{self, Sync::*, SyncData};
 use crate::tools::{
@@ -359,7 +359,7 @@ impl ChatId {
         Ok(chat_id)
     }
 
-    pub async fn set_selfavatar_timestamp(self, context: &Context, timestamp: i64) -> Result<()> {
+    async fn set_selfavatar_timestamp(self, context: &Context, timestamp: i64) -> Result<()> {
         let chat = Chat::load_from_db(context, self).await?;
         if chat.is_mailing_list() {
             let list_post = match ContactAddress::new(chat.get_mailinglist_addr().unwrap_or("")) {
@@ -384,7 +384,7 @@ impl ChatId {
                 .execute(
                     "UPDATE contacts
                      SET selfavatar_sent=?
-                     WHERE id IN(SELECT contact_id FROM chats_contacts WHERE chat_id=?);",
+                     WHERE id IN(SELECT contact_id FROM chats_contacts WHERE chat_id=? AND add_timestamp >= remove_timestamp)",
                     (timestamp, self),
                 )
                 .await?;
@@ -1100,6 +1100,8 @@ impl ChatId {
                  JOIN chats_contacts as y
                  WHERE x.contact_id > 9
                    AND y.contact_id > 9
+                   AND x.add_timestamp >= x.remove_timestamp
+                   AND y.add_timestamp >= y.remove_timestamp
                    AND x.chat_id=?
                    AND y.chat_id<>x.chat_id
                    AND y.chat_id>?
@@ -1124,6 +1126,7 @@ impl ChatId {
                 "SELECT chat_id, count(*) AS n
                  FROM chats_contacts
                  WHERE contact_id > ? AND chat_id > ?
+                 AND add_timestamp >= remove_timestamp
                  GROUP BY chat_id",
                 (ContactId::LAST_SPECIAL, DC_CHAT_ID_LAST_SPECIAL),
                 |row| {
@@ -1236,15 +1239,6 @@ impl ChatId {
     /// Returns true if chat is a device chat.
     pub async fn is_device_talk(self, context: &Context) -> Result<bool> {
         Ok(self.get_param(context).await?.exists(Param::Devicetalk))
-    }
-
-    /// Returns chat member list timestamp.
-    pub(crate) async fn get_member_list_timestamp(self, context: &Context) -> Result<i64> {
-        Ok(self
-            .get_param(context)
-            .await?
-            .get_i64(Param::MemberListTimestamp)
-            .unwrap_or_default())
     }
 
     async fn parent_query<T, F>(
@@ -1672,31 +1666,63 @@ impl Chat {
     ///
     /// Otherwise returns a reason useful for logging.
     pub(crate) async fn why_cant_send(&self, context: &Context) -> Result<Option<CantSendReason>> {
-        use CantSendReason::*;
+        self.why_cant_send_ex(context, &|_| false).await
+    }
 
+    pub(crate) async fn why_cant_send_ex(
+        &self,
+        context: &Context,
+        skip_fn: &(dyn Send + Sync + Fn(&CantSendReason) -> bool),
+    ) -> Result<Option<CantSendReason>> {
+        use CantSendReason::*;
         // NB: Don't forget to update Chatlist::try_load() when changing this function!
-        let reason = if self.id.is_special() {
-            Some(SpecialChat)
-        } else if self.is_device_talk() {
-            Some(DeviceChat)
-        } else if self.is_contact_request() {
-            Some(ContactRequest)
-        } else if self.is_protection_broken() {
-            Some(ProtectionBroken)
-        } else if self.is_mailing_list() && self.get_mailinglist_addr().is_none_or_empty() {
-            Some(ReadOnlyMailingList)
-        } else if !self.is_self_in_chat(context).await? {
-            Some(NotAMember)
-        } else if self
-            .check_securejoin_wait(context, constants::SECUREJOIN_WAIT_TIMEOUT)
-            .await?
-            > 0
+
+        if self.id.is_special() {
+            let reason = SpecialChat;
+            if !skip_fn(&reason) {
+                return Ok(Some(reason));
+            }
+        }
+        if self.is_device_talk() {
+            let reason = DeviceChat;
+            if !skip_fn(&reason) {
+                return Ok(Some(reason));
+            }
+        }
+        if self.is_contact_request() {
+            let reason = ContactRequest;
+            if !skip_fn(&reason) {
+                return Ok(Some(reason));
+            }
+        }
+        if self.is_protection_broken() {
+            let reason = ProtectionBroken;
+            if !skip_fn(&reason) {
+                return Ok(Some(reason));
+            }
+        }
+        if self.is_mailing_list() && self.get_mailinglist_addr().is_none_or_empty() {
+            let reason = ReadOnlyMailingList;
+            if !skip_fn(&reason) {
+                return Ok(Some(reason));
+            }
+        }
+
+        // Do potentially slow checks last and after calls to `skip_fn` which should be fast.
+        let reason = NotAMember;
+        if !skip_fn(&reason) && !self.is_self_in_chat(context).await? {
+            return Ok(Some(reason));
+        }
+        let reason = SecurejoinWait;
+        if !skip_fn(&reason)
+            && self
+                .check_securejoin_wait(context, constants::SECUREJOIN_WAIT_TIMEOUT)
+                .await?
+                > 0
         {
-            Some(SecurejoinWait)
-        } else {
-            None
-        };
-        Ok(reason)
+            return Ok(Some(reason));
+        }
+        Ok(None)
     }
 
     /// Returns true if can send to the chat.
@@ -1877,7 +1903,6 @@ impl Chat {
             profile_image: self
                 .get_profile_image(context)
                 .await?
-                .map(Into::into)
                 .unwrap_or_else(std::path::PathBuf::new),
             draft,
             is_muted: self.is_muted(),
@@ -2252,7 +2277,7 @@ impl Chat {
                 "SELECT c.addr \
                 FROM contacts c INNER JOIN chats_contacts cc \
                 ON c.id=cc.contact_id \
-                WHERE cc.chat_id=?",
+                WHERE cc.chat_id=? AND cc.add_timestamp >= cc.remove_timestamp",
                 (self.id,),
                 |row| row.get::<_, String>(0),
                 |addrs| addrs.collect::<Result<Vec<_>, _>>().map_err(Into::into),
@@ -2591,7 +2616,6 @@ impl ChatIdBlocked {
                 },
             )
             .await
-            .map_err(Into::into)
     }
 
     /// Returns the chat for the 1:1 chat with this contact.
@@ -2800,7 +2824,9 @@ pub async fn is_contact_in_chat(
     let exists = context
         .sql
         .exists(
-            "SELECT COUNT(*) FROM chats_contacts WHERE chat_id=? AND contact_id=?;",
+            "SELECT COUNT(*) FROM chats_contacts
+             WHERE chat_id=? AND contact_id=?
+             AND add_timestamp >= remove_timestamp",
             (chat_id, contact_id),
         )
         .await?;
@@ -2874,20 +2900,22 @@ async fn prepare_send_msg(
 ) -> Result<Vec<i64>> {
     let mut chat = Chat::load_from_db(context, chat_id).await?;
 
-    // Check if the chat can be sent to.
-    if let Some(reason) = chat.why_cant_send(context).await? {
-        if matches!(
-            reason,
-            CantSendReason::ProtectionBroken
-                | CantSendReason::ContactRequest
-                | CantSendReason::SecurejoinWait
-        ) && msg.param.get_cmd() == SystemMessage::SecurejoinMessage
-        {
-            // Send out the message, the securejoin message is supposed to repair the verification.
+    let skip_fn = |reason: &CantSendReason| match reason {
+        CantSendReason::ProtectionBroken
+        | CantSendReason::ContactRequest
+        | CantSendReason::SecurejoinWait => {
+            // Allow securejoin messages, they are supposed to repair the verification.
             // If the chat is a contact request, let the user accept it later.
-        } else {
-            bail!("cannot send to {chat_id}: {reason}");
+            msg.param.get_cmd() == SystemMessage::SecurejoinMessage
         }
+        // Allow to send "Member removed" messages so we can leave the group.
+        // Necessary checks should be made anyway before removing contact
+        // from the chat.
+        CantSendReason::NotAMember => msg.param.get_cmd() == SystemMessage::MemberRemovedFromGroup,
+        _ => false,
+    };
+    if let Some(reason) = chat.why_cant_send_ex(context, &skip_fn).await? {
+        bail!("Cannot send to {chat_id}: {reason}");
     }
 
     // Check a quote reply is not leaking data from other chats.
@@ -3027,18 +3055,6 @@ pub(crate) async fn create_send_msg_jobs(context: &Context, msg: &mut Message) -
 
     if rendered_msg.is_gossiped {
         msg.chat_id.set_gossiped_timestamp(context, now).await?;
-    }
-
-    if msg.param.get_cmd() == SystemMessage::MemberRemovedFromGroup {
-        // Reject member list synchronisation from older messages. See also
-        // `receive_imf::apply_group_changes()`.
-        msg.chat_id
-            .update_timestamp(
-                context,
-                Param::MemberListTimestamp,
-                now.saturating_add(constants::TIMESTAMP_SENT_TOLERANCE),
-            )
-            .await?;
     }
 
     if rendered_msg.last_added_location_id.is_some() {
@@ -3468,8 +3484,28 @@ pub async fn get_chat_contacts(context: &Context, chat_id: ChatId) -> Result<Vec
                FROM chats_contacts cc
                LEFT JOIN contacts c
                       ON c.id=cc.contact_id
-              WHERE cc.chat_id=?
+              WHERE cc.chat_id=? AND cc.add_timestamp >= cc.remove_timestamp
               ORDER BY c.id=1, c.last_seen DESC, c.id DESC;",
+            (chat_id,),
+            |row| row.get::<_, ContactId>(0),
+            |ids| ids.collect::<Result<Vec<_>, _>>().map_err(Into::into),
+        )
+        .await?;
+
+    Ok(list)
+}
+
+/// Returns a vector of contact IDs for given chat ID that are no longer part of the group.
+pub async fn get_past_chat_contacts(context: &Context, chat_id: ChatId) -> Result<Vec<ContactId>> {
+    let list = context
+        .sql
+        .query_map(
+            "SELECT cc.contact_id
+             FROM chats_contacts cc
+             LEFT JOIN contacts c
+                  ON c.id=cc.contact_id
+             WHERE cc.chat_id=? AND cc.add_timestamp < cc.remove_timestamp
+             ORDER BY c.id=1, c.last_seen DESC, c.id DESC",
             (chat_id,),
             |row| row.get::<_, ContactId>(0),
             |ids| ids.collect::<Result<Vec<_>, _>>().map_err(Into::into),
@@ -3502,9 +3538,7 @@ pub async fn create_group_chat(
         .await?;
 
     let chat_id = ChatId::new(u32::try_from(row_id)?);
-    if !is_contact_in_chat(context, chat_id, ContactId::SELF).await? {
-        add_to_chat_contacts_table(context, chat_id, &[ContactId::SELF]).await?;
-    }
+    add_to_chat_contacts_table(context, timestamp, chat_id, &[ContactId::SELF]).await?;
 
     context.emit_msgs_changed_without_ids();
     chatlist_events::emit_chatlist_changed(context);
@@ -3604,18 +3638,37 @@ pub(crate) async fn create_broadcast_list_ex(
 /// Set chat contacts in the `chats_contacts` table.
 pub(crate) async fn update_chat_contacts_table(
     context: &Context,
+    timestamp: i64,
     id: ChatId,
     contacts: &HashSet<ContactId>,
 ) -> Result<()> {
     context
         .sql
         .transaction(move |transaction| {
-            transaction.execute("DELETE FROM chats_contacts WHERE chat_id=?", (id,))?;
-            for contact_id in contacts {
-                transaction.execute(
-                    "INSERT INTO chats_contacts (chat_id, contact_id) VALUES(?, ?)",
-                    (id, contact_id),
+            // Bump `remove_timestamp` to at least `now`
+            // even for members from `contacts`.
+            // We add members from `contacts` back below.
+            transaction.execute(
+                "UPDATE chats_contacts
+                 SET remove_timestamp=MAX(add_timestamp+1, ?)
+                 WHERE chat_id=?",
+                (timestamp, id),
+            )?;
+
+            if !contacts.is_empty() {
+                let mut statement = transaction.prepare(
+                    "INSERT INTO chats_contacts (chat_id, contact_id, add_timestamp)
+                     VALUES                     (?1,      ?2,         ?3)
+                     ON CONFLICT (chat_id, contact_id)
+                     DO UPDATE SET add_timestamp=remove_timestamp",
                 )?;
+
+                for contact_id in contacts {
+                    // We bumped `add_timestamp` for existing rows above,
+                    // so on conflict it is enough to set `add_timestamp = remove_timestamp`
+                    // and this guarantees that `add_timestamp` is no less than `timestamp`.
+                    statement.execute((id, contact_id, timestamp))?;
+                }
             }
             Ok(())
         })
@@ -3626,17 +3679,21 @@ pub(crate) async fn update_chat_contacts_table(
 /// Adds contacts to the `chats_contacts` table.
 pub(crate) async fn add_to_chat_contacts_table(
     context: &Context,
+    timestamp: i64,
     chat_id: ChatId,
     contact_ids: &[ContactId],
 ) -> Result<()> {
     context
         .sql
         .transaction(move |transaction| {
+            let mut add_statement = transaction.prepare(
+                "INSERT INTO chats_contacts (chat_id, contact_id, add_timestamp) VALUES(?1, ?2, ?3)
+                 ON CONFLICT (chat_id, contact_id)
+                 DO UPDATE SET add_timestamp=MAX(remove_timestamp, ?3)",
+            )?;
+
             for contact_id in contact_ids {
-                transaction.execute(
-                    "INSERT OR IGNORE INTO chats_contacts (chat_id, contact_id) VALUES(?, ?)",
-                    (chat_id, contact_id),
-                )?;
+                add_statement.execute((chat_id, contact_id, timestamp))?;
             }
             Ok(())
         })
@@ -3645,17 +3702,21 @@ pub(crate) async fn add_to_chat_contacts_table(
     Ok(())
 }
 
-/// remove a contact from the chats_contact table
+/// Removes a contact from the chat
+/// by updating the `remove_timestamp`.
 pub(crate) async fn remove_from_chat_contacts_table(
     context: &Context,
     chat_id: ChatId,
     contact_id: ContactId,
 ) -> Result<()> {
+    let now = time();
     context
         .sql
         .execute(
-            "DELETE FROM chats_contacts WHERE chat_id=? AND contact_id=?",
-            (chat_id, contact_id),
+            "UPDATE chats_contacts
+             SET remove_timestamp=MAX(add_timestamp+1, ?)
+             WHERE chat_id=? AND contact_id=?",
+            (now, chat_id, contact_id),
         )
         .await?;
     Ok(())
@@ -3745,7 +3806,7 @@ pub(crate) async fn add_contact_to_chat_ex(
         if is_contact_in_chat(context, chat_id, contact_id).await? {
             return Ok(false);
         }
-        add_to_chat_contacts_table(context, chat_id, &[contact_id]).await?;
+        add_to_chat_contacts_table(context, time(), chat_id, &[contact_id]).await?;
     }
     if chat.typ == Chattype::Group && chat.is_promoted() {
         msg.viewtype = Viewtype::Text;
@@ -3755,10 +3816,8 @@ pub(crate) async fn add_contact_to_chat_ex(
         msg.param.set_cmd(SystemMessage::MemberAddedToGroup);
         msg.param.set(Param::Arg, contact_addr);
         msg.param.set_int(Param::Arg2, from_handshake.into());
-        if let Err(e) = send_msg(context, chat_id, &mut msg).await {
-            remove_from_chat_contacts_table(context, chat_id, contact_id).await?;
-            return Err(e);
-        }
+        send_msg(context, chat_id, &mut msg).await?;
+
         sync = Nosync;
         // TODO: Remove this compat code needed because Core <= v1.143:
         // - doesn't accept synchronization of QR code tokens for unpromoted groups, so we also send
@@ -3826,7 +3885,7 @@ pub(crate) async fn shall_attach_selfavatar(context: &Context, chat_id: ChatId) 
                 "SELECT c.selfavatar_sent
                 FROM chats_contacts cc
                 LEFT JOIN contacts c ON c.id=cc.contact_id
-                WHERE cc.chat_id=? AND cc.contact_id!=?;",
+                WHERE cc.chat_id=? AND cc.contact_id!=? AND cc.add_timestamp >= cc.remove_timestamp",
                 (chat_id, ContactId::SELF),
                 |row| Ok(row.get::<_, i64>(0)),
                 |rows| {
@@ -3954,6 +4013,9 @@ pub async fn remove_contact_from_chat(
             bail!("{}", err_msg);
         } else {
             let mut sync = Nosync;
+
+            remove_from_chat_contacts_table(context, chat_id, contact_id).await?;
+
             // We do not return an error if the contact does not exist in the database.
             // This allows to delete dangling references to deleted contacts
             // in case of the database becoming inconsistent due to a bug.
@@ -3983,18 +4045,6 @@ pub async fn remove_contact_from_chat(
                     sync = Sync;
                 }
             }
-            // we remove the member from the chat after constructing the
-            // to-be-send message. If between send_msg() and here the
-            // process dies, the user will be able to redo the action. It's better than the other
-            // way round: you removed someone from DB but no peer or device gets to know about it
-            // and group membership is thus different on different devices. But if send_msg()
-            // failed, we still remove the member locally, otherwise it would be impossible to
-            // remove a member with missing key from a protected group.
-            // Note also that sending a message needs all recipients
-            // in order to correctly determine encryption so if we
-            // removed it first, it would complicate the
-            // check/encryption logic.
-            remove_from_chat_contacts_table(context, chat_id, contact_id).await?;
             context.emit_event(EventType::ChatModified(chat_id));
             if sync.into() {
                 chat.sync_contacts(context).await.log_err(context).ok();
@@ -4152,7 +4202,6 @@ pub async fn forward_msgs(context: &Context, msg_ids: &[MsgId], chat_id: ChatId)
     ensure!(!msg_ids.is_empty(), "empty msgs_ids: nothing to forward");
     ensure!(!chat_id.is_special(), "can not forward to special chat");
 
-    let mut created_chats: Vec<ChatId> = Vec::new();
     let mut created_msgs: Vec<MsgId> = Vec::new();
     let mut curr_timestamp: i64;
 
@@ -4164,20 +4213,17 @@ pub async fn forward_msgs(context: &Context, msg_ids: &[MsgId], chat_id: ChatId)
         bail!("cannot send to {}: {}", chat_id, reason);
     }
     curr_timestamp = create_smeared_timestamps(context, msg_ids.len());
-    let ids = context
-        .sql
-        .query_map(
-            &format!(
-                "SELECT id FROM msgs WHERE id IN({}) ORDER BY timestamp,id",
-                sql::repeat_vars(msg_ids.len())
-            ),
-            rusqlite::params_from_iter(msg_ids),
-            |row| row.get::<_, MsgId>(0),
-            |ids| ids.collect::<Result<Vec<_>, _>>().map_err(Into::into),
-        )
-        .await?;
-
-    for id in ids {
+    let mut msgs = Vec::with_capacity(msg_ids.len());
+    for id in msg_ids {
+        let ts: i64 = context
+            .sql
+            .query_get_value("SELECT timestamp FROM msgs WHERE id=?", (id,))
+            .await?
+            .context("No message {id}")?;
+        msgs.push((ts, *id));
+    }
+    msgs.sort_unstable();
+    for (_, id) in msgs {
         let src_msg_id: MsgId = id;
         let mut msg = Message::load_from_db(context, src_msg_id).await?;
         if msg.state == MessageState::OutDraft {
@@ -4214,11 +4260,10 @@ pub async fn forward_msgs(context: &Context, msg_ids: &[MsgId], chat_id: ChatId)
         if !create_send_msg_jobs(context, &mut msg).await?.is_empty() {
             context.scheduler.interrupt_smtp().await;
         }
-        created_chats.push(chat_id);
         created_msgs.push(new_msg_id);
     }
-    for (chat_id, msg_id) in created_chats.iter().zip(created_msgs.iter()) {
-        context.emit_msgs_changed(*chat_id, *msg_id);
+    for msg_id in created_msgs {
+        context.emit_msgs_changed(chat_id, msg_id);
     }
     Ok(())
 }
@@ -4614,7 +4659,7 @@ async fn set_contacts_by_addrs(context: &Context, id: ChatId, addrs: &[String]) 
     if contacts == contacts_old {
         return Ok(());
     }
-    update_chat_contacts_table(context, id, &contacts).await?;
+    update_chat_contacts_table(context, time(), id, &contacts).await?;
     context.emit_event(EventType::ChatModified(id));
     Ok(())
 }
@@ -5125,11 +5170,11 @@ mod tests {
         bob.recv_msg(&alice_sent_add_msg).await;
 
         SystemTime::shift(Duration::from_secs(3600));
-        // This adds Bob because they left quite long ago.
+
+        // Alice sends a message to Bob because the message about leaving is lost.
         let alice_sent_msg = alice.send_text(alice_chat_id, "What a silence!").await;
         bob.recv_msg(&alice_sent_msg).await;
 
-        // Test that add message is rewritten.
         bob.golden_test_chat(bob_chat_id, "chat_test_parallel_member_remove")
             .await;
 
@@ -5149,9 +5194,9 @@ mod tests {
         Ok(())
     }
 
-    /// Test that if a message implicitly adds a member, both messages appear.
+    /// Test that member removal is synchronized eventually even if the message is lost.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_msg_with_implicit_member_add() -> Result<()> {
+    async fn test_msg_with_implicit_member_removed() -> Result<()> {
         let mut tcm = TestContextManager::new();
         let alice = tcm.alice().await;
         let bob = tcm.bob().await;
@@ -5167,22 +5212,35 @@ mod tests {
         let bob_received_msg = bob.recv_msg(&sent_msg).await;
         let bob_chat_id = bob_received_msg.get_chat_id();
         bob_chat_id.accept(&bob).await?;
+        assert_eq!(get_chat_contacts(&bob, bob_chat_id).await?.len(), 2);
 
         add_contact_to_chat(&alice, alice_chat_id, alice_fiona_contact_id).await?;
         let sent_msg = alice.pop_sent_msg().await;
         bob.recv_msg(&sent_msg).await;
+
+        // Bob removed Fiona, but the message is lost.
         remove_contact_from_chat(&bob, bob_chat_id, bob_fiona_contact_id).await?;
         bob.pop_sent_msg().await;
 
         // This doesn't add Fiona back because Bob just removed them.
         let sent_msg = alice.send_text(alice_chat_id, "Welcome, Fiona!").await;
         bob.recv_msg(&sent_msg).await;
+        assert_eq!(get_chat_contacts(&bob, bob_chat_id).await?.len(), 2);
 
+        // Even after some time Fiona is not added back.
         SystemTime::shift(Duration::from_secs(3600));
         let sent_msg = alice.send_text(alice_chat_id, "Welcome back, Fiona!").await;
         bob.recv_msg(&sent_msg).await;
-        bob.golden_test_chat(bob_chat_id, "chat_test_msg_with_implicit_member_add")
+        assert_eq!(get_chat_contacts(&bob, bob_chat_id).await?.len(), 2);
+
+        // If Bob sends a message to Alice now, Fiona is removed.
+        assert_eq!(get_chat_contacts(&alice, alice_chat_id).await?.len(), 3);
+        let sent_msg = bob
+            .send_text(alice_chat_id, "I have removed Fiona some time ago.")
             .await;
+        alice.recv_msg(&sent_msg).await;
+        assert_eq!(get_chat_contacts(&alice, alice_chat_id).await?.len(), 2);
+
         Ok(())
     }
 
@@ -5225,6 +5283,8 @@ mod tests {
         assert_eq!(a2_msg.get_info_type(), SystemMessage::MemberAddedToGroup);
         assert_eq!(get_chat_contacts(&a1, a1_chat_id).await?.len(), 2);
         assert_eq!(get_chat_contacts(&a2, a2_chat_id).await?.len(), 2);
+        assert_eq!(get_past_chat_contacts(&a1, a1_chat_id).await?.len(), 0);
+        assert_eq!(get_past_chat_contacts(&a2, a2_chat_id).await?.len(), 0);
 
         // rename the group
         set_chat_name(&a1, a1_chat_id, "bar").await?;
@@ -5257,6 +5317,8 @@ mod tests {
         );
         assert_eq!(get_chat_contacts(&a1, a1_chat_id).await?.len(), 1);
         assert_eq!(get_chat_contacts(&a2, a2_chat_id).await?.len(), 1);
+        assert_eq!(get_past_chat_contacts(&a1, a1_chat_id).await?.len(), 1);
+        assert_eq!(get_past_chat_contacts(&a2, a2_chat_id).await?.len(), 1);
 
         Ok(())
     }
@@ -5266,7 +5328,7 @@ mod tests {
         let _n = TimeShiftFalsePositiveNote;
 
         // Alice creates a group with Bob, Claire and Daisy and then removes Claire and Daisy
-        // (sleep() is needed as otherwise smeared time from Alice looks to Bob like messages from the future which are all set to "now" then)
+        // (time shift is needed as otherwise smeared time from Alice looks to Bob like messages from the future which are all set to "now" then)
         let alice = TestContext::new_alice().await;
 
         let bob_id = Contact::create(&alice, "", "bob@example.net").await?;
@@ -5281,17 +5343,17 @@ mod tests {
 
         add_contact_to_chat(&alice, alice_chat_id, claire_id).await?;
         let add2 = alice.pop_sent_msg().await;
-        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        SystemTime::shift(Duration::from_millis(1100));
 
         add_contact_to_chat(&alice, alice_chat_id, daisy_id).await?;
         let add3 = alice.pop_sent_msg().await;
-        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        SystemTime::shift(Duration::from_millis(1100));
 
         assert_eq!(get_chat_contacts(&alice, alice_chat_id).await?.len(), 4);
 
         remove_contact_from_chat(&alice, alice_chat_id, claire_id).await?;
         let remove1 = alice.pop_sent_msg().await;
-        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        SystemTime::shift(Duration::from_millis(1100));
 
         remove_contact_from_chat(&alice, alice_chat_id, daisy_id).await?;
         let remove2 = alice.pop_sent_msg().await;
@@ -5301,8 +5363,8 @@ mod tests {
         // Bob receives the add and deletion messages out of order
         let bob = TestContext::new_bob().await;
         bob.recv_msg(&add1).await;
-        bob.recv_msg(&add3).await;
-        let bob_chat_id = bob.recv_msg(&add2).await.chat_id;
+        let bob_chat_id = bob.recv_msg(&add3).await.chat_id;
+        bob.recv_msg_trash(&add2).await; // No-op addition message is trashed.
         assert_eq!(get_chat_contacts(&bob, bob_chat_id).await?.len(), 4);
 
         bob.recv_msg(&remove2).await;
@@ -5341,7 +5403,8 @@ mod tests {
     /// Test that group updates are robust to lost messages and eventual out of order arrival.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_modify_chat_lost() -> Result<()> {
-        let alice = TestContext::new_alice().await;
+        let mut tcm = TestContextManager::new();
+        let alice = tcm.alice().await;
 
         let bob_id = Contact::create(&alice, "", "bob@example.net").await?;
         let claire_id = Contact::create(&alice, "", "claire@foo.de").await?;
@@ -5354,16 +5417,16 @@ mod tests {
 
         send_text_msg(&alice, alice_chat_id, "populate".to_string()).await?;
         let add = alice.pop_sent_msg().await;
-        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        SystemTime::shift(Duration::from_millis(1100));
 
         remove_contact_from_chat(&alice, alice_chat_id, claire_id).await?;
         let remove1 = alice.pop_sent_msg().await;
-        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        SystemTime::shift(Duration::from_millis(1100));
 
         remove_contact_from_chat(&alice, alice_chat_id, daisy_id).await?;
         let remove2 = alice.pop_sent_msg().await;
 
-        let bob = TestContext::new_bob().await;
+        let bob = tcm.bob().await;
 
         bob.recv_msg(&add).await;
         let bob_chat_id = bob.get_last_msg().await.chat_id;
@@ -5376,7 +5439,7 @@ mod tests {
 
         // Eventually, first removal message arrives.
         // This has no effect.
-        bob.recv_msg_trash(&remove1).await;
+        bob.recv_msg(&remove1).await;
         assert_eq!(get_chat_contacts(&bob, bob_chat_id).await?.len(), 2);
         Ok(())
     }
@@ -7778,6 +7841,121 @@ mod tests {
         self_chat.set_draft(&alice, Some(&mut msg)).await.unwrap();
         let draft2 = self_chat.get_draft(&alice).await?.unwrap();
         assert_eq!(draft1.timestamp_sort, draft2.timestamp_sort);
+
+        Ok(())
+    }
+
+    /// Test group consistency.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_add_member_bug() -> Result<()> {
+        let mut tcm = TestContextManager::new();
+
+        let alice = &tcm.alice().await;
+        let bob = &tcm.bob().await;
+
+        let alice_bob_contact_id = Contact::create(alice, "Bob", "bob@example.net").await?;
+        let alice_fiona_contact_id = Contact::create(alice, "Fiona", "fiona@example.net").await?;
+
+        // Create a group.
+        let alice_chat_id =
+            create_group_chat(alice, ProtectionStatus::Unprotected, "Group chat").await?;
+        add_contact_to_chat(alice, alice_chat_id, alice_bob_contact_id).await?;
+        add_contact_to_chat(alice, alice_chat_id, alice_fiona_contact_id).await?;
+
+        // Promote the group.
+        let alice_sent_msg = alice
+            .send_text(alice_chat_id, "Hi! I created a group.")
+            .await;
+        let bob_received_msg = bob.recv_msg(&alice_sent_msg).await;
+
+        let bob_chat_id = bob_received_msg.get_chat_id();
+        bob_chat_id.accept(bob).await?;
+
+        // Alice removes Fiona from the chat.
+        remove_contact_from_chat(alice, alice_chat_id, alice_fiona_contact_id).await?;
+        let _alice_sent_add_msg = alice.pop_sent_msg().await;
+
+        SystemTime::shift(Duration::from_secs(3600));
+
+        // Bob sends a message
+        // to Alice and Fiona because he still has not received
+        // a message about Fiona being removed.
+        let bob_sent_msg = bob.send_text(bob_chat_id, "Hi Alice!").await;
+
+        // Alice receives a message.
+        // This should not add Fiona back.
+        let _alice_received_msg = alice.recv_msg(&bob_sent_msg).await;
+
+        assert_eq!(get_chat_contacts(alice, alice_chat_id).await?.len(), 2);
+
+        Ok(())
+    }
+
+    /// Test that tombstones for past members are added to chats_contacts table
+    /// even if the row did not exist before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_past_members() -> Result<()> {
+        let mut tcm = TestContextManager::new();
+
+        let alice = &tcm.alice().await;
+        let alice_fiona_contact_id = Contact::create(alice, "Fiona", "fiona@example.net").await?;
+
+        let alice_chat_id =
+            create_group_chat(alice, ProtectionStatus::Unprotected, "Group chat").await?;
+        add_contact_to_chat(alice, alice_chat_id, alice_fiona_contact_id).await?;
+        alice
+            .send_text(alice_chat_id, "Hi! I created a group.")
+            .await;
+        remove_contact_from_chat(alice, alice_chat_id, alice_fiona_contact_id).await?;
+        assert_eq!(get_past_chat_contacts(alice, alice_chat_id).await?.len(), 1);
+
+        let bob = &tcm.bob().await;
+        let bob_addr = bob.get_config(Config::Addr).await?.unwrap();
+        let alice_bob_contact_id = Contact::create(alice, "Bob", &bob_addr).await?;
+        add_contact_to_chat(alice, alice_chat_id, alice_bob_contact_id).await?;
+
+        let add_message = alice.pop_sent_msg().await;
+        let bob_add_message = bob.recv_msg(&add_message).await;
+        let bob_chat_id = bob_add_message.chat_id;
+        assert_eq!(get_chat_contacts(bob, bob_chat_id).await?.len(), 2);
+        assert_eq!(get_past_chat_contacts(bob, bob_chat_id).await?.len(), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn non_member_cannot_modify_member_list() -> Result<()> {
+        let mut tcm = TestContextManager::new();
+
+        let alice = &tcm.alice().await;
+        let bob = &tcm.bob().await;
+
+        let bob_addr = bob.get_config(Config::Addr).await?.unwrap();
+        let alice_bob_contact_id = Contact::create(alice, "Bob", &bob_addr).await?;
+
+        let alice_chat_id =
+            create_group_chat(alice, ProtectionStatus::Unprotected, "Group chat").await?;
+        add_contact_to_chat(alice, alice_chat_id, alice_bob_contact_id).await?;
+        let alice_sent_msg = alice
+            .send_text(alice_chat_id, "Hi! I created a group.")
+            .await;
+        let bob_received_msg = bob.recv_msg(&alice_sent_msg).await;
+        let bob_chat_id = bob_received_msg.get_chat_id();
+        bob_chat_id.accept(bob).await?;
+
+        let bob_fiona_contact_id = Contact::create(bob, "Fiona", "fiona@example.net").await?;
+
+        // Alice removes Bob and Bob adds Fiona at the same time.
+        remove_contact_from_chat(alice, alice_chat_id, alice_bob_contact_id).await?;
+        add_contact_to_chat(bob, bob_chat_id, bob_fiona_contact_id).await?;
+
+        let bob_sent_add_msg = bob.pop_sent_msg().await;
+
+        // Alice ignores Bob's message because Bob is not a member.
+        assert_eq!(get_chat_contacts(alice, alice_chat_id).await?.len(), 1);
+        alice.recv_msg_trash(&bob_sent_add_msg).await;
+        assert_eq!(get_chat_contacts(alice, alice_chat_id).await?.len(), 1);
+
         Ok(())
     }
 }

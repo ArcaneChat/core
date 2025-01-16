@@ -1455,9 +1455,7 @@ impl Session {
 
                 let is_seen = fetch_response.flags().any(|flag| flag == Flag::Seen);
 
-                let rfc724_mid = if let Some(rfc724_mid) = uid_message_ids.get(&request_uid) {
-                    rfc724_mid
-                } else {
+                let Some(rfc724_mid) = uid_message_ids.get(&request_uid) else {
                     error!(
                         context,
                         "No Message-ID corresponding to UID {} passed in uid_messsage_ids.",
@@ -1594,10 +1592,8 @@ impl Session {
         };
 
         if self.can_metadata() && self.can_push() {
-            let device_token_changed = context
-                .get_config(Config::DeviceToken)
-                .await?
-                .map_or(true, |config_token| device_token != config_token);
+            let device_token_changed =
+                context.get_config(Config::DeviceToken).await?.as_ref() != Some(&device_token);
 
             if device_token_changed {
                 let folder = context

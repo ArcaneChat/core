@@ -144,7 +144,7 @@ impl Chatlist {
                                   ORDER BY timestamp DESC, id DESC LIMIT 1)
                  WHERE c.id>9
                    AND c.blocked!=1
-                   AND c.id IN(SELECT chat_id FROM chats_contacts WHERE contact_id=?2)
+                   AND c.id IN(SELECT chat_id FROM chats_contacts WHERE contact_id=?2 AND add_timestamp >= remove_timestamp)
                  GROUP BY c.id
                  ORDER BY c.archived=?3 DESC, IFNULL(m.timestamp,c.created_timestamp) DESC, m.id DESC;",
                 (MessageState::OutDraft, query_contact_id, ChatVisibility::Pinned),
@@ -261,7 +261,7 @@ impl Chatlist {
                      WHERE c.id>9 AND c.id!=?
                        AND c.blocked=0
                        AND NOT c.archived=?
-                       AND (c.type!=? OR c.id IN(SELECT chat_id FROM chats_contacts WHERE contact_id=?))
+                       AND (c.type!=? OR c.id IN(SELECT chat_id FROM chats_contacts WHERE contact_id=? AND add_timestamp >= remove_timestamp))
                      GROUP BY c.id
                      ORDER BY c.id=? DESC, c.archived=? DESC, IFNULL(m.timestamp,c.created_timestamp) DESC, m.id DESC;",
                     (
@@ -550,7 +550,7 @@ mod tests {
         let chats = Chatlist::try_load(&t, 0, Some("is:unread"), None)
             .await
             .unwrap();
-        assert!(chats.len() == 1);
+        assert_eq!(chats.len(), 1);
 
         let chats = Chatlist::try_load(&t, DC_GCL_ARCHIVED_ONLY, None, None)
             .await
@@ -576,7 +576,7 @@ mod tests {
             .unwrap();
 
         let chats = Chatlist::try_load(&t, 0, None, None).await.unwrap();
-        assert!(chats.len() == 3);
+        assert_eq!(chats.len(), 3);
         assert!(!Chat::load_from_db(&t, chats.get_chat_id(0).unwrap())
             .await
             .unwrap()
@@ -585,7 +585,7 @@ mod tests {
         let chats = Chatlist::try_load(&t, DC_GCL_FOR_FORWARDING, None, None)
             .await
             .unwrap();
-        assert!(chats.len() == 2); // device chat cannot be written and is skipped on forwarding
+        assert_eq!(chats.len(), 2); // device chat cannot be written and is skipped on forwarding
         assert!(Chat::load_from_db(&t, chats.get_chat_id(0).unwrap())
             .await
             .unwrap()
@@ -597,7 +597,7 @@ mod tests {
         let chats = Chatlist::try_load(&t, DC_GCL_FOR_FORWARDING, None, None)
             .await
             .unwrap();
-        assert!(chats.len() == 1);
+        assert_eq!(chats.len(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
