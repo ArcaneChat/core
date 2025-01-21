@@ -93,8 +93,7 @@
         cargoLock = {
           lockFile = ./Cargo.lock;
           outputHashes = {
-            "email-0.0.20" = "sha256-rV4Uzqt2Qdrfi5Ti1r+Si1c2iW1kKyWLwOgLkQ5JGGw=";
-            "encoded-words-0.2.0" = "sha256-KK9st0hLFh4dsrnLd6D8lC6pRFFs8W+WpZSGMGJcosk=";
+            "email-0.0.20" = "sha256-cfR3D5jFQpw32bGsgapK2Uwuxmht+rRK/n1ZUmCb2WA=";
             "lettre-0.9.2" = "sha256-+hU1cFacyyeC9UGVBpS14BWlJjHy90i/3ynMkKAzclk=";
           };
         };
