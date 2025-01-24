@@ -183,8 +183,6 @@ pub enum Param {
     GroupNameTimestamp = b'g',
 
     /// For Chats: timestamp of member list update.
-    ///
-    /// Deprecated 2025-01-07.
     MemberListTimestamp = b'k',
 
     /// For Webxdc Message Instances: Current document name
@@ -375,7 +373,6 @@ impl Params {
     /// Note that in the [ParamsFile::FsPath] case the blob can be
     /// created without copying if the path already refers to a valid
     /// blob.  If so a [BlobObject] will be returned.
-    #[allow(clippy::needless_lifetimes)]
     pub async fn get_blob<'a>(
         &self,
         key: Param,

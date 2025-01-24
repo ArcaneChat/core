@@ -1,6 +1,7 @@
 //! # MIME message production.
 
 use std::collections::HashSet;
+use std::path::Path;
 
 use anyhow::{bail, Context as _, Result};
 use base64::Engine as _;
@@ -154,6 +155,7 @@ fn new_address_with_name(name: &str, address: String) -> Address {
 
 impl MimeFactory {
     pub async fn from_msg(context: &Context, msg: Message) -> Result<MimeFactory> {
+        let now = time();
         let chat = Chat::load_from_db(context, msg.chat_id).await?;
         let attach_profile_data = Self::should_attach_profile_data(&msg);
         let undisclosed_recipients = chat.typ == Chattype::Broadcast;
@@ -239,7 +241,7 @@ impl MimeFactory {
                                     }
                                 }
                                 recipient_ids.insert(id);
-                            } else {
+                            } else if remove_timestamp.saturating_add(60 * 24 * 3600) > now {
                                 // Row is a tombstone,
                                 // member is not actually part of the group.
                                 if !recipients_contain_addr(&past_members, &addr) {
@@ -620,7 +622,13 @@ impl MimeFactory {
             );
         }
 
-        if !self.member_timestamps.is_empty() {
+        let chat_memberlist_is_stale = if let Loaded::Message { chat, .. } = &self.loaded {
+            chat.member_list_is_stale(context).await?
+        } else {
+            false
+        };
+
+        if !self.member_timestamps.is_empty() && !chat_memberlist_is_stale {
             headers.push(
                 Header::new_with_value(
                     "Chat-Group-Member-Timestamps".into(),
@@ -1142,7 +1150,6 @@ impl MimeFactory {
         part.body(text)
     }
 
-    #[allow(clippy::cognitive_complexity)]
     async fn render_message(
         &mut self,
         context: &Context,
@@ -1605,12 +1612,17 @@ pub(crate) fn wrapped_base64_encode(buf: &[u8]) -> String {
 }
 
 async fn build_body_file(context: &Context, msg: &Message) -> Result<PartBuilder> {
+    let file_name = msg.get_filename().context("msg has no file")?;
+    let suffix = Path::new(&file_name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("dat");
+
     let blob = msg
         .param
         .get_blob(Param::File, context)
         .await?
         .context("msg has no file")?;
-    let suffix = blob.suffix().unwrap_or("dat");
 
     // Get file name to use for sending.  For privacy purposes, we do
     // not transfer the original filenames eg. for images; these names
@@ -1650,18 +1662,14 @@ async fn build_body_file(context: &Context, msg: &Message) -> Result<PartBuilder
                 ),
             &suffix
         ),
-        _ => msg
-            .param
-            .get(Param::Filename)
-            .unwrap_or_else(|| blob.as_file_name())
-            .to_string(),
+        _ => file_name,
     };
 
     /* check mimetype */
     let mimetype: mime::Mime = match msg.param.get(Param::MimeType) {
         Some(mtype) => mtype.parse()?,
         None => {
-            if let Some(res) = message::guess_msgtype_from_suffix(blob.as_rel_path()) {
+            if let Some(res) = message::guess_msgtype_from_suffix(msg) {
                 res.1.parse()?
             } else {
                 mime::APPLICATION_OCTET_STREAM
@@ -2624,8 +2632,7 @@ mod tests {
         // Long messages are truncated and MimeMessage::decoded_data is set for them. We need
         // decoded_data to check presence of the necessary headers.
         msg.set_text("a".repeat(constants::DC_DESIRED_TEXT_LEN + 1));
-        msg.set_file_from_bytes(&bob, "foo.bar", "content".as_bytes(), None)
-            .await?;
+        msg.set_file_from_bytes(&bob, "foo.bar", "content".as_bytes(), None)?;
         let sent = bob.send_msg(chat, &mut msg).await;
         assert!(msg.get_showpadlock());
         assert!(sent.payload.contains("\r\nSubject: [...]\r\n"));

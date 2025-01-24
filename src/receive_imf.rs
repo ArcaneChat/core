@@ -158,7 +158,7 @@ async fn insert_tombstone(context: &Context, rfc724_mid: &str) -> Result<MsgId> 
 /// If `is_partial_download` is set, it contains the full message size in bytes.
 /// Do not confuse that with `replace_msg_id` that will be set when the full message is loaded
 /// later.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) async fn receive_imf_inner(
     context: &Context,
     folder: &str,
@@ -697,7 +697,7 @@ pub async fn from_field_to_contact_id(
 /// Creates a `ReceivedMsg` from given parts which might consist of
 /// multiple messages (if there are multiple attachments).
 /// Every entry in `mime_parser.parts` produces a new row in the `msgs` table.
-#[allow(clippy::too_many_arguments, clippy::cognitive_complexity)]
+#[expect(clippy::too_many_arguments)]
 async fn add_parts(
     context: &Context,
     mime_parser: &mut MimeMessage,
@@ -1862,7 +1862,7 @@ async fn lookup_chat_by_reply(
     Ok(Some((parent_chat.id, parent_chat.blocked)))
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn lookup_chat_or_create_adhoc_group(
     context: &Context,
     mime_parser: &MimeMessage,
@@ -2007,7 +2007,7 @@ async fn is_probably_private_reply(
 /// than two members, a new ad hoc group is created.
 ///
 /// On success the function returns the created (chat_id, chat_blocked) tuple.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn create_group(
     context: &Context,
     mime_parser: &mut MimeMessage,
@@ -2224,7 +2224,6 @@ async fn update_chats_contacts_timestamps(
 ///
 /// * `to_ids` - contents of the `To` and `Cc` headers.
 /// * `past_ids` - contents of the `Chat-Group-Past-Members` header.
-#[allow(clippy::too_many_arguments)]
 async fn apply_group_changes(
     context: &Context,
     mime_parser: &mut MimeMessage,
@@ -2246,7 +2245,6 @@ async fn apply_group_changes(
     let mut send_event_chat_modified = false;
     let (mut removed_id, mut added_id) = (None, None);
     let mut better_msg = None;
-    let mut group_changes_msgs = Vec::new();
 
     // True if a Delta Chat client has explicitly added our current primary address.
     let self_added =
@@ -2348,7 +2346,40 @@ async fn apply_group_changes(
     }
 
     if is_from_in_chat {
-        if let Some(ref chat_group_member_timestamps) = mime_parser.chat_group_member_timestamps() {
+        if chat.member_list_is_stale(context).await? {
+            info!(context, "Member list is stale.");
+            let mut new_members: HashSet<ContactId> = HashSet::from_iter(to_ids.iter().copied());
+            new_members.insert(ContactId::SELF);
+            if !from_id.is_special() {
+                new_members.insert(from_id);
+            }
+
+            context
+                .sql
+                .transaction(|transaction| {
+                    // Remove all contacts and tombstones.
+                    transaction.execute(
+                        "DELETE FROM chats_contacts
+                         WHERE chat_id=?",
+                        (chat_id,),
+                    )?;
+
+                    // Insert contacts with default timestamps of 0.
+                    let mut statement = transaction.prepare(
+                        "INSERT INTO chats_contacts (chat_id, contact_id)
+                         VALUES                     (?,       ?)",
+                    )?;
+                    for contact_id in &new_members {
+                        statement.execute((chat_id, contact_id))?;
+                    }
+
+                    Ok(())
+                })
+                .await?;
+            send_event_chat_modified = true;
+        } else if let Some(ref chat_group_member_timestamps) =
+            mime_parser.chat_group_member_timestamps()
+        {
             send_event_chat_modified |= update_chats_contacts_timestamps(
                 context,
                 chat_id,
@@ -2398,6 +2429,14 @@ async fn apply_group_changes(
                 send_event_chat_modified = true;
             }
         }
+
+        chat_id
+            .update_timestamp(
+                context,
+                Param::MemberListTimestamp,
+                mime_parser.timestamp_sent,
+            )
+            .await?;
     }
 
     let new_chat_contacts = HashSet::<ContactId>::from_iter(
@@ -2428,33 +2467,7 @@ async fn apply_group_changes(
     if let Some(removed_id) = removed_id {
         removed_ids.remove(&removed_id);
     }
-    if !added_ids.is_empty() {
-        warn!(
-            context,
-            "Implicit addition of {added_ids:?} to chat {chat_id}."
-        );
-    }
-    if !removed_ids.is_empty() {
-        warn!(
-            context,
-            "Implicit removal of {removed_ids:?} from chat {chat_id}."
-        );
-    }
-    group_changes_msgs.reserve(added_ids.len() + removed_ids.len());
-    for contact_id in added_ids {
-        let contact = Contact::get_by_id(context, contact_id).await?;
-        group_changes_msgs.push(
-            stock_str::msg_add_member_local(context, contact.get_addr(), ContactId::UNDEFINED)
-                .await,
-        );
-    }
-    for contact_id in removed_ids {
-        let contact = Contact::get_by_id(context, contact_id).await?;
-        group_changes_msgs.push(
-            stock_str::msg_del_member_local(context, contact.get_addr(), ContactId::UNDEFINED)
-                .await,
-        );
-    }
+    let group_changes_msgs = group_changes_msgs(context, &added_ids, &removed_ids, chat_id).await?;
 
     if let Some(avatar_action) = &mime_parser.group_avatar {
         if !new_chat_contacts.contains(&ContactId::SELF) {
@@ -2492,6 +2505,45 @@ async fn apply_group_changes(
         chatlist_events::emit_chatlist_item_changed(context, chat_id);
     }
     Ok((group_changes_msgs, better_msg))
+}
+
+/// Returns a list of strings that should be shown as info messages, informing about group membership changes.
+async fn group_changes_msgs(
+    context: &Context,
+    added_ids: &HashSet<ContactId>,
+    removed_ids: &HashSet<ContactId>,
+    chat_id: ChatId,
+) -> Result<Vec<String>> {
+    let mut group_changes_msgs = Vec::new();
+    if !added_ids.is_empty() {
+        warn!(
+            context,
+            "Implicit addition of {added_ids:?} to chat {chat_id}."
+        );
+    }
+    if !removed_ids.is_empty() {
+        warn!(
+            context,
+            "Implicit removal of {removed_ids:?} from chat {chat_id}."
+        );
+    }
+    group_changes_msgs.reserve(added_ids.len() + removed_ids.len());
+    for contact_id in added_ids {
+        let contact = Contact::get_by_id(context, *contact_id).await?;
+        group_changes_msgs.push(
+            stock_str::msg_add_member_local(context, contact.get_addr(), ContactId::UNDEFINED)
+                .await,
+        );
+    }
+    for contact_id in removed_ids {
+        let contact = Contact::get_by_id(context, *contact_id).await?;
+        group_changes_msgs.push(
+            stock_str::msg_del_member_local(context, contact.get_addr(), ContactId::UNDEFINED)
+                .await,
+        );
+    }
+
+    Ok(group_changes_msgs)
 }
 
 static LIST_ID_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"^(.+)<(.+)>$").unwrap());
@@ -3047,4 +3099,4 @@ async fn add_or_lookup_contacts_by_address_list(
 }
 
 #[cfg(test)]
-mod tests;
+mod receive_imf_tests;

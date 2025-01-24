@@ -345,7 +345,7 @@ async fn import_vcard_contact(context: &Context, contact: &VcardContact) -> Resu
         return Ok(id);
     }
     let path = match &contact.profile_image {
-        Some(image) => match BlobObject::store_from_base64(context, image, "avatar").await {
+        Some(image) => match BlobObject::store_from_base64(context, image) {
             Err(e) => {
                 warn!(
                     context,
@@ -806,7 +806,6 @@ impl Contact {
         }
 
         let mut name = sanitize_name(name);
-        #[allow(clippy::collapsible_if)]
         if origin <= Origin::OutgoingTo {
             // The user may accidentally have written to a "noreply" address with another MUA:
             if addr.contains("noreply")

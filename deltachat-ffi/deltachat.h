@@ -4757,8 +4757,34 @@ void            dc_msg_set_override_sender_name(dc_msg_t* msg, const char* name)
  * @param file If the message object is used in dc_send_msg() later,
  *     this must be the full path of the image file to send.
  * @param filemime The MIME type of the file. NULL if you don't know or don't care.
+ * @deprecated 2025-01-21 Use dc_msg_set_file_and_deduplicate instead
  */
 void            dc_msg_set_file               (dc_msg_t* msg, const char* file, const char* filemime);
+
+
+/**
+ * Sets the file associated with a message.
+ *
+ * If `name` is non-null, it is used as the file name
+ * and the actual current name of the file is ignored.
+ *
+ * If the source file is already in the blobdir, it will be renamed,
+ * otherwise it will be copied to the blobdir first.
+ *
+ * In order to deduplicate files that contain the same data,
+ * the file will be named `<hash>.<extension>`, e.g. `ce940175885d7b78f7b7e9f1396611f.jpg`.
+ *
+ * NOTE:
+ * - This function will rename the file. To get the new file path, call `get_file()`.
+ * - The file must not be modified after this function was called.
+ *
+ * @memberof dc_msg_t
+ * @param msg The message object. Must not be NULL.
+ * @param file The path of the file to attach. Must not be NULL.
+ * @param name The original filename of the attachment. If NULL, the current name of `file` will be used instead.
+ * @param filemime The MIME type of the file. NULL if you don't know or don't care.
+ */
+void            dc_msg_set_file_and_deduplicate(dc_msg_t* msg, const char* file, const char* name, const char* filemime);
 
 
 /**
