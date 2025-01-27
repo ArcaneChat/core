@@ -186,8 +186,8 @@ impl MimeFactory {
         if chat.is_self_talk() {
             if msg.param.get_cmd() == SystemMessage::AutocryptSetupMessage {
                 recipients.push(from_addr.to_string());
-                to.push((from_displayname.to_string(), from_addr.to_string()));
             }
+            to.push((from_displayname.to_string(), from_addr.to_string()));
         } else if chat.is_mailing_list() {
             let list_post = chat
                 .param
@@ -622,24 +622,23 @@ impl MimeFactory {
             );
         }
 
-        let chat_memberlist_is_stale = if let Loaded::Message { chat, .. } = &self.loaded {
-            chat.member_list_is_stale(context).await?
-        } else {
-            false
-        };
-
-        if !self.member_timestamps.is_empty() && !chat_memberlist_is_stale {
-            headers.push(
-                Header::new_with_value(
-                    "Chat-Group-Member-Timestamps".into(),
-                    self.member_timestamps
-                        .iter()
-                        .map(|ts| ts.to_string())
-                        .collect::<Vec<String>>()
-                        .join(" "),
-                )
-                .unwrap(),
-            );
+        if let Loaded::Message { chat, .. } = &self.loaded {
+            if chat.typ == Chattype::Group
+                && !self.member_timestamps.is_empty()
+                && !chat.member_list_is_stale(context).await?
+            {
+                headers.push(
+                    Header::new_with_value(
+                        "Chat-Group-Member-Timestamps".into(),
+                        self.member_timestamps
+                            .iter()
+                            .map(|ts| ts.to_string())
+                            .collect::<Vec<String>>()
+                            .join(" "),
+                    )
+                    .unwrap(),
+                );
+            }
         }
 
         let subject_str = self.subject_str(context).await?;

@@ -752,6 +752,16 @@ async fn test_self_talk() -> Result<()> {
     assert!(msg.get_showpadlock());
 
     let sent_msg = t.pop_sent_msg().await;
+    let payload = sent_msg.payload();
+    // Make sure the `To` field contains the address and not
+    // "undisclosed recipients".
+    // Otherwise Delta Chat core <1.153.0 assigns the message
+    // to the trash chat.
+    assert_eq!(
+        payload.match_indices("To: <alice@example.org>\r\n").count(),
+        1
+    );
+
     let t2 = TestContext::new_alice().await;
     t2.recv_msg(&sent_msg).await;
     let chat = &t2.get_self_chat().await;
@@ -2485,7 +2495,9 @@ async fn test_broadcast() -> Result<()> {
     }
 
     {
-        let msg = bob.recv_msg(&alice.pop_sent_msg().await).await;
+        let sent_msg = alice.pop_sent_msg().await;
+        assert!(!sent_msg.payload.contains("Chat-Group-Member-Timestamps:"));
+        let msg = bob.recv_msg(&sent_msg).await;
         assert_eq!(msg.get_text(), "ola!");
         assert_eq!(msg.subject, "Broadcast list");
         assert!(!msg.get_showpadlock()); // avoid leaking recipients in encryption data
@@ -3125,6 +3137,9 @@ async fn test_sync_broadcast() -> Result<()> {
     remove_contact_from_chat(alice0, a0_broadcast_id, a0b_contact_id).await?;
     sync(alice0, alice1).await;
     assert!(get_chat_contacts(alice1, a1_broadcast_id).await?.is_empty());
+    assert!(get_past_chat_contacts(alice1, a1_broadcast_id)
+        .await?
+        .is_empty());
     Ok(())
 }
 
@@ -3522,4 +3537,13 @@ async fn test_restore_backup_after_60_days() -> Result<()> {
     assert_eq!(get_past_chat_contacts(fiona, fiona_chat_id).await?.len(), 0);
 
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_one_to_one_chat_no_group_member_timestamps() {
+    let t = TestContext::new_alice().await;
+    let chat = t.create_chat_with_contact("bob", "bob@example.com").await;
+    let sent = t.send_text(chat.id, "Hi!").await;
+    let payload = sent.payload;
+    assert!(!payload.contains("Chat-Group-Member-Timestamps:"));
 }
