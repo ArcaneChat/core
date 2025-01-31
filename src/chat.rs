@@ -2802,11 +2802,7 @@ async fn prepare_msg_blob(context: &Context, msg: &mut Message) -> Result<()> {
                 || maybe_sticker && !msg.param.exists(Param::ForceSticker))
         {
             let new_name = blob
-                .recode_to_image_size(
-                    context,
-                    msg.get_filename().unwrap_or_else(|| "file".to_string()),
-                    &mut maybe_sticker,
-                )
+                .recode_to_image_size(context, msg.get_filename(), &mut maybe_sticker)
                 .await?;
             msg.param.set(Param::Filename, new_name);
 
@@ -4229,7 +4225,11 @@ pub async fn set_chat_profile_image(
         msg.param.remove(Param::Arg);
         msg.text = stock_str::msg_grp_img_deleted(context, ContactId::SELF).await;
     } else {
-        let mut image_blob = BlobObject::new_from_path(context, Path::new(new_image)).await?;
+        let mut image_blob = BlobObject::create_and_deduplicate(
+            context,
+            Path::new(new_image),
+            Path::new(new_image),
+        )?;
         image_blob.recode_to_avatar_size(context).await?;
         chat.param.set(Param::ProfileImage, image_blob.as_name());
         msg.param.set(Param::Arg, image_blob.as_name());
