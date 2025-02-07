@@ -1,6 +1,6 @@
 [package]
 name = "deltachat"
-version = "1.155.2"
+version = "1.155.3"
 edition = "2021"
 license = "MPL-2.0"
 rust-version = "1.81"
@@ -49,7 +49,7 @@ base64 = { workspace = true }
 brotli = { version = "7", default-features=false, features = ["std"] }
 bytes = "1"
 chrono = { workspace = true, features = ["alloc", "clock", "std"] }
-data-encoding = "2.6.0"
+data-encoding = "2.7.0"
 email = { git = "https://github.com/deltachat/rust-email", branch = "master" }
 encoded-words = "0.2"
 escaper = "0.1"
@@ -64,8 +64,8 @@ humansize = "2"
 hyper = "1"
 hyper-util = "0.1.10"
 image = { version = "0.25.5", default-features=false, features = ["gif", "jpeg", "ico", "png", "pnm", "webp", "bmp"] }
-iroh-gossip = { version = "0.30", default-features = false, features = ["net"] }
-iroh = { version = "0.30", default-features = false }
+iroh-gossip = { version = "0.32", default-features = false, features = ["net"] }
+iroh = { version = "0.32", default-features = false }
 kamadak-exif = "0.6.1"
 lettre_email = { git = "https://github.com/deltachat/lettre", branch = "master" }
 libc = { workspace = true }
@@ -77,7 +77,7 @@ num-traits = { workspace = true }
 once_cell = { workspace = true }
 parking_lot = "0.12"
 percent-encoding = "2.3"
-pgp = { version = "0.14.2", default-features = false }
+pgp = { version = "0.15.0", default-features = false }
 pin-project = "1"
 qrcodegen = "1.7.0"
 quick-xml = "0.37"
@@ -86,8 +86,8 @@ rand = { workspace = true }
 regex = { workspace = true }
 rusqlite = { workspace = true, features = ["sqlcipher"] }
 rust-hsluv = "0.1"
-rustls-pki-types = "1.10.1"
-rustls = { version = "0.23.20", default-features = false }
+rustls-pki-types = "1.11.0"
+rustls = { version = "0.23.22", default-features = false }
 sanitize-filename = { workspace = true }
 serde_json = { workspace = true }
 serde_urlencoded = "0.7.1"
@@ -110,7 +110,7 @@ tokio = { workspace = true, features = ["fs", "rt-multi-thread", "macros"] }
 toml = "0.8"
 url = "2"
 uuid = { version = "1", features = ["serde", "v4"] }
-webpki-roots = "0.26.7"
+webpki-roots = "0.26.8"
 blake3 = "1.5.5"
 
 [dev-dependencies]
@@ -176,7 +176,7 @@ deltachat-contact-tools = { path = "deltachat-contact-tools" }
 deltachat-jsonrpc = { path = "deltachat-jsonrpc", default-features = false }
 deltachat = { path = ".", default-features = false }
 futures = "0.3.31"
-futures-lite = "2.5.0"
+futures-lite = "2.6.0"
 libc = "0.2"
 log = "0.4"
 nu-ansi-term = "0.46"
@@ -189,7 +189,7 @@ sanitize-filename = "0.5"
 serde = "1.0"
 serde_json = "1"
 tempfile = "3.14.0"
-thiserror = "1"
+thiserror = "2"
 tokio = "1"
 tokio-util = "0.7.13"
 tracing-subscriber = "0.3"

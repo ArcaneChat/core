@@ -1789,6 +1789,7 @@ mod tests {
             "key_id",
             "webxdc_integration",
             "device_token",
+            "encrypted_device_token",
         ];
         let t = TestContext::new().await;
         let info = t.get_info().await.unwrap();
