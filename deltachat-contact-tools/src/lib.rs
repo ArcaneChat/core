@@ -78,21 +78,21 @@ pub fn make_vcard(contacts: &[VcardContact]) -> String {
         let addr = &c.addr;
         let display_name = c.display_name();
         res += &format!(
-            "BEGIN:VCARD\n\
-             VERSION:4.0\n\
-             EMAIL:{addr}\n\
-             FN:{display_name}\n"
+            "BEGIN:VCARD\r\n\
+             VERSION:4.0\r\n\
+             EMAIL:{addr}\r\n\
+             FN:{display_name}\r\n"
         );
         if let Some(key) = &c.key {
-            res += &format!("KEY:data:application/pgp-keys;base64,{key}\n");
+            res += &format!("KEY:data:application/pgp-keys;base64,{key}\r\n");
         }
         if let Some(profile_image) = &c.profile_image {
-            res += &format!("PHOTO:data:image/jpeg;base64,{profile_image}\n");
+            res += &format!("PHOTO:data:image/jpeg;base64,{profile_image}\r\n");
         }
         if let Some(timestamp) = format_timestamp(c) {
-            res += &format!("REV:{timestamp}\n");
+            res += &format!("REV:{timestamp}\r\n");
         }
-        res += "END:VCARD\n";
+        res += "END:VCARD\r\n";
     }
     res
 }
@@ -206,22 +206,21 @@ pub fn parse_vcard(vcard: &str) -> Vec<VcardContact> {
             } else if let Some(rev) = vcard_property(line, "rev") {
                 datetime.get_or_insert(rev);
             } else if line.eq_ignore_ascii_case("END:VCARD") {
+                let (authname, addr) =
+                    sanitize_name_and_addr(display_name.unwrap_or(""), addr.unwrap_or(""));
+
+                contacts.push(VcardContact {
+                    authname,
+                    addr,
+                    key: key.map(|s| s.to_string()),
+                    profile_image: photo.map(|s| s.to_string()),
+                    timestamp: datetime
+                        .context("No timestamp in vcard")
+                        .and_then(parse_datetime),
+                });
                 break;
             }
         }
-
-        let (authname, addr) =
-            sanitize_name_and_addr(display_name.unwrap_or(""), addr.unwrap_or(""));
-
-        contacts.push(VcardContact {
-            authname,
-            addr,
-            key: key.map(|s| s.to_string()),
-            profile_image: photo.map(|s| s.to_string()),
-            timestamp: datetime
-                .context("No timestamp in vcard")
-                .and_then(parse_datetime),
-        });
     }
 
     contacts
@@ -541,6 +540,30 @@ END:VCARD",
     }
 
     #[test]
+    fn test_vcard_with_trailing_newline() {
+        let contacts = parse_vcard(
+            "BEGIN:VCARD\r
+VERSION:4.0\r
+FN:Alice Wonderland\r
+N:Wonderland;Alice;;;Ms.\r
+GENDER:W\r
+EMAIL;TYPE=work:alice@example.com\r
+KEY;TYPE=PGP;ENCODING=b:[base64-data]\r
+REV:20240418T184242Z\r
+END:VCARD\r
+\r",
+        );
+
+        assert_eq!(contacts[0].addr, "alice@example.com".to_string());
+        assert_eq!(contacts[0].authname, "Alice Wonderland".to_string());
+        assert_eq!(contacts[0].key, Some("[base64-data]".to_string()));
+        assert_eq!(contacts[0].profile_image, None);
+        assert_eq!(*contacts[0].timestamp.as_ref().unwrap(), 1713465762);
+
+        assert_eq!(contacts.len(), 1);
+    }
+
+    #[test]
     fn test_make_and_parse_vcard() {
         let contacts = [
             VcardContact {
@@ -559,20 +582,20 @@ END:VCARD",
             },
         ];
         let items = [
-            "BEGIN:VCARD\n\
-             VERSION:4.0\n\
-             EMAIL:alice@example.org\n\
-             FN:Alice Wonderland\n\
-             KEY:data:application/pgp-keys;base64,[base64-data]\n\
-             PHOTO:data:image/jpeg;base64,image in Base64\n\
-             REV:20240418T184242Z\n\
-             END:VCARD\n",
-            "BEGIN:VCARD\n\
-             VERSION:4.0\n\
-             EMAIL:bob@example.com\n\
-             FN:bob@example.com\n\
-             REV:19700101T000000Z\n\
-             END:VCARD\n",
+            "BEGIN:VCARD\r\n\
+             VERSION:4.0\r\n\
+             EMAIL:alice@example.org\r\n\
+             FN:Alice Wonderland\r\n\
+             KEY:data:application/pgp-keys;base64,[base64-data]\r\n\
+             PHOTO:data:image/jpeg;base64,image in Base64\r\n\
+             REV:20240418T184242Z\r\n\
+             END:VCARD\r\n",
+            "BEGIN:VCARD\r\n\
+             VERSION:4.0\r\n\
+             EMAIL:bob@example.com\r\n\
+             FN:bob@example.com\r\n\
+             REV:19700101T000000Z\r\n\
+             END:VCARD\r\n",
         ];
         let mut expected = "".to_string();
         for len in 0..=contacts.len() {
