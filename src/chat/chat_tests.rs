@@ -774,6 +774,21 @@ async fn test_self_talk() -> Result<()> {
     Ok(())
 }
 
+/// Tests that when BCC-self is disabled
+/// and no messages are actually sent
+/// in a self-chat, they have a padlock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_self_talk_no_bcc_padlock() -> Result<()> {
+    let t = &TestContext::new_alice().await;
+    t.set_config_bool(Config::BccSelf, false).await?;
+    let chat = &t.get_self_chat().await;
+
+    let msg_id = send_text_msg(t, chat.id, "Foobar".to_string()).await?;
+    let msg = Message::load_from_db(t, msg_id).await?;
+    assert!(msg.get_showpadlock());
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_add_device_msg_unlabelled() {
     let t = TestContext::new().await;
@@ -3059,6 +3074,34 @@ async fn test_sync_visibility() -> Result<()> {
     Ok(())
 }
 
+/// Tests syncing of chat visibility on device message chat.
+///
+/// Previously due to a bug pinning "Device Messages"
+/// chat resulted in creation of `device@localhost` chat
+/// on another device.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_sync_device_messages_visibility() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice0 = &tcm.alice().await;
+    let alice1 = &tcm.alice().await;
+    for a in [alice0, alice1] {
+        a.set_config_bool(Config::SyncMsgs, true).await?;
+    }
+
+    let device_chat_id0 = ChatId::get_for_contact(alice0, ContactId::DEVICE).await?;
+    device_chat_id0
+        .set_visibility(alice0, ChatVisibility::Pinned)
+        .await?;
+
+    sync(alice0, alice1).await;
+
+    let device_chat_id1 = ChatId::get_for_contact(alice1, ContactId::DEVICE).await?;
+    let device_chat1 = Chat::load_from_db(alice1, device_chat_id1).await?;
+    assert_eq!(device_chat1.get_visibility(), ChatVisibility::Pinned);
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_sync_muted() -> Result<()> {
     let alice0 = &TestContext::new_alice().await;
@@ -3414,6 +3457,61 @@ async fn test_expire_past_members_after_60_days() -> Result<()> {
     let bob_chat_id = bob_add_message.chat_id;
     assert_eq!(get_chat_contacts(bob, bob_chat_id).await?.len(), 2);
     assert_eq!(get_past_chat_contacts(bob, bob_chat_id).await?.len(), 0);
+
+    Ok(())
+}
+
+/// Test that past members are ordered by the timestamp of their removal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_past_members_order() -> Result<()> {
+    let t = &TestContext::new_alice().await;
+
+    let bob_contact_id = Contact::create(t, "Bob", "bob@example.net").await?;
+    let charlie_contact_id = Contact::create(t, "Charlie", "charlie@example.org").await?;
+    let fiona_contact_id = Contact::create(t, "Fiona", "fiona@example.net").await?;
+
+    let chat_id = create_group_chat(t, ProtectionStatus::Unprotected, "Group chat").await?;
+    add_contact_to_chat(t, chat_id, bob_contact_id).await?;
+    add_contact_to_chat(t, chat_id, charlie_contact_id).await?;
+    add_contact_to_chat(t, chat_id, fiona_contact_id).await?;
+    t.send_text(chat_id, "Hi! I created a group.").await;
+
+    assert_eq!(get_past_chat_contacts(t, chat_id).await?.len(), 0);
+
+    remove_contact_from_chat(t, chat_id, charlie_contact_id).await?;
+
+    let past_contacts = get_past_chat_contacts(t, chat_id).await?;
+    assert_eq!(past_contacts.len(), 1);
+    assert_eq!(past_contacts[0], charlie_contact_id);
+
+    SystemTime::shift(Duration::from_secs(5));
+    remove_contact_from_chat(t, chat_id, bob_contact_id).await?;
+
+    let past_contacts = get_past_chat_contacts(t, chat_id).await?;
+    assert_eq!(past_contacts.len(), 2);
+    assert_eq!(past_contacts[0], bob_contact_id);
+    assert_eq!(past_contacts[1], charlie_contact_id);
+
+    SystemTime::shift(Duration::from_secs(5));
+    remove_contact_from_chat(t, chat_id, fiona_contact_id).await?;
+
+    let past_contacts = get_past_chat_contacts(t, chat_id).await?;
+    assert_eq!(past_contacts.len(), 3);
+    assert_eq!(past_contacts[0], fiona_contact_id);
+    assert_eq!(past_contacts[1], bob_contact_id);
+    assert_eq!(past_contacts[2], charlie_contact_id);
+
+    // Adding and removing Bob
+    // moves him to the top of past member list.
+    SystemTime::shift(Duration::from_secs(5));
+    add_contact_to_chat(t, chat_id, bob_contact_id).await?;
+    remove_contact_from_chat(t, chat_id, bob_contact_id).await?;
+
+    let past_contacts = get_past_chat_contacts(t, chat_id).await?;
+    assert_eq!(past_contacts.len(), 3);
+    assert_eq!(past_contacts[0], bob_contact_id);
+    assert_eq!(past_contacts[1], fiona_contact_id);
+    assert_eq!(past_contacts[2], charlie_contact_id);
 
     Ok(())
 }

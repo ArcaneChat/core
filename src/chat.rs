@@ -2318,6 +2318,10 @@ impl Chat {
     async fn get_sync_id(&self, context: &Context) -> Result<Option<SyncId>> {
         match self.typ {
             Chattype::Single => {
+                if self.is_device_talk() {
+                    return Ok(Some(SyncId::Device));
+                }
+
                 let mut r = None;
                 for contact_id in get_chat_contacts(context, self.id).await? {
                     if contact_id == ContactId::SELF && !self.is_self_talk() {
@@ -3053,6 +3057,8 @@ pub(crate) async fn create_send_msg_jobs(context: &Context, msg: &mut Message) -
             context,
             "Message {} has no recipient, skipping smtp-send.", msg.id
         );
+        msg.param.set_int(Param::GuaranteeE2ee, 1);
+        msg.update_param(context).await?;
         msg.id.set_delivered(context).await?;
         msg.state = MessageState::OutDelivered;
         return Ok(Vec::new());
@@ -3526,6 +3532,8 @@ pub async fn get_chat_contacts(context: &Context, chat_id: ChatId) -> Result<Vec
 }
 
 /// Returns a vector of contact IDs for given chat ID that are no longer part of the group.
+///
+/// Members that have been removed recently are in the beginning of the list.
 pub async fn get_past_chat_contacts(context: &Context, chat_id: ChatId) -> Result<Vec<ContactId>> {
     let now = time();
     let list = context
@@ -3538,7 +3546,7 @@ pub async fn get_past_chat_contacts(context: &Context, chat_id: ChatId) -> Resul
              WHERE cc.chat_id=?
              AND cc.add_timestamp < cc.remove_timestamp
              AND ? < cc.remove_timestamp
-             ORDER BY c.id=1, c.last_seen DESC, c.id DESC",
+             ORDER BY c.id=1, cc.remove_timestamp DESC, c.id DESC",
             (chat_id, now.saturating_sub(60 * 24 * 3600)),
             |row| row.get::<_, ContactId>(0),
             |ids| ids.collect::<Result<Vec<_>, _>>().map_err(Into::into),
@@ -4807,6 +4815,9 @@ pub(crate) enum SyncId {
     Grpid(String),
     /// "Message-ID"-s, from oldest to latest. Used for ad-hoc groups.
     Msgids(Vec<String>),
+
+    // Special id for device chat.
+    Device,
 }
 
 /// An action synchronised to other devices.
@@ -4871,6 +4882,7 @@ impl Context {
                 ChatId::lookup_by_message(&msg)
                     .with_context(|| format!("No chat found for Message-IDs {msgids:?}"))?
             }
+            SyncId::Device => ChatId::get_for_contact(self, ContactId::DEVICE).await?,
         };
         match action {
             SyncAction::Block => if is_community { Ok(()) } else {chat_id.block_ex(self, Nosync).await},

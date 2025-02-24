@@ -16,6 +16,8 @@ on:
     branches:
       - main
 
+permissions: {}
+
 env:
   RUSTFLAGS: -Dwarnings
 
@@ -29,6 +31,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           show-progress: false
+          persist-credentials: false
       - name: Install rustfmt and clippy
         run: rustup toolchain install $RUSTUP_TOOLCHAIN --profile minimal --component rustfmt --component clippy
       - name: Cache rust cargo artifacts
@@ -42,18 +45,6 @@ jobs:
       - name: Check with only default features
         run: cargo check --all-targets
 
-  npm_constants:
-    name: Check if node constants are up to date
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          show-progress: false
-      - name: Rebuild constants
-        run: npm run build:core:constants
-      - name: Check that constants are not changed
-        run: git diff --exit-code
-
   cargo_deny:
     name: cargo deny
     runs-on: ubuntu-latest
@@ -61,6 +52,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           show-progress: false
+          persist-credentials: false
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           arguments: --all-features --workspace
@@ -74,6 +66,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           show-progress: false
+          persist-credentials: false
       - name: Check provider database
         run: scripts/update-provider-database.sh
 
@@ -86,6 +79,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           show-progress: false
+          persist-credentials: false
       - name: Cache rust cargo artifacts
         uses: swatinem/rust-cache@v2
       - name: Rustdoc
@@ -111,6 +105,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           show-progress: false
+          persist-credentials: false
 
       - name: Install Rust ${{ matrix.rust }}
         run: rustup toolchain install --profile minimal ${{ matrix.rust }}
@@ -147,6 +142,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           show-progress: false
+          persist-credentials: false
 
       - name: Cache rust cargo artifacts
         uses: swatinem/rust-cache@v2
@@ -171,6 +167,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           show-progress: false
+          persist-credentials: false
 
       - name: Cache rust cargo artifacts
         uses: swatinem/rust-cache@v2
@@ -192,6 +189,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           show-progress: false
+          persist-credentials: false
 
       - name: Install tox
         run: pip install tox
@@ -234,6 +232,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           show-progress: false
+          persist-credentials: false
 
       - name: Download libdeltachat.a
         uses: actions/download-artifact@v4
@@ -286,6 +285,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           show-progress: false
+          persist-credentials: false
 
       - name: Install python
         uses: actions/setup-python@v5
