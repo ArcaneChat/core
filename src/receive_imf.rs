@@ -1203,7 +1203,7 @@ async fn add_parts(
             if is_community {
               // check if the message belongs to a mailing list
               if let Some(mailinglist_header) = mime_parser.get_mailinglist_header() {
-                  if let Some((new_chat_id, new_chat_id_blocked)) = create_or_lookup_mailinglist(
+                  if let Some((new_chat_id, _new_chat_id_blocked)) = create_or_lookup_mailinglist(
                       context,
                       allow_creation,
                       mailinglist_header,
@@ -1212,7 +1212,7 @@ async fn add_parts(
                   .await?
                   {
                       chat_id = Some(new_chat_id);
-                      chat_id_blocked = new_chat_id_blocked;
+                      //chat_id_blocked = new_chat_id_blocked;
                   }
               }
             } else {
