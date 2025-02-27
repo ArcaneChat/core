@@ -4,6 +4,7 @@ import time
 import pytest
 
 from deltachat_rpc_client import Chat, EventType, SpecialContactId
+from deltachat_rpc_client.rpc import JsonRpcError
 
 
 def test_qr_setup_contact(acfactory, tmp_path) -> None:
@@ -26,17 +27,21 @@ def test_qr_setup_contact(acfactory, tmp_path) -> None:
     bob_contact_alice_snapshot = bob_contact_alice.get_snapshot()
     assert bob_contact_alice_snapshot.is_verified
 
-    # Test that if Bob changes the key, backwards verification is lost.
+    # Test that if Bob imports a key,
+    # backwards verification is not lost
+    # because default key is not changed.
     logging.info("Bob 2 is created")
     bob2 = acfactory.new_configured_account()
     bob2.export_self_keys(tmp_path)
 
-    logging.info("Bob imports a key")
-    bob.import_self_keys(tmp_path)
+    logging.info("Bob tries to import a key")
+    # Importing a second key is not allowed.
+    with pytest.raises(JsonRpcError):
+        bob.import_self_keys(tmp_path)
 
-    assert bob.get_config("key_id") == "2"
+    assert bob.get_config("key_id") == "1"
     bob_contact_alice_snapshot = bob_contact_alice.get_snapshot()
-    assert not bob_contact_alice_snapshot.is_verified
+    assert bob_contact_alice_snapshot.is_verified
 
 
 def test_qr_setup_contact_svg(acfactory) -> None:
@@ -653,12 +658,14 @@ def test_withdraw_securejoin_qr(acfactory):
     bob_chat = bob.secure_join(qr_code)
     bob.wait_for_securejoin_joiner_success()
 
+    alice.clear_all_events()
+
     snapshot = bob.get_message_by_id(bob.wait_for_incoming_msg_event().msg_id).get_snapshot()
     assert snapshot.text == "Member Me ({}) added by {}.".format(bob.get_config("addr"), alice.get_config("addr"))
     assert snapshot.chat.get_basic_snapshot().is_protected
     bob_chat.leave()
 
-    snapshot = alice.get_message_by_id(alice.wait_for_incoming_msg_event().msg_id).get_snapshot()
+    snapshot = alice.get_message_by_id(alice.wait_for_msgs_changed_event().msg_id).get_snapshot()
     assert snapshot.text == "Group left by {}.".format(bob.get_config("addr"))
 
     logging.info("Alice withdraws QR code.")

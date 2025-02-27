@@ -15,15 +15,15 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_tar::Archive;
 
 use crate::blob::BlobDirContents;
-use crate::chat::{self, delete_and_reset_all_device_msgs};
+use crate::chat::delete_and_reset_all_device_msgs;
 use crate::config::Config;
 use crate::context::Context;
 use crate::e2ee;
 use crate::events::EventType;
 use crate::key::{self, DcKey, DcSecretKey, SignedPublicKey, SignedSecretKey};
 use crate::log::LogExt;
-use crate::message::{Message, Viewtype};
 use crate::pgp;
+use crate::qr::DCBACKUP_VERSION;
 use crate::sql;
 use crate::tools::{
     create_folder, delete_file, get_filesuffix_lc, read_file, time, write_file, TempPathGuard,
@@ -139,20 +139,7 @@ pub async fn has_backup(_context: &Context, dir_name: &Path) -> Result<String> {
     }
 }
 
-async fn maybe_add_bcc_self_device_msg(context: &Context) -> Result<()> {
-    if !context.sql.get_raw_config_bool("bcc_self").await? {
-        let mut msg = Message::new(Viewtype::Text);
-        // TODO: define this as a stockstring once the wording is settled.
-        msg.text = "It seems you are using multiple devices with Delta Chat. Great!\n\n\
-             If you also want to synchronize outgoing messages across all devices, \
-             go to \"Settings → Advanced\" and enable \"Send Copy to Self\"."
-            .to_string();
-        chat::add_device_msg(context, Some("bcc-self-hint"), Some(&mut msg)).await?;
-    }
-    Ok(())
-}
-
-async fn set_self_key(context: &Context, armored: &str, set_default: bool) -> Result<()> {
+async fn set_self_key(context: &Context, armored: &str) -> Result<()> {
     // try hard to only modify key-state
     let (private_key, header) = SignedSecretKey::from_asc(armored)?;
     let public_key = private_key.split_public_key()?;
@@ -184,16 +171,7 @@ async fn set_self_key(context: &Context, armored: &str, set_default: bool) -> Re
         public: public_key,
         secret: private_key,
     };
-    key::store_self_keypair(
-        context,
-        &keypair,
-        if set_default {
-            key::KeyPairUse::Default
-        } else {
-            key::KeyPairUse::ReadOnly
-        },
-    )
-    .await?;
+    key::store_self_keypair(context, &keypair).await?;
 
     info!(context, "stored self key: {:?}", keypair.secret.key_id());
     Ok(())
@@ -223,7 +201,7 @@ async fn imex_inner(
             .await
             .context("Cannot create private key or private key not available")?;
 
-        create_folder(context, &path).await?;
+        create_folder(context, path).await?;
     }
 
     match what {
@@ -414,6 +392,9 @@ async fn import_backup_stream_inner<R: tokio::io::AsyncRead + Unpin>(
             .import(&unpacked_database, passphrase.clone())
             .await
             .context("cannot import unpacked database");
+    }
+    if res.is_ok() {
+        res = check_backup_version(context).await;
     }
     if res.is_ok() {
         res = adjust_bcc_self(context).await;
@@ -613,10 +594,10 @@ where
 }
 
 /// Imports secret key from a file.
-async fn import_secret_key(context: &Context, path: &Path, set_default: bool) -> Result<()> {
-    let buf = read_file(context, &path).await?;
+async fn import_secret_key(context: &Context, path: &Path) -> Result<()> {
+    let buf = read_file(context, path).await?;
     let armored = std::string::String::from_utf8_lossy(&buf);
-    set_self_key(context, &armored, set_default).await?;
+    set_self_key(context, &armored).await?;
     Ok(())
 }
 
@@ -638,8 +619,7 @@ async fn import_self_keys(context: &Context, path: &Path) -> Result<()> {
             "Importing secret key from {} as the default key.",
             path.display()
         );
-        let set_default = true;
-        import_secret_key(context, path, set_default).await?;
+        import_secret_key(context, path).await?;
         return Ok(());
     }
 
@@ -657,14 +637,13 @@ async fn import_self_keys(context: &Context, path: &Path) -> Result<()> {
         } else {
             continue;
         };
-        let set_default = !name_f.contains("legacy");
         info!(
             context,
             "Considering key file: {}.",
             path_plus_name.display()
         );
 
-        if let Err(err) = import_secret_key(context, &path_plus_name, set_default).await {
+        if let Err(err) = import_secret_key(context, &path_plus_name).await {
             warn!(
                 context,
                 "Failed to import secret key from {}: {:#}.",
@@ -801,6 +780,10 @@ async fn export_database(
         .sql
         .set_raw_config_int("backup_time", timestamp)
         .await?;
+    context
+        .sql
+        .set_raw_config_int("backup_version", DCBACKUP_VERSION)
+        .await?;
     sql::housekeeping(context).await.log_err(context).ok();
     context
         .sql
@@ -835,6 +818,15 @@ async fn adjust_bcc_self(context: &Context) -> Result<()> {
     if context.is_chatmail().await? && !context.config_exists(Config::BccSelf).await? {
         context.set_config(Config::BccSelf, Some("1")).await?;
     }
+    Ok(())
+}
+
+async fn check_backup_version(context: &Context) -> Result<()> {
+    let version = (context.sql.get_raw_config_int("backup_version").await?).unwrap_or(2);
+    ensure!(
+        version <= DCBACKUP_VERSION,
+        "Backup too new, please update Delta Chat"
+    );
     Ok(())
 }
 
@@ -885,7 +877,7 @@ mod tests {
 
         assert_eq!(bytes, key.to_asc(None).into_bytes());
 
-        let alice = &TestContext::new_alice().await;
+        let alice = &TestContext::new().await;
         if let Err(err) = imex(alice, ImexMode::ImportSelfKeys, Path::new(&filename), None).await {
             panic!("got error on import: {err:#}");
         }
@@ -907,7 +899,7 @@ mod tests {
             panic!("got error on export: {err:#}");
         }
 
-        let context2 = TestContext::new_alice().await;
+        let context2 = TestContext::new().await;
         if let Err(err) = imex(
             &context2.ctx,
             ImexMode::ImportSelfKeys,
@@ -934,14 +926,17 @@ mod tests {
         let alice = &TestContext::new_alice().await;
         let old_key = key::load_self_secret_key(alice).await?;
 
-        imex(alice, ImexMode::ImportSelfKeys, export_dir.path(), None).await?;
-
-        let new_key = key::load_self_secret_key(alice).await?;
-        assert_ne!(new_key, old_key);
-        assert_eq!(
-            key::load_self_secret_keyring(alice).await?,
-            vec![new_key, old_key]
+        assert!(
+            imex(alice, ImexMode::ImportSelfKeys, export_dir.path(), None)
+                .await
+                .is_err()
         );
+
+        // Importing a second key is not allowed anymore,
+        // even as a non-default key.
+        assert_eq!(key::load_self_secret_key(alice).await?, old_key);
+
+        assert_eq!(key::load_self_secret_keyring(alice).await?, vec![old_key]);
 
         let msg = alice.recv_msg(&sent).await;
         assert!(msg.get_showpadlock());

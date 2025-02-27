@@ -33,7 +33,7 @@ use crate::contact::{Contact, ContactId, Modifier, Origin};
 use crate::context::Context;
 use crate::e2ee::EncryptHelper;
 use crate::events::{Event, EventEmitter, EventType, Events};
-use crate::key::{self, DcKey, KeyPairUse};
+use crate::key::{self, DcKey};
 use crate::message::{update_msg_state, Message, MessageState, MsgId, Viewtype};
 use crate::mimeparser::{MimeMessage, SystemMessage};
 use crate::peerstate::Peerstate;
@@ -271,7 +271,7 @@ impl TestContextBuilder {
 
             let test_context = TestContext::new_internal(Some(name), self.log_sink).await;
             test_context.configure_addr(&addr).await;
-            key::store_self_keypair(&test_context, &key_pair, KeyPairUse::Default)
+            key::store_self_keypair(&test_context, &key_pair)
                 .await
                 .expect("Failed to save key");
             test_context
@@ -400,11 +400,11 @@ impl TestContext {
     /// Sets a name for this [`TestContext`] if one isn't yet set.
     ///
     /// This will show up in events logged in the test output.
-    pub fn set_name(&self, name: impl Into<String>) {
+    pub fn set_name(&self, name: &str) {
         let mut context_names = CONTEXT_NAMES.write().unwrap();
         context_names
             .entry(self.ctx.get_id())
-            .or_insert_with(|| name.into());
+            .or_insert_with(|| name.to_string());
     }
 
     /// Returns the name of this [`TestContext`].
@@ -604,6 +604,19 @@ impl TestContext {
                 to call set_config(Config::ShowEmails, Some(\"2\")).await)"
         );
 
+        msg
+    }
+
+    /// Receive a message using the `receive_imf()` pipeline. Panics if it's not hidden.
+    pub async fn recv_msg_hidden(&self, msg: &SentMessage<'_>) -> Message {
+        let received = self
+            .recv_msg_opt(msg)
+            .await
+            .expect("receive_imf() seems not to have added a new message to the db");
+        let msg = Message::load_from_db(self, *received.msg_ids.last().unwrap())
+            .await
+            .unwrap();
+        assert!(msg.hidden);
         msg
     }
 

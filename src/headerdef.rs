@@ -80,6 +80,12 @@ pub enum HeaderDef {
     ChatDispositionNotificationTo,
     ChatWebrtcRoom,
 
+    /// This message deletes the messages listed in the value by rfc724_mid.
+    ChatDelete,
+
+    /// This message obsoletes the text of the message defined here by rfc724_mid.
+    ChatEdit,
+
     /// [Autocrypt](https://autocrypt.org/) header.
     Autocrypt,
     AutocryptGossip,

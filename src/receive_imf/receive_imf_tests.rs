@@ -1061,8 +1061,8 @@ async fn test_classic_mailing_list() -> Result<()> {
     let mime = sent.payload();
 
     println!("Sent mime message is:\n\n{mime}\n\n");
-    assert!(mime.contains("Content-Type: text/plain; charset=utf-8\r\n"));
-    assert!(mime.contains("Subject: =?utf-8?q?Re=3A_=5Bdelta-dev=5D_What=27s_up=3F?=\r\n"));
+    assert!(mime.contains("Content-Type: text/plain; charset=\"utf-8\"\r\n"));
+    assert!(mime.contains("Subject: Re: [delta-dev] What's up?\r\n"));
     assert!(mime.contains("MIME-Version: 1.0\r\n"));
     assert!(mime.contains("In-Reply-To: <38942@posteo.org>\r\n"));
     assert!(mime.contains("Chat-Version: 1.0\r\n"));
@@ -4705,8 +4705,10 @@ async fn test_outgoing_msg_forgery() -> Result<()> {
     // We need Bob only to encrypt the forged message to Alice's key, actually Bob doesn't
     // participate in the scenario.
     let bob = &TestContext::new().await;
+    assert_eq!(crate::key::load_self_secret_keyring(bob).await?.len(), 0);
     bob.configure_addr("bob@example.net").await;
     imex(bob, ImexMode::ImportSelfKeys, export_dir.path(), None).await?;
+    assert_eq!(crate::key::load_self_secret_keyring(bob).await?.len(), 1);
     let malice = &TestContext::new().await;
     malice.configure_addr(alice_addr).await;
 
@@ -4714,6 +4716,7 @@ async fn test_outgoing_msg_forgery() -> Result<()> {
         .send_recv_accept(bob, malice, "hi from bob")
         .await
         .chat_id;
+    assert_eq!(crate::key::load_self_secret_keyring(bob).await?.len(), 1);
 
     let sent_msg = malice.send_text(malice_chat_id, "hi from malice").await;
     let msg = alice.recv_msg(&sent_msg).await;
@@ -5612,7 +5615,7 @@ PGh0bWw+PGJvZHk+dGV4dDwvYm9keT5kYXRh
 
     assert_eq!(msg.get_filename().unwrap(), "test.HTML");
 
-    let blob = msg.param.get_blob(Param::File, alice).await?.unwrap();
+    let blob = msg.param.get_file_blob(alice)?.unwrap();
     assert_eq!(blob.suffix().unwrap(), "html");
 
     Ok(())

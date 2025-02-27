@@ -1,7 +1,7 @@
 //! # Synchronize items between devices.
 
 use anyhow::Result;
-use lettre_email::PartBuilder;
+use mail_builder::mime::MimePart;
 use serde::{Deserialize, Serialize};
 
 use crate::chat::{self, ChatId};
@@ -17,6 +17,7 @@ use crate::sync::SyncData::{AddQrToken, AlterChat, DeleteQrToken};
 use crate::token::Namespace;
 use crate::tools::time;
 use crate::{message, stock_str, token};
+use std::collections::HashSet;
 
 /// Whether to send device sync messages. Aimed for usage in the internal API.
 #[derive(Debug, PartialEq)]
@@ -65,6 +66,9 @@ pub(crate) enum SyncData {
     SaveMessage {
         src: String,  // RFC724 id (i.e. "Message-Id" header)
         dest: String, // RFC724 id (i.e. "Message-Id" header)
+    },
+    DeleteMessages {
+        msgs: Vec<String>, // RFC724 id (i.e. "Message-Id" header)
     },
 }
 
@@ -165,7 +169,7 @@ impl Context {
     ///
     /// Mustn't be called from multiple tasks in parallel to avoid sending the same sync items twice
     /// because sync items are removed from the db only after successful sending. We guarantee this
-    /// by calling `send_sync_msg()` only from the SMTP loop.
+    /// by calling `send_sync_msg()` only from the inbox loop.
     pub async fn send_sync_msg(&self) -> Result<Option<MsgId>> {
         if let Some((json, ids)) = self.build_sync_json().await? {
             let chat_id =
@@ -227,14 +231,8 @@ impl Context {
         }
     }
 
-    pub(crate) fn build_sync_part(&self, json: String) -> PartBuilder {
-        PartBuilder::new()
-            .content_type(&"application/json".parse::<mime::Mime>().unwrap())
-            .header((
-                "Content-Disposition",
-                "attachment; filename=\"multi-device-sync.json\"",
-            ))
-            .body(json)
+    pub(crate) fn build_sync_part(&self, json: String) -> MimePart<'static> {
+        MimePart::new("application/json", json).attachment("multi-device-sync.json")
     }
 
     /// Takes a JSON string created by `build_sync_json()`
@@ -264,6 +262,7 @@ impl Context {
                     AlterChat { id, action } => self.sync_alter_chat(id, action).await,
                     SyncData::Config { key, val } => self.sync_config(key, val).await,
                     SyncData::SaveMessage { src, dest } => self.save_message(src, dest).await,
+                    SyncData::DeleteMessages { msgs } => self.sync_message_deletion(msgs).await,
                 },
                 SyncDataOrUnknown::Unknown(data) => {
                     warn!(self, "Ignored unknown sync item: {data}.");
@@ -301,6 +300,26 @@ impl Context {
         if let Some((src_msg_id, _)) = message::rfc724_mid_exists(self, src_rfc724_mid).await? {
             chat::save_copy_in_self_talk(self, &src_msg_id, dest_rfc724_mid).await?;
         }
+        Ok(())
+    }
+
+    async fn sync_message_deletion(&self, msgs: &Vec<String>) -> Result<()> {
+        let mut modified_chat_ids = HashSet::new();
+        let mut msg_ids = Vec::new();
+        for rfc724_mid in msgs {
+            if let Some((msg_id, _)) = message::rfc724_mid_exists(self, rfc724_mid).await? {
+                if let Some(msg) = Message::load_from_db_optional(self, msg_id).await? {
+                    message::delete_msg_locally(self, &msg).await?;
+                    msg_ids.push(msg.id);
+                    modified_chat_ids.insert(msg.chat_id);
+                } else {
+                    warn!(self, "Sync message delete: Database entry does not exist.");
+                }
+            } else {
+                warn!(self, "Sync message delete: {rfc724_mid:?} not found.");
+            }
+        }
+        message::delete_msgs_locally_done(self, &msg_ids, modified_chat_ids).await?;
         Ok(())
     }
 }

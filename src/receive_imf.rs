@@ -15,7 +15,7 @@ use regex::Regex;
 use crate::aheader::EncryptPreference;
 use crate::chat::{self, Chat, ChatId, ChatIdBlocked, ProtectionStatus};
 use crate::config::Config;
-use crate::constants::{Blocked, Chattype, ShowEmails, DC_CHAT_ID_TRASH};
+use crate::constants::{Blocked, Chattype, ShowEmails, DC_CHAT_ID_TRASH, EDITED_PREFIX};
 use crate::contact::{Contact, ContactId, Origin};
 use crate::context::Context;
 use crate::debug_logging::maybe_set_logging_xdc_inner;
@@ -53,6 +53,9 @@ pub struct ReceivedMsg {
 
     /// Received message state.
     pub state: MessageState,
+
+    /// Whether the message is hidden.
+    pub hidden: bool,
 
     /// Message timestamp for sorting.
     pub sort_timestamp: i64,
@@ -192,6 +195,7 @@ pub(crate) async fn receive_imf_inner(
             return Ok(Some(ReceivedMsg {
                 chat_id: DC_CHAT_ID_TRASH,
                 state: MessageState::Undefined,
+                hidden: false,
                 sort_timestamp: 0,
                 msg_ids,
                 needs_delete_job: false,
@@ -364,7 +368,7 @@ pub(crate) async fn receive_imf_inner(
     if mime_parser.get_header(HeaderDef::SecureJoin).is_some() {
         let res;
         if mime_parser.incoming {
-            res = handle_securejoin_handshake(context, &mime_parser, from_id)
+            res = handle_securejoin_handshake(context, &mut mime_parser, from_id)
                 .await
                 .context("error in Secure-Join message handling")?;
 
@@ -385,6 +389,7 @@ pub(crate) async fn receive_imf_inner(
                 received_msg = Some(ReceivedMsg {
                     chat_id: DC_CHAT_ID_TRASH,
                     state: MessageState::InSeen,
+                    hidden: false,
                     sort_timestamp: mime_parser.timestamp_sent,
                     msg_ids: vec![msg_id],
                     needs_delete_job: res == securejoin::HandshakeMessage::Done,
@@ -619,7 +624,9 @@ pub(crate) async fn receive_imf_inner(
         }
     }
 
-    if let Some(replace_chat_id) = replace_chat_id {
+    if received_msg.hidden {
+        // No need to emit an event about the changed message
+    } else if let Some(replace_chat_id) = replace_chat_id {
         context.emit_msgs_changed_without_msg_id(replace_chat_id);
     } else if !chat_id.is_trash() {
         let fresh = received_msg.state == MessageState::InFresh;
@@ -724,7 +731,7 @@ async fn add_parts(
     let mut chat_id_blocked = Blocked::Not;
 
     let mut better_msg = None;
-    let mut group_changes_msgs = (Vec::new(), None);
+    let mut group_changes = GroupChangesInfo::default();
     if mime_parser.is_system_message == SystemMessage::LocationStreamingEnabled {
         better_msg = Some(stock_str::msg_location_enabled_by(context, from_id).await);
     }
@@ -779,7 +786,7 @@ async fn add_parts(
     // (of course, the user can add other chats manually later)
     let to_id: ContactId;
     let state: MessageState;
-    let mut hidden = false;
+    let mut hidden = is_reaction;
     let mut needs_delete_job = false;
     let mut restore_protection = false;
 
@@ -917,7 +924,7 @@ async fn add_parts(
                 }
             }
 
-            group_changes_msgs = apply_group_changes(
+            group_changes = apply_group_changes(
                 context,
                 mime_parser,
                 group_chat_id,
@@ -1038,8 +1045,9 @@ async fn add_parts(
         state = if (seen && !is_community)
             || fetching_existing_messages
             || is_mdn
-            || is_reaction
             || chat_id_blocked == Blocked::Yes
+            || group_changes.silent
+        // No check for `hidden` because only reactions are such and they should be `InFresh`.
         {
             MessageState::InSeen
         } else {
@@ -1187,7 +1195,7 @@ async fn add_parts(
         }
 
         if let Some(chat_id) = chat_id {
-            group_changes_msgs = apply_group_changes(
+            group_changes = apply_group_changes(
                 context,
                 mime_parser,
                 chat_id,
@@ -1265,14 +1273,10 @@ async fn add_parts(
     }
 
     let orig_chat_id = chat_id;
-    let mut chat_id = if is_reaction {
+    let mut chat_id = chat_id.unwrap_or_else(|| {
+        info!(context, "No chat id for message (TRASH).");
         DC_CHAT_ID_TRASH
-    } else {
-        chat_id.unwrap_or_else(|| {
-            info!(context, "No chat id for message (TRASH).");
-            DC_CHAT_ID_TRASH
-        })
-    };
+    });
 
     // Extract ephemeral timer from the message or use the existing timer if the message is not fully downloaded.
     let mut ephemeral_timer = if is_partial_download.is_some() {
@@ -1411,18 +1415,14 @@ async fn add_parts(
         }
     }
 
-    // Ensure replies to messages are sorted after the parent message.
-    //
-    // This is useful in a case where sender clocks are not
-    // synchronized and parent message has a Date: header with a
-    // timestamp higher than reply timestamp.
-    //
-    // This does not help if parent message arrives later than the
-    // reply.
-    let parent_timestamp = mime_parser.get_parent_timestamp(context).await?;
-    let sort_timestamp = parent_timestamp.map_or(sort_timestamp, |parent_timestamp| {
-        std::cmp::max(sort_timestamp, parent_timestamp)
-    });
+    let sort_timestamp = tweak_sort_timestamp(
+        context,
+        mime_parser,
+        group_changes.silent,
+        chat_id,
+        sort_timestamp,
+    )
+    .await?;
 
     // if the mime-headers should be saved, find out its size
     // (the mime-header ends with an empty line)
@@ -1466,24 +1466,23 @@ async fn add_parts(
 
     let mut created_db_entries = Vec::with_capacity(mime_parser.parts.len());
 
-    if let Some(msg) = group_changes_msgs.1 {
+    if let Some(m) = group_changes.better_msg {
         match &better_msg {
-            None => better_msg = Some(msg),
+            None => better_msg = Some(m),
             Some(_) => {
-                if !msg.is_empty() {
-                    group_changes_msgs.0.push(msg)
+                if !m.is_empty() {
+                    group_changes.extra_msgs.push((m, is_system_message))
                 }
             }
         }
     }
 
-    for group_changes_msg in group_changes_msgs.0 {
-        // Currently all additional group changes messages are "Member added".
+    for (group_changes_msg, cmd) in group_changes.extra_msgs {
         chat::add_info_msg_with_cmd(
             context,
             chat_id,
             &group_changes_msg,
-            SystemMessage::MemberAddedToGroup,
+            cmd,
             sort_timestamp,
             None,
             None,
@@ -1515,6 +1514,73 @@ async fn add_parts(
                     context,
                     "Cannot add iroh peer because the message has no In-Reply-To."
                 );
+            }
+        }
+    }
+
+    if let Some(rfc724_mid) = mime_parser.get_header(HeaderDef::ChatEdit) {
+        chat_id = DC_CHAT_ID_TRASH;
+        if let Some((original_msg_id, _)) = rfc724_mid_exists(context, rfc724_mid).await? {
+            if let Some(mut original_msg) =
+                Message::load_from_db_optional(context, original_msg_id).await?
+            {
+                if original_msg.from_id == from_id {
+                    if let Some(part) = mime_parser.parts.first() {
+                        let edit_msg_showpadlock = part
+                            .param
+                            .get_bool(Param::GuaranteeE2ee)
+                            .unwrap_or_default();
+                        if edit_msg_showpadlock || !original_msg.get_showpadlock() {
+                            let new_text =
+                                part.msg.strip_prefix(EDITED_PREFIX).unwrap_or(&part.msg);
+                            chat::save_text_edit_to_db(context, &mut original_msg, new_text)
+                                .await?;
+                        } else {
+                            warn!(context, "Edit message: Not encrypted.");
+                        }
+                    }
+                } else {
+                    warn!(context, "Edit message: Bad sender.");
+                }
+            } else {
+                warn!(context, "Edit message: Database entry does not exist.");
+            }
+        } else {
+            warn!(
+                context,
+                "Edit message: rfc724_mid {rfc724_mid:?} not found."
+            );
+        }
+    } else if let Some(rfc724_mid_list) = mime_parser.get_header(HeaderDef::ChatDelete) {
+        chat_id = DC_CHAT_ID_TRASH;
+        if let Some(part) = mime_parser.parts.first() {
+            if part.param.get_bool(Param::GuaranteeE2ee).unwrap_or(false) {
+                let mut modified_chat_ids = HashSet::new();
+                let mut msg_ids = Vec::new();
+
+                let rfc724_mid_vec: Vec<&str> = rfc724_mid_list.split_whitespace().collect();
+                for rfc724_mid in rfc724_mid_vec {
+                    if let Some((msg_id, _)) =
+                        message::rfc724_mid_exists(context, rfc724_mid).await?
+                    {
+                        if let Some(msg) = Message::load_from_db_optional(context, msg_id).await? {
+                            if msg.from_id == from_id {
+                                message::delete_msg_locally(context, &msg).await?;
+                                msg_ids.push(msg.id);
+                                modified_chat_ids.insert(msg.chat_id);
+                            } else {
+                                warn!(context, "Delete message: Bad sender.");
+                            }
+                        } else {
+                            warn!(context, "Delete message: Database entry does not exist.");
+                        }
+                    } else {
+                        warn!(context, "Delete message: {rfc724_mid:?} not found.");
+                    }
+                }
+                message::delete_msgs_locally_done(context, &msg_ids, modified_chat_ids).await?;
+            } else {
+                warn!(context, "Delete message: Not encrypted.");
             }
         }
     }
@@ -1639,11 +1705,11 @@ RETURNING id
                     typ,
                     state,
                     is_dc_message,
-                    if trash { "" } else { msg },
-                    if trash { None } else { message::normalize_text(msg) },
-                    if trash { "" } else { &subject },
+                    if trash || hidden { "" } else { msg },
+                    if trash || hidden { None } else { message::normalize_text(msg) },
+                    if trash || hidden { "" } else { &subject },
                     // txt_raw might contain invalid utf8
-                    if trash { "" } else { &txt_raw },
+                    if trash || hidden { "" } else { &txt_raw },
                     if trash {
                         "".to_string()
                     } else {
@@ -1651,7 +1717,7 @@ RETURNING id
                     },
                     hidden,
                     part.bytes as isize,
-                    if (save_mime_headers || save_mime_modified) && !trash {
+                    if (save_mime_headers || save_mime_modified) && !(trash || hidden) {
                         mime_headers.clone()
                     } else {
                         Vec::new()
@@ -1711,9 +1777,7 @@ RETURNING id
             context,
             part.typ,
             chat_id,
-            part.param
-                .get_path(Param::File, context)
-                .unwrap_or_default(),
+            part.param.get(Param::Filename),
             *msg_id,
         )
         .await?;
@@ -1740,7 +1804,7 @@ RETURNING id
         "Message has {icnt} parts and is assigned to chat #{chat_id}."
     );
 
-    if !chat_id.is_trash() {
+    if !chat_id.is_trash() && !hidden {
         let mut chat = Chat::load_from_db(context, chat_id).await?;
 
         // In contrast to most other update-timestamps,
@@ -1778,12 +1842,47 @@ RETURNING id
     Ok(ReceivedMsg {
         chat_id,
         state,
+        hidden,
         sort_timestamp,
         msg_ids: created_db_entries,
         needs_delete_job,
         #[cfg(test)]
         from_is_signed: mime_parser.from_is_signed,
     })
+}
+
+async fn tweak_sort_timestamp(
+    context: &Context,
+    mime_parser: &mut MimeMessage,
+    silent: bool,
+    chat_id: ChatId,
+    sort_timestamp: i64,
+) -> Result<i64> {
+    // Ensure replies to messages are sorted after the parent message.
+    //
+    // This is useful in a case where sender clocks are not
+    // synchronized and parent message has a Date: header with a
+    // timestamp higher than reply timestamp.
+    //
+    // This does not help if parent message arrives later than the
+    // reply.
+    let parent_timestamp = mime_parser.get_parent_timestamp(context).await?;
+    let mut sort_timestamp = parent_timestamp.map_or(sort_timestamp, |parent_timestamp| {
+        std::cmp::max(sort_timestamp, parent_timestamp)
+    });
+
+    // If the message should be silent,
+    // set the timestamp to be no more than the same as last message
+    // so that the chat is not sorted to the top of the chatlist.
+    if silent {
+        let last_msg_timestamp = if let Some(t) = chat_id.get_timestamp(context).await? {
+            t
+        } else {
+            chat_id.created_timestamp(context).await?
+        };
+        sort_timestamp = std::cmp::min(sort_timestamp, last_msg_timestamp);
+    }
+    Ok(sort_timestamp)
 }
 
 /// Saves attached locations to the database.
@@ -2234,11 +2333,23 @@ async fn update_chats_contacts_timestamps(
     Ok(modified)
 }
 
+/// The return type of [apply_group_changes].
+/// Contains information on which system messages
+/// should be shown in the chat.
+#[derive(Default)]
+struct GroupChangesInfo {
+    /// Optional: A better message that should replace the original system message.
+    /// If this is an empty string, the original system message should be trashed.
+    better_msg: Option<String>,
+    /// If true, the user should not be notified about the group change.
+    silent: bool,
+    /// A list of additional group changes messages that should be shown in the chat.
+    extra_msgs: Vec<(String, SystemMessage)>,
+}
+
 /// Apply group member list, name, avatar and protection status changes from the MIME message.
 ///
-/// Returns `Vec` of group changes messages and, optionally, a better message to replace the
-/// original system message. If the better message is empty, the original system message
-/// should be trashed.
+/// Returns [GroupChangesInfo].
 ///
 /// * `to_ids` - contents of the `To` and `Cc` headers.
 /// * `past_ids` - contents of the `Chat-Group-Past-Members` header.
@@ -2250,19 +2361,20 @@ async fn apply_group_changes(
     to_ids: &[ContactId],
     past_ids: &[ContactId],
     verified_encryption: &VerifiedEncryption,
-) -> Result<(Vec<String>, Option<String>)> {
+) -> Result<GroupChangesInfo> {
     if chat_id.is_special() {
         // Do not apply group changes to the trash chat.
-        return Ok((Vec::new(), None));
+        return Ok(GroupChangesInfo::default());
     }
     let mut chat = Chat::load_from_db(context, chat_id).await?;
     if chat.typ != Chattype::Group {
-        return Ok((Vec::new(), None));
+        return Ok(GroupChangesInfo::default());
     }
 
     let mut send_event_chat_modified = false;
     let (mut removed_id, mut added_id) = (None, None);
     let mut better_msg = None;
+    let mut silent = false;
 
     // True if a Delta Chat client has explicitly added our current primary address.
     let self_added =
@@ -2300,6 +2412,7 @@ async fn apply_group_changes(
         removed_id = Contact::lookup_id_by_addr(context, removed_addr, Origin::Unknown).await?;
         if let Some(id) = removed_id {
             better_msg = if id == from_id {
+                silent = true;
                 Some(stock_str::msg_group_left_local(context, from_id).await)
             } else {
                 Some(stock_str::msg_del_member_local(context, removed_addr, from_id).await)
@@ -2526,7 +2639,11 @@ async fn apply_group_changes(
         context.emit_event(EventType::ChatModified(chat_id));
         chatlist_events::emit_chatlist_item_changed(context, chat_id);
     }
-    Ok((group_changes_msgs, better_msg))
+    Ok(GroupChangesInfo {
+        better_msg,
+        silent,
+        extra_msgs: group_changes_msgs,
+    })
 }
 
 /// Returns a list of strings that should be shown as info messages, informing about group membership changes.
@@ -2535,7 +2652,7 @@ async fn group_changes_msgs(
     added_ids: &HashSet<ContactId>,
     removed_ids: &HashSet<ContactId>,
     chat_id: ChatId,
-) -> Result<Vec<String>> {
+) -> Result<Vec<(String, SystemMessage)>> {
     let mut group_changes_msgs = Vec::new();
     if !added_ids.is_empty() {
         warn!(
@@ -2552,17 +2669,19 @@ async fn group_changes_msgs(
     group_changes_msgs.reserve(added_ids.len() + removed_ids.len());
     for contact_id in added_ids {
         let contact = Contact::get_by_id(context, *contact_id).await?;
-        group_changes_msgs.push(
+        group_changes_msgs.push((
             stock_str::msg_add_member_local(context, contact.get_addr(), ContactId::UNDEFINED)
                 .await,
-        );
+            SystemMessage::MemberAddedToGroup,
+        ));
     }
     for contact_id in removed_ids {
         let contact = Contact::get_by_id(context, *contact_id).await?;
-        group_changes_msgs.push(
+        group_changes_msgs.push((
             stock_str::msg_del_member_local(context, contact.get_addr(), ContactId::UNDEFINED)
                 .await,
-        );
+            SystemMessage::MemberRemovedFromGroup,
+        ));
     }
 
     Ok(group_changes_msgs)

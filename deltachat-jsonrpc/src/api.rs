@@ -1305,6 +1305,12 @@ impl CommandApi {
         Ok(results)
     }
 
+    async fn save_msgs(&self, account_id: u32, message_ids: Vec<u32>) -> Result<()> {
+        let ctx = self.get_context(account_id).await?;
+        let message_ids: Vec<MsgId> = message_ids.into_iter().map(MsgId::new).collect();
+        chat::save_msgs(&ctx, &message_ids).await
+    }
+
     // ---------------------------------------------
     //  contact
     // ---------------------------------------------
@@ -1944,7 +1950,7 @@ impl CommandApi {
         let ctx = self.get_context(account_id).await?;
 
         let mut msg = Message::new(Viewtype::Sticker);
-        msg.set_file(&sticker_path, None);
+        msg.set_file_and_deduplicate(&ctx, Path::new(&sticker_path), None, None)?;
 
         // JSON-rpc does not need heuristics to turn [Viewtype::Sticker] into [Viewtype::Image]
         msg.force_sticker();
@@ -1996,6 +2002,16 @@ impl CommandApi {
             .context("Failed to send created message")?
             .to_u32();
         Ok(msg_id)
+    }
+
+    async fn send_edit_request(
+        &self,
+        account_id: u32,
+        msg_id: u32,
+        new_text: String,
+    ) -> Result<()> {
+        let ctx = self.get_context(account_id).await?;
+        chat::send_edit_request(&ctx, MsgId::new(msg_id), new_text).await
     }
 
     /// Checks if messages can be sent to a given chat.
@@ -2164,12 +2180,14 @@ impl CommandApi {
 
     // mimics the old desktop call, will get replaced with something better in the composer rewrite,
     // the better version will just be sending the current draft, though there will be probably something similar with more options to this for the corner cases like setting a marker on the map
+    #[expect(clippy::too_many_arguments)]
     async fn misc_send_msg(
         &self,
         account_id: u32,
         chat_id: u32,
         text: Option<String>,
         file: Option<String>,
+        filename: Option<String>,
         location: Option<(f64, f64)>,
         quoted_message_id: Option<u32>,
     ) -> Result<(u32, MessageObject)> {
@@ -2181,7 +2199,7 @@ impl CommandApi {
         });
         message.set_text(text.unwrap_or_default());
         if let Some(file) = file {
-            message.set_file(file, None);
+            message.set_file_and_deduplicate(&ctx, Path::new(&file), filename.as_deref(), None)?;
         }
         if let Some((latitude, longitude)) = location {
             message.set_location(latitude, longitude);
@@ -2209,12 +2227,14 @@ impl CommandApi {
     // the better version should support:
     // - changing viewtype to enable/disable compression
     // - keeping same message id as long as attachment does not change for webxdc messages
+    #[expect(clippy::too_many_arguments)]
     async fn misc_set_draft(
         &self,
         account_id: u32,
         chat_id: u32,
         text: Option<String>,
         file: Option<String>,
+        filename: Option<String>,
         quoted_message_id: Option<u32>,
         view_type: Option<MessageViewtype>,
     ) -> Result<()> {
@@ -2231,7 +2251,7 @@ impl CommandApi {
         ));
         draft.set_text(text.unwrap_or_default());
         if let Some(file) = file {
-            draft.set_file(file, None);
+            draft.set_file_and_deduplicate(&ctx, Path::new(&file), filename.as_deref(), None)?;
         }
         if let Some(id) = quoted_message_id {
             draft

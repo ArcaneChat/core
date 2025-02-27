@@ -1,6 +1,7 @@
 //! # Messages and their identifiers.
 
 use std::collections::BTreeSet;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::str;
 
@@ -11,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{fs, io};
 
 use crate::blob::BlobObject;
-use crate::chat::{Chat, ChatId, ChatIdBlocked, ChatVisibility};
+use crate::chat::{send_msg, Chat, ChatId, ChatIdBlocked, ChatVisibility};
 use crate::chatlist_events;
 use crate::config::Config;
 use crate::constants::{
@@ -32,6 +33,7 @@ use crate::pgp::split_armored_data;
 use crate::reaction::get_msg_reactions;
 use crate::sql;
 use crate::summary::Summary;
+use crate::sync::SyncData;
 use crate::tools::{
     buf_compress, buf_decompress, get_filebytes, get_filemeta, gm2local_offset, read_file,
     sanitize_filename, time, timestamp_to_str, truncate,
@@ -637,7 +639,7 @@ impl Message {
 
     /// Returns the full path to the file associated with a message.
     pub fn get_file(&self, context: &Context) -> Option<PathBuf> {
-        self.param.get_path(Param::File, context).unwrap_or(None)
+        self.param.get_file_path(context).unwrap_or(None)
     }
 
     /// Returns vector of vcards if the file has a vCard attachment.
@@ -670,7 +672,7 @@ impl Message {
     /// If message is an image or gif, set Param::Width and Param::Height
     pub(crate) async fn try_calc_and_set_dimensions(&mut self, context: &Context) -> Result<()> {
         if self.viewtype.has_file() {
-            let file_param = self.param.get_path(Param::File, context)?;
+            let file_param = self.param.get_file_path(context)?;
             if let Some(path_and_filename) = file_param {
                 if (self.viewtype == Viewtype::Image || self.viewtype == Viewtype::Gif)
                     && !self.param.exists(Param::Width)
@@ -829,7 +831,7 @@ impl Message {
 
     /// Returns the size of the file in bytes, if applicable.
     pub async fn get_filebytes(&self, context: &Context) -> Result<Option<u64>> {
-        if let Some(path) = self.param.get_path(Param::File, context)? {
+        if let Some(path) = self.param.get_file_path(context)? {
             Ok(Some(get_filebytes(context, &path).await.with_context(
                 || format!("failed to get {} size in bytes", path.display()),
             )?))
@@ -943,6 +945,11 @@ impl Message {
         0 != self.param.get_int(Param::Forwarded).unwrap_or_default()
     }
 
+    /// Returns true if the message is edited.
+    pub fn is_edited(&self) -> bool {
+        self.param.get_bool(Param::IsEdited).unwrap_or_default()
+    }
+
     /// Returns true if the message is an informational message.
     pub fn is_info(&self) -> bool {
         let cmd = self.param.get_cmd();
@@ -980,7 +987,7 @@ impl Message {
         }
 
         if let Some(filename) = self.get_file(context) {
-            if let Ok(ref buf) = read_file(context, filename).await {
+            if let Ok(ref buf) = read_file(context, &filename).await {
                 if let Ok((typ, headers, _)) = split_armored_data(buf) {
                     if typ == pgp::armor::BlockType::Message {
                         return headers.get(crate::pgp::HEADER_SETUPCODE).cloned();
@@ -1080,21 +1087,6 @@ impl Message {
     /// will be used (e.g. `Message from Alice` or `Re: <last subject>`).
     pub fn set_subject(&mut self, subject: String) {
         self.subject = subject;
-    }
-
-    /// Sets the file associated with a message.
-    ///
-    /// This function does not use the file or check if it exists,
-    /// the file will only be used when the message is prepared
-    /// for sending.
-    pub fn set_file(&mut self, file: impl ToString, filemime: Option<&str>) {
-        if let Some(name) = Path::new(&file.to_string()).file_name() {
-            if let Some(name) = name.to_str() {
-                self.param.set(Param::Filename, name);
-            }
-        }
-        self.param.set(Param::File, file);
-        self.param.set_optional(Param::MimeType, filemime);
     }
 
     /// Sets the file associated with a message, deduplicating files with the same name.
@@ -1382,7 +1374,7 @@ impl Message {
     /// * Lack of valid signature on an e2ee message, usually for received messages.
     /// * Failure to decrypt an e2ee message, usually for received messages.
     /// * When a message could not be delivered to one or more recipients the non-delivery
-    ///    notification text can be stored in the error status.
+    ///   notification text can be stored in the error status.
     pub fn error(&self) -> Option<String> {
         self.error.clone()
     }
@@ -1673,34 +1665,90 @@ pub async fn get_mime_headers(context: &Context, msg_id: MsgId) -> Result<Vec<u8
     Ok(headers)
 }
 
-/// Deletes requested messages
-/// by moving them to the trash chat
-/// and scheduling for deletion on IMAP.
+/// Delete a single message from the database, including references in other tables.
+/// This may be called in batches; the final events are emitted in delete_msgs_locally_done() then.
+pub(crate) async fn delete_msg_locally(context: &Context, msg: &Message) -> Result<()> {
+    if msg.location_id > 0 {
+        delete_poi_location(context, msg.location_id).await?;
+    }
+    let on_server = true;
+    msg.id
+        .trash(context, on_server)
+        .await
+        .with_context(|| format!("Unable to trash message {}", msg.id))?;
+
+    context.emit_event(EventType::MsgDeleted {
+        chat_id: msg.chat_id,
+        msg_id: msg.id,
+    });
+
+    if msg.viewtype == Viewtype::Webxdc {
+        context.emit_event(EventType::WebxdcInstanceDeleted { msg_id: msg.id });
+    }
+
+    let logging_xdc_id = context
+        .debug_logging
+        .read()
+        .expect("RwLock is poisoned")
+        .as_ref()
+        .map(|dl| dl.msg_id);
+    if let Some(id) = logging_xdc_id {
+        if id == msg.id {
+            set_debug_logging_xdc(context, None).await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Do final events and jobs after batch deletion using calls to delete_msg_locally().
+/// To avoid additional database queries, collecting data is up to the caller.
+pub(crate) async fn delete_msgs_locally_done(
+    context: &Context,
+    msg_ids: &[MsgId],
+    modified_chat_ids: HashSet<ChatId>,
+) -> Result<()> {
+    for modified_chat_id in modified_chat_ids {
+        context.emit_msgs_changed_without_msg_id(modified_chat_id);
+        chatlist_events::emit_chatlist_item_changed(context, modified_chat_id);
+    }
+    if !msg_ids.is_empty() {
+        context.emit_msgs_changed_without_ids();
+        chatlist_events::emit_chatlist_changed(context);
+        // Run housekeeping to delete unused blobs.
+        context
+            .set_config_internal(Config::LastHousekeeping, None)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Delete messages on all devices and on IMAP.
 pub async fn delete_msgs(context: &Context, msg_ids: &[MsgId]) -> Result<()> {
-    let mut modified_chat_ids = BTreeSet::new();
+    delete_msgs_ex(context, msg_ids, false).await
+}
+
+/// Delete messages on all devices, on IMAP and optionally for all chat members.
+/// Deleted messages are moved to the trash chat and scheduling for deletion on IMAP.
+/// When deleting messages for others, all messages must be self-sent and in the same chat.
+pub async fn delete_msgs_ex(
+    context: &Context,
+    msg_ids: &[MsgId],
+    delete_for_all: bool,
+) -> Result<()> {
+    let mut modified_chat_ids = HashSet::new();
+    let mut deleted_rfc724_mid = Vec::new();
     let mut res = Ok(());
 
     for &msg_id in msg_ids {
         let msg = Message::load_from_db(context, msg_id).await?;
-        if msg.location_id > 0 {
-            delete_poi_location(context, msg.location_id).await?;
-        }
-        let on_server = true;
-        msg_id
-            .trash(context, on_server)
-            .await
-            .with_context(|| format!("Unable to trash message {msg_id}"))?;
-
-        context.emit_event(EventType::MsgDeleted {
-            chat_id: msg.chat_id,
-            msg_id,
-        });
-
-        if msg.viewtype == Viewtype::Webxdc {
-            context.emit_event(EventType::WebxdcInstanceDeleted { msg_id });
-        }
+        ensure!(
+            !delete_for_all || msg.from_id == ContactId::SELF,
+            "Can delete only own messages for others"
+        );
 
         modified_chat_ids.insert(msg.chat_id);
+        deleted_rfc724_mid.push(msg.rfc724_mid.clone());
 
         let target = context.get_delete_msgs_target().await?;
         let update_db = |trans: &mut rusqlite::Transaction| {
@@ -1716,38 +1764,39 @@ pub async fn delete_msgs(context: &Context, msg_ids: &[MsgId]) -> Result<()> {
             res = Err(e);
             continue;
         }
-
-        let logging_xdc_id = context
-            .debug_logging
-            .read()
-            .expect("RwLock is poisoned")
-            .as_ref()
-            .map(|dl| dl.msg_id);
-
-        if let Some(id) = logging_xdc_id {
-            if id == msg_id {
-                set_debug_logging_xdc(context, None).await?;
-            }
-        }
     }
     res?;
 
-    for modified_chat_id in modified_chat_ids {
-        context.emit_msgs_changed_without_msg_id(modified_chat_id);
-        chatlist_events::emit_chatlist_item_changed(context, modified_chat_id);
-    }
-
-    if !msg_ids.is_empty() {
-        context.emit_msgs_changed_without_ids();
-        chatlist_events::emit_chatlist_changed(context);
-        // Run housekeeping to delete unused blobs.
+    if delete_for_all {
+        ensure!(
+            modified_chat_ids.len() == 1,
+            "Can delete only from same chat."
+        );
+        if let Some(chat_id) = modified_chat_ids.iter().next() {
+            let mut msg = Message::new_text("🚮".to_owned());
+            msg.param.set_int(Param::GuaranteeE2ee, 1);
+            msg.param
+                .set(Param::DeleteRequestFor, deleted_rfc724_mid.join(" "));
+            msg.hidden = true;
+            send_msg(context, *chat_id, &mut msg).await?;
+        }
+    } else {
         context
-            .set_config_internal(Config::LastHousekeeping, None)
+            .add_sync_item(SyncData::DeleteMessages {
+                msgs: deleted_rfc724_mid,
+            })
             .await?;
     }
 
-    // Interrupt Inbox loop to start message deletion and run housekeeping.
+    for &msg_id in msg_ids {
+        let msg = Message::load_from_db(context, msg_id).await?;
+        delete_msg_locally(context, &msg).await?;
+    }
+    delete_msgs_locally_done(context, msg_ids, modified_chat_ids).await?;
+
+    // Interrupt Inbox loop to start message deletion, run housekeeping and call send_sync_msg().
     context.scheduler.interrupt_inbox().await;
+
     Ok(())
 }
 
@@ -2174,12 +2223,12 @@ pub enum Viewtype {
     /// Image message.
     /// If the image is a GIF and has the appropriate extension, the viewtype is auto-changed to
     /// `Gif` when sending the message.
-    /// File, width and height are set via dc_msg_set_file(), dc_msg_set_dimension
-    /// and retrieved via dc_msg_set_file(), dc_msg_set_dimension().
+    /// File, width and height are set via dc_msg_set_file_and_deduplicate(), dc_msg_set_dimension()
+    /// and retrieved via dc_msg_get_file(), dc_msg_get_height(), dc_msg_get_width().
     Image = 20,
 
     /// Animated GIF message.
-    /// File, width and height are set via dc_msg_set_file(), dc_msg_set_dimension()
+    /// File, width and height are set via dc_msg_set_file_and_deduplicate(), dc_msg_set_dimension()
     /// and retrieved via dc_msg_get_file(), dc_msg_get_width(), dc_msg_get_height().
     Gif = 21,
 
@@ -2192,26 +2241,26 @@ pub enum Viewtype {
     Sticker = 23,
 
     /// Message containing an Audio file.
-    /// File and duration are set via dc_msg_set_file(), dc_msg_set_duration()
+    /// File and duration are set via dc_msg_set_file_and_deduplicate(), dc_msg_set_duration()
     /// and retrieved via dc_msg_get_file(), dc_msg_get_duration().
     Audio = 40,
 
     /// A voice message that was directly recorded by the user.
     /// For all other audio messages, the type #DC_MSG_AUDIO should be used.
-    /// File and duration are set via dc_msg_set_file(), dc_msg_set_duration()
+    /// File and duration are set via dc_msg_set_file_and_deduplicate(), dc_msg_set_duration()
     /// and retrieved via dc_msg_get_file(), dc_msg_get_duration()
     Voice = 41,
 
     /// Video messages.
     /// File, width, height and durarion
-    /// are set via dc_msg_set_file(), dc_msg_set_dimension(), dc_msg_set_duration()
+    /// are set via dc_msg_set_file_and_deduplicate(), dc_msg_set_dimension(), dc_msg_set_duration()
     /// and retrieved via
     /// dc_msg_get_file(), dc_msg_get_width(),
     /// dc_msg_get_height(), dc_msg_get_duration().
     Video = 50,
 
     /// Message containing any file, eg. a PDF.
-    /// The file is set via dc_msg_set_file()
+    /// The file is set via dc_msg_set_file_and_deduplicate()
     /// and retrieved via dc_msg_get_file().
     File = 60,
 

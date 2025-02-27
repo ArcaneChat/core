@@ -1042,6 +1042,42 @@ pub unsafe extern "C" fn dc_send_text_msg(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn dc_send_edit_request(
+    context: *mut dc_context_t,
+    msg_id: u32,
+    new_text: *const libc::c_char,
+) {
+    if context.is_null() || new_text.is_null() {
+        eprintln!("ignoring careless call to dc_send_edit_request()");
+        return;
+    }
+    let ctx = &*context;
+    let new_text = to_string_lossy(new_text);
+
+    block_on(chat::send_edit_request(ctx, MsgId::new(msg_id), new_text))
+        .unwrap_or_log_default(ctx, "Failed to send text edit")
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_send_delete_request(
+    context: *mut dc_context_t,
+    msg_ids: *const u32,
+    msg_cnt: libc::c_int,
+) {
+    if context.is_null() || msg_ids.is_null() || msg_cnt <= 0 {
+        eprintln!("ignoring careless call to dc_send_delete_request()");
+        return;
+    }
+    let ctx = &*context;
+    let msg_ids = convert_and_prune_message_ids(msg_ids, msg_cnt);
+
+    block_on(message::delete_msgs_ex(ctx, &msg_ids, true))
+        .context("failed dc_send_delete_request() call")
+        .log_err(ctx)
+        .ok();
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn dc_send_videochat_invitation(
     context: *mut dc_context_t,
     chat_id: u32,
@@ -3694,6 +3730,16 @@ pub unsafe extern "C" fn dc_msg_is_forwarded(msg: *mut dc_msg_t) -> libc::c_int 
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn dc_msg_is_edited(msg: *mut dc_msg_t) -> libc::c_int {
+    if msg.is_null() {
+        eprintln!("ignoring careless call to dc_msg_is_edited()");
+        return 0;
+    }
+    let ffi_msg = &*msg;
+    ffi_msg.message.is_edited().into()
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn dc_msg_is_info(msg: *mut dc_msg_t) -> libc::c_int {
     if msg.is_null() {
         eprintln!("ignoring careless call to dc_msg_is_info()");
@@ -3826,23 +3872,6 @@ pub unsafe extern "C" fn dc_msg_set_override_sender_name(
     ffi_msg
         .message
         .set_override_sender_name(to_opt_string_lossy(name))
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn dc_msg_set_file(
-    msg: *mut dc_msg_t,
-    file: *const libc::c_char,
-    filemime: *const libc::c_char,
-) {
-    if msg.is_null() || file.is_null() {
-        eprintln!("ignoring careless call to dc_msg_set_file()");
-        return;
-    }
-    let ffi_msg = &mut *msg;
-    ffi_msg.message.set_file(
-        to_string_lossy(file),
-        to_opt_string_lossy(filemime).as_deref(),
-    )
 }
 
 #[no_mangle]

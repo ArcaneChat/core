@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use crate::api::VcardContact;
 use anyhow::{Context as _, Result};
 use deltachat::chat::Chat;
@@ -36,6 +38,8 @@ pub struct MessageObject {
     parent_id: Option<u32>,
 
     text: String,
+
+    is_edited: bool,
 
     /// Check if a message has a POI location bound to it.
     /// These locations are also returned by `get_locations` method.
@@ -88,6 +92,10 @@ pub struct MessageObject {
     webxdc_href: Option<String>,
 
     download_state: DownloadState,
+
+    original_msg_id: Option<u32>,
+
+    saved_message_id: Option<u32>,
 
     reactions: Option<JSONRPCReactions>,
 
@@ -198,6 +206,7 @@ impl MessageObject {
             quote,
             parent_id,
             text: message.get_text(),
+            is_edited: message.is_edited(),
             has_location: message.has_location(),
             has_html: message.has_html(),
             view_type: message.get_viewtype().into(),
@@ -252,6 +261,16 @@ impl MessageObject {
             webxdc_href: message.get_webxdc_href(),
 
             download_state,
+
+            original_msg_id: message
+                .get_original_msg_id(context)
+                .await?
+                .map(|id| id.to_u32()),
+
+            saved_message_id: message
+                .get_saved_msg_id(context)
+                .await?
+                .map(|id| id.to_u32()),
 
             reactions,
 
@@ -593,6 +612,7 @@ pub struct MessageData {
     pub html: Option<String>,
     pub viewtype: Option<MessageViewtype>,
     pub file: Option<String>,
+    pub filename: Option<String>,
     pub location: Option<(f64, f64)>,
     pub override_sender_name: Option<String>,
     /// Quoted message id. Takes preference over `quoted_text` (see below).
@@ -617,7 +637,12 @@ impl MessageData {
             message.set_override_sender_name(self.override_sender_name);
         }
         if let Some(file) = self.file {
-            message.set_file(file, None);
+            message.set_file_and_deduplicate(
+                context,
+                Path::new(&file),
+                self.filename.as_deref(),
+                None,
+            )?;
         }
         if let Some((latitude, longitude)) = self.location {
             message.set_location(latitude, longitude);

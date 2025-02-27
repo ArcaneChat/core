@@ -3,6 +3,7 @@
 use std::cmp;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::io::Cursor;
 use std::marker::Sync;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -11,6 +12,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, ensure, Context as _, Result};
 use deltachat_contact_tools::{sanitize_bidi_characters, sanitize_single_line, ContactAddress};
 use deltachat_derive::{FromSql, ToSql};
+use mail_builder::mime::MimePart;
 use serde::{Deserialize, Serialize};
 use strum_macros::EnumIter;
 use tokio::task;
@@ -18,12 +20,11 @@ use tokio::task;
 use crate::aheader::EncryptPreference;
 use crate::blob::BlobObject;
 use crate::chatlist::Chatlist;
-use crate::chatlist_events;
 use crate::color::str_to_color;
 use crate::config::Config;
 use crate::constants::{
     self, Blocked, Chattype, DC_CHAT_ID_ALLDONE_HINT, DC_CHAT_ID_ARCHIVED_LINK,
-    DC_CHAT_ID_LAST_SPECIAL, DC_CHAT_ID_TRASH, DC_RESEND_USER_AVATAR_DAYS,
+    DC_CHAT_ID_LAST_SPECIAL, DC_CHAT_ID_TRASH, DC_RESEND_USER_AVATAR_DAYS, EDITED_PREFIX,
     TIMESTAMP_SENT_TOLERANCE,
 };
 use crate::contact::{self, Contact, ContactId, Origin};
@@ -32,7 +33,6 @@ use crate::debug_logging::maybe_set_logging_xdc;
 use crate::download::DownloadState;
 use crate::ephemeral::{start_chat_ephemeral_timers, Timer as EphemeralTimer};
 use crate::events::EventType;
-use crate::html::new_html_mimepart;
 use crate::location;
 use crate::log::LogExt;
 use crate::message::{self, Message, MessageState, MsgId, Viewtype};
@@ -41,7 +41,6 @@ use crate::mimeparser::SystemMessage;
 use crate::param::{Param, Params};
 use crate::peerstate::Peerstate;
 use crate::receive_imf::ReceivedMsg;
-use crate::securejoin::BobState;
 use crate::smtp::send_msg_to_smtp;
 use crate::stock_str;
 use crate::sync::{self, Sync::*, SyncData};
@@ -51,6 +50,7 @@ use crate::tools::{
     truncate_msg_text, IsNoneOrEmpty, SystemTime,
 };
 use crate::webxdc::StatusUpdateSerial;
+use crate::{chatlist_events, imap};
 
 /// An chat item, such as a message or a marker.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -910,12 +910,6 @@ impl ChatId {
                 }
             }
             _ => {
-                let blob = msg
-                    .param
-                    .get_blob(Param::File, context)
-                    .await?
-                    .context("no file stored in params")?;
-                msg.param.set(Param::File, blob.as_name());
                 if msg.viewtype == Viewtype::File {
                     if let Some((better_type, _)) = message::guess_msgtype_from_suffix(msg)
                         // We do not do an automatic conversion to other viewtypes here so that
@@ -928,6 +922,10 @@ impl ChatId {
                     }
                 }
                 if msg.viewtype == Viewtype::Vcard {
+                    let blob = msg
+                        .param
+                        .get_file_blob(context)?
+                        .context("no file stored in params")?;
                     msg.try_set_vcard(context, &blob.to_abs_path()).await?;
                 }
             }
@@ -1068,6 +1066,14 @@ impl ChatId {
                 .await?
         };
         Ok(count)
+    }
+
+    pub(crate) async fn created_timestamp(self, context: &Context) -> Result<i64> {
+        Ok(context
+            .sql
+            .query_get_value("SELECT created_timestamp FROM chats WHERE id=?", (self,))
+            .await?
+            .unwrap_or(0))
     }
 
     /// Returns timestamp of the latest message in the chat.
@@ -2177,14 +2183,18 @@ impl Chat {
         } else {
             None
         };
-        let new_mime_headers = new_mime_headers.map(|s| new_html_mimepart(s).build().as_string());
+        let new_mime_headers: Option<String> = new_mime_headers.map(|s| {
+            let html_part = MimePart::new("text/html", s);
+            let mut buffer = Vec::new();
+            let cursor = Cursor::new(&mut buffer);
+            html_part.write_part(cursor).ok();
+            String::from_utf8_lossy(&buffer).to_string()
+        });
         let new_mime_headers = new_mime_headers.or_else(|| match was_truncated {
             // We need to add some headers so that they are stripped before formatting HTML by
             // `MsgId::get_html()`, not a part of the actual text. Let's add "Content-Type", it's
             // anyway a useful metadata about the stored text.
-            true => Some(
-                "Content-Type: text/plain; charset=utf-8\r\n\r\n".to_string() + &msg.text + "\r\n",
-            ),
+            true => Some("Content-Type: text/plain; charset=utf-8\r\n\r\n".to_string() + &msg.text),
             false => None,
         });
         let new_mime_headers = match new_mime_headers {
@@ -2584,19 +2594,27 @@ pub(crate) async fn update_special_chat_names(context: &Context) -> Result<()> {
 /// Checks if there is a 1:1 chat in-progress SecureJoin for Bob and, if necessary, schedules a task
 /// unblocking the chat and notifying the user accordingly.
 pub(crate) async fn resume_securejoin_wait(context: &Context) -> Result<()> {
-    let Some(bobstate) = BobState::from_db(&context.sql).await? else {
-        return Ok(());
-    };
-    if !bobstate.in_progress() {
-        return Ok(());
-    }
-    let chat_id = bobstate.alice_chat();
-    let chat = Chat::load_from_db(context, chat_id).await?;
-    let timeout = chat
-        .check_securejoin_wait(context, constants::SECUREJOIN_WAIT_TIMEOUT)
+    let chat_ids: Vec<ChatId> = context
+        .sql
+        .query_map(
+            "SELECT chat_id FROM bobstate",
+            (),
+            |row| {
+                let chat_id: ChatId = row.get(0)?;
+                Ok(chat_id)
+            },
+            |rows| rows.collect::<Result<Vec<_>, _>>().map_err(Into::into),
+        )
         .await?;
-    if timeout > 0 {
-        chat_id.spawn_securejoin_wait(context, timeout);
+
+    for chat_id in chat_ids {
+        let chat = Chat::load_from_db(context, chat_id).await?;
+        let timeout = chat
+            .check_securejoin_wait(context, constants::SECUREJOIN_WAIT_TIMEOUT)
+            .await?;
+        if timeout > 0 {
+            chat_id.spawn_securejoin_wait(context, timeout);
+        }
     }
     Ok(())
 }
@@ -2760,8 +2778,7 @@ async fn prepare_msg_blob(context: &Context, msg: &mut Message) -> Result<()> {
     } else if msg.viewtype.has_file() {
         let mut blob = msg
             .param
-            .get_blob(Param::File, context)
-            .await?
+            .get_file_blob(context)?
             .with_context(|| format!("attachment missing for message of type #{}", msg.viewtype))?;
         let send_as_is = msg.viewtype == Viewtype::File;
 
@@ -2809,19 +2826,11 @@ async fn prepare_msg_blob(context: &Context, msg: &mut Message) -> Result<()> {
                 .recode_to_image_size(context, msg.get_filename(), &mut maybe_sticker)
                 .await?;
             msg.param.set(Param::Filename, new_name);
+            msg.param.set(Param::File, blob.as_name());
 
             if !maybe_sticker {
                 msg.viewtype = Viewtype::Image;
             }
-        }
-        msg.param.set(Param::File, blob.as_name());
-        if let (Some(filename), Some(blob_ext)) = (msg.param.get(Param::Filename), blob.suffix()) {
-            let stem = match filename.rsplit_once('.') {
-                Some((stem, _)) => stem,
-                None => filename,
-            };
-            msg.param
-                .set(Param::Filename, stem.to_string() + "." + blob_ext);
         }
 
         if !msg.param.exists(Param::MimeType) {
@@ -3168,6 +3177,66 @@ pub async fn send_text_msg(
     send_msg(context, chat_id, &mut msg).await
 }
 
+/// Sends chat members a request to edit the given message's text.
+pub async fn send_edit_request(context: &Context, msg_id: MsgId, new_text: String) -> Result<()> {
+    let mut original_msg = Message::load_from_db(context, msg_id).await?;
+    ensure!(
+        original_msg.from_id == ContactId::SELF,
+        "Can edit only own messages"
+    );
+    ensure!(!original_msg.is_info(), "Cannot edit info messages");
+    ensure!(!original_msg.has_html(), "Cannot edit HTML messages");
+    ensure!(
+        original_msg.viewtype != Viewtype::VideochatInvitation,
+        "Cannot edit videochat invitations"
+    );
+    ensure!(
+        !original_msg.text.is_empty(), // avoid complexity in UI element changes. focus is typos and rewordings
+        "Cannot add text"
+    );
+    ensure!(!new_text.trim().is_empty(), "Edited text cannot be empty");
+    if original_msg.text == new_text {
+        info!(context, "Text unchanged.");
+        return Ok(());
+    }
+
+    save_text_edit_to_db(context, &mut original_msg, &new_text).await?;
+
+    let mut edit_msg = Message::new_text(EDITED_PREFIX.to_owned() + &new_text); // prefix only set for nicer display in Non-Delta-MUAs
+    edit_msg.set_quote(context, Some(&original_msg)).await?; // quote only set for nicer display in Non-Delta-MUAs
+    if original_msg.get_showpadlock() {
+        edit_msg.param.set_int(Param::GuaranteeE2ee, 1);
+    }
+    edit_msg
+        .param
+        .set(Param::TextEditFor, original_msg.rfc724_mid);
+    edit_msg.hidden = true;
+    send_msg(context, original_msg.chat_id, &mut edit_msg).await?;
+    Ok(())
+}
+
+pub(crate) async fn save_text_edit_to_db(
+    context: &Context,
+    original_msg: &mut Message,
+    new_text: &str,
+) -> Result<()> {
+    original_msg.param.set_int(Param::IsEdited, 1);
+    context
+        .sql
+        .execute(
+            "UPDATE msgs SET txt=?, txt_normalized=?, param=? WHERE id=?",
+            (
+                new_text,
+                message::normalize_text(new_text),
+                original_msg.param.to_string(),
+                original_msg.id,
+            ),
+        )
+        .await?;
+    context.emit_msgs_changed(original_msg.chat_id, original_msg.id);
+    Ok(())
+}
+
 /// Sends invitation to a videochat.
 pub async fn send_videochat_invitation(context: &Context, chat_id: ChatId) -> Result<MsgId> {
     ensure!(
@@ -3372,7 +3441,7 @@ pub async fn marknoticed_chat(context: &Context, chat_id: ChatId) -> Result<()> 
     } else {
         start_chat_ephemeral_timers(context, chat_id).await?;
 
-        if context
+        let noticed_msgs_count = context
             .sql
             .execute(
                 "UPDATE msgs
@@ -3382,9 +3451,36 @@ pub async fn marknoticed_chat(context: &Context, chat_id: ChatId) -> Result<()> 
             AND chat_id=?;",
                 (MessageState::InNoticed, MessageState::InFresh, chat_id),
             )
-            .await?
-            == 0
-        {
+            .await?;
+
+        // This is to trigger emitting `MsgsNoticed` on other devices when reactions are noticed
+        // locally (i.e. when the chat was opened locally).
+        let hidden_messages = context
+            .sql
+            .query_map(
+                "SELECT id, rfc724_mid FROM msgs
+                    WHERE state=?
+                      AND hidden=1
+                      AND chat_id=?
+                    ORDER BY id LIMIT 100", // LIMIT to 100 in order to avoid blocking the UI too long, usually there will be less than 100 messages anyway
+                (MessageState::InFresh, chat_id), // No need to check for InNoticed messages, because reactions are never InNoticed
+                |row| {
+                    let msg_id: MsgId = row.get(0)?;
+                    let rfc724_mid: String = row.get(1)?;
+                    Ok((msg_id, rfc724_mid))
+                },
+                |rows| {
+                    rows.collect::<std::result::Result<Vec<_>, _>>()
+                        .map_err(Into::into)
+                },
+            )
+            .await?;
+        for (msg_id, rfc724_mid) in &hidden_messages {
+            message::update_msg_state(context, *msg_id, MessageState::InSeen).await?;
+            imap::markseen_on_imap_table(context, rfc724_mid).await?;
+        }
+
+        if noticed_msgs_count == 0 {
             return Ok(());
         }
     }
@@ -4342,7 +4438,7 @@ pub async fn save_msgs(context: &Context, msg_ids: &[MsgId]) -> Result<()> {
             })
             .await?;
     }
-    context.send_sync_msg().await?;
+    context.scheduler.interrupt_inbox().await;
     Ok(())
 }
 

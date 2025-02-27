@@ -695,15 +695,44 @@ async fn test_leave_group() -> Result<()> {
 
     assert_eq!(get_chat_contacts(&alice, alice_chat_id).await?.len(), 2);
 
+    // Clear events so that we can later check
+    // that the 'Group left' message didn't trigger IncomingMsg:
+    alice.evtracker.clear_events();
+
+    // Shift the time so that we can later check the 'Group left' message's timestamp:
+    SystemTime::shift(Duration::from_secs(60));
+
     // Bob leaves the group.
     let bob_chat_id = bob_msg.chat_id;
     bob_chat_id.accept(&bob).await?;
     remove_contact_from_chat(&bob, bob_chat_id, ContactId::SELF).await?;
 
     let leave_msg = bob.pop_sent_msg().await;
-    alice.recv_msg(&leave_msg).await;
+    let rcvd_leave_msg = alice.recv_msg(&leave_msg).await;
 
     assert_eq!(get_chat_contacts(&alice, alice_chat_id).await?.len(), 1);
+
+    assert_eq!(rcvd_leave_msg.state, MessageState::InSeen);
+
+    alice.emit_event(EventType::Test);
+    alice
+        .evtracker
+        .get_matching(|ev| match ev {
+            EventType::Test => true,
+            EventType::IncomingMsg { .. } => panic!("'Group left' message should be silent"),
+            EventType::MsgsNoticed(..) => {
+                panic!("'Group left' message shouldn't clear notifications")
+            }
+            _ => false,
+        })
+        .await;
+
+    // The 'Group left' message timestamp should be the same as the previous message in the chat
+    // so that the chat is not popped up in the chatlist:
+    assert_eq!(
+        sent_msg.load_from_db().await.timestamp_sort,
+        rcvd_leave_msg.timestamp_sort
+    );
 
     Ok(())
 }
@@ -3644,4 +3673,173 @@ async fn test_one_to_one_chat_no_group_member_timestamps() {
     let sent = t.send_text(chat.id, "Hi!").await;
     let payload = sent.payload;
     assert!(!payload.contains("Chat-Group-Member-Timestamps:"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_send_edit_request() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+    let alice_chat = alice.create_chat(bob).await;
+
+    // Alice sends a message with typos, followed by a correction message
+    let sent1 = alice.send_text(alice_chat.id, "zext me in delra.cat").await;
+    let alice_msg = sent1.load_from_db().await;
+    assert_eq!(alice_msg.text, "zext me in delra.cat");
+
+    send_edit_request(alice, alice_msg.id, "Text me on Delta.Chat".to_string()).await?;
+    let sent2 = alice.pop_sent_msg().await;
+    let test = Message::load_from_db(alice, alice_msg.id).await?;
+    assert_eq!(test.text, "Text me on Delta.Chat");
+
+    // Bob receives both messages and has the correct text at the end
+    let bob_msg = bob.recv_msg(&sent1).await;
+    assert_eq!(bob_msg.text, "zext me in delra.cat");
+
+    bob.recv_msg_opt(&sent2).await;
+    let test = Message::load_from_db(bob, bob_msg.id).await?;
+    assert_eq!(test.text, "Text me on Delta.Chat");
+
+    // alice has another device, and sees the correction also there
+    let alice2 = tcm.alice().await;
+    let alice2_msg = alice2.recv_msg(&sent1).await;
+    assert_eq!(alice2_msg.text, "zext me in delra.cat");
+
+    alice2.recv_msg_opt(&sent2).await;
+    let test = Message::load_from_db(&alice2, alice2_msg.id).await?;
+    assert_eq!(test.text, "Text me on Delta.Chat");
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_receive_edit_request_after_removal() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+    let alice_chat = alice.create_chat(bob).await;
+
+    // Alice sends a messag with typos, followed by a correction message
+    let sent1 = alice.send_text(alice_chat.id, "zext me in delra.cat").await;
+    let alice_msg = sent1.load_from_db().await;
+    send_edit_request(alice, alice_msg.id, "Text me on Delta.Chat".to_string()).await?;
+    let sent2 = alice.pop_sent_msg().await;
+
+    // Bob receives first message, deletes it and then ignores the correction
+    let bob_msg = bob.recv_msg(&sent1).await;
+    let bob_chat_id = bob_msg.chat_id;
+    assert_eq!(bob_msg.text, "zext me in delra.cat");
+    assert_eq!(bob_chat_id.get_msg_cnt(bob).await?, 1);
+
+    delete_msgs(bob, &[bob_msg.id]).await?;
+    assert_eq!(bob_chat_id.get_msg_cnt(bob).await?, 0);
+
+    bob.recv_msg_trash(&sent2).await;
+    assert_eq!(bob_chat_id.get_msg_cnt(bob).await?, 0);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_cannot_send_edit_request() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+    let chat_id = alice
+        .create_group_with_members(ProtectionStatus::Unprotected, "My Group", &[bob])
+        .await;
+
+    // Alice can edit her message
+    let sent1 = alice.send_text(chat_id, "foo").await;
+    send_edit_request(alice, sent1.sender_msg_id, "bar".to_string()).await?;
+
+    // Bob cannot edit Alice's message
+    let msg = bob.recv_msg(&sent1).await;
+    assert!(send_edit_request(bob, msg.id, "bar".to_string())
+        .await
+        .is_err());
+
+    // HTML messages cannot be edited
+    let mut msg = Message::new_text("plain text".to_string());
+    msg.set_html(Some("<b>html</b> text".to_string()));
+    let sent2 = alice.send_msg(chat_id, &mut msg).await;
+    assert!(msg.has_html());
+    assert!(
+        send_edit_request(alice, sent2.sender_msg_id, "foo".to_string())
+            .await
+            .is_err()
+    );
+
+    // Info messages cannot be edited
+    set_chat_name(alice, chat_id, "bar").await?;
+    let msg = alice.get_last_msg().await;
+    assert!(msg.is_info());
+    assert_eq!(msg.from_id, ContactId::SELF);
+    assert!(send_edit_request(alice, msg.id, "bar".to_string())
+        .await
+        .is_err());
+
+    // Videochat invitations cannot be edited
+    alice
+        .set_config(Config::WebrtcInstance, Some("https://foo.bar"))
+        .await?;
+    let msg_id = send_videochat_invitation(alice, chat_id).await?;
+    assert!(send_edit_request(alice, msg_id, "bar".to_string())
+        .await
+        .is_err());
+
+    // If not text was given initally, there is nothing to edit
+    // (this also avoids complexity in UI element changes; focus is typos and rewordings)
+    let mut msg = Message::new(Viewtype::File);
+    msg.make_vcard(alice, &[ContactId::SELF]).await?;
+    let sent3 = alice.send_msg(chat_id, &mut msg).await;
+    assert!(msg.text.is_empty());
+    assert!(
+        send_edit_request(alice, sent3.sender_msg_id, "bar".to_string())
+            .await
+            .is_err()
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_send_delete_request() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+    let alice_chat = alice.create_chat(bob).await;
+    let bob_chat = bob.create_chat(alice).await;
+
+    // Bobs sends a message to Alice, so Alice learns Bob's key
+    let sent0 = bob.send_text(bob_chat.id, "¡ola!").await;
+    alice.recv_msg(&sent0).await;
+
+    // Alice sends a message, then sends a deletion request
+    let sent1 = alice.send_text(alice_chat.id, "wtf").await;
+    let alice_msg = sent1.load_from_db().await;
+    assert_eq!(alice_chat.id.get_msg_cnt(alice).await?, 2);
+
+    message::delete_msgs_ex(alice, &[alice_msg.id], true).await?;
+    let sent2 = alice.pop_sent_msg().await;
+    assert_eq!(alice_chat.id.get_msg_cnt(alice).await?, 1);
+
+    // Bob receives both messages and has nothing the end
+    let bob_msg = bob.recv_msg(&sent1).await;
+    assert_eq!(bob_msg.text, "wtf");
+    assert_eq!(bob_msg.chat_id.get_msg_cnt(bob).await?, 2);
+
+    bob.recv_msg_opt(&sent2).await;
+    assert_eq!(bob_msg.chat_id.get_msg_cnt(bob).await?, 1);
+
+    // Alice has another device, and there is also nothing at the end
+    let alice2 = &tcm.alice().await;
+    alice2.recv_msg(&sent0).await;
+    let alice2_msg = alice2.recv_msg(&sent1).await;
+    assert_eq!(alice2_msg.chat_id.get_msg_cnt(alice2).await?, 2);
+
+    alice2.recv_msg_opt(&sent2).await;
+    assert_eq!(alice2_msg.chat_id.get_msg_cnt(alice2).await?, 1);
+
+    Ok(())
 }

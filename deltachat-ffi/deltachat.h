@@ -975,7 +975,7 @@ uint32_t        dc_get_chat_id_by_contact_id (dc_context_t* context, uint32_t co
  * ~~~
  * dc_msg_t* msg = dc_msg_new(context, DC_MSG_IMAGE);
  *
- * dc_msg_set_file(msg, "/file/to/send.jpg", NULL);
+ * dc_msg_set_file_and_deduplicate(msg, "/file/to/send.jpg", NULL, NULL);
  * dc_send_msg(context, chat_id, msg);
  *
  * dc_msg_unref(msg);
@@ -1037,6 +1037,38 @@ uint32_t        dc_send_msg_sync                  (dc_context_t* context, uint32
  * @return The ID of the message that is about being sent.
  */
 uint32_t        dc_send_text_msg             (dc_context_t* context, uint32_t chat_id, const char* text_to_send);
+
+
+/**
+ * Send chat members a request to edit the given message's text.
+ *
+ * Only outgoing messages sent by self can be edited.
+ * Edited messages should be flagged as such in the UI, see dc_msg_is_edited().
+ * UI is informed about changes using the event #DC_EVENT_MSGS_CHANGED.
+ * If the text is not changed, no event and no edit request message are sent.
+ *
+ * @memberof dc_context_t
+ * @param context The context object as returned from dc_context_new().
+ * @param msg_id The message ID of the message to edit.
+ * @param new_text The new text.
+ *      This must not be NULL nor empty.
+ */
+void            dc_send_edit_request         (dc_context_t* context, uint32_t msg_id, const char* new_text);
+
+
+/**
+ * Send chat members a request to delete the given messages.
+ *
+ * Only outgoing messages can be deleted this way
+ * and all messages must be in the same chat.
+ * No tombstone or sth. like that is left.
+ *
+ * @memberof dc_context_t
+ * @param context The context object as returned from dc_context_new().
+ * @param msg_ids An array of uint32_t containing all message IDs to delete.
+ * @param msg_cnt The number of messages IDs in the msg_ids array.
+ */
+ void            dc_send_delete_request       (dc_context_t* context, const uint32_t* msg_ids, int msg_cnt);
 
 
 /**
@@ -1946,7 +1978,7 @@ char*           dc_get_mime_headers          (dc_context_t* context, uint32_t ms
 
 
 /**
- * Delete messages. The messages are deleted on the current device and
+ * Delete messages. The messages are deleted on all devices and
  * on the IMAP server.
  *
  * @memberof dc_context_t
@@ -2459,8 +2491,9 @@ void            dc_stop_ongoing_process      (dc_context_t* context);
 #define         DC_QR_FPR_MISMATCH           220 // id=contact
 #define         DC_QR_FPR_WITHOUT_ADDR       230 // test1=formatted fingerprint
 #define         DC_QR_ACCOUNT                250 // text1=domain
-#define         DC_QR_BACKUP                 251
+#define         DC_QR_BACKUP                 251 // deprecated
 #define         DC_QR_BACKUP2                252
+#define         DC_QR_BACKUP_TOO_NEW         255
 #define         DC_QR_WEBRTC_INSTANCE        260 // text1=domain, text2=instance pattern
 #define         DC_QR_PROXY                  271 // text1=address (e.g. "127.0.0.1:9050")
 #define         DC_QR_ADDR                   320 // id=contact
@@ -4438,6 +4471,20 @@ int             dc_msg_is_forwarded           (const dc_msg_t* msg);
 
 
 /**
+ * Check if the message was edited.
+ *
+ * Edited messages should be marked by the UI as such,
+ * e.g. by the text "Edited" beside the time.
+ * To edit messages, use dc_send_edit_request().
+ *
+ * @memberof dc_msg_t
+ * @param msg The message object.
+ * @return 1=message is edited, 0=message not edited.
+ */
+ int             dc_msg_is_edited             (const dc_msg_t* msg);
+
+
+/**
  * Check if the message is an informational message, created by the
  * device or by another users. Such messages are not "typed" by the user but
  * created due to other actions,
@@ -4747,22 +4794,6 @@ void            dc_msg_set_override_sender_name(dc_msg_t* msg, const char* name)
 
 
 /**
- * Set the file associated with a message object.
- * This does not alter any information in the database
- * nor copy or move the file or checks if the file exist.
- * All this can be done with dc_send_msg() later.
- *
- * @memberof dc_msg_t
- * @param msg The message object.
- * @param file If the message object is used in dc_send_msg() later,
- *     this must be the full path of the image file to send.
- * @param filemime The MIME type of the file. NULL if you don't know or don't care.
- * @deprecated 2025-01-21 Use dc_msg_set_file_and_deduplicate instead
- */
-void            dc_msg_set_file               (dc_msg_t* msg, const char* file, const char* filemime);
-
-
-/**
  * Sets the file associated with a message.
  *
  * If `name` is non-null, it is used as the file name
@@ -4789,7 +4820,7 @@ void            dc_msg_set_file_and_deduplicate(dc_msg_t* msg, const char* file,
 
 /**
  * Set the dimensions associated with message object.
- * Typically this is the width and the height of an image or video associated using dc_msg_set_file().
+ * Typically this is the width and the height of an image or video associated using dc_msg_set_file_and_deduplicate().
  * This does not alter any information in the database; this may be done by dc_send_msg() later.
  *
  * @memberof dc_msg_t
@@ -4802,7 +4833,7 @@ void            dc_msg_set_dimension          (dc_msg_t* msg, int width, int hei
 
 /**
  * Set the duration associated with message object.
- * Typically this is the duration of an audio or video associated using dc_msg_set_file().
+ * Typically this is the duration of an audio or video associated using dc_msg_set_file_and_deduplicate().
  * This does not alter any information in the database; this may be done by dc_send_msg() later.
  *
  * @memberof dc_msg_t
@@ -5444,7 +5475,7 @@ int64_t         dc_lot_get_timestamp     (const dc_lot_t* lot);
  * If you want to define the type of a dc_msg_t object for sending,
  * use dc_msg_new().
  * Depending on the type, you will set more properties using e.g.
- * dc_msg_set_text() or dc_msg_set_file().
+ * dc_msg_set_text() or dc_msg_set_file_and_deduplicate().
  * To finally send the message, use dc_send_msg().
  *
  * To get the types of dc_msg_t objects received, use dc_msg_get_viewtype().
@@ -5465,7 +5496,7 @@ int64_t         dc_lot_get_timestamp     (const dc_lot_t* lot);
 /**
  * Image message.
  * If the image is an animated GIF, the type #DC_MSG_GIF should be used.
- * File, width, and height are set via dc_msg_set_file(), dc_msg_set_dimension()
+ * File, width, and height are set via dc_msg_set_file_and_deduplicate(), dc_msg_set_dimension()
  * and retrieved via dc_msg_get_file(), dc_msg_get_width(), and dc_msg_get_height().
  *
  * Before sending, the image is recoded to an reasonable size,
@@ -5478,7 +5509,7 @@ int64_t         dc_lot_get_timestamp     (const dc_lot_t* lot);
 
 /**
  * Animated GIF message.
- * File, width, and height are set via dc_msg_set_file(), dc_msg_set_dimension()
+ * File, width, and height are set via dc_msg_set_file_and_deduplicate(), dc_msg_set_dimension()
  * and retrieved via dc_msg_get_file(), dc_msg_get_width(), and dc_msg_get_height().
  */
 #define DC_MSG_GIF       21
@@ -5496,7 +5527,7 @@ int64_t         dc_lot_get_timestamp     (const dc_lot_t* lot);
 
 /**
  * Message containing an audio file.
- * File and duration are set via dc_msg_set_file(), dc_msg_set_duration()
+ * File and duration are set via dc_msg_set_file_and_deduplicate(), dc_msg_set_duration()
  * and retrieved via dc_msg_get_file(), and dc_msg_get_duration().
  */
 #define DC_MSG_AUDIO     40
@@ -5505,7 +5536,7 @@ int64_t         dc_lot_get_timestamp     (const dc_lot_t* lot);
 /**
  * A voice message that was directly recorded by the user.
  * For all other audio messages, the type #DC_MSG_AUDIO should be used.
- * File and duration are set via dc_msg_set_file(), dc_msg_set_duration()
+ * File and duration are set via dc_msg_set_file_and_deduplicate(), dc_msg_set_duration()
  * and retrieved via dc_msg_get_file(), and dc_msg_get_duration().
  */
 #define DC_MSG_VOICE     41
@@ -5514,7 +5545,7 @@ int64_t         dc_lot_get_timestamp     (const dc_lot_t* lot);
 /**
  * Video messages.
  * File, width, height, and duration
- * are set via dc_msg_set_file(), dc_msg_set_dimension(), dc_msg_set_duration()
+ * are set via dc_msg_set_file_and_deduplicate(), dc_msg_set_dimension(), dc_msg_set_duration()
  * and retrieved via
  * dc_msg_get_file(), dc_msg_get_width(),
  * dc_msg_get_height(), and dc_msg_get_duration().
@@ -5524,7 +5555,7 @@ int64_t         dc_lot_get_timestamp     (const dc_lot_t* lot);
 
 /**
  * Message containing any file, e.g. a PDF.
- * The file is set via dc_msg_set_file()
+ * The file is set via dc_msg_set_file_and_deduplicate()
  * and retrieved via dc_msg_get_file().
  */
 #define DC_MSG_FILE      60

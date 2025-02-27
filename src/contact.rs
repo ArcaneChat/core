@@ -247,7 +247,16 @@ pub async fn make_vcard(context: &Context, contacts: &[ContactId]) -> Result<Str
             timestamp: Ok(now),
         });
     }
-    Ok(contact_tools::make_vcard(&vcard_contacts))
+
+    // XXX: newline at the end of vCard is trimmed
+    // for compatibility with core <=1.155.3
+    // Newer core should be able to deal with
+    // trailing CRLF as the fix
+    // <https://github.com/deltachat/deltachat-core-rust/pull/6522>
+    // is merged.
+    Ok(contact_tools::make_vcard(&vcard_contacts)
+        .trim_end()
+        .to_string())
 }
 
 /// Imports contacts from the given vCard.
@@ -496,7 +505,11 @@ pub enum Origin {
     /// set on Alice's side for contacts like Bob that have scanned the QR code offered by her. Only means the contact has once been established using the "securejoin" procedure in the past, getting the current key verification status requires calling contact_is_verified() !
     SecurejoinInvited = 0x0100_0000,
 
-    /// set on Bob's side for contacts scanned and verified from a QR code. Only means the contact has once been established using the "securejoin" procedure in the past, getting the current key verification status requires calling contact_is_verified() !
+    /// Set on Bob's side for contacts scanned from a QR code.
+    /// Only means the contact has been scanned from the QR code,
+    /// but does not mean that securejoin succeeded
+    /// or the key has not changed since the last scan.
+    /// Getting the current key verification status requires calling contact_is_verified() !
     SecurejoinJoined = 0x0200_0000,
 
     /// contact added manually by create_contact(), this should be the largest origin as otherwise the user cannot modify the names
@@ -1426,7 +1439,7 @@ impl Contact {
     pub async fn get_profile_image(&self, context: &Context) -> Result<Option<PathBuf>> {
         if self.id == ContactId::SELF {
             if let Some(p) = context.get_config(Config::Selfavatar).await? {
-                return Ok(Some(PathBuf::from(p)));
+                return Ok(Some(PathBuf::from(p))); // get_config() calls get_abs_path() internally already
             }
         } else if let Some(image_rel) = self.param.get(Param::ProfileImage) {
             if !image_rel.is_empty() {

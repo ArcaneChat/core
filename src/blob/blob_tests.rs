@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use super::*;
 use crate::message::{Message, Viewtype};
+use crate::param::Param;
 use crate::sql;
 use crate::test_utils::{self, TestContext};
 use crate::tools::SystemTime;
@@ -42,20 +43,6 @@ async fn test_lowercase_ext() {
         blob.as_name().ends_with(".txt"),
         "Blob {blob:?} should end with .txt"
     );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_as_file_name() {
-    let t = TestContext::new().await;
-    let blob = BlobObject::create_and_deduplicate_from_bytes(&t, FILE_BYTES, "foo.txt").unwrap();
-    assert_eq!(blob.as_file_name(), FILE_DEDUPLICATED);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_as_rel_path() {
-    let t = TestContext::new().await;
-    let blob = BlobObject::create_and_deduplicate_from_bytes(&t, FILE_BYTES, "foo.txt").unwrap();
-    assert_eq!(blob.as_rel_path(), Path::new(FILE_DEDUPLICATED));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -113,59 +100,19 @@ async fn test_create_long_names() {
     let t = TestContext::new().await;
     let s = format!("file.{}", "a".repeat(100));
     let blob = BlobObject::create_and_deduplicate_from_bytes(&t, b"data", &s).unwrap();
-    let blobname = blob.as_name().split('/').last().unwrap();
+    let blobname = blob.as_name().split('/').next_back().unwrap();
     assert!(blobname.len() < 70);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_create_and_copy() {
-    let t = TestContext::new().await;
-    let src = t.dir.path().join("src");
-    fs::write(&src, b"boo").await.unwrap();
-    let blob = BlobObject::create_and_copy(&t, src.as_ref()).await.unwrap();
-    assert_eq!(blob.as_name(), "$BLOBDIR/src");
-    let data = fs::read(blob.to_abs_path()).await.unwrap();
-    assert_eq!(data, b"boo");
-
-    let whoops = t.dir.path().join("whoops");
-    assert!(BlobObject::create_and_copy(&t, whoops.as_ref())
-        .await
-        .is_err());
-    let whoops = t.get_blobdir().join("whoops");
-    assert!(!whoops.exists());
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_create_from_path() {
-    let t = TestContext::new().await;
-
-    let src_ext = t.dir.path().join("external");
-    fs::write(&src_ext, b"boo").await.unwrap();
-    let blob = BlobObject::new_from_path(&t, src_ext.as_ref())
-        .await
-        .unwrap();
-    assert_eq!(blob.as_name(), "$BLOBDIR/external");
-    let data = fs::read(blob.to_abs_path()).await.unwrap();
-    assert_eq!(data, b"boo");
-
-    let src_int = t.get_blobdir().join("internal");
-    fs::write(&src_int, b"boo").await.unwrap();
-    let blob = BlobObject::new_from_path(&t, &src_int).await.unwrap();
-    assert_eq!(blob.as_name(), "$BLOBDIR/internal");
-    let data = fs::read(blob.to_abs_path()).await.unwrap();
-    assert_eq!(data, b"boo");
-}
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_create_from_name_long() {
     let t = TestContext::new().await;
     let src_ext = t.dir.path().join("autocrypt-setup-message-4137848473.html");
     fs::write(&src_ext, b"boo").await.unwrap();
-    let blob = BlobObject::new_from_path(&t, src_ext.as_ref())
-        .await
-        .unwrap();
+    let blob = BlobObject::create_and_deduplicate(&t, &src_ext, &src_ext).unwrap();
     assert_eq!(
         blob.as_name(),
-        "$BLOBDIR/autocrypt-setup-message-4137848473.html"
+        "$BLOBDIR/06f010b24d1efe57ffab44a8ad20c54.html"
     );
 }
 
@@ -173,68 +120,10 @@ async fn test_create_from_name_long() {
 fn test_is_blob_name() {
     assert!(BlobObject::is_acceptible_blob_name("foo"));
     assert!(BlobObject::is_acceptible_blob_name("foo.txt"));
-    assert!(BlobObject::is_acceptible_blob_name("f".repeat(128)));
+    assert!(BlobObject::is_acceptible_blob_name(&"f".repeat(128)));
     assert!(!BlobObject::is_acceptible_blob_name("foo/bar"));
     assert!(!BlobObject::is_acceptible_blob_name("foo\\bar"));
     assert!(!BlobObject::is_acceptible_blob_name("foo\x00bar"));
-}
-
-#[test]
-fn test_sanitise_name() {
-    let (stem, ext) = BlobObject::sanitize_name_and_split_extension(
-        "Я ЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯ.txt",
-    );
-    assert_eq!(ext, ".txt");
-    assert!(!stem.is_empty());
-
-    // the extensions are kept together as between stem and extension a number may be added -
-    // and `foo.tar.gz` should become `foo-1234.tar.gz` and not `foo.tar-1234.gz`
-    let (stem, ext) = BlobObject::sanitize_name_and_split_extension("wot.tar.gz");
-    assert_eq!(stem, "wot");
-    assert_eq!(ext, ".tar.gz");
-
-    let (stem, ext) = BlobObject::sanitize_name_and_split_extension(".foo.bar");
-    assert_eq!(stem, "file");
-    assert_eq!(ext, ".foo.bar");
-
-    let (stem, ext) = BlobObject::sanitize_name_and_split_extension("foo?.bar");
-    assert!(stem.contains("foo"));
-    assert!(!stem.contains('?'));
-    assert_eq!(ext, ".bar");
-
-    let (stem, ext) = BlobObject::sanitize_name_and_split_extension("no-extension");
-    assert_eq!(stem, "no-extension");
-    assert_eq!(ext, "");
-
-    let (stem, ext) =
-        BlobObject::sanitize_name_and_split_extension("path/ignored\\this: is* forbidden?.c");
-    assert_eq!(ext, ".c");
-    assert!(!stem.contains("path"));
-    assert!(!stem.contains("ignored"));
-    assert!(stem.contains("this"));
-    assert!(stem.contains("forbidden"));
-    assert!(!stem.contains('/'));
-    assert!(!stem.contains('\\'));
-    assert!(!stem.contains(':'));
-    assert!(!stem.contains('*'));
-    assert!(!stem.contains('?'));
-
-    let (stem, ext) = BlobObject::sanitize_name_and_split_extension(
-        "file.with_lots_of_characters_behind_point_and_double_ending.tar.gz",
-    );
-    assert_eq!(
-        stem,
-        "file.with_lots_of_characters_behind_point_and_double_ending"
-    );
-    assert_eq!(ext, ".tar.gz");
-
-    let (stem, ext) = BlobObject::sanitize_name_and_split_extension("a. tar.tar.gz");
-    assert_eq!(stem, "a. tar");
-    assert_eq!(ext, ".tar.gz");
-
-    let (stem, ext) = BlobObject::sanitize_name_and_split_extension("Guia_uso_GNB (v0.8).pdf");
-    assert_eq!(stem, "Guia_uso_GNB (v0.8)");
-    assert_eq!(ext, ".pdf");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -249,7 +138,7 @@ async fn test_add_white_bg() {
         let avatar_src = t.dir.path().join("avatar.png");
         fs::write(&avatar_src, bytes).await.unwrap();
 
-        let mut blob = BlobObject::new_from_path(&t, &avatar_src).await.unwrap();
+        let mut blob = BlobObject::create_and_deduplicate(&t, &avatar_src, &avatar_src).unwrap();
         let img_wh = 128;
         let maybe_sticker = &mut false;
         let strict_limits = true;
@@ -298,7 +187,7 @@ async fn test_selfavatar_outside_blobdir() {
         constants::BALANCED_AVATAR_SIZE,
     );
 
-    let mut blob = BlobObject::new_from_path(&t, avatar_path).await.unwrap();
+    let mut blob = BlobObject::create_and_deduplicate(&t, avatar_path, avatar_path).unwrap();
     let maybe_sticker = &mut false;
     let strict_limits = true;
     blob.recode_to_size(&t, None, maybe_sticker, 1000, 3000, strict_limits)
@@ -337,7 +226,7 @@ async fn test_selfavatar_in_blobdir() {
         .unwrap();
     let avatar_cfg = t.get_config(Config::Selfavatar).await.unwrap().unwrap();
     assert!(
-        avatar_cfg.ends_with("9e7f409ac5c92b942cc4f31cee2770a.png"),
+        avatar_cfg.ends_with("fa7418e646301203538041f60d03190.png"),
         "Avatar file name {avatar_cfg} should end with its hash"
     );
 
@@ -655,6 +544,12 @@ impl SendImageCheckMediaquality<'_> {
         alice_msg.save_file(&alice, &file_saved).await?;
         check_image_size(file_saved, compressed_width, compressed_height);
 
+        if original_width == compressed_width {
+            assert_extension(&alice, alice_msg, extension);
+        } else {
+            assert_extension(&alice, alice_msg, "jpg");
+        }
+
         let bob_msg = bob.recv_msg(&sent).await;
         assert_eq!(bob_msg.get_viewtype(), Viewtype::Image);
         assert_eq!(bob_msg.get_width() as u32, compressed_width);
@@ -673,8 +568,50 @@ impl SendImageCheckMediaquality<'_> {
         assert!(exif.is_none());
 
         let img = check_image_size(file_saved, compressed_width, compressed_height);
+
+        if original_width == compressed_width {
+            assert_extension(&bob, bob_msg, extension);
+        } else {
+            assert_extension(&bob, bob_msg, "jpg");
+        }
+
         Ok(img)
     }
+}
+
+fn assert_extension(context: &TestContext, msg: Message, extension: &str) {
+    assert!(msg
+        .param
+        .get(Param::File)
+        .unwrap()
+        .ends_with(&format!(".{extension}")));
+    assert!(msg
+        .param
+        .get(Param::Filename)
+        .unwrap()
+        .ends_with(&format!(".{extension}")));
+    assert!(msg
+        .get_filename()
+        .unwrap()
+        .ends_with(&format!(".{extension}")));
+    assert_eq!(
+        msg.get_file(context)
+            .unwrap()
+            .extension()
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        extension
+    );
+    assert_eq!(
+        msg.param
+            .get_file_blob(context)
+            .unwrap()
+            .unwrap()
+            .suffix()
+            .unwrap(),
+        extension
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

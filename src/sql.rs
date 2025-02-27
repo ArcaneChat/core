@@ -251,7 +251,7 @@ impl Sql {
 
         if recode_avatar {
             if let Some(avatar) = context.get_config(Config::Selfavatar).await? {
-                let mut blob = BlobObject::new_from_path(context, avatar.as_ref()).await?;
+                let mut blob = BlobObject::from_path(context, Path::new(&avatar))?;
                 match blob.recode_to_avatar_size(context).await {
                     Ok(()) => {
                         if let Some(path) = blob.to_abs_path().to_str() {
@@ -458,7 +458,9 @@ impl Sql {
     ///   in parallel with other transactions. NB: Creating and modifying temporary tables are also
     ///   allowed with `query_only`, temporary tables aren't visible in other connections, but you
     ///   need to pass `PRAGMA query_only=0;` to SQLite before that:
-    ///     `pragma_update(None, "query_only", "0")`.
+    ///   ```text
+    ///   pragma_update(None, "query_only", "0")
+    ///   ```
     ///   Also temporary tables need to be dropped because the connection is returned to the pool
     ///   then.
     ///
@@ -912,42 +914,47 @@ pub async fn remove_unused_files(context: &Context) -> Result<()> {
                         continue;
                     }
 
-                    if let Ok(stats) = tokio::fs::metadata(entry.path()).await {
-                        if stats.is_dir() {
-                            if let Err(e) = tokio::fs::remove_dir(entry.path()).await {
-                                // The dir could be created not by a user, but by a desktop
-                                // environment f.e. So, no warning.
-                                info!(
-                                    context,
-                                    "Housekeeping: Cannot rmdir {}: {:#}.",
-                                    entry.path().display(),
-                                    e
-                                );
-                            }
-                            continue;
-                        }
-                        unreferenced_count += 1;
-                        let recently_created =
-                            stats.created().is_ok_and(|t| t > keep_files_newer_than);
-                        let recently_modified =
-                            stats.modified().is_ok_and(|t| t > keep_files_newer_than);
-                        let recently_accessed =
-                            stats.accessed().is_ok_and(|t| t > keep_files_newer_than);
+                    let Ok(stats) = tokio::fs::metadata(entry.path()).await else {
+                        warn!(
+                            context,
+                            "Cannot get metadata for {}.",
+                            entry.path().display()
+                        );
+                        continue;
+                    };
 
-                        if p == blobdir
-                            && (recently_created || recently_modified || recently_accessed)
-                        {
+                    if stats.is_dir() {
+                        if let Err(e) = tokio::fs::remove_dir(entry.path()).await {
+                            // The dir could be created not by a user, but by a desktop
+                            // environment f.e. So, no warning.
                             info!(
                                 context,
-                                "Housekeeping: Keeping new unreferenced file #{}: {:?}.",
-                                unreferenced_count,
-                                entry.file_name(),
+                                "Housekeeping: Cannot rmdir {}: {:#}.",
+                                entry.path().display(),
+                                e
                             );
-                            continue;
                         }
-                    } else {
-                        unreferenced_count += 1;
+                        continue;
                     }
+
+                    unreferenced_count += 1;
+                    let recently_created = stats.created().is_ok_and(|t| t > keep_files_newer_than);
+                    let recently_modified =
+                        stats.modified().is_ok_and(|t| t > keep_files_newer_than);
+                    let recently_accessed =
+                        stats.accessed().is_ok_and(|t| t > keep_files_newer_than);
+
+                    if p == blobdir && (recently_created || recently_modified || recently_accessed)
+                    {
+                        info!(
+                            context,
+                            "Housekeeping: Keeping new unreferenced file #{}: {:?}.",
+                            unreferenced_count,
+                            entry.file_name(),
+                        );
+                        continue;
+                    }
+
                     info!(
                         context,
                         "Housekeeping: Deleting unreferenced file #{}: {:?}.",
