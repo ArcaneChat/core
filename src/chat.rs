@@ -3032,7 +3032,7 @@ pub(crate) async fn create_send_msg_jobs(context: &Context, msg: &mut Message) -
         .context("Can't get ui-config")
         .unwrap_or_default()
         .unwrap_or("1".to_string());
-    let needs_encryption = force_encryption == "1" || msg.param.get_bool(Param::GuaranteeE2ee).unwrap_or_default();
+    let needs_encryption = (force_encryption == "1" && msg.param.get_cmd() != SystemMessage::SecurejoinMessage) || msg.param.get_bool(Param::GuaranteeE2ee).unwrap_or_default();
     let mimefactory = MimeFactory::from_msg(context, msg.clone()).await?;
     let attach_selfavatar = mimefactory.attach_selfavatar;
     let mut recipients = mimefactory.recipients();
