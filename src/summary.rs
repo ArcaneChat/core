@@ -95,7 +95,6 @@ impl Summary {
         chat: &Chat,
         contact: Option<&Contact>,
     ) -> Result<Summary> {
-        let is_community = context.get_config_bool(Config::IsCommunity).await?;
         let prefix = if msg.state == MessageState::OutDraft {
             Some(SummaryPrefix::Draft(stock_str::draft(context).await))
         } else if msg.from_id == ContactId::SELF {
