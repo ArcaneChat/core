@@ -99,23 +99,25 @@ impl Summary {
         let prefix = if msg.state == MessageState::OutDraft {
             Some(SummaryPrefix::Draft(stock_str::draft(context).await))
         } else if msg.from_id == ContactId::SELF {
-            if is_community && !msg.is_info() {
-              msg.get_override_sender_name()
-                 .or_else(|| contact.map(|contact| msg.get_sender_name(contact)))
-                 .map(SummaryPrefix::Username)
-            } else if msg.is_info() || chat.is_self_talk() {
+            if msg.is_info() {
                 None
             } else {
                 Some(SummaryPrefix::Me(stock_str::self_msg(context).await))
             }
-        } else {
-            if (chat.typ == Chattype::Single && !is_community) || msg.is_info() || contact.is_none() {
-               None
+        } else if chat.typ == Chattype::Group
+            || chat.typ == Chattype::Broadcast
+            || chat.typ == Chattype::Mailinglist
+            || chat.is_self_talk()
+        {
+            if msg.is_info() || contact.is_none() {
+                None
             } else {
-               msg.get_override_sender_name()
-                 .or_else(|| contact.map(|contact| msg.get_sender_name(contact)))
-                 .map(SummaryPrefix::Username)
+                msg.get_override_sender_name()
+                    .or_else(|| contact.map(|contact| msg.get_sender_name(contact)))
+                    .map(SummaryPrefix::Username)
             }
+        } else {
+            None
         };
 
         let mut text = msg.get_summary_text(context).await;
