@@ -31,37 +31,6 @@ def test_basic_imap_api(acfactory, tmp_path):
     imap2.shutdown()
 
 
-@pytest.mark.ignored()
-def test_configure_generate_key(acfactory, lp):
-    # A slow test which will generate new keys.
-    acfactory.remove_preconfigured_keys()
-    ac1 = acfactory.new_online_configuring_account(key_gen_type=str(dc.const.DC_KEY_GEN_RSA2048))
-    ac2 = acfactory.new_online_configuring_account(key_gen_type=str(dc.const.DC_KEY_GEN_ED25519))
-    acfactory.bring_accounts_online()
-    chat = acfactory.get_accepted_chat(ac1, ac2)
-
-    lp.sec("ac1: send unencrypted message to ac2")
-    chat.send_text("message1")
-    lp.sec("ac2: waiting for message from ac1")
-    msg_in = ac2._evtracker.wait_next_incoming_message()
-    assert msg_in.text == "message1"
-    assert not msg_in.is_encrypted()
-
-    lp.sec("ac2: send encrypted message to ac1")
-    msg_in.chat.send_text("message2")
-    lp.sec("ac1: waiting for message from ac2")
-    msg2_in = ac1._evtracker.wait_next_incoming_message()
-    assert msg2_in.text == "message2"
-    assert msg2_in.is_encrypted()
-
-    lp.sec("ac1: send encrypted message to ac2")
-    msg2_in.chat.send_text("message3")
-    lp.sec("ac2: waiting for message from ac1")
-    msg3_in = ac2._evtracker.wait_next_incoming_message()
-    assert msg3_in.text == "message3"
-    assert msg3_in.is_encrypted()
-
-
 def test_configure_canceled(acfactory):
     ac1 = acfactory.new_online_configuring_account()
     ac1.stop_ongoing()
@@ -1010,7 +979,6 @@ def test_gossip_encryption_preference(acfactory, lp):
 
 def test_send_first_message_as_long_unicode_with_cr(acfactory, lp):
     ac1, ac2 = acfactory.get_online_accounts(2)
-    ac2.set_config("save_mime_headers", "1")
 
     lp.sec("ac1: create chat with ac2")
     chat = acfactory.get_accepted_chat(ac1, ac2)
@@ -1398,26 +1366,6 @@ def test_quote_attachment(tmp_path, acfactory, lp):
     assert received_reply.text == "message reply"
     assert received_reply.quoted_text == received_message.text
     assert open(received_reply.filename).read() == "data to send"
-
-
-def test_saved_mime_on_received_message(acfactory, lp):
-    ac1, ac2 = acfactory.get_online_accounts(2)
-
-    lp.sec("configure ac2 to save mime headers, create ac1/ac2 chat")
-    ac2.set_config("save_mime_headers", "1")
-    chat = ac1.create_chat(ac2)
-
-    lp.sec("sending text message from ac1 to ac2")
-    msg_out = chat.send_text("message1")
-    ac1._evtracker.wait_msg_delivered(msg_out)
-    assert msg_out.get_mime_headers() is None
-
-    lp.sec("wait for ac2 to receive message")
-    ev = ac2._evtracker.get_matching("DC_EVENT_INCOMING_MSG")
-    in_id = ev.data2
-    mime = ac2.get_message_by_id(in_id).get_mime_headers()
-    assert mime.get_all("From")
-    assert mime.get_all("Received")
 
 
 def test_send_mark_seen_clean_incoming_events(acfactory, lp):

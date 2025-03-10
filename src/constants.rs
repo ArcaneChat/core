@@ -58,25 +58,6 @@ pub enum MediaQuality {
     Worse = 1,
 }
 
-/// Type of the key to generate.
-#[derive(
-    Debug, Default, Display, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive, FromSql, ToSql,
-)]
-#[repr(u8)]
-pub enum KeyGenType {
-    #[default]
-    Default = 0,
-
-    /// 2048-bit RSA.
-    Rsa2048 = 1,
-
-    /// [Ed25519](https://ed25519.cr.yp.to/) signature and X25519 encryption.
-    Ed25519 = 2,
-
-    /// 4096-bit RSA.
-    Rsa4096 = 3,
-}
-
 /// Video chat URL type.
 #[derive(
     Debug, Default, Display, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive, FromSql, ToSql,
@@ -204,9 +185,11 @@ pub(crate) const DC_FETCH_EXISTING_MSGS_COUNT: i64 = 100;
 pub const BALANCED_IMAGE_BYTES: usize = 500_000;
 pub const WORSE_IMAGE_BYTES: usize = 130_000;
 
-// max. width/height of an avatar
-pub(crate) const BALANCED_AVATAR_SIZE: u32 = 256;
+// max. width/height and bytes of an avatar
+pub(crate) const BALANCED_AVATAR_SIZE: u32 = 512;
+pub(crate) const BALANCED_AVATAR_BYTES: usize = 60_000;
 pub(crate) const WORSE_AVATAR_SIZE: u32 = 128;
+pub(crate) const WORSE_AVATAR_BYTES: usize = 20_000; // this also fits to Outlook servers don't allowing headers larger than 32k.
 
 // max. width/height of images scaled down because of being too huge
 pub const BALANCED_IMAGE_SIZE: u32 = 1280;
@@ -251,16 +234,6 @@ mod tests {
         assert_eq!(Chattype::Group, Chattype::from_i32(120).unwrap());
         assert_eq!(Chattype::Mailinglist, Chattype::from_i32(140).unwrap());
         assert_eq!(Chattype::Broadcast, Chattype::from_i32(160).unwrap());
-    }
-
-    #[test]
-    fn test_keygentype_values() {
-        // values may be written to disk and must not change
-        assert_eq!(KeyGenType::Default, KeyGenType::default());
-        assert_eq!(KeyGenType::Default, KeyGenType::from_i32(0).unwrap());
-        assert_eq!(KeyGenType::Rsa2048, KeyGenType::from_i32(1).unwrap());
-        assert_eq!(KeyGenType::Ed25519, KeyGenType::from_i32(2).unwrap());
-        assert_eq!(KeyGenType::Rsa4096, KeyGenType::from_i32(3).unwrap());
     }
 
     #[test]

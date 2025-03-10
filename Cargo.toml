@@ -1,6 +1,6 @@
 [package]
 name = "deltachat"
-version = "1.156.2"
+version = "1.156.3"
 edition = "2021"
 license = "MPL-2.0"
 rust-version = "1.81"
@@ -57,17 +57,17 @@ fd-lock = "4"
 futures-lite = { workspace = true }
 futures = { workspace = true }
 hex = "0.4.0"
-hickory-resolver = "=0.25.0-alpha.4"
+hickory-resolver = "=0.25.0-alpha.5"
 http-body-util = "0.1.2"
 humansize = "2"
 hyper = "1"
 hyper-util = "0.1.10"
 image = { version = "0.25.5", default-features=false, features = ["gif", "jpeg", "ico", "png", "pnm", "webp", "bmp"] }
-iroh-gossip = { version = "0.32", default-features = false, features = ["net"] }
-iroh = { version = "0.32", default-features = false }
+iroh-gossip = { version = "0.33", default-features = false, features = ["net"] }
+iroh = { version = "0.33", default-features = false }
 kamadak-exif = "0.6.1"
 libc = { workspace = true }
-mail-builder = { git = "https://github.com/stalwartlabs/mail-builder", branch = "main", default-features = false }
+mail-builder = { version = "0.4.2", default-features = false }
 mailparse = "0.16.1"
 mime = "0.3.17"
 num_cpus = "1.16"
@@ -101,7 +101,7 @@ tagger = "4.3.4"
 textwrap = "0.16.1"
 thiserror = { workspace = true }
 tokio-io-timeout = "1.2.0"
-tokio-rustls = { version = "0.26.1", default-features = false }
+tokio-rustls = { version = "0.26.2", default-features = false }
 tokio-stream = { version = "0.1.17", features = ["fs"] }
 tokio-tar = { version = "0.3" } # TODO: integrate tokio into async-tar
 tokio-util = { workspace = true }
@@ -110,7 +110,7 @@ toml = "0.8"
 url = "2"
 uuid = { version = "1", features = ["serde", "v4"] }
 webpki-roots = "0.26.8"
-blake3 = "1.5.5"
+blake3 = "1.6.1"
 
 [dev-dependencies]
 anyhow = { workspace = true, features = ["backtrace"] } # Enable `backtrace` feature in tests.
@@ -174,7 +174,7 @@ harness = false
 anyhow = "1"
 async-channel = "2.3.1"
 base64 = "0.22"
-chrono = { version = "0.4.39", default-features = false }
+chrono = { version = "0.4.40", default-features = false }
 deltachat-contact-tools = { path = "deltachat-contact-tools" }
 deltachat-jsonrpc = { path = "deltachat-jsonrpc", default-features = false }
 deltachat = { path = ".", default-features = false }

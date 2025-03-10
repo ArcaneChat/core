@@ -440,17 +440,6 @@ char*           dc_get_blobdir               (const dc_context_t* context);
  *                    also show all mails of confirmed contacts,
  *                    DC_SHOW_EMAILS_ALL (2)=
  *                    also show mails of unconfirmed contacts (default).
- * - `key_gen_type` = DC_KEY_GEN_DEFAULT (0)=
- *                    generate recommended key type (default),
- *                    DC_KEY_GEN_RSA2048 (1)=
- *                    generate RSA 2048 keypair
- *                    DC_KEY_GEN_ED25519 (2)=
- *                    generate Curve25519 keypair
- *                    DC_KEY_GEN_RSA4096 (3)=
- *                    generate RSA 4096 keypair
- * - `save_mime_headers` = 1=save mime headers
- *                    and make dc_get_mime_headers() work for subsequent calls,
- *                    0=do not save mime headers (default)
  * - `delete_device_after` = 0=do not delete messages from device automatically (default),
  *                    >=1=seconds, after which messages are deleted automatically from the device.
  *                    Messages in the "saved messages" chat (see dc_chat_is_self_talk()) are skipped.
@@ -1958,23 +1947,6 @@ char*           dc_get_msg_html              (dc_context_t* context, uint32_t ms
   * @param msg_id The message ID to download the content for.
   */
 void dc_download_full_msg (dc_context_t* context, int msg_id);
-
-
-/**
- * Get the raw mime-headers of the given message.
- * Raw headers are saved for incoming messages
- * only if `dc_set_config(context, "save_mime_headers", "1")`
- * was called before.
- *
- * @memberof dc_context_t
- * @param context The context object.
- * @param msg_id The message ID, must be the ID of an incoming message.
- * @return Raw headers as a multi-line string, must be released using dc_str_unref() after usage.
- *     Returns NULL if there are no headers saved for the given message,
- *     e.g. because of save_mime_headers is not set
- *     or the message is not incoming.
- */
-char*           dc_get_mime_headers          (dc_context_t* context, uint32_t msg_id);
 
 
 /**
@@ -6323,6 +6295,18 @@ void dc_event_unref(dc_event_t* event);
 
 
 /**
+ * Chat was deleted.
+ * This event is emitted in response to dc_delete_chat()
+ * called on this or another device.
+ * The event is a good place to remove notifications or homescreen shortcuts.
+ *
+ * @param data1 (int) chat_id
+ * @param data2 (int) 0
+ */
+#define DC_EVENT_CHAT_DELETED             2023
+
+
+/**
  * Contact(s) created, renamed, verified, blocked or deleted.
  *
  * @param data1 (int) contact_id of the changed contact or 0 on batch-changes or deletion.
@@ -6560,15 +6544,6 @@ void dc_event_unref(dc_event_t* event);
  */
 #define DC_MEDIA_QUALITY_BALANCED 0
 #define DC_MEDIA_QUALITY_WORSE    1
-
-
-/*
- * Values for dc_get|set_config("key_gen_type")
- */
-#define DC_KEY_GEN_DEFAULT 0
-#define DC_KEY_GEN_RSA2048 1
-#define DC_KEY_GEN_ED25519 2
-#define DC_KEY_GEN_RSA4096 3
 
 
 /**

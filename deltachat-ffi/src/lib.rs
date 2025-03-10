@@ -544,6 +544,7 @@ pub unsafe extern "C" fn dc_event_get_id(event: *mut dc_event_t) -> libc::c_int 
         EventType::MsgDeleted { .. } => 2016,
         EventType::ChatModified(_) => 2020,
         EventType::ChatEphemeralTimerModified { .. } => 2021,
+        EventType::ChatDeleted { .. } => 2023,
         EventType::ContactsChanged(_) => 2030,
         EventType::LocationChanged(_) => 2035,
         EventType::ConfigureProgress { .. } => 2041,
@@ -610,7 +611,8 @@ pub unsafe extern "C" fn dc_event_get_data1_int(event: *mut dc_event_t) -> libc:
         | EventType::MsgRead { chat_id, .. }
         | EventType::MsgDeleted { chat_id, .. }
         | EventType::ChatModified(chat_id)
-        | EventType::ChatEphemeralTimerModified { chat_id, .. } => chat_id.to_u32() as libc::c_int,
+        | EventType::ChatEphemeralTimerModified { chat_id, .. }
+        | EventType::ChatDeleted { chat_id } => chat_id.to_u32() as libc::c_int,
         EventType::ContactsChanged(id) | EventType::LocationChanged(id) => {
             let id = id.unwrap_or_default();
             id.to_u32() as libc::c_int
@@ -676,6 +678,7 @@ pub unsafe extern "C" fn dc_event_get_data2_int(event: *mut dc_event_t) -> libc:
         | EventType::AccountsItemChanged
         | EventType::ConfigSynced { .. }
         | EventType::ChatModified(_)
+        | EventType::ChatDeleted { .. }
         | EventType::WebxdcRealtimeAdvertisementReceived { .. }
         | EventType::EventChannelOverflow { .. } => 0,
         EventType::MsgsChanged { msg_id, .. }
@@ -767,6 +770,7 @@ pub unsafe extern "C" fn dc_event_get_data2_str(event: *mut dc_event_t) -> *mut 
         | EventType::WebxdcInstanceDeleted { .. }
         | EventType::AccountsBackgroundFetchDone
         | EventType::ChatEphemeralTimerModified { .. }
+        | EventType::ChatDeleted { .. }
         | EventType::IncomingMsgBunch { .. }
         | EventType::ChatlistItemChanged { .. }
         | EventType::ChatlistChanged
@@ -1947,28 +1951,6 @@ pub unsafe extern "C" fn dc_get_msg_html(
     block_on(MsgId::new(msg_id).get_html(ctx))
         .unwrap_or_log_default(ctx, "Failed get_msg_html")
         .strdup()
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn dc_get_mime_headers(
-    context: *mut dc_context_t,
-    msg_id: u32,
-) -> *mut libc::c_char {
-    if context.is_null() {
-        eprintln!("ignoring careless call to dc_get_mime_headers()");
-        return ptr::null_mut(); // NULL explicitly defined as "no mime headers"
-    }
-    let ctx = &*context;
-
-    block_on(async move {
-        let mime = message::get_mime_headers(ctx, MsgId::new(msg_id))
-            .await
-            .unwrap_or_log_default(ctx, "failed to get mime headers");
-        if mime.is_empty() {
-            return ptr::null_mut();
-        }
-        mime.strdup()
-    })
 }
 
 #[no_mangle]

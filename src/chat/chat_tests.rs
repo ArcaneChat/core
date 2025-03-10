@@ -1883,10 +1883,6 @@ async fn test_sticker(
     msg.set_file_and_deduplicate(&alice, &file, Some(filename), None)?;
 
     let sent_msg = alice.send_msg(alice_chat.id, &mut msg).await;
-    let mime = sent_msg.payload();
-    if res_viewtype == Viewtype::Sticker {
-        assert_eq!(mime.match_indices("Chat-Content: sticker").count(), 1);
-    }
 
     let msg = bob.recv_msg(&sent_msg).await;
     assert_eq!(msg.chat_id, bob_chat.id);
@@ -3048,6 +3044,10 @@ async fn test_sync_delete_chat() -> Result<()> {
     a0b_chat_id.delete(alice0).await?;
     sync(alice0, alice1).await;
     alice1.assert_no_chat(a1b_chat_id).await;
+    alice1
+        .evtracker
+        .get_matching(|evt| matches!(evt, EventType::ChatDeleted { .. }))
+        .await;
 
     let bob_grp_chat_id = bob
         .create_group_with_members(ProtectionStatus::Unprotected, "grp", &[alice0])
@@ -3060,6 +3060,11 @@ async fn test_sync_delete_chat() -> Result<()> {
     a0_grp_chat_id.delete(alice0).await?;
     sync(alice0, alice1).await;
     alice1.assert_no_chat(a1_grp_chat_id).await;
+    alice0
+        .evtracker
+        .get_matching(|evt| matches!(evt, EventType::ChatDeleted { .. }))
+        .await;
+
     Ok(())
 }
 

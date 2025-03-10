@@ -193,10 +193,6 @@ pub enum Config {
     #[strum(props(default = "1"))]
     FetchedExistingMsgs,
 
-    /// Type of the OpenPGP key to generate.
-    #[strum(props(default = "0"))]
-    KeyGenType,
-
     /// Timer in seconds after which the message is deleted from the
     /// server.
     ///
@@ -219,9 +215,6 @@ pub enum Config {
     /// Move messages to the Trash folder instead of marking them "\Deleted". Overrides
     /// `ProviderOptions::delete_to_trash`.
     DeleteToTrash,
-
-    /// Save raw MIME messages with headers in the database if true.
-    SaveMimeHeaders,
 
     /// The primary email address. Also see `SecondaryAddrs`.
     ConfiguredAddr,
@@ -720,7 +713,6 @@ impl Context {
             | Config::OnlyFetchMvbox
             | Config::FetchExistingMsgs
             | Config::DeleteToTrash
-            | Config::SaveMimeHeaders
             | Config::Configured
             | Config::Bot
             | Config::NotifyAboutWrongPw

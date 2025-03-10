@@ -141,7 +141,7 @@ async fn test_setup_contact_ex(case: SetupContactCase) {
         msg.get_header(HeaderDef::SecureJoin).unwrap(),
         "vc-auth-required"
     );
-    let bob_chat = bob.create_chat(&alice).await;
+    let bob_chat = bob.get_chat(&alice).await;
     assert_eq!(bob_chat.can_send(&bob).await.unwrap(), false);
     assert_eq!(
         bob_chat.why_cant_send(&bob).await.unwrap(),
@@ -154,7 +154,7 @@ async fn test_setup_contact_ex(case: SetupContactCase) {
 
     // Step 4: Bob receives vc-auth-required, sends vc-request-with-auth
     bob.recv_msg_trash(&sent).await;
-    let bob_chat = bob.create_chat(&alice).await;
+    let bob_chat = bob.get_chat(&alice).await;
     assert_eq!(bob_chat.can_send(&bob).await.unwrap(), true);
 
     // Check Bob emitted the JoinerProgress event.
@@ -252,7 +252,7 @@ async fn test_setup_contact_ex(case: SetupContactCase) {
     assert_eq!(contact_bob.is_bot(), false);
 
     // exactly one one-to-one chat should be visible for both now
-    // (check this before calling alice.create_chat() explicitly below)
+    // (check this before calling alice.get_chat() explicitly below)
     assert_eq!(
         Chatlist::try_load(&alice, 0, None, None)
             .await
@@ -267,7 +267,7 @@ async fn test_setup_contact_ex(case: SetupContactCase) {
 
     // Check Alice got the verified message in her 1:1 chat.
     {
-        let chat = alice.create_chat(&bob).await;
+        let chat = alice.get_chat(&bob).await;
         let msg = get_chat_msg(&alice, chat.get_id(), 0, 1).await;
         assert!(msg.is_info());
         let expected_text = chat_protection_enabled(&alice).await;
@@ -669,11 +669,11 @@ async fn test_secure_join() -> Result<()> {
     assert_eq!(Chatlist::try_load(&bob, 0, None, None).await?.len(), 1);
 
     // If Bob then sends a direct message to alice, however, the one-to-one with Alice should appear.
-    let bobs_chat_with_alice = bob.create_chat(&alice).await;
+    let bobs_chat_with_alice = bob.get_chat(&alice).await;
     let sent = bob.send_text(bobs_chat_with_alice.id, "Hello").await;
     alice.recv_msg(&sent).await;
     assert_eq!(Chatlist::try_load(&alice, 0, None, None).await?.len(), 2);
-    assert_eq!(Chatlist::try_load(&bob, 0, None, None).await?.len(), 2);
+    assert_eq!(Chatlist::try_load(&bob, 0, None, None).await?.len(), 1);
 
     Ok(())
 }
@@ -816,8 +816,13 @@ async fn test_shared_bobs_key() -> Result<()> {
     let bob3_addr = "bob3@example.net";
     bob3.configure_addr(bob3_addr).await;
     imex(bob3, ImexMode::ImportSelfKeys, export_dir.path(), None).await?;
-    tcm.send_recv(bob3, alice, "hi Alice!").await;
-    let msg = tcm.send_recv(alice, bob3, "hi Bob3!").await;
+    let chat = bob3.create_email_chat(alice).await;
+    let sent = bob3.send_text(chat.id, "hi Alice!").await;
+    let msg = alice.recv_msg(&sent).await;
+    assert!(!msg.get_showpadlock());
+    let chat = alice.create_email_chat(bob3).await;
+    let sent = alice.send_text(chat.id, "hi Bob3!").await;
+    let msg = bob3.recv_msg(&sent).await;
     assert!(msg.get_showpadlock());
 
     let mut bob_ids = HashSet::new();

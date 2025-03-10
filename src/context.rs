@@ -931,12 +931,6 @@ impl Context {
             self.get_config_int(Config::ShowEmails).await?.to_string(),
         );
         res.insert(
-            "save_mime_headers",
-            self.get_config_bool(Config::SaveMimeHeaders)
-                .await?
-                .to_string(),
-        );
-        res.insert(
             "download_limit",
             self.get_config_int(Config::DownloadLimit)
                 .await?
@@ -955,10 +949,6 @@ impl Context {
         res.insert("configured_trash_folder", configured_trash_folder);
         res.insert("mdns_enabled", mdns_enabled.to_string());
         res.insert("e2ee_enabled", e2ee_enabled.to_string());
-        res.insert(
-            "key_gen_type",
-            self.get_config_int(Config::KeyGenType).await?.to_string(),
-        );
         res.insert("bcc_self", bcc_self.to_string());
         res.insert("sync_msgs", sync_msgs.to_string());
         res.insert("disable_idle", disable_idle.to_string());
