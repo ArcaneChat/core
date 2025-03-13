@@ -299,10 +299,6 @@ async fn test_member_add_remove() -> Result<()> {
     let alice = tcm.alice().await;
     let bob = tcm.bob().await;
 
-    // Disable encryption so we can inspect raw message contents.
-    alice.set_config(Config::E2eeEnabled, Some("0")).await?;
-    bob.set_config(Config::E2eeEnabled, Some("0")).await?;
-
     // Create contact for Bob on the Alice side with name "robert".
     let alice_bob_contact_id = Contact::create(&alice, "robert", "bob@example.net").await?;
 
@@ -372,9 +368,6 @@ async fn test_parallel_member_remove() -> Result<()> {
 
     let alice = tcm.alice().await;
     let bob = tcm.bob().await;
-
-    alice.set_config(Config::E2eeEnabled, Some("0")).await?;
-    bob.set_config(Config::E2eeEnabled, Some("0")).await?;
 
     let alice_bob_contact_id = Contact::create(&alice, "Bob", "bob@example.net").await?;
     let alice_fiona_contact_id = Contact::create(&alice, "Fiona", "fiona@example.net").await?;
@@ -2677,11 +2670,10 @@ async fn test_chat_get_encryption_info() -> Result<()> {
         "No encryption:\n\
             fiona@example.net\n\
             \n\
-            End-to-end encryption preferred:\n\
+            End-to-end encryption available:\n\
             bob@example.net"
     );
 
-    bob.set_config(Config::E2eeEnabled, Some("0")).await?;
     send_text_msg(&bob, direct_chat.id, "Hello!".to_string()).await?;
     alice.recv_msg(&bob.pop_sent_msg().await).await;
 
@@ -3883,5 +3875,22 @@ async fn test_send_delete_request() -> Result<()> {
     alice2.recv_msg_opt(&sent2).await;
     assert_eq!(alice2_msg.chat_id.get_msg_cnt(alice2).await?, 1);
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_send_delete_request_no_encryption() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+    let alice_chat = alice.create_email_chat(bob).await;
+
+    // Alice sends a message, then tries to send a deletion request which fails.
+    let sent1 = alice.send_text(alice_chat.id, "wtf").await;
+    assert!(message::delete_msgs_ex(alice, &[sent1.sender_msg_id], true)
+        .await
+        .is_err());
+    sent1.load_from_db().await;
+    assert_eq!(alice_chat.id.get_msg_cnt(alice).await?, 1);
     Ok(())
 }

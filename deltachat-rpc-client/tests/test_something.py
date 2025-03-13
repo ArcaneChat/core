@@ -287,12 +287,9 @@ def test_message(acfactory) -> None:
     assert reactions == snapshot.reactions
 
 
-def test_reaction_seen_on_another_dev(acfactory, tmp_path) -> None:
+def test_reaction_seen_on_another_dev(acfactory) -> None:
     alice, bob = acfactory.get_online_accounts(2)
-    alice.export_backup(tmp_path)
-    files = list(tmp_path.glob("*.tar"))
-    alice2 = acfactory.get_unconfigured_account()
-    alice2.import_backup(files[0])
+    alice2 = alice.clone()
     alice2.start_io()
 
     bob_addr = bob.get_config("addr")
@@ -661,7 +658,7 @@ def test_download_limit_chat_assignment(acfactory, tmp_path, n_accounts):
             assert snapshot.chat == bob_chat_alice
 
 
-def test_markseen_contact_request(acfactory, tmp_path):
+def test_markseen_contact_request(acfactory):
     """
     Test that seen status is synchronized for contact request messages
     even though read receipt is not sent.
@@ -669,10 +666,7 @@ def test_markseen_contact_request(acfactory, tmp_path):
     alice, bob = acfactory.get_online_accounts(2)
 
     # Bob sets up a second device.
-    bob.export_backup(tmp_path)
-    files = list(tmp_path.glob("*.tar"))
-    bob2 = acfactory.get_unconfigured_account()
-    bob2.import_backup(files[0])
+    bob2 = bob.clone()
     bob2.start_io()
 
     alice_chat_bob = alice.create_chat(bob)
@@ -716,3 +710,28 @@ def test_configured_imap_certificate_checks(acfactory):
     # Core 1.142.4, 1.142.5 and 1.142.6 saved this value due to bug.
     # This test is a regression test to prevent this happening again.
     assert configured_certificate_checks != "0"
+
+
+def test_no_old_msg_is_fresh(acfactory):
+    ac1, ac2 = acfactory.get_online_accounts(2)
+    ac1_clone = ac1.clone()
+    ac1_clone.start_io()
+
+    ac1.create_chat(ac2)
+    ac1_clone_chat = ac1_clone.create_chat(ac2)
+
+    ac1.get_device_chat().mark_noticed()
+
+    logging.info("Send a first message from ac2 to ac1 and check that it's 'fresh'")
+    first_msg = ac2.create_chat(ac1).send_text("Hi")
+    ac1.wait_for_incoming_msg_event()
+    assert ac1.create_chat(ac2).get_fresh_message_count() == 1
+    assert len(list(ac1.get_fresh_messages())) == 1
+
+    logging.info("Send a message from ac1_clone to ac2 and check that ac1 marks the first message as 'noticed'")
+    ac1_clone_chat.send_text("Hi back")
+    ev = ac1.wait_for_msgs_noticed_event()
+
+    assert ev.chat_id == first_msg.get_snapshot().chat_id
+    assert ac1.create_chat(ac2).get_fresh_message_count() == 0
+    assert len(list(ac1.get_fresh_messages())) == 0

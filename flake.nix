@@ -18,9 +18,9 @@
         manifest = (pkgs.lib.importTOML ./Cargo.toml).package;
         androidSdk = android.sdk.${system} (sdkPkgs:
           builtins.attrValues {
-            inherit (sdkPkgs) ndk-27-0-11902837 cmdline-tools-latest;
+            inherit (sdkPkgs) ndk-27-2-12479018 cmdline-tools-latest;
           });
-        androidNdkRoot = "${androidSdk}/share/android-sdk/ndk/27.0.11902837";
+        androidNdkRoot = "${androidSdk}/share/android-sdk/ndk/27.2.12479018";
 
         rustSrc = nix-filter.lib {
           root = ./.;
@@ -30,6 +30,7 @@
           include = [
             ./benches
             ./assets
+            ./fuzz
             ./Cargo.lock
             ./Cargo.toml
             ./CMakeLists.txt
@@ -308,10 +309,41 @@
             LD = "${targetCc}";
           };
 
-        mkAndroidPackages = arch: {
-          "deltachat-rpc-server-${arch}-android" = mkAndroidRustPackage arch "deltachat-rpc-server";
-          "deltachat-repl-${arch}-android" = mkAndroidRustPackage arch "deltachat-repl";
-        };
+        mkAndroidPackages = arch:
+          let
+            rpc-server = mkAndroidRustPackage arch "deltachat-rpc-server";
+          in
+          {
+            "deltachat-rpc-server-${arch}-android" = rpc-server;
+            "deltachat-repl-${arch}-android" = mkAndroidRustPackage arch "deltachat-repl";
+            "deltachat-rpc-server-${arch}-android-wheel" =
+              pkgs.stdenv.mkDerivation {
+                pname = "deltachat-rpc-server-${arch}-android-wheel";
+                version = manifest.version;
+                src = nix-filter.lib {
+                  root = ./.;
+                  include = [
+                    "scripts/wheel-rpc-server.py"
+                    "deltachat-rpc-server/README.md"
+                    "LICENSE"
+                    "Cargo.toml"
+                  ];
+                };
+                nativeBuildInputs = [
+                  pkgs.python3
+                  pkgs.python3Packages.wheel
+                ];
+                buildInputs = [
+                  rpc-server
+                ];
+                buildPhase = ''
+                  mkdir tmp
+                  cp ${rpc-server}/bin/deltachat-rpc-server tmp/deltachat-rpc-server
+                  python3 scripts/wheel-rpc-server.py ${arch}-android tmp/deltachat-rpc-server
+                '';
+                installPhase = ''mkdir -p $out; cp -av deltachat_rpc_server-*.whl $out'';
+              };
+          };
 
         mkRustPackages = arch:
           let

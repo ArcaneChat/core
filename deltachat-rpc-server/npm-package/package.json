@@ -8,12 +8,12 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/deltachat/deltachat-core-rust.git"
+    "url": "https://github.com/chatmail/core.git"
   },
   "scripts": {
     "prepack": "node scripts/update_optional_dependencies_and_version.js"
   },
   "type": "module",
   "types": "index.d.ts",
-  "version": "1.156.3"
+  "version": "1.157.1"
 }

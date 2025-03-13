@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, Optional, Union
 from warnings import warn
 
@@ -37,6 +39,16 @@ class Account:
     def remove(self) -> None:
         """Remove the account."""
         self._rpc.remove_account(self.id)
+
+    def clone(self) -> "Account":
+        """Clone given account."""
+        with TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            self.export_backup(tmp_path)
+            files = list(tmp_path.glob("*.tar"))
+            new_account = self.manager.add_account()
+            new_account.import_backup(files[0])
+            return new_account
 
     def start_io(self) -> None:
         """Start the account I/O."""
@@ -83,6 +95,10 @@ class Account:
         return self.get_config("selfavatar")
 
     def check_qr(self, qr):
+        """Parse QR code contents.
+
+        This function takes the raw text scanned
+        and checks what can be done with it."""
         return self._rpc.check_qr(self.id, qr)
 
     def set_config_from_qr(self, qr: str):
@@ -125,6 +141,9 @@ class Account:
         return self._rpc.make_vcard(self.id, contact_ids)
 
     def import_vcard(self, vcard: str) -> list[Contact]:
+        """Import vCard.
+
+        Return created or modified contacts in the order they appear in vCard."""
         contact_ids = self._rpc.import_vcard_contents(self.id, vcard)
         return [Contact(self, contact_id) for contact_id in contact_ids]
 
@@ -132,6 +151,10 @@ class Account:
         vcard = account.self_contact.make_vcard()
         [contact] = self.import_vcard(vcard)
         return contact.create_chat()
+
+    def get_device_chat(self) -> Chat:
+        """Return device chat."""
+        return self.device_contact.create_chat()
 
     def get_contact_by_id(self, contact_id: int) -> Contact:
         """Return Contact instance for the given contact ID."""
@@ -192,6 +215,11 @@ class Account:
     def self_contact(self) -> Contact:
         """This account's identity as a Contact."""
         return Contact(self, SpecialContactId.SELF)
+
+    @property
+    def device_contact(self) -> Chat:
+        """This account's device contact."""
+        return Contact(self, SpecialContactId.DEVICE)
 
     def get_chatlist(
         self,
@@ -316,6 +344,13 @@ class Account:
         while True:
             event = self.wait_for_event()
             if event.kind == EventType.MSGS_CHANGED:
+                return event
+
+    def wait_for_msgs_noticed_event(self):
+        """Wait for messages noticed event and return it."""
+        while True:
+            event = self.wait_for_event()
+            if event.kind == EventType.MSGS_NOTICED:
                 return event
 
     def wait_for_incoming_msg(self):

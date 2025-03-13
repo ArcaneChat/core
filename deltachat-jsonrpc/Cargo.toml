@@ -1,11 +1,11 @@
 [package]
 name = "deltachat-jsonrpc"
-version = "1.156.3"
+version = "1.157.1"
 description = "DeltaChat JSON-RPC API"
 edition = "2021"
 default-run = "deltachat-jsonrpc-server"
 license = "MPL-2.0"
-repository = "https://github.com/deltachat/deltachat-core-rust"
+repository = "https://github.com/chatmail/core"
 
 [[bin]]
 name = "deltachat-jsonrpc-server"
