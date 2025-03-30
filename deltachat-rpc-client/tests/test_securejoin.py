@@ -76,17 +76,11 @@ def test_qr_securejoin(acfactory, protect):
     bob.secure_join(qr_code)
 
     # Alice deletes "vg-request".
-    while True:
-        event = alice.wait_for_event()
-        if event["kind"] == "ImapMessageDeleted":
-            break
+    alice.wait_for_event(EventType.IMAP_MESSAGE_DELETED)
     alice.wait_for_securejoin_inviter_success()
     # Bob deletes "vg-auth-required", Alice deletes "vg-request-with-auth".
     for ac in [alice, bob]:
-        while True:
-            event = ac.wait_for_event()
-            if event["kind"] == "ImapMessageDeleted":
-                break
+        ac.wait_for_event(EventType.IMAP_MESSAGE_DELETED)
     bob.wait_for_securejoin_joiner_success()
 
     # Test that Alice verified Bob's profile.
@@ -123,8 +117,7 @@ def test_qr_securejoin_contact_request(acfactory) -> None:
     """Alice invites Bob to a group when Bob's chat with Alice is in a contact request mode."""
     alice, bob = acfactory.get_online_accounts(2)
 
-    bob_addr = bob.get_config("addr")
-    alice_contact_bob = alice.create_contact(bob_addr, "Bob")
+    alice_contact_bob = alice.create_contact(bob, "Bob")
     alice_chat_bob = alice_contact_bob.create_chat()
     alice_chat_bob.send_text("Hello!")
 
@@ -161,11 +154,8 @@ def test_qr_readreceipt(acfactory) -> None:
     logging.info("Alice creates a verified group")
     group = alice.create_group("Group", protect=True)
 
-    bob_addr = bob.get_config("addr")
-    charlie_addr = charlie.get_config("addr")
-
-    alice_contact_bob = alice.create_contact(bob_addr, "Bob")
-    alice_contact_charlie = alice.create_contact(charlie_addr, "Charlie")
+    alice_contact_bob = alice.create_contact(bob, "Bob")
+    alice_contact_charlie = alice.create_contact(charlie, "Charlie")
 
     group.add_contact(alice_contact_bob)
     group.add_contact(alice_contact_charlie)
@@ -192,7 +182,7 @@ def test_qr_readreceipt(acfactory) -> None:
     charlie_snapshot = charlie_message.get_snapshot()
     assert charlie_snapshot.text == "Hi from Bob!"
 
-    bob_contact_charlie = bob.create_contact(charlie_addr, "Charlie")
+    bob_contact_charlie = bob.create_contact(charlie, "Charlie")
     assert not bob.get_chat_by_contact(bob_contact_charlie)
 
     logging.info("Charlie reads Bob's message")
@@ -463,12 +453,12 @@ def test_qr_new_group_unblocked(acfactory):
     assert ac2_msg.chat.get_basic_snapshot().is_contact_request
 
 
+@pytest.mark.skip(reason="AEAP is disabled for now")
 def test_aeap_flow_verified(acfactory):
     """Test that a new address is added to a contact when it changes its address."""
     ac1, ac2 = acfactory.get_online_accounts(2)
 
-    # ac1new is only used to get a new address.
-    ac1new = acfactory.new_preconfigured_account()
+    addr, password = acfactory.get_credentials()
 
     logging.info("ac1: create verified-group QR, ac2 scans and joins")
     chat = ac1.create_group("hello", protect=True)
@@ -488,8 +478,8 @@ def test_aeap_flow_verified(acfactory):
     assert msg_in_1.text == msg_out.text
 
     logging.info("changing email account")
-    ac1.set_config("addr", ac1new.get_config("addr"))
-    ac1.set_config("mail_pw", ac1new.get_config("mail_pw"))
+    ac1.set_config("addr", addr)
+    ac1.set_config("mail_pw", password)
     ac1.stop_io()
     ac1.configure()
     ac1.start_io()
@@ -502,11 +492,9 @@ def test_aeap_flow_verified(acfactory):
     msg_in_2_snapshot = msg_in_2.get_snapshot()
     assert msg_in_2_snapshot.text == msg_out.text
     assert msg_in_2_snapshot.chat.id == msg_in_1.chat.id
-    assert msg_in_2.get_sender_contact().get_snapshot().address == ac1new.get_config("addr")
+    assert msg_in_2.get_sender_contact().get_snapshot().address == addr
     assert len(msg_in_2_snapshot.chat.get_contacts()) == 2
-    assert ac1new.get_config("addr") in [
-        contact.get_snapshot().address for contact in msg_in_2_snapshot.chat.get_contacts()
-    ]
+    assert addr in [contact.get_snapshot().address for contact in msg_in_2_snapshot.chat.get_contacts()]
 
 
 def test_gossip_verification(acfactory) -> None:
@@ -522,9 +510,9 @@ def test_gossip_verification(acfactory) -> None:
     bob.secure_join(qr_code)
     bob.wait_for_securejoin_joiner_success()
 
-    bob_contact_alice = bob.create_contact(alice.get_config("addr"), "Alice")
-    bob_contact_carol = bob.create_contact(carol.get_config("addr"), "Carol")
-    carol_contact_alice = carol.create_contact(alice.get_config("addr"), "Alice")
+    bob_contact_alice = bob.create_contact(alice, "Alice")
+    bob_contact_carol = bob.create_contact(carol, "Carol")
+    carol_contact_alice = carol.create_contact(alice, "Alice")
 
     logging.info("Bob creates an Autocrypt group")
     bob_group_chat = bob.create_group("Autocrypt Group")
@@ -584,7 +572,7 @@ def test_securejoin_after_contact_resetup(acfactory) -> None:
     ac2.wait_for_securejoin_joiner_success()
 
     # ac1 is verified for ac2.
-    ac2_contact_ac1 = ac2.create_contact(ac1.get_config("addr"), "")
+    ac2_contact_ac1 = ac2.create_contact(ac1, "")
     assert ac2_contact_ac1.get_snapshot().is_verified
 
     # ac1 resetups the account.
@@ -599,7 +587,7 @@ def test_securejoin_after_contact_resetup(acfactory) -> None:
     # header sent by old ac1.
     while True:
         # ac1 sends a message to ac2.
-        ac1_contact_ac2 = ac1.create_contact(ac2.get_config("addr"), "")
+        ac1_contact_ac2 = ac1.create_contact(ac2, "")
         ac1_chat_ac2 = ac1_contact_ac2.create_chat()
         ac1_chat_ac2.send_text("Hello!")
 

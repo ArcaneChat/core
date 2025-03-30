@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
-from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, Optional, Union
 from warnings import warn
 
@@ -28,9 +26,12 @@ class Account:
     def _rpc(self) -> "Rpc":
         return self.manager.rpc
 
-    def wait_for_event(self) -> AttrDict:
+    def wait_for_event(self, event_type=None) -> AttrDict:
         """Wait until the next event and return it."""
-        return AttrDict(self._rpc.wait_for_event(self.id))
+        while True:
+            next_event = AttrDict(self._rpc.wait_for_event(self.id))
+            if event_type is None or next_event.kind == event_type:
+                return next_event
 
     def clear_all_events(self):
         """Removes all queued-up events for a given account. Useful for tests."""
@@ -41,14 +42,14 @@ class Account:
         self._rpc.remove_account(self.id)
 
     def clone(self) -> "Account":
-        """Clone given account."""
-        with TemporaryDirectory() as tmp_dir:
-            tmp_path = Path(tmp_dir)
-            self.export_backup(tmp_path)
-            files = list(tmp_path.glob("*.tar"))
-            new_account = self.manager.add_account()
-            new_account.import_backup(files[0])
-            return new_account
+        """Clone given account.
+        This uses backup-transfer via iroh, i.e. the 'Add second device' feature."""
+        future = self._rpc.provide_backup.future(self.id)
+        qr = self._rpc.get_backup_qr(self.id)
+        new_account = self.manager.add_account()
+        new_account._rpc.get_backup(new_account.id, qr)
+        future()
+        return new_account
 
     def start_io(self) -> None:
         """Start the account I/O."""
@@ -112,12 +113,9 @@ class Account:
     def bring_online(self):
         """Start I/O and wait until IMAP becomes IDLE."""
         self.start_io()
-        while True:
-            event = self.wait_for_event()
-            if event.kind == EventType.IMAP_INBOX_IDLE:
-                break
+        self.wait_for_event(EventType.IMAP_INBOX_IDLE)
 
-    def create_contact(self, obj: Union[int, str, Contact], name: Optional[str] = None) -> Contact:
+    def create_contact(self, obj: Union[int, str, Contact, "Account"], name: Optional[str] = None) -> Contact:
         """Create a new Contact or return an existing one.
 
         Calling this method will always result in the same
@@ -125,9 +123,15 @@ class Account:
         with that e-mail address, it is unblocked and its display
         name is updated if specified.
 
-        :param obj: email-address or contact id.
+        :param obj: email-address, contact id or account.
         :param name: (optional) display name for this contact.
         """
+        if isinstance(obj, Account):
+            vcard = obj.self_contact.make_vcard()
+            [contact] = self.import_vcard(vcard)
+            if name:
+                contact.set_name(name)
+            return contact
         if isinstance(obj, int):
             obj = Contact(self, obj)
         if isinstance(obj, Contact):
@@ -148,9 +152,8 @@ class Account:
         return [Contact(self, contact_id) for contact_id in contact_ids]
 
     def create_chat(self, account: "Account") -> Chat:
-        vcard = account.self_contact.make_vcard()
-        [contact] = self.import_vcard(vcard)
-        return contact.create_chat()
+        """Create a 1:1 chat with another account."""
+        return self.create_contact(account).create_chat()
 
     def get_device_chat(self) -> Chat:
         """Return device chat."""
@@ -334,24 +337,15 @@ class Account:
 
     def wait_for_incoming_msg_event(self):
         """Wait for incoming message event and return it."""
-        while True:
-            event = self.wait_for_event()
-            if event.kind == EventType.INCOMING_MSG:
-                return event
+        return self.wait_for_event(EventType.INCOMING_MSG)
 
     def wait_for_msgs_changed_event(self):
         """Wait for messages changed event and return it."""
-        while True:
-            event = self.wait_for_event()
-            if event.kind == EventType.MSGS_CHANGED:
-                return event
+        return self.wait_for_event(EventType.MSGS_CHANGED)
 
     def wait_for_msgs_noticed_event(self):
         """Wait for messages noticed event and return it."""
-        while True:
-            event = self.wait_for_event()
-            if event.kind == EventType.MSGS_NOTICED:
-                return event
+        return self.wait_for_event(EventType.MSGS_NOTICED)
 
     def wait_for_incoming_msg(self):
         """Wait for incoming message and return it.
@@ -372,10 +366,7 @@ class Account:
                 break
 
     def wait_for_reactions_changed(self):
-        while True:
-            event = self.wait_for_event()
-            if event.kind == EventType.REACTIONS_CHANGED:
-                return event
+        return self.wait_for_event(EventType.REACTIONS_CHANGED)
 
     def get_fresh_messages_in_arrival_order(self) -> list[Message]:
         """Return fresh messages list sorted in the order of their arrival, with ascending IDs."""

@@ -86,7 +86,9 @@ pub struct MimeFactory {
     /// Vector of pairs of recipient name and address that goes into the `To` field.
     ///
     /// The list of actual message recipient addresses may be different,
-    /// e.g. if members are hidden for broadcast lists.
+    /// e.g. if members are hidden for broadcast lists
+    /// or if the keys for some recipients are missing
+    /// and encrypted message cannot be sent to them.
     to: Vec<(String, String)>,
 
     /// Vector of pairs of past group member names and addresses.
@@ -184,9 +186,6 @@ impl MimeFactory {
         let mut req_mdn = false;
 
         if chat.is_self_talk() {
-            if msg.param.get_cmd() == SystemMessage::AutocryptSetupMessage {
-                recipients.push(from_addr.to_string());
-            }
             to.push((from_displayname.to_string(), from_addr.to_string()));
         } else if chat.is_mailing_list() {
             let list_post = chat
@@ -607,10 +606,7 @@ impl MimeFactory {
                 || to.len() + past_members.len() == self.member_timestamps.len()
         );
         if to.is_empty() {
-            to.push(Address::new_group(
-                Some("hidden-recipients".to_string()),
-                Vec::new(),
-            ));
+            to.push(hidden_recipients());
         }
 
         // Start with Internet Message Format headers in the order of the standard example
@@ -713,12 +709,11 @@ impl MimeFactory {
 
         if let Loaded::Message { chat, .. } = &self.loaded {
             if chat.typ == Chattype::Broadcast {
-                let encoded_chat_name = encode_words(&chat.name);
                 headers.push((
                     "List-ID",
-                    mail_builder::headers::raw::Raw::new(format!(
-                        "{encoded_chat_name} <{}>",
-                        chat.grpid
+                    mail_builder::headers::text::Text::new(format!(
+                        "{} <{}>",
+                        chat.name, chat.grpid
                     ))
                     .into(),
                 ));
@@ -791,9 +786,7 @@ impl MimeFactory {
 
         let peerstates = self.peerstates_for_recipients(context).await?;
         let is_encrypted = !self.should_force_plaintext()
-            && encrypt_helper
-                .should_encrypt(context, e2ee_guaranteed, &peerstates)
-                .await?;
+            && (e2ee_guaranteed || encrypt_helper.should_encrypt(context, &peerstates).await?);
         let is_securejoin_message = if let Loaded::Message { msg, .. } = &self.loaded {
             msg.param.get_cmd() == SystemMessage::SecurejoinMessage
         } else {
@@ -888,21 +881,23 @@ impl MimeFactory {
             } else if header_name == "to" {
                 protected_headers.push(header.clone());
                 if is_encrypted {
+                    let mut to_without_names = to
+                        .clone()
+                        .into_iter()
+                        .filter_map(|header| match header {
+                            Address::Address(mb) => Some(Address::Address(EmailAddress {
+                                name: None,
+                                email: mb.email,
+                            })),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    if to_without_names.is_empty() {
+                        to_without_names.push(hidden_recipients());
+                    }
                     unprotected_headers.push((
                         original_header_name,
-                        Address::new_list(
-                            to.clone()
-                                .into_iter()
-                                .filter_map(|header| match header {
-                                    Address::Address(mb) => Some(Address::Address(EmailAddress {
-                                        name: None,
-                                        email: mb.email,
-                                    })),
-                                    _ => None,
-                                })
-                                .collect::<Vec<_>>(),
-                        )
-                        .into(),
+                        Address::new_list(to_without_names).into(),
                     ));
                 } else {
                     unprotected_headers.push(header.clone());
@@ -987,13 +982,22 @@ impl MimeFactory {
                 Loaded::Mdn { .. } => true,
             };
 
+            let (encryption_keyring, missing_key_addresses) =
+                encrypt_helper.encryption_keyring(context, verified, &peerstates)?;
+
             // XXX: additional newline is needed
             // to pass filtermail at
             // <https://github.com/deltachat/chatmail/blob/4d915f9800435bf13057d41af8d708abd34dbfa8/chatmaild/src/chatmaild/filtermail.py#L84-L86>
             let encrypted = encrypt_helper
-                .encrypt(context, verified, message, peerstates, compress)
+                .encrypt(context, encryption_keyring, message, compress)
                 .await?
                 + "\n";
+
+            // Remove recipients for which the key is missing.
+            if !missing_key_addresses.is_empty() {
+                self.recipients
+                    .retain(|addr| !missing_key_addresses.contains(addr));
+            }
 
             // Set the appropriate Content-Type for the outer message
             MimePart::new(
@@ -1633,6 +1637,10 @@ impl MimeFactory {
     }
 }
 
+fn hidden_recipients() -> Address<'static> {
+    Address::new_group(Some("hidden-recipients".to_string()), Vec::new())
+}
+
 async fn build_body_file(context: &Context, msg: &Message) -> Result<MimePart<'static>> {
     let file_name = msg.get_filename().context("msg has no file")?;
     let suffix = Path::new(&file_name)
@@ -1746,14 +1754,6 @@ fn render_rfc724_mid(rfc724_mid: &str) -> String {
     } else {
         format!("<{rfc724_mid}>")
     }
-}
-
-/* ******************************************************************************
- * Encode/decode header words, RFC 2047
- ******************************************************************************/
-
-fn encode_words(word: &str) -> String {
-    encoded_words::encode(word, None, encoded_words::EncodingFlag::Shortest, None)
 }
 
 #[cfg(test)]

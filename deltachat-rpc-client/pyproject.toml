@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "deltachat-rpc-client"
-version = "1.157.2"
+version = "1.158.0"
 description = "Python client for Delta Chat core JSON-RPC interface"
 classifiers = [
     "Development Status :: 5 - Production/Stable",
@@ -70,3 +70,11 @@ line-length = 120
 
 [tool.isort]
 profile = "black"
+
+[dependency-groups]
+dev = [
+    "imap-tools",
+    "pytest",
+    "pytest-timeout",
+    "pytest-xdist",
+]

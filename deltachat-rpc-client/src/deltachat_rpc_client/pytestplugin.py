@@ -4,19 +4,12 @@ import os
 import random
 from typing import AsyncGenerator, Optional
 
+import py
 import pytest
 
 from . import Account, AttrDict, Bot, Chat, Client, DeltaChat, EventType, Message
 from ._utils import futuremethod
 from .rpc import Rpc
-
-
-def get_temp_credentials() -> dict:
-    domain = os.getenv("CHATMAIL_DOMAIN")
-    username = "ci-" + "".join(random.choice("2345789acdefghjkmnpqrstuvwxyz") for i in range(6))
-    password = f"{username}${username}"
-    addr = f"{username}@{domain}"
-    return {"email": addr, "password": password}
 
 
 class ACFactory:
@@ -31,26 +24,25 @@ class ACFactory:
     def get_unconfigured_bot(self) -> Bot:
         return Bot(self.get_unconfigured_account())
 
-    def new_preconfigured_account(self) -> Account:
-        """Make a new account with configuration options set, but configuration not started."""
-        credentials = get_temp_credentials()
-        account = self.get_unconfigured_account()
-        account.set_config("addr", credentials["email"])
-        account.set_config("mail_pw", credentials["password"])
-        assert not account.is_configured()
-        return account
+    def get_credentials(self) -> (str, str):
+        domain = os.getenv("CHATMAIL_DOMAIN")
+        username = "ci-" + "".join(random.choice("2345789acdefghjkmnpqrstuvwxyz") for i in range(6))
+        return f"{username}@{domain}", f"{username}${username}"
 
     @futuremethod
     def new_configured_account(self):
-        account = self.new_preconfigured_account()
-        yield account.configure.future()
+        addr, password = self.get_credentials()
+        account = self.get_unconfigured_account()
+        params = {"addr": addr, "password": password}
+        yield account._rpc.add_transport.future(account.id, params)
+
         assert account.is_configured()
         return account
 
     def new_configured_bot(self) -> Bot:
-        credentials = get_temp_credentials()
+        addr, password = self.get_credentials()
         bot = self.get_unconfigured_bot()
-        bot.configure(credentials["email"], credentials["password"])
+        bot.configure(addr, password)
         return bot
 
     @futuremethod
@@ -124,3 +116,50 @@ def rpc(tmp_path) -> AsyncGenerator:
 @pytest.fixture
 def acfactory(rpc) -> AsyncGenerator:
     return ACFactory(DeltaChat(rpc))
+
+
+@pytest.fixture
+def data():
+    """Test data."""
+
+    class Data:
+        def __init__(self) -> None:
+            for path in reversed(py.path.local(__file__).parts()):
+                datadir = path.join("test-data")
+                if datadir.isdir():
+                    self.path = datadir
+                    return
+            raise Exception("Data path cannot be found")
+
+        def get_path(self, bn):
+            """return path of file or None if it doesn't exist."""
+            fn = os.path.join(self.path, *bn.split("/"))
+            assert os.path.exists(fn)
+            return fn
+
+        def read_path(self, bn, mode="r"):
+            fn = self.get_path(bn)
+            if fn is not None:
+                with open(fn, mode) as f:
+                    return f.read()
+            return None
+
+    return Data()
+
+
+@pytest.fixture
+def log():
+    """Log printer fixture."""
+
+    class Printer:
+        def section(self, msg: str) -> None:
+            print()
+            print("=" * 10, msg, "=" * 10)
+
+        def step(self, msg: str) -> None:
+            print("-" * 5, "step " + msg, "-" * 5)
+
+        def indent(self, msg: str) -> None:
+            print("  " + msg)
+
+    return Printer()

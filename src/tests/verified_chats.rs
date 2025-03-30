@@ -1,7 +1,9 @@
 use anyhow::Result;
 use pretty_assertions::assert_eq;
 
-use crate::chat::{self, add_contact_to_chat, Chat, ProtectionStatus};
+use crate::chat::{
+    self, add_contact_to_chat, remove_contact_from_chat, send_msg, Chat, ProtectionStatus,
+};
 use crate::chatlist::Chatlist;
 use crate::config::Config;
 use crate::constants::{Chattype, DC_GCL_FOR_FORWARDING};
@@ -950,6 +952,70 @@ async fn test_no_unencrypted_name_if_encrypted() -> Result<()> {
 
         assert_eq!(Contact::get_display_name(&contact), "Bob Smith");
     }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_verified_lost_member_added() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+    let fiona = &tcm.fiona().await;
+
+    tcm.execute_securejoin(bob, alice).await;
+    tcm.execute_securejoin(fiona, alice).await;
+
+    let alice_chat_id = alice
+        .create_group_with_members(ProtectionStatus::Protected, "Group", &[bob])
+        .await;
+    let alice_sent = alice.send_text(alice_chat_id, "Hi!").await;
+    let bob_chat_id = bob.recv_msg(&alice_sent).await.chat_id;
+    assert_eq!(chat::get_chat_contacts(bob, bob_chat_id).await?.len(), 2);
+
+    // Attempt to add member, but message is lost.
+    let fiona_id = alice.add_or_lookup_contact(fiona).await.id;
+    add_contact_to_chat(alice, alice_chat_id, fiona_id).await?;
+    alice.pop_sent_msg().await;
+
+    let alice_sent = alice.send_text(alice_chat_id, "Hi again!").await;
+    bob.recv_msg(&alice_sent).await;
+    assert_eq!(chat::get_chat_contacts(bob, bob_chat_id).await?.len(), 3);
+
+    bob_chat_id.accept(bob).await?;
+    let sent = bob.send_text(bob_chat_id, "Hello!").await;
+    let sent_msg = Message::load_from_db(bob, sent.sender_msg_id).await?;
+    assert_eq!(sent_msg.get_showpadlock(), true);
+
+    // The message will not be sent to Fiona.
+    // Test that Fiona will not be able to decrypt it.
+    let fiona_rcvd = fiona.recv_msg(&sent).await;
+    assert_eq!(fiona_rcvd.get_showpadlock(), false);
+    assert_eq!(
+        fiona_rcvd.get_text(),
+        "[...] – [This message was encrypted for another setup.]"
+    );
+
+    // Advance the time so Alice does not leave at the same second
+    // as the group was created.
+    SystemTime::shift(std::time::Duration::from_secs(100));
+
+    // Alice leaves the chat.
+    remove_contact_from_chat(alice, alice_chat_id, ContactId::SELF).await?;
+    assert_eq!(
+        chat::get_chat_contacts(alice, alice_chat_id).await?.len(),
+        2
+    );
+    bob.recv_msg(&alice.pop_sent_msg().await).await;
+
+    // Now only Bob and Fiona are in the chat.
+    assert_eq!(chat::get_chat_contacts(bob, bob_chat_id).await?.len(), 2);
+
+    // Bob cannot send messages anymore because there are no recipients
+    // other than self for which Bob has the key.
+    let mut msg = Message::new_text("No key for Fiona".to_string());
+    let result = send_msg(bob, bob_chat_id, &mut msg).await;
+    assert!(result.is_err());
+
     Ok(())
 }
 

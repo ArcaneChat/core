@@ -52,7 +52,7 @@ pub(crate) mod events;
 pub use events::*;
 
 mod aheader;
-mod blob;
+pub mod blob;
 pub mod chat;
 pub mod chatlist;
 pub mod config;
@@ -68,7 +68,7 @@ mod imap;
 pub mod imex;
 pub mod key;
 pub mod location;
-mod login_param;
+pub mod login_param;
 pub mod message;
 mod mimefactory;
 pub mod mimeparser;

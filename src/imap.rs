@@ -271,12 +271,14 @@ impl Imap {
         let param = ConfiguredLoginParam::load(context)
             .await?
             .context("Not configured")?;
+        let proxy_config = ProxyConfig::load(context).await?;
+        let strict_tls = param.strict_tls(proxy_config.is_some());
         let imap = Self::new(
             param.imap.clone(),
             param.imap_password.clone(),
-            param.proxy_config.clone(),
+            proxy_config,
             &param.addr,
-            param.strict_tls(),
+            strict_tls,
             param.oauth2,
             idle_interrupt_receiver,
         );
@@ -348,10 +350,11 @@ impl Imap {
                 connection_candidate,
             )
             .await
+            .context("IMAP failed to connect")
             {
                 Ok(client) => client,
                 Err(err) => {
-                    warn!(context, "IMAP failed to connect: {err:#}.");
+                    warn!(context, "{err:#}.");
                     first_error.get_or_insert(err);
                     continue;
                 }

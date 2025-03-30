@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str;
 use std::sync::Arc;
 use std::time::Duration;
@@ -7,6 +7,7 @@ use std::{collections::HashMap, str::FromStr};
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 pub use deltachat::accounts::Accounts;
+use deltachat::blob::BlobObject;
 use deltachat::chat::{
     self, add_contact_to_chat, forward_msgs, get_chat_media, get_chat_msgs, get_chat_msgs_ex,
     marknoticed_chat, remove_contact_from_chat, Chat, ChatId, ChatItem, MessageListOptions,
@@ -21,7 +22,7 @@ use deltachat::ephemeral::Timer;
 use deltachat::location;
 use deltachat::message::get_msg_read_receipts;
 use deltachat::message::{
-    self, delete_msgs, markseen_msgs, Message, MessageState, MsgId, Viewtype,
+    self, delete_msgs_ex, markseen_msgs, Message, MessageState, MsgId, Viewtype,
 };
 use deltachat::peer_channels::{
     leave_webxdc_realtime, send_webxdc_realtime_advertisement, send_webxdc_realtime_data,
@@ -38,6 +39,7 @@ use deltachat::{imex, info};
 use sanitize_filename::is_sanitized;
 use tokio::fs;
 use tokio::sync::{watch, Mutex, RwLock};
+use types::login_param::EnteredLoginParam;
 use walkdir::WalkDir;
 use yerpc::rpc;
 
@@ -341,9 +343,17 @@ impl CommandApi {
         ctx.get_info().await
     }
 
+    /// Get the blob dir.
     async fn get_blob_dir(&self, account_id: u32) -> Result<Option<String>> {
         let ctx = self.get_context(account_id).await?;
         Ok(ctx.get_blobdir().to_str().map(|s| s.to_owned()))
+    }
+
+    /// Copy file to blob dir.
+    async fn copy_to_blob_dir(&self, account_id: u32, path: String) -> Result<PathBuf> {
+        let ctx = self.get_context(account_id).await?;
+        let file = Path::new(&path);
+        Ok(BlobObject::create_and_deduplicate(&ctx, file, file)?.to_abs_path())
     }
 
     async fn draft_self_report(&self, account_id: u32) -> Result<u32> {
@@ -422,6 +432,9 @@ impl CommandApi {
 
     /// Configures this account with the currently set parameters.
     /// Setup the credential config before calling this.
+    ///
+    /// Deprecated as of 2025-02; use `add_transport_from_qr()`
+    /// or `add_transport()` instead.
     async fn configure(&self, account_id: u32) -> Result<()> {
         let ctx = self.get_context(account_id).await?;
         ctx.stop_io().await;
@@ -434,6 +447,69 @@ impl CommandApi {
         }
         ctx.start_io().await;
         Ok(())
+    }
+
+    /// Configures a new email account using the provided parameters
+    /// and adds it as a transport.
+    ///
+    /// If the email address is the same as an existing transport,
+    /// then this existing account will be reconfigured instead of a new one being added.
+    ///
+    /// This function stops and starts IO as needed.
+    ///
+    /// Usually it will be enough to only set `addr` and `password`,
+    /// and all the other settings will be autoconfigured.
+    ///
+    /// During configuration, ConfigureProgress events are emitted;
+    /// they indicate a successful configuration as well as errors
+    /// and may be used to create a progress bar.
+    /// This function will return after configuration is finished.
+    ///
+    /// If configuration is successful,
+    /// the working server parameters will be saved
+    /// and used for connecting to the server.
+    /// The parameters entered by the user will be saved separately
+    /// so that they can be prefilled when the user opens the server-configuration screen again.
+    ///
+    /// See also:
+    /// - [Self::is_configured()] to check whether there is
+    ///   at least one working transport.
+    /// - [Self::add_transport_from_qr()] to add a transport
+    ///   from a server encoded in a QR code.
+    /// - [Self::list_transports()] to get a list of all configured transports.
+    /// - [Self::delete_transport()] to remove a transport.
+    async fn add_transport(&self, account_id: u32, param: EnteredLoginParam) -> Result<()> {
+        let ctx = self.get_context(account_id).await?;
+        ctx.add_transport(&param.try_into()?).await
+    }
+
+    /// Adds a new email account as a transport
+    /// using the server encoded in the QR code.
+    /// See [Self::add_transport].
+    async fn add_transport_from_qr(&self, account_id: u32, qr: String) -> Result<()> {
+        let ctx = self.get_context(account_id).await?;
+        ctx.add_transport_from_qr(&qr).await
+    }
+
+    /// Returns the list of all email accounts that are used as a transport in the current profile.
+    /// Use [Self::add_transport()] to add or change a transport
+    /// and [Self::delete_transport()] to delete a transport.
+    async fn list_transports(&self, account_id: u32) -> Result<Vec<EnteredLoginParam>> {
+        let ctx = self.get_context(account_id).await?;
+        let res = ctx
+            .list_transports()
+            .await?
+            .into_iter()
+            .map(|t| t.into())
+            .collect();
+        Ok(res)
+    }
+
+    /// Removes the transport with the specified email address
+    /// (i.e. [EnteredLoginParam::addr]).
+    async fn delete_transport(&self, account_id: u32, addr: String) -> Result<()> {
+        let ctx = self.get_context(account_id).await?;
+        ctx.delete_transport(&addr).await
     }
 
     /// Signal an ongoing process to stop.
@@ -1205,7 +1281,15 @@ impl CommandApi {
     async fn delete_messages(&self, account_id: u32, message_ids: Vec<u32>) -> Result<()> {
         let ctx = self.get_context(account_id).await?;
         let msgs: Vec<MsgId> = message_ids.into_iter().map(MsgId::new).collect();
-        delete_msgs(&ctx, &msgs).await
+        delete_msgs_ex(&ctx, &msgs, false).await
+    }
+
+    /// Delete messages. The messages are deleted on the current device,
+    /// on the IMAP server and also for all chat members
+    async fn delete_messages_for_all(&self, account_id: u32, message_ids: Vec<u32>) -> Result<()> {
+        let ctx = self.get_context(account_id).await?;
+        let msgs: Vec<MsgId> = message_ids.into_iter().map(MsgId::new).collect();
+        delete_msgs_ex(&ctx, &msgs, true).await
     }
 
     /// Get an informational text for a single message. The text is multiline and may
@@ -1453,6 +1537,7 @@ impl CommandApi {
         Ok(())
     }
 
+    /// Sets display name for existing contact.
     async fn change_contact_name(
         &self,
         account_id: u32,
@@ -1461,9 +1546,7 @@ impl CommandApi {
     ) -> Result<()> {
         let ctx = self.get_context(account_id).await?;
         let contact_id = ContactId::new(contact_id);
-        let contact = Contact::get_by_id(&ctx, contact_id).await?;
-        let addr = contact.get_addr();
-        Contact::create(&ctx, &name, addr).await?;
+        contact_id.set_name(&ctx, &name).await?;
         Ok(())
     }
 
@@ -1863,13 +1946,9 @@ impl CommandApi {
 
     /// Get href from a WebxdcInfoMessage which might include a hash holding
     /// information about a specific position or state in a webxdc app (optional)
-    async fn get_webxdc_href(
-        &self,
-        account_id: u32,
-        instance_msg_id: u32,
-    ) -> Result<Option<String>> {
+    async fn get_webxdc_href(&self, account_id: u32, info_msg_id: u32) -> Result<Option<String>> {
         let ctx = self.get_context(account_id).await?;
-        let message = Message::load_from_db(&ctx, MsgId::new(instance_msg_id)).await?;
+        let message = Message::load_from_db(&ctx, MsgId::new(info_msg_id)).await?;
         Ok(message.get_webxdc_href())
     }
 

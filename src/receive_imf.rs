@@ -405,8 +405,11 @@ pub(crate) async fn receive_imf_inner(
         received_msg = None;
     }
 
-    let verified_encryption =
-        has_verified_encryption(context, &mime_parser, from_id, &to_ids).await?;
+    let verified_encryption = has_verified_encryption(&mime_parser, from_id)?;
+
+    if verified_encryption == VerifiedEncryption::Verified {
+        mark_recipients_as_verified(context, from_id, &to_ids, &mime_parser).await?;
+    }
 
     if verified_encryption == VerifiedEncryption::Verified
         && mime_parser.get_header(HeaderDef::ChatVerified).is_some()
@@ -1555,7 +1558,6 @@ async fn add_parts(
             }
         }
 
-        let mut txt_raw = "".to_string();
         let (msg, typ): (&str, Viewtype) = if let Some(better_msg) = &better_msg {
             if better_msg.is_empty() && is_partial_download.is_none() {
                 chat_id = DC_CHAT_ID_TRASH;
@@ -1569,11 +1571,6 @@ async fn add_parts(
 
         save_mime_modified |= mime_parser.is_mime_modified && !part_is_empty && !hidden;
         let save_mime_modified = save_mime_modified && parts.peek().is_none();
-
-        if part.typ == Viewtype::Text {
-            let msg_raw = part.msg_raw.as_ref().cloned().unwrap_or_default();
-            txt_raw = format!("{subject}\n\n{msg_raw}");
-        }
 
         let ephemeral_timestamp = if in_fresh {
             0
@@ -1601,7 +1598,7 @@ INSERT INTO msgs
     rfc724_mid, chat_id,
     from_id, to_id, timestamp, timestamp_sent, 
     timestamp_rcvd, type, state, msgrmsg, 
-    txt, txt_normalized, subject, txt_raw, param, hidden,
+    txt, txt_normalized, subject, param, hidden,
     bytes, mime_headers, mime_compressed, mime_in_reply_to,
     mime_references, mime_modified, error, ephemeral_timer,
     ephemeral_timestamp, download_state, hop_info
@@ -1610,7 +1607,7 @@ INSERT INTO msgs
     ?,
     ?, ?, ?, ?,
     ?, ?, ?, ?,
-    ?, ?, ?, ?, ?,
+    ?, ?, ?, ?,
     ?, ?, ?, ?, ?, 1,
     ?, ?, ?, ?,
     ?, ?, ?, ?
@@ -1620,7 +1617,7 @@ SET rfc724_mid=excluded.rfc724_mid, chat_id=excluded.chat_id,
     from_id=excluded.from_id, to_id=excluded.to_id, timestamp_sent=excluded.timestamp_sent,
     type=excluded.type, state=max(state,excluded.state), msgrmsg=excluded.msgrmsg,
     txt=excluded.txt, txt_normalized=excluded.txt_normalized, subject=excluded.subject,
-    txt_raw=excluded.txt_raw, param=excluded.param,
+    param=excluded.param,
     hidden=excluded.hidden,bytes=excluded.bytes, mime_headers=excluded.mime_headers,
     mime_compressed=excluded.mime_compressed, mime_in_reply_to=excluded.mime_in_reply_to,
     mime_references=excluded.mime_references, mime_modified=excluded.mime_modified, error=excluded.error, ephemeral_timer=excluded.ephemeral_timer,
@@ -1642,8 +1639,6 @@ RETURNING id
                     if trash || hidden { "" } else { msg },
                     if trash || hidden { None } else { message::normalize_text(msg) },
                     if trash || hidden { "" } else { &subject },
-                    // txt_raw might contain invalid utf8
-                    if trash || hidden { "" } else { &txt_raw },
                     if trash {
                         "".to_string()
                     } else {
@@ -3078,22 +3073,11 @@ async fn update_verified_keys(
 /// Checks whether the message is allowed to appear in a protected chat.
 ///
 /// This means that it is encrypted and signed with a verified key.
-///
-/// Also propagates gossiped keys to verified if needed.
-async fn has_verified_encryption(
-    context: &Context,
+fn has_verified_encryption(
     mimeparser: &MimeMessage,
     from_id: ContactId,
-    to_ids: &[ContactId],
 ) -> Result<VerifiedEncryption> {
     use VerifiedEncryption::*;
-
-    // We do not need to check if we are verified with ourself.
-    let to_ids = to_ids
-        .iter()
-        .copied()
-        .filter(|id| *id != ContactId::SELF)
-        .collect::<Vec<ContactId>>();
 
     if !mimeparser.was_encrypted() {
         return Ok(NotVerified("This message is not encrypted".to_string()));
@@ -3123,21 +3107,24 @@ async fn has_verified_encryption(
         }
     }
 
-    mark_recipients_as_verified(context, from_id, to_ids, mimeparser).await?;
     Ok(Verified)
 }
 
 async fn mark_recipients_as_verified(
     context: &Context,
     from_id: ContactId,
-    to_ids: Vec<ContactId>,
+    to_ids: &[ContactId],
     mimeparser: &MimeMessage,
 ) -> Result<()> {
     if mimeparser.get_header(HeaderDef::ChatVerified).is_none() {
         return Ok(());
     }
     let contact = Contact::get_by_id(context, from_id).await?;
-    for id in to_ids {
+    for &id in to_ids {
+        if id == ContactId::SELF {
+            continue;
+        }
+
         let Some((to_addr, is_verified)) = context
             .sql
             .query_row_optional(

@@ -1,8 +1,9 @@
 //! End-to-end encryption support.
 
+use std::collections::BTreeSet;
 use std::io::Cursor;
 
-use anyhow::{format_err, Context as _, Result};
+use anyhow::{bail, Result};
 use mail_builder::mime::MimePart;
 use num_traits::FromPrimitive;
 
@@ -42,79 +43,76 @@ impl EncryptHelper {
     }
 
     /// Determines if we can and should encrypt.
-    ///
-    /// `e2ee_guaranteed` should be set to true for replies to encrypted messages (as required by
-    /// Autocrypt Level 1, version 1.1) and for messages sent in protected groups.
-    ///
-    /// Returns an error if `e2ee_guaranteed` is true, but one or more keys are missing.
     pub(crate) async fn should_encrypt(
         &self,
         context: &Context,
-        e2ee_guaranteed: bool,
         peerstates: &[(Option<Peerstate>, String)],
     ) -> Result<bool> {
         let is_chatmail = context.is_chatmail().await?;
-        let mut prefer_encrypt_count = 1;
-        for (peerstate, addr) in peerstates {
-            match peerstate {
-                Some(peerstate) => {
-                    if match peerstate.prefer_encrypt {
-                        EncryptPreference::Reset => is_chatmail,
-                        EncryptPreference::NoPreference | EncryptPreference::Mutual => true,
-                    } {
-                        prefer_encrypt_count += 1;
-                    }
-                }
-                None => {
-                    let msg = format!("Peerstate for {addr:?} missing, cannot encrypt");
-                    if e2ee_guaranteed {
-                        return Err(format_err!("{msg}"));
-                    } else {
-                        info!(context, "{msg}.");
-                        return Ok(false);
-                    }
+        for (peerstate, _addr) in peerstates {
+            if let Some(peerstate) = peerstate {
+                // For chatmail we ignore the encryption preference,
+                // because we can either send encrypted or not at all.
+                if is_chatmail || peerstate.prefer_encrypt != EncryptPreference::Reset {
+                    continue;
                 }
             }
+            return Ok(false);
         }
-
-        // Count number of recipients, including self.
-        // This does not depend on whether we send a copy to self or not.
-        let recipients_count = peerstates.len() + 1;
-
-        Ok(e2ee_guaranteed || 2 * prefer_encrypt_count > recipients_count)
+        Ok(true)
     }
 
-    /// Tries to encrypt the passed in `mail`.
-    pub async fn encrypt(
-        self,
+    /// Constructs a vector of public keys for given peerstates.
+    ///
+    /// In addition returns the set of recipient addresses
+    /// for which there is no key available.
+    ///
+    /// Returns an error if there are recipients
+    /// other than self, but no recipient keys are available.
+    pub(crate) fn encryption_keyring(
+        &self,
         context: &Context,
         verified: bool,
-        mail_to_encrypt: MimePart<'static>,
-        peerstates: Vec<(Option<Peerstate>, String)>,
-        compress: bool,
-    ) -> Result<String> {
-        let mut keyring: Vec<SignedPublicKey> = Vec::new();
+        peerstates: &[(Option<Peerstate>, String)],
+    ) -> Result<(Vec<SignedPublicKey>, BTreeSet<String>)> {
+        // Encrypt to self unconditionally,
+        // even for a single-device setup.
+        let mut keyring = vec![self.public_key.clone()];
+        let mut missing_key_addresses = BTreeSet::new();
+
+        if peerstates.is_empty() {
+            return Ok((keyring, missing_key_addresses));
+        }
 
         let mut verifier_addresses: Vec<&str> = Vec::new();
 
-        for (peerstate, addr) in peerstates
-            .iter()
-            .filter_map(|(state, addr)| state.clone().map(|s| (s, addr)))
-        {
-            let key = peerstate
-                .take_key(verified)
-                .with_context(|| format!("proper enc-key for {addr} missing, cannot encrypt"))?;
-            keyring.push(key);
-            verifier_addresses.push(addr);
+        for (peerstate, addr) in peerstates {
+            if let Some(peerstate) = peerstate {
+                if let Some(key) = peerstate.clone().take_key(verified) {
+                    keyring.push(key);
+                    verifier_addresses.push(addr);
+                } else {
+                    warn!(context, "Encryption key for {addr} is missing.");
+                    missing_key_addresses.insert(addr.clone());
+                }
+            } else {
+                warn!(context, "Peerstate for {addr} is missing.");
+                missing_key_addresses.insert(addr.clone());
+            }
         }
 
-        // Encrypt to self.
-        keyring.push(self.public_key.clone());
+        debug_assert!(
+            !keyring.is_empty(),
+            "At least our own key is in the keyring"
+        );
+        if keyring.len() <= 1 {
+            bail!("No recipient keys are available, cannot encrypt");
+        }
 
         // Encrypt to secondary verified keys
         // if we also encrypt to the introducer ("verifier") of the key.
         if verified {
-            for (peerstate, _addr) in &peerstates {
+            for (peerstate, _addr) in peerstates {
                 if let Some(peerstate) = peerstate {
                     if let (Some(key), Some(verifier)) = (
                         peerstate.secondary_verified_key.as_ref(),
@@ -128,6 +126,17 @@ impl EncryptHelper {
             }
         }
 
+        Ok((keyring, missing_key_addresses))
+    }
+
+    /// Tries to encrypt the passed in `mail`.
+    pub async fn encrypt(
+        self,
+        context: &Context,
+        keyring: Vec<SignedPublicKey>,
+        mail_to_encrypt: MimePart<'static>,
+        compress: bool,
+    ) -> Result<String> {
         let sign_key = load_self_secret_key(context).await?;
 
         let mut raw_message = Vec::new();
@@ -324,22 +333,17 @@ Sent with my Delta Chat Messenger: https://delta.chat";
         let encrypt_helper = EncryptHelper::new(&t).await.unwrap();
 
         let ps = new_peerstates(EncryptPreference::NoPreference);
-        assert!(encrypt_helper.should_encrypt(&t, true, &ps).await?);
-        // Own preference is `Mutual` and we have the peer's key.
-        assert!(encrypt_helper.should_encrypt(&t, false, &ps).await?);
+        assert!(encrypt_helper.should_encrypt(&t, &ps).await?);
 
         let ps = new_peerstates(EncryptPreference::Reset);
-        assert!(encrypt_helper.should_encrypt(&t, true, &ps).await?);
-        assert!(!encrypt_helper.should_encrypt(&t, false, &ps).await?);
+        assert!(!encrypt_helper.should_encrypt(&t, &ps).await?);
 
         let ps = new_peerstates(EncryptPreference::Mutual);
-        assert!(encrypt_helper.should_encrypt(&t, true, &ps).await?);
-        assert!(encrypt_helper.should_encrypt(&t, false, &ps).await?);
+        assert!(encrypt_helper.should_encrypt(&t, &ps).await?);
 
         // test with missing peerstate
         let ps = vec![(None, "bob@foo.bar".to_string())];
-        assert!(encrypt_helper.should_encrypt(&t, true, &ps).await.is_err());
-        assert!(!encrypt_helper.should_encrypt(&t, false, &ps).await?);
+        assert!(!encrypt_helper.should_encrypt(&t, &ps).await?);
         Ok(())
     }
 

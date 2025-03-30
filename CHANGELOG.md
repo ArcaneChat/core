@@ -1,5 +1,89 @@
 # Changelog
 
+## [1.158.0] - 2025-03-29
+
+### API-Changes
+
+- deltachat-rpc-client: Accept `Account` as `Account.create_contact()` argument.
+- Rust: Add `ContactId.set_name()`.
+- JSON-RPC: Rename parameter name in `get_webxdc_href` to `info_msg_id` to reduce confusion potential ([#6681](https://github.com/chatmail/core/pull/6681)).
+
+### Features / Changes
+
+- Nicer configuration error ([#6684](https://github.com/chatmail/core/pull/6684)).
+- securejoin: Do not create 1:1 chat on Alice's side until `vc-request-with-auth`.
+- Understandable error message when accounts.lock can't be locked ([#6695](https://github.com/chatmail/core/pull/6695)).
+- Simplify e2ee decision logic, remove majority vote.
+- Stop saving txt_raw.
+
+### Fixes
+
+- Do not fail to send the message if some keys are missing.
+- Synchronize contact name changes.
+- Move group name timestamp update up in create_send_msg_jobs().
+- Fixes for transport JSON-RPC  ([#6680](https://github.com/chatmail/core/pull/6680)).
+
+### Build system
+
+- deltachat-rpc-client: Move development dependencies from tox.ini to pyproject.toml.
+- Update resolve-conf from 0.7.0 to 0.7.1.
+
+### Refactor
+
+- Do not convert SQL arguments to `String` unnecessarily.
+- Factor out `update_chat_names()`.
+- Use `created_timestamp()` instead of duplicating its code ([#6692](https://github.com/chatmail/core/pull/6692)).
+- Use `chat_id.get_timestamp()` instead of duplicating its code ([#6691](https://github.com/chatmail/core/pull/6691)).
+- Move `mark_recipients_as_verified()` call out of `has_verified_encryption()`.
+- Move `proxy_config` out of `ConfiguredLoginParam` ([#6712](https://github.com/chatmail/core/pull/6712)).
+
+### Tests
+
+- Use vCard in TestContext.add_or_lookup_contact().
+- Remove test_group_with_removed_message_id.
+- Use add_or_lookup_email_contact() in get_chat().
+- Use add_or_lookup_email_contact in test_setup_contact_ex.
+- Use vCards more in Python tests.
+- Use TestContextManager in more tests.
+- Use vCards to create contacts in more Rust tests.
+- Set chat name multiple times in a row.
+- Online test for renaming the group multiple times.
+
+## [1.157.3] - 2025-03-19
+
+### API-Changes
+
+- jsonrpc: Add `copy_to_blob_dir` api ([#6660](https://github.com/chatmail/core/pull/6660)).
+- Add "delete_for_all" function in json-rpc ([#6672](https://github.com/chatmail/core/pull/6672)).
+- Sketch add_transport_from_qr(), add_transport(), list_transports(), delete_transport() APIs ([#6589](https://github.com/chatmail/core/pull/6589)).
+
+### Build system
+
+- Remove websocket support from deltachat-jsonrpc.
+- Remove encoded-words dependency.
+
+### Fixes
+
+- Never send empty `To:` header ([#6663](https://github.com/chatmail/core/pull/6663)).
+- Use protected `Date` header for signed messages.
+- Fix setting up a profile and immediately transferring to a second device ([#6657](https://github.com/chatmail/core/pull/6657)).
+- Don't SMTP-send self-only messages if DeleteServerAfter is "immediate" ([#6661](https://github.com/chatmail/core/pull/6661)).
+- Use protected `Date` with protected Autocrypt.
+
+### Miscellaneous Tasks
+
+- cargo: Bump uuid from 1.12.1 to 1.15.1.
+- Update `strum` dependency.
+
+### Refactor
+
+- deltachat-rpc-client: Use wait_for_event() type argument.
+
+### Tests
+
+- Avoid creating contacts in `test_sync_{accept,block}_before_first_msg()`.
+- Fix `test_no_old_msg_is_fresh` flakiness.
+
 ## [1.157.2] - 2025-03-15
 
 ### Fixes
@@ -6015,3 +6099,5 @@ https://github.com/chatmail/core/pulls?q=is%3Apr+is%3Aclosed
 [1.157.0]: https://github.com/chatmail/core/compare/v1.156.3..v1.157.0
 [1.157.1]: https://github.com/chatmail/core/compare/v1.157.0..v1.157.1
 [1.157.2]: https://github.com/chatmail/core/compare/v1.157.1..v1.157.2
+[1.157.3]: https://github.com/chatmail/core/compare/v1.157.2..v1.157.3
+[1.158.0]: https://github.com/chatmail/core/compare/v1.157.3..v1.158.0

@@ -192,9 +192,10 @@ async fn test_forward_webxdc_instance() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_resend_webxdc_instance_and_info() -> Result<()> {
     let mut tcm = TestContextManager::new();
+    let alice = tcm.alice().await;
+    let bob = tcm.bob().await;
 
     // Alice uses webxdc in a group
-    let alice = tcm.alice().await;
     alice.set_config_bool(Config::BccSelf, false).await?;
     let alice_grp = create_group_chat(&alice, ProtectionStatus::Unprotected, "grp").await?;
     let alice_instance = send_webxdc_instance(&alice, alice_grp).await?;
@@ -212,7 +213,7 @@ async fn test_resend_webxdc_instance_and_info() -> Result<()> {
     add_contact_to_chat(
         &alice,
         alice_grp,
-        Contact::create(&alice, "", "bob@example.net").await?,
+        alice.add_or_lookup_contact_id(&bob).await,
     )
     .await?;
     assert_eq!(alice_grp.get_msg_cnt(&alice).await?, 3);
@@ -222,7 +223,6 @@ async fn test_resend_webxdc_instance_and_info() -> Result<()> {
     let sent2 = alice.pop_sent_msg().await;
 
     // Bob receives webxdc, legacy info-messages updates are received and added to the chat.
-    let bob = tcm.bob().await;
     let bob_instance = bob.recv_msg(&sent1).await;
     bob.recv_msg_trash(&sent2).await;
     assert_eq!(bob_instance.viewtype, Viewtype::Webxdc);

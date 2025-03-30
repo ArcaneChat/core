@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 
-use anyhow::{ensure, Context as _, Result};
+use anyhow::{bail, ensure, Context as _, Result};
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -73,9 +73,7 @@ impl Accounts {
         let config_file = dir.join(CONFIG_NAME);
         ensure!(config_file.exists(), "{:?} does not exist", config_file);
 
-        let config = Config::from_file(config_file, writable)
-            .await
-            .context("failed to load accounts config")?;
+        let config = Config::from_file(config_file, writable).await?;
         let events = Events::new();
         let stockstrings = StockStrings::new();
         let push_subscriber = PushSubscriber::new();
@@ -460,7 +458,9 @@ impl Config {
             rx.await?;
             Ok(())
         });
-        locked_rx.await?;
+        if locked_rx.await.is_err() {
+            bail!("Delta Chat is already running. To use Delta Chat, you must first close the existing Delta Chat process, or restart your device. (accounts.lock file is already locked)");
+        };
         Ok(Some(lock_task))
     }
 
