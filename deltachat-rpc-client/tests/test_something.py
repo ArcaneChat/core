@@ -797,3 +797,11 @@ def test_rename_group(acfactory):
         alice_group.set_name(name)
         bob.wait_for_incoming_msg_event()
         assert bob_chat.get_basic_snapshot().name == name
+
+
+def test_get_all_accounts_deadlock(rpc):
+    """Regression test for get_all_accounts deadlock."""
+    for _ in range(100):
+        all_accounts = rpc.get_all_accounts.future()
+        rpc.add_account()
+        all_accounts()

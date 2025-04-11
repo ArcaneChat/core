@@ -16,6 +16,7 @@ use tokio::fs;
 use crate::blob::BlobObject;
 use crate::chat::{self, Chat};
 use crate::config::Config;
+use crate::constants::ASM_SUBJECT;
 use crate::constants::{Chattype, DC_FROM_HANDSHAKE};
 use crate::contact::{Contact, ContactId, Origin};
 use crate::context::Context;
@@ -415,12 +416,10 @@ impl MimeFactory {
 
     fn should_force_plaintext(&self) -> bool {
         match &self.loaded {
-            Loaded::Message { chat, msg } => {
-                msg.param
-                    .get_bool(Param::ForcePlaintext)
-                    .unwrap_or_default()
-                    || chat.typ == Chattype::Broadcast
-            }
+            Loaded::Message { msg, .. } => msg
+                .param
+                .get_bool(Param::ForcePlaintext)
+                .unwrap_or_default(),
             Loaded::Mdn { .. } => false,
         }
     }
@@ -1305,7 +1304,7 @@ impl MimeFactory {
                     mail_builder::headers::raw::Raw::new("v1").into(),
                 ));
 
-                placeholdertext = Some(stock_str::ac_setup_msg_body(context).await);
+                placeholdertext = Some(ASM_SUBJECT.to_string());
             }
             SystemMessage::SecurejoinMessage => {
                 let step = msg.param.get(Param::Arg).unwrap_or_default();
