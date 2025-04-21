@@ -1,9 +1,9 @@
 [package]
 name = "deltachat"
-version = "1.159.0"
+version = "1.159.1"
 edition = "2021"
 license = "MPL-2.0"
-rust-version = "1.81"
+rust-version = "1.82"
 repository = "https://github.com/chatmail/core"
 
 [profile.dev]

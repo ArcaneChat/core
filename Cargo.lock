@@ -1050,9 +1050,9 @@ dependencies = [
 
 [[package]]
 name = "crossbeam-channel"
-version = "0.5.14"
+version = "0.5.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06ba6d68e24814cb8de6bb986db8222d3a027d15872cabc0d18817bc3c0e4471"
+checksum = "82b8f8f868b36967f9606790d1903570de9ceaf870a7bf9fbbd3016d636a2cb2"
 dependencies = [
  "crossbeam-utils",
 ]
@@ -1255,7 +1255,7 @@ dependencies = [
 
 [[package]]
 name = "deltachat"
-version = "1.159.0"
+version = "1.159.1"
 dependencies = [
  "anyhow",
  "async-broadcast",
@@ -1364,7 +1364,7 @@ dependencies = [
 
 [[package]]
 name = "deltachat-jsonrpc"
-version = "1.159.0"
+version = "1.159.1"
 dependencies = [
  "anyhow",
  "async-channel 2.3.1",
@@ -1387,7 +1387,7 @@ dependencies = [
 
 [[package]]
 name = "deltachat-repl"
-version = "1.159.0"
+version = "1.159.1"
 dependencies = [
  "anyhow",
  "deltachat",
@@ -1403,7 +1403,7 @@ dependencies = [
 
 [[package]]
 name = "deltachat-rpc-server"
-version = "1.159.0"
+version = "1.159.1"
 dependencies = [
  "anyhow",
  "deltachat",
@@ -1432,7 +1432,7 @@ dependencies = [
 
 [[package]]
 name = "deltachat_ffi"
-version = "1.159.0"
+version = "1.159.1"
 dependencies = [
  "anyhow",
  "deltachat",

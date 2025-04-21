@@ -34,7 +34,7 @@ class ACFactory:
         addr, password = self.get_credentials()
         account = self.get_unconfigured_account()
         params = {"addr": addr, "password": password}
-        yield account._rpc.add_transport.future(account.id, params)
+        yield account.add_transport.future(params)
 
         assert account.is_configured()
         return account

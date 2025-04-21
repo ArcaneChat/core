@@ -1,5 +1,45 @@
 # Changelog
 
+## [1.159.1] - 2025-04-12
+
+### API-Changes
+
+- deltachat-rpc-client: Add `Account.add_transport()`.
+- Add jsonrpc for info_contact_id.
+
+### Build system
+
+- Update crossbeam-channel from 0.5.14 to 0.5.15.
+- Increase MSRV to 1.82.0.
+
+### CI
+
+- Don't make ruff format quiet ([#6785](https://github.com/chatmail/core/pull/6785)).
+
+### Documentation
+
+- MimeFactory.member_timestamps has the same order as To: rather than RCPT TO:.
+- Two JsonRPC doc improvements ([#6778](https://github.com/chatmail/core/pull/6778)).
+
+### Features / Changes
+
+- Improve error message when the user tries to do AEAP ([#6786](https://github.com/chatmail/core/pull/6786)).
+- Pass email and password via env in python-jsonrpc.
+- Track gossiping per (chat, fingerprint) pair.
+
+### Fixes
+
+- Add missing ChatDeleted event to python jsonrpc client.
+- Never send Autocrypt-Gossip in broadcast lists.
+- Restart I/O when mvbox_move setting is changed.
+
+### Tests
+
+- Port test_delete_deltachat_folder to JSON-RPC.
+- Autocrypt-Gossip header isn't sent in broadcast messages.
+- Encrypt test_subject_in_group().
+- Encrypt test_remove_member_bcc.
+
 ## [1.159.0] - 2025-04-08
 
 ### API-Changes
@@ -6191,3 +6231,4 @@ https://github.com/chatmail/core/pulls?q=is%3Apr+is%3Aclosed
 [1.157.3]: https://github.com/chatmail/core/compare/v1.157.2..v1.157.3
 [1.158.0]: https://github.com/chatmail/core/compare/v1.157.3..v1.158.0
 [1.159.0]: https://github.com/chatmail/core/compare/v1.158.0..v1.159.0
+[1.159.1]: https://github.com/chatmail/core/compare/v1.159.0..v1.159.1
