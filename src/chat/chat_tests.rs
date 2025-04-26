@@ -2553,10 +2553,8 @@ async fn test_broadcast() -> Result<()> {
         let sent_msg = alice.pop_sent_msg().await;
         let msg = bob.parse_msg(&sent_msg).await;
         assert!(msg.was_encrypted());
-        assert!(msg
-            .get_header(HeaderDef::ChatGroupMemberTimestamps)
-            .is_none());
-        assert!(msg.get_header(HeaderDef::AutocryptGossip).is_none());
+        assert!(!msg.header_exists(HeaderDef::ChatGroupMemberTimestamps));
+        assert!(!msg.header_exists(HeaderDef::AutocryptGossip));
         let msg = bob.recv_msg(&sent_msg).await;
         assert_eq!(msg.get_text(), "ola!");
         assert_eq!(msg.subject, "Broadcast list");
@@ -4050,5 +4048,37 @@ async fn test_send_delete_request_no_encryption() -> Result<()> {
         .is_err());
     sent1.load_from_db().await;
     assert_eq!(alice_chat.id.get_msg_cnt(alice).await?, 1);
+    Ok(())
+}
+
+/// Tests that in multi-device setup
+/// second device learns the key of a contact
+/// via Autocrypt-Gossip in 1:1 chats.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_oneone_gossip() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let alice2 = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+
+    tcm.section("Alice imports Bob's vCard and sends a message from the first device");
+    let alice_chat = alice.create_chat(bob).await;
+    let sent_msg = alice.send_text(alice_chat.id, "Hello Bob!").await;
+
+    tcm.section("Alice receives a copy on second device");
+    let rcvd_msg = alice2.recv_msg(&sent_msg).await;
+    assert_eq!(rcvd_msg.get_showpadlock(), true);
+
+    tcm.section("Alice sends a message from the second device");
+    let alice2_chat_id = rcvd_msg.chat_id;
+    let sent_msg2 = alice2
+        .send_text(alice2_chat_id, "Hello from second device!")
+        .await;
+
+    tcm.section("Bob receives a message from the second device");
+    let rcvd_msg2 = bob.recv_msg(&sent_msg2).await;
+    assert_eq!(rcvd_msg2.get_showpadlock(), true);
+    assert_eq!(rcvd_msg2.text, "Hello from second device!");
+
     Ok(())
 }

@@ -1715,13 +1715,13 @@ impl Chat {
             return Ok(Some(reason));
         }
         let reason = SecurejoinWait;
-        if !skip_fn(&reason) {
-            let (can_write, _) = self
+        if !skip_fn(&reason)
+            && self
                 .check_securejoin_wait(context, constants::SECUREJOIN_WAIT_TIMEOUT)
-                .await?;
-            if !can_write {
-                return Ok(Some(reason));
-            }
+                .await?
+                > 0
+        {
+            return Ok(Some(reason));
         }
         Ok(None)
     }
@@ -1733,18 +1733,17 @@ impl Chat {
         Ok(self.why_cant_send(context).await?.is_none())
     }
 
-    /// Returns if the chat can be sent to
-    /// and the remaining timeout for the 1:1 chat in-progress SecureJoin.
+    /// Returns the remaining timeout for the 1:1 chat in-progress SecureJoin.
     ///
-    /// If the timeout has expired, adds an info message with additional information;
-    /// the chat still cannot be sent to in this case. See also [`CantSendReason::SecurejoinWait`].
+    /// If the timeout has expired, adds an info message with additional information.
+    /// See also [`CantSendReason::SecurejoinWait`].
     pub(crate) async fn check_securejoin_wait(
         &self,
         context: &Context,
         timeout: u64,
-    ) -> Result<(bool, u64)> {
+    ) -> Result<u64> {
         if self.typ != Chattype::Single || self.protected != ProtectionStatus::Unprotected {
-            return Ok((true, 0));
+            return Ok(0);
         }
 
         // chat is single and unprotected:
@@ -1768,11 +1767,10 @@ impl Chat {
             )
             .await?
         else {
-            return Ok((true, 0));
+            return Ok(0);
         };
-
         if param == param_timeout {
-            return Ok((false, 0));
+            return Ok(0);
         }
 
         let now = time();
@@ -1782,10 +1780,9 @@ impl Chat {
                 .saturating_add(timeout.try_into()?)
                 .saturating_sub(now);
             if timeout > 0 {
-                return Ok((false, timeout as u64));
+                return Ok(timeout as u64);
             }
         }
-
         add_info_msg_with_cmd(
             context,
             self.id,
@@ -1800,8 +1797,8 @@ impl Chat {
             None,
         )
         .await?;
-
-        Ok((false, 0))
+        context.emit_event(EventType::ChatModified(self.id));
+        Ok(0)
     }
 
     /// Checks if the user is part of a chat
@@ -2604,7 +2601,7 @@ pub(crate) async fn resume_securejoin_wait(context: &Context) -> Result<()> {
 
     for chat_id in chat_ids {
         let chat = Chat::load_from_db(context, chat_id).await?;
-        let (_, timeout) = chat
+        let timeout = chat
             .check_securejoin_wait(context, constants::SECUREJOIN_WAIT_TIMEOUT)
             .await?;
         if timeout > 0 {

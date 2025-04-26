@@ -120,7 +120,7 @@ async fn test_setup_contact_ex(case: SetupContactCase) {
     assert!(!msg.was_encrypted());
     assert_eq!(msg.get_header(HeaderDef::SecureJoin).unwrap(), "vc-request");
     assert!(msg.get_header(HeaderDef::SecureJoinInvitenumber).is_some());
-    assert!(msg.get_header(HeaderDef::AutoSubmitted).is_none());
+    assert!(!msg.header_exists(HeaderDef::AutoSubmitted));
 
     // Step 3: Alice receives vc-request, sends vc-auth-required
     alice.recv_msg_trash(&sent).await;
@@ -149,7 +149,7 @@ async fn test_setup_contact_ex(case: SetupContactCase) {
     );
     if case == SetupContactCase::SecurejoinWaitTimeout {
         SystemTime::shift(Duration::from_secs(constants::SECUREJOIN_WAIT_TIMEOUT));
-        assert_eq!(bob_chat.can_send(&bob).await.unwrap(), false);
+        assert_eq!(bob_chat.can_send(&bob).await.unwrap(), true);
     }
 
     // Step 4: Bob receives vc-auth-required, sends vc-request-with-auth
@@ -318,7 +318,7 @@ async fn test_setup_contact_ex(case: SetupContactCase) {
                 .check_securejoin_wait(&bob, constants::SECUREJOIN_WAIT_TIMEOUT)
                 .await
                 .unwrap(),
-            (true, 0)
+            0
         );
     }
 
@@ -452,7 +452,7 @@ async fn test_setup_contact_bob_knows_alice() -> Result<()> {
             .expect("Error looking up contact")
             .expect("Contact not found");
     let contact_alice = Contact::get_by_id(&bob.ctx, contact_alice_id).await?;
-    assert_eq!(contact_bob.is_verified(&bob.ctx).await?, false);
+    assert_eq!(contact_alice.is_verified(&bob.ctx).await?, false);
 
     // Step 7: Bob receives vc-contact-confirm
     bob.recv_msg_trash(&sent).await;
@@ -523,7 +523,7 @@ async fn test_secure_join() -> Result<()> {
     assert!(!msg.was_encrypted());
     assert_eq!(msg.get_header(HeaderDef::SecureJoin).unwrap(), "vg-request");
     assert!(msg.get_header(HeaderDef::SecureJoinInvitenumber).is_some());
-    assert!(msg.get_header(HeaderDef::AutoSubmitted).is_none());
+    assert!(!msg.header_exists(HeaderDef::AutoSubmitted));
 
     // Old Delta Chat core sent `Secure-Join-Group` header in `vg-request`,
     // but it was only used by Alice in `vg-request-with-auth`.
@@ -531,7 +531,7 @@ async fn test_secure_join() -> Result<()> {
     // and it is deprecated.
     // Now `Secure-Join-Group` header
     // is only sent in `vg-request-with-auth` for compatibility.
-    assert!(msg.get_header(HeaderDef::SecureJoinGroup).is_none());
+    assert!(!msg.header_exists(HeaderDef::SecureJoinGroup));
 
     // Step 3: Alice receives vg-request, sends vg-auth-required
     alice.recv_msg_trash(&sent).await;
@@ -606,7 +606,7 @@ async fn test_secure_join() -> Result<()> {
     // Formally this message is auto-submitted, but as the member addition is a result of an
     // explicit user action, the Auto-Submitted header shouldn't be present. Otherwise it would
     // be strange to have it in "member-added" messages of verified groups only.
-    assert!(msg.get_header(HeaderDef::AutoSubmitted).is_none());
+    assert!(!msg.header_exists(HeaderDef::AutoSubmitted));
     // This is a two-member group, but Alice must Autocrypt-gossip to her other devices.
     assert!(msg.get_header(HeaderDef::AutocryptGossip).is_some());
 
@@ -636,7 +636,7 @@ async fn test_secure_join() -> Result<()> {
             .expect("Error looking up contact")
             .expect("Contact not found");
     let contact_alice = Contact::get_by_id(&bob.ctx, contact_alice_id).await?;
-    assert_eq!(contact_bob.is_verified(&bob.ctx).await?, false);
+    assert_eq!(contact_alice.is_verified(&bob.ctx).await?, false);
 
     // Step 7: Bob receives vg-member-added
     bob.recv_msg(&sent).await;

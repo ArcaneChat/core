@@ -1255,7 +1255,7 @@ dependencies = [
 
 [[package]]
 name = "deltachat"
-version = "1.159.1"
+version = "1.159.3"
 dependencies = [
  "anyhow",
  "async-broadcast",
@@ -1364,7 +1364,7 @@ dependencies = [
 
 [[package]]
 name = "deltachat-jsonrpc"
-version = "1.159.1"
+version = "1.159.3"
 dependencies = [
  "anyhow",
  "async-channel 2.3.1",
@@ -1372,7 +1372,6 @@ dependencies = [
  "deltachat",
  "deltachat-contact-tools",
  "futures",
- "log",
  "num-traits",
  "sanitize-filename",
  "schemars",
@@ -1387,7 +1386,7 @@ dependencies = [
 
 [[package]]
 name = "deltachat-repl"
-version = "1.159.1"
+version = "1.159.3"
 dependencies = [
  "anyhow",
  "deltachat",
@@ -1403,7 +1402,7 @@ dependencies = [
 
 [[package]]
 name = "deltachat-rpc-server"
-version = "1.159.1"
+version = "1.159.3"
 dependencies = [
  "anyhow",
  "deltachat",
@@ -1432,7 +1431,7 @@ dependencies = [
 
 [[package]]
 name = "deltachat_ffi"
-version = "1.159.1"
+version = "1.159.3"
 dependencies = [
  "anyhow",
  "deltachat",
@@ -7291,9 +7290,9 @@ dependencies = [
 
 [[package]]
 name = "yerpc"
-version = "0.6.3"
+version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0a3c86bc22116513ae8b72b96da2f4fc9de66110000864456d1bd5244c15de68"
+checksum = "1dc24983fbe850227bfc1de89bf8cbfb3e2463afc322e0de2f155c4c23d06445"
 dependencies = [
  "anyhow",
  "async-channel 1.9.0",
