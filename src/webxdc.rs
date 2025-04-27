@@ -77,9 +77,6 @@ pub struct WebxdcManifest {
     /// prefered screen orientation (landscape or portrait).
     pub orientation: Option<String>,
 
-    /// If the webxdc is a community backup
-    pub community: Option<bool>,
-
     /// Set to "map" to request integration.
     pub request_integration: Option<String>,
 }
@@ -116,9 +113,6 @@ pub struct WebxdcInfo {
 
     /// prefered screen orientation (landscape or portrait).
     pub orientation: String,
-
-    /// If the webxdc is a community backup
-    pub community: bool,
 
     /// Address to be used for `window.webxdc.selfAddr` in JS land.
     pub self_addr: String,
@@ -971,11 +965,6 @@ impl Message {
                 orientation
             } else {
                 "".to_string()
-            },
-            community: if let Some(community) = manifest.community {
-                community
-            } else {
-                false
             },
             self_addr,
             send_update_interval: context.ratelimit.read().await.update_interval(),

@@ -436,9 +436,6 @@ pub enum Config {
     /// MsgId of webxdc map integration.
     WebxdcIntegration,
 
-    /// 1 if the current account is a community
-    IsCommunity,
-
     /// Enable webxdc realtime features.
     #[strum(props(default = "1"))]
     WebxdcRealtimeEnabled,

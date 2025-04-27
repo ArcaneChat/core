@@ -637,15 +637,11 @@ impl Contact {
             .await?
         {
             if contact_id == ContactId::SELF {
+                contact.name = stock_str::self_msg(context).await;
                 contact.authname = context
                     .get_config(Config::Displayname)
                     .await?
                     .unwrap_or_default();
-                contact.name = if context.get_config_bool(Config::IsCommunity).await? {
-                  contact.authname.clone()
-                } else {
-                  stock_str::self_msg(context).await
-                };
                 contact.addr = context
                     .get_config(Config::ConfiguredAddr)
                     .await?

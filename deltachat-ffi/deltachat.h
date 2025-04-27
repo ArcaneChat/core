@@ -4304,11 +4304,6 @@ int             dc_msg_get_showpadlock        (const dc_msg_t* msg);
 int             dc_msg_is_bot                 (const dc_msg_t* msg); 
 
 /**
- * Get a color for the overriden sender name.
- */
-uint32_t        dc_msg_get_sender_color (const dc_msg_t* msg);
-
-/**
  * Get the ephemeral timer duration for a message.
  * This is the value of dc_get_chat_ephemeral_timer() in the moment the message was sent.
  *

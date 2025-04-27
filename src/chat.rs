@@ -3012,20 +3012,6 @@ pub(crate) async fn create_send_msg_jobs(context: &Context, msg: &mut Message) -
             .await?;
     }
 
-    if context.get_config_bool(Config::IsCommunity).await? {
-      if let Some(_) = msg.param.get(Param::OverrideSenderDisplayname) {
-      } else {
-        let selfname = context.get_ui_config("ui.community.selfname")
-          .await
-          .context("Can't get ui-config")
-          .unwrap_or_default()
-          .unwrap_or_default();
-        if selfname != "" {
-          msg.param.set(Param::OverrideSenderDisplayname, selfname);
-        }
-      }
-    }
-
     let force_encryption = (context.get_ui_config("ui.force_encryption")
         .await
         .context("Can't get ui-config")
@@ -3771,6 +3757,12 @@ pub(crate) async fn create_broadcast_list_ex(
     context.emit_msgs_changed_without_ids();
     chatlist_events::emit_chatlist_changed(context);
 
+    if sync.into() {
+        let id = SyncId::Grpid(grpid);
+        let action = SyncAction::CreateBroadcast(chat_name);
+        self::sync(context, id, action).await.log_err(context).ok();
+    }
+
     Ok(chat_id)
 }
 
@@ -4296,7 +4288,7 @@ async fn rename_ex(
     if !success {
         bail!("Failed to set name");
     }
-    if sync.into() && chat.name != new_name && (chat.typ != Chattype::Mailinglist || !context.get_config_bool(Config::IsCommunity).await?) {
+    if sync.into() && chat.name != new_name {
         let sync_name = new_name.to_string();
         chat.sync(context, SyncAction::Rename(sync_name))
             .await
@@ -4939,10 +4931,8 @@ pub(crate) enum SyncAction {
 impl Context {
     /// Executes [`SyncData::AlterChat`] item sent by other device.
     pub(crate) async fn sync_alter_chat(&self, id: &SyncId, action: &SyncAction) -> Result<()> {
-        let is_community = self.get_config_bool(Config::IsCommunity).await?;
         let chat_id = match id {
             SyncId::ContactAddr(addr) => {
-                if is_community { return Ok(()); }
                 if let SyncAction::Rename(to) = action {
                     Contact::create_ex(self, Nosync, to, addr).await?;
                     return Ok(());
@@ -4967,7 +4957,6 @@ impl Context {
             }
             SyncId::Grpid(grpid) => {
                 if let SyncAction::CreateBroadcast(name) = action {
-                    if is_community { return Ok(()); }
                     create_broadcast_list_ex(self, Nosync, grpid.clone(), name.clone()).await?;
                     return Ok(());
                 }
@@ -4986,15 +4975,15 @@ impl Context {
             SyncId::Device => ChatId::get_for_contact(self, ContactId::DEVICE).await?,
         };
         match action {
-            SyncAction::Block => if is_community { Ok(()) } else {chat_id.block_ex(self, Nosync).await},
-            SyncAction::Unblock => if is_community { Ok(()) } else {chat_id.unblock_ex(self, Nosync).await},
-            SyncAction::Accept => if is_community { Ok(()) } else {chat_id.accept_ex(self, Nosync).await},
-            SyncAction::SetVisibility(v) => if is_community { Ok(()) } else {chat_id.set_visibility_ex(self, Nosync, *v).await},
-            SyncAction::SetMuted(duration) => if is_community { Ok(()) } else {set_muted_ex(self, Nosync, chat_id, *duration).await},
+            SyncAction::Block => chat_id.block_ex(self, Nosync).await,
+            SyncAction::Unblock => chat_id.unblock_ex(self, Nosync).await,
+            SyncAction::Accept => chat_id.accept_ex(self, Nosync).await,
+            SyncAction::SetVisibility(v) => chat_id.set_visibility_ex(self, Nosync, *v).await,
+            SyncAction::SetMuted(duration) => set_muted_ex(self, Nosync, chat_id, *duration).await,
             SyncAction::CreateBroadcast(_) => {
                 Err(anyhow!("sync_alter_chat({id:?}, {action:?}): Bad request."))
             }
-            SyncAction::Rename(to) => if is_community && Chat::load_from_db(self, chat_id).await?.typ == Chattype::Broadcast { Ok(()) } else {rename_ex(self, Nosync, chat_id, to).await},
+            SyncAction::Rename(to) => rename_ex(self, Nosync, chat_id, to).await,
             SyncAction::SetContacts(addrs) => set_contacts_by_addrs(self, chat_id, addrs).await,
             SyncAction::Delete => chat_id.delete_ex(self, Nosync).await,
         }

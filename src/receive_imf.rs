@@ -632,9 +632,8 @@ pub(crate) async fn receive_imf_inner(
         context.emit_msgs_changed_without_msg_id(replace_chat_id);
     } else if !chat_id.is_trash() {
         let fresh = received_msg.state == MessageState::InFresh;
-        let is_community = context.get_config_bool(Config::IsCommunity).await?;
         for msg_id in &received_msg.msg_ids {
-            chat_id.emit_msg_event(context, *msg_id, (mime_parser.incoming || is_community) && fresh);
+            chat_id.emit_msg_event(context, *msg_id, mime_parser.incoming && fresh);
         }
     }
     context.new_msgs_notify.notify_one();
@@ -801,7 +800,6 @@ async fn add_parts(
         }
     }
 
-    let is_community = context.get_config_bool(Config::IsCommunity).await?;
     if chat_id.is_none() && is_mdn {
         chat_id = Some(DC_CHAT_ID_TRASH);
         info!(context, "Message is an MDN (TRASH).",);
@@ -1205,35 +1203,18 @@ async fn add_parts(
         }
 
         if chat_id.is_none() {
-            if is_community {
-              // check if the message belongs to a mailing list
-              if let Some(mailinglist_header) = mime_parser.get_mailinglist_header() {
-                  if let Some((new_chat_id, _new_chat_id_blocked)) = create_or_lookup_mailinglist(
-                      context,
-                      allow_creation,
-                      mailinglist_header,
-                      mime_parser,
-                  )
-                  .await?
-                  {
-                      chat_id = Some(new_chat_id);
-                      //chat_id_blocked = new_chat_id_blocked;
-                  }
-              }
-            } else {
-              // Check if the message belongs to a broadcast list.
-              if let Some(mailinglist_header) = mime_parser.get_mailinglist_header() {
-                  let listid = mailinglist_header_listid(mailinglist_header)?;
-                  chat_id = Some(
-                      if let Some((id, ..)) = chat::get_chat_id_by_grpid(context, &listid).await? {
-                          id
-                      } else {
-                          let name =
-                              compute_mailinglist_name(mailinglist_header, &listid, mime_parser);
-                          chat::create_broadcast_list_ex(context, Nosync, listid, name).await?
-                      },
-                  );
-              }
+            // Check if the message belongs to a broadcast list.
+            if let Some(mailinglist_header) = mime_parser.get_mailinglist_header() {
+                let listid = mailinglist_header_listid(mailinglist_header)?;
+                chat_id = Some(
+                    if let Some((id, ..)) = chat::get_chat_id_by_grpid(context, &listid).await? {
+                        id
+                    } else {
+                        let name =
+                            compute_mailinglist_name(mailinglist_header, &listid, mime_parser);
+                        chat::create_broadcast_list_ex(context, Nosync, listid, name).await?
+                    },
+                );
             }
         }
 

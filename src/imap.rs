@@ -1161,9 +1161,6 @@ impl Session {
 
     /// Synchronizes `\Seen` flags using `CONDSTORE` extension.
     pub(crate) async fn sync_seen_flags(&mut self, context: &Context, folder: &str) -> Result<()> {
-        if context.get_config_bool(Config::IsCommunity).await? {
-          return Ok(()); // disable syncing markseen
-        }
         if !self.can_condstore() {
             info!(
                 context,
@@ -2215,7 +2212,7 @@ pub(crate) async fn prefetch_should_download(
         .await?
         .is_some()
     {
-        //markseen_on_imap_table(context, message_id).await?;
+        markseen_on_imap_table(context, message_id).await?;
         return Ok(false);
     }
 

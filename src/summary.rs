@@ -5,7 +5,6 @@ use std::fmt;
 use std::str;
 
 use crate::chat::Chat;
-use crate::config::Config;
 use crate::constants::Chattype;
 use crate::contact::{Contact, ContactId};
 use crate::context::Context;

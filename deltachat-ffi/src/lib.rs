@@ -4287,23 +4287,6 @@ pub unsafe extern "C" fn dc_contact_get_color(contact: *mut dc_contact_t) -> u32
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dc_msg_get_sender_color(msg: *mut dc_msg_t) -> u32 {
-    if msg.is_null() {
-        eprintln!("ignoring careless call to dc_msg_get_sender_color()");
-        return 0;
-    }
-    let ffi_msg = &mut *msg;
-    let ctx = &*ffi_msg.context;
-
-    let name = ffi_msg.message.get_override_sender_name();
-    if let Some(name) = name {
-      return ctx.get_color(name);
-    } else {
-      return 0;
-    }
-}
-
-#[no_mangle]
 pub unsafe extern "C" fn dc_contact_get_status(contact: *mut dc_contact_t) -> *mut libc::c_char {
     if contact.is_null() {
         eprintln!("ignoring careless call to dc_contact_get_status()");

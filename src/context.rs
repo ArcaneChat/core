@@ -18,7 +18,6 @@ use tokio::sync::{Mutex, Notify, RwLock};
 use crate::aheader::EncryptPreference;
 use crate::chat::{get_chat_cnt, ChatId, ProtectionStatus};
 use crate::chatlist_events;
-use crate::color::str_to_color;
 use crate::config::Config;
 use crate::constants::{
     self, DC_BACKGROUND_FETCH_QUOTA_CHECK_RATELIMIT, DC_CHAT_ID_TRASH, DC_VERSION_STR,
@@ -332,11 +331,6 @@ pub fn get_info() -> BTreeMap<&'static str, String> {
 }
 
 impl Context {
-    /// Get a color for the contact name.
-    pub fn get_color(&self, name: String) -> u32 {
-        str_to_color(&name)
-    }
-
     /// Creates new context and opens the database.
     pub async fn new(
         dbfile: &Path,
