@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.159.5] - 2025-05-14
+
+### Fixes
+
+- Don't change webxdc self-addr when saving and loading draft ([#6854](https://github.com/chatmail/core/pull/6854)).
+
+### Miscellaneous Tasks
+
+- Remove duplicate miniz_oxide dependency.
+- Update async-smtp to 0.10.2.
+
 ## [1.159.4] - 2025-05-13
 
 ### Documentation
@@ -6291,3 +6302,4 @@ https://github.com/chatmail/core/pulls?q=is%3Apr+is%3Aclosed
 [1.159.2]: https://github.com/chatmail/core/compare/v1.159.1..v1.159.2
 [1.159.3]: https://github.com/chatmail/core/compare/v1.159.2..v1.159.3
 [1.159.4]: https://github.com/chatmail/core/compare/v1.159.3..v1.159.4
+[1.159.5]: https://github.com/chatmail/core/compare/v1.159.4..v1.159.5

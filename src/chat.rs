@@ -1015,6 +1015,7 @@ impl ChatId {
                 transaction.execute(
                     "INSERT INTO msgs (
                  chat_id,
+                 rfc724_mid,
                  from_id,
                  timestamp,
                  type,
@@ -1024,9 +1025,10 @@ impl ChatId {
                  param,
                  hidden,
                  mime_in_reply_to)
-         VALUES (?,?,?,?,?,?,?,?,?,?);",
+         VALUES (?,?,?,?,?,?,?,?,?,?,?);",
                     (
                         self,
+                        &msg.rfc724_mid,
                         ContactId::SELF,
                         time(),
                         msg.viewtype,
