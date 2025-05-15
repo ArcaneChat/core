@@ -1503,6 +1503,39 @@ async fn test_shall_attach_selfavatar() -> Result<()> {
     Ok(())
 }
 
+/// Tests that profile data is attached to group leave messages. There are some pros and cons of
+/// doing this, but at least we don't want to complicate the code with this special case.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_profile_data_on_group_leave() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let t = &tcm.alice().await;
+    let chat_id = create_group_chat(t, ProtectionStatus::Unprotected, "foo").await?;
+
+    let (contact_id, _) = Contact::add_or_lookup(
+        t,
+        "",
+        &ContactAddress::new("foo@bar.org")?,
+        Origin::IncomingUnknownTo,
+    )
+    .await?;
+    add_contact_to_chat(t, chat_id, contact_id).await?;
+
+    send_text_msg(t, chat_id, "populate".to_string()).await?;
+    t.pop_sent_msg().await;
+
+    let file = t.dir.path().join("avatar.png");
+    let bytes = include_bytes!("../../test-data/image/avatar64x64.png");
+    tokio::fs::write(&file, bytes).await?;
+    t.set_config(Config::Selfavatar, Some(file.to_str().unwrap()))
+        .await?;
+    assert!(shall_attach_selfavatar(t, chat_id).await?);
+
+    remove_contact_from_chat(t, chat_id, ContactId::SELF).await?;
+    let sent_msg = t.pop_sent_msg().await;
+    assert!(sent_msg.payload().contains("Chat-User-Avatar"));
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_set_mute_duration() {
     let t = TestContext::new().await;
@@ -2007,20 +2040,28 @@ async fn test_sticker_forward() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_forward() -> Result<()> {
+async fn test_forward_basic() -> Result<()> {
     let alice = TestContext::new_alice().await;
     let bob = TestContext::new_bob().await;
     let alice_chat = alice.create_chat(&bob).await;
     let bob_chat = bob.create_chat(&alice).await;
 
-    let mut msg = Message::new_text("Hi Bob".to_owned());
-    let sent_msg = alice.send_msg(alice_chat.get_id(), &mut msg).await;
+    let mut alice_msg = Message::new_text("Hi Bob".to_owned());
+    let sent_msg = alice.send_msg(alice_chat.get_id(), &mut alice_msg).await;
     let msg = bob.recv_msg(&sent_msg).await;
+    assert_eq!(alice_msg.rfc724_mid, msg.rfc724_mid);
 
     forward_msgs(&bob, &[msg.id], bob_chat.get_id()).await?;
 
     let forwarded_msg = bob.pop_sent_msg().await;
+    assert_eq!(bob_chat.id.get_msg_cnt(&bob).await?, 2);
+    assert_ne!(
+        forwarded_msg.load_from_db().await.rfc724_mid,
+        msg.rfc724_mid,
+    );
+    let msg_bob = Message::load_from_db(&bob, forwarded_msg.sender_msg_id).await?;
     let msg = alice.recv_msg(&forwarded_msg).await;
+    assert_eq!(msg.rfc724_mid(), msg_bob.rfc724_mid());
     assert_eq!(msg.get_text(), "Hi Bob");
     assert!(msg.is_forwarded());
     Ok(())

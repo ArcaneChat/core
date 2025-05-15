@@ -34,6 +34,7 @@ use crate::reaction::get_msg_reactions;
 use crate::sql;
 use crate::summary::Summary;
 use crate::sync::SyncData;
+use crate::tools::create_outgoing_rfc724_mid;
 use crate::tools::{
     buf_compress, buf_decompress, get_filebytes, get_filemeta, gm2local_offset, read_file,
     sanitize_filename, time, timestamp_to_str,
@@ -471,6 +472,7 @@ impl Message {
     pub fn new(viewtype: Viewtype) -> Self {
         Message {
             viewtype,
+            rfc724_mid: create_outgoing_rfc724_mid(),
             ..Default::default()
         }
     }
@@ -480,6 +482,7 @@ impl Message {
         Message {
             viewtype: Viewtype::Text,
             text,
+            rfc724_mid: create_outgoing_rfc724_mid(),
             ..Default::default()
         }
     }
