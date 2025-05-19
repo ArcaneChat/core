@@ -38,6 +38,7 @@ skip = [
      { name = "regex-automata", version = "0.1.10" },
      { name = "regex-syntax", version = "0.6.29" },
      { name = "rustix", version = "0.38.44" },
+     { name = "spin", version = "0.9.8" },
      { name = "strum_macros", version = "0.26.2" },
      { name = "strum", version = "0.26.2" },
      { name = "syn", version = "1.0.109" },
