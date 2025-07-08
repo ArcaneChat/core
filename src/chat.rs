@@ -34,7 +34,7 @@ use crate::download::DownloadState;
 use crate::ephemeral::{start_chat_ephemeral_timers, Timer as EphemeralTimer};
 use crate::events::EventType;
 use crate::location;
-use crate::log::LogExt;
+use crate::log::{error, info, warn, LogExt};
 use crate::message::{self, Message, MessageState, MsgId, Viewtype};
 use crate::mimefactory::MimeFactory;
 use crate::mimeparser::SystemMessage;
@@ -673,7 +673,7 @@ impl ChatId {
     ) -> Result<()> {
         let chat_id = ChatId::create_for_contact_with_blocked(context, contact_id, Blocked::Yes)
             .await
-            .with_context(|| format!("can't create chat for {}", contact_id))?;
+            .with_context(|| format!("can't create chat for {contact_id}"))?;
         chat_id
             .set_protection(
                 context,
@@ -1528,7 +1528,7 @@ impl std::fmt::Display for ChatId {
 /// This allows you to directly store [ChatId] into the database as
 /// well as query for a [ChatId].
 impl rusqlite::types::ToSql for ChatId {
-    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput> {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
         let val = rusqlite::types::Value::Integer(i64::from(self.0));
         let out = rusqlite::types::ToSqlOutput::Owned(val);
         Ok(out)
@@ -2400,7 +2400,7 @@ pub enum ChatVisibility {
 }
 
 impl rusqlite::types::ToSql for ChatVisibility {
-    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput> {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
         let val = rusqlite::types::Value::Integer(*self as i64);
         let out = rusqlite::types::ToSqlOutput::Owned(val);
         Ok(out)
@@ -2963,7 +2963,10 @@ async fn prepare_send_msg(
     if chat.typ != Chattype::Single && !context.get_config_bool(Config::Bot).await? {
         if let Some(quoted_message) = msg.quoted_message(context).await? {
             if quoted_message.chat_id != chat_id {
-                bail!("Bad quote reply");
+                bail!(
+                    "Quote of message from {} cannot be sent to {chat_id}",
+                    quoted_message.chat_id
+                );
             }
         }
     }
@@ -3561,37 +3564,62 @@ pub async fn get_chat_media(
     msg_type2: Viewtype,
     msg_type3: Viewtype,
 ) -> Result<Vec<MsgId>> {
-    // TODO This query could/should be converted to `AND type IN (?, ?, ?)`.
-    let list = context
-        .sql
-        .query_map(
-            "SELECT id
+    let list = if msg_type == Viewtype::Webxdc
+        && msg_type2 == Viewtype::Unknown
+        && msg_type3 == Viewtype::Unknown
+    {
+        context
+            .sql
+            .query_map(
+                "SELECT id
                FROM msgs
               WHERE (1=? OR chat_id=?)
                 AND chat_id != ?
-                AND (type=? OR type=? OR type=?)
+                AND type = ?
+                AND hidden=0
+              ORDER BY max(timestamp, timestamp_rcvd), id;",
+                (
+                    chat_id.is_none(),
+                    chat_id.unwrap_or_else(|| ChatId::new(0)),
+                    DC_CHAT_ID_TRASH,
+                    Viewtype::Webxdc,
+                ),
+                |row| row.get::<_, MsgId>(0),
+                |ids| Ok(ids.flatten().collect()),
+            )
+            .await?
+    } else {
+        context
+            .sql
+            .query_map(
+                "SELECT id
+               FROM msgs
+              WHERE (1=? OR chat_id=?)
+                AND chat_id != ?
+                AND type IN (?, ?, ?)
                 AND hidden=0
               ORDER BY timestamp, id;",
-            (
-                chat_id.is_none(),
-                chat_id.unwrap_or_else(|| ChatId::new(0)),
-                DC_CHAT_ID_TRASH,
-                msg_type,
-                if msg_type2 != Viewtype::Unknown {
-                    msg_type2
-                } else {
-                    msg_type
-                },
-                if msg_type3 != Viewtype::Unknown {
-                    msg_type3
-                } else {
-                    msg_type
-                },
-            ),
-            |row| row.get::<_, MsgId>(0),
-            |ids| Ok(ids.flatten().collect()),
-        )
-        .await?;
+                (
+                    chat_id.is_none(),
+                    chat_id.unwrap_or_else(|| ChatId::new(0)),
+                    DC_CHAT_ID_TRASH,
+                    msg_type,
+                    if msg_type2 != Viewtype::Unknown {
+                        msg_type2
+                    } else {
+                        msg_type
+                    },
+                    if msg_type3 != Viewtype::Unknown {
+                        msg_type3
+                    } else {
+                        msg_type
+                    },
+                ),
+                |row| row.get::<_, MsgId>(0),
+                |ids| Ok(ids.flatten().collect()),
+            )
+            .await?
+    };
     Ok(list)
 }
 
@@ -4057,7 +4085,7 @@ pub enum MuteDuration {
 }
 
 impl rusqlite::types::ToSql for MuteDuration {
-    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput> {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
         let duration: i64 = match &self {
             MuteDuration::NotMuted => 0,
             MuteDuration::Forever => -1,
@@ -4374,7 +4402,7 @@ pub async fn forward_msgs(context: &Context, msg_ids: &[MsgId], chat_id: ChatId)
             .sql
             .query_get_value("SELECT timestamp FROM msgs WHERE id=?", (id,))
             .await?
-            .context("No message {id}")?;
+            .with_context(|| format!("No message {id}"))?;
         msgs.push((ts, *id));
     }
     msgs.sort_unstable();
@@ -4429,7 +4457,17 @@ pub async fn forward_msgs(context: &Context, msg_ids: &[MsgId], chat_id: ChatId)
 /// Save a copy of the message in "Saved Messages"
 /// and send a sync messages so that other devices save the message as well, unless deleted there.
 pub async fn save_msgs(context: &Context, msg_ids: &[MsgId]) -> Result<()> {
-    for src_msg_id in msg_ids {
+    let mut msgs = Vec::with_capacity(msg_ids.len());
+    for id in msg_ids {
+        let ts: i64 = context
+            .sql
+            .query_get_value("SELECT timestamp FROM msgs WHERE id=?", (id,))
+            .await?
+            .with_context(|| format!("No message {id}"))?;
+        msgs.push((ts, *id));
+    }
+    msgs.sort_unstable();
+    for (_, src_msg_id) in msgs {
         let dest_rfc724_mid = create_outgoing_rfc724_mid();
         let src_rfc724_mid = save_copy_in_self_talk(context, src_msg_id, &dest_rfc724_mid).await?;
         context
@@ -4450,11 +4488,11 @@ pub async fn save_msgs(context: &Context, msg_ids: &[MsgId]) -> Result<()> {
 /// Returns data needed to add a `SaveMessage` sync item.
 pub(crate) async fn save_copy_in_self_talk(
     context: &Context,
-    src_msg_id: &MsgId,
+    src_msg_id: MsgId,
     dest_rfc724_mid: &String,
 ) -> Result<String> {
     let dest_chat_id = ChatId::create_for_contact(context, ContactId::SELF).await?;
-    let mut msg = Message::load_from_db(context, *src_msg_id).await?;
+    let mut msg = Message::load_from_db(context, src_msg_id).await?;
     msg.param.remove(Param::Cmd);
     msg.param.remove(Param::WebxdcDocument);
     msg.param.remove(Param::WebxdcDocumentTimestamp);
@@ -4492,7 +4530,7 @@ pub(crate) async fn save_copy_in_self_talk(
         .await?;
     let dest_msg_id = MsgId::new(row_id.try_into()?);
 
-    context.emit_msgs_changed(msg.chat_id, *src_msg_id);
+    context.emit_msgs_changed(msg.chat_id, src_msg_id);
     context.emit_msgs_changed(dest_chat_id, dest_msg_id);
     chatlist_events::emit_chatlist_changed(context);
     chatlist_events::emit_chatlist_item_changed(context, dest_chat_id);

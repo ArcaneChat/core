@@ -29,14 +29,14 @@ use crate::dehtml::dehtml;
 use crate::events::EventType;
 use crate::headerdef::{HeaderDef, HeaderDefMap};
 use crate::key::{self, load_self_secret_keyring, DcKey, Fingerprint, SignedPublicKey};
+use crate::log::{error, info, warn};
 use crate::message::{self, get_vcard_summary, set_msg_failed, Message, MsgId, Viewtype};
 use crate::param::{Param, Params};
 use crate::peerstate::Peerstate;
 use crate::simplify::{simplify, SimplifiedText};
 use crate::sync::SyncItems;
-use crate::tools::time;
 use crate::tools::{
-    get_filemeta, parse_receive_headers, smeared_time, truncate_msg_text, validate_id,
+    get_filemeta, parse_receive_headers, smeared_time, time, truncate_msg_text, validate_id,
 };
 use crate::{chatlist_events, location, stock_str, tools};
 
@@ -342,10 +342,10 @@ impl MimeMessage {
         let mail_raw; // Memory location for a possible decrypted message.
         let decrypted_msg; // Decrypted signed OpenPGP message.
 
-        let (mail, encrypted) =
+        let (mail, is_encrypted) =
             match tokio::task::block_in_place(|| try_decrypt(&mail, &private_keyring)) {
-                Ok(Some(msg)) => {
-                    mail_raw = msg.get_content()?.unwrap_or_default();
+                Ok(Some(mut msg)) => {
+                    mail_raw = msg.as_data_vec().unwrap_or_default();
 
                     let decrypted_mail = mailparse::parse_mail(&mail_raw)?;
                     if std::env::var(crate::DCC_MIME_DEBUG).is_ok() {
@@ -434,7 +434,7 @@ impl MimeMessage {
             signatures.extend(signatures_detached);
             content
         });
-        if let (Ok(mail), true) = (mail, encrypted) {
+        if let (Ok(mail), true) = (mail, is_encrypted) {
             if !signatures.is_empty() {
                 // Remove unsigned opportunistically protected headers from messages considered
                 // Autocrypt-encrypted / displayed with padlock.
@@ -529,7 +529,7 @@ impl MimeMessage {
                 }
             }
         }
-        if !encrypted {
+        if !is_encrypted {
             signatures.clear();
         }
         if let Some(peerstate) = &mut peerstate {
@@ -2377,7 +2377,7 @@ async fn handle_ndn(
         let aggregated_error = message
             .error
             .as_ref()
-            .map(|err| format!("{}\n\n{}", err, err_msg));
+            .map(|err| format!("{err}\n\n{err_msg}"));
         set_msg_failed(
             context,
             &mut message,

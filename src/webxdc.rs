@@ -40,13 +40,13 @@ use crate::contact::ContactId;
 use crate::context::Context;
 use crate::events::EventType;
 use crate::key::{load_self_public_key, DcKey};
+use crate::log::{info, warn};
 use crate::message::{Message, MessageState, MsgId, Viewtype};
 use crate::mimefactory::RECOMMENDED_FILE_SIZE;
 use crate::mimeparser::SystemMessage;
 use crate::param::Param;
 use crate::param::Params;
-use crate::tools::create_id;
-use crate::tools::{create_smeared_timestamp, get_abs_path};
+use crate::tools::{create_id, create_smeared_timestamp, get_abs_path};
 
 /// The current API version.
 /// If `min_api` in manifest.toml is set to a larger value,
@@ -163,7 +163,7 @@ impl StatusUpdateSerial {
 }
 
 impl rusqlite::types::ToSql for StatusUpdateSerial {
-    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput> {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
         let val = rusqlite::types::Value::Integer(i64::from(self.0));
         let out = rusqlite::types::ToSqlOutput::Owned(val);
         Ok(out)
@@ -976,7 +976,7 @@ impl Message {
         let fingerprint = load_self_public_key(context).await?.dc_fingerprint().hex();
         let data = format!("{}-{}", fingerprint, self.rfc724_mid);
         let hash = Sha256::digest(data.as_bytes());
-        Ok(format!("{:x}", hash))
+        Ok(format!("{hash:x}"))
     }
 
     /// Get link attached to an info message.

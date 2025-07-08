@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "deltachat-rpc-client"
-version = "1.159.5"
+version = "1.160.0"
 description = "Python client for Delta Chat core JSON-RPC interface"
 classifiers = [
     "Development Status :: 5 - Production/Stable",
@@ -65,6 +65,9 @@ lint.select = [
   "PLW", # Pylint Warning
 
   "RUF006" # asyncio-dangling-task
+]
+lint.ignore = [
+  "PLC0415" # `import` should be at the top-level of a file
 ]
 line-length = 120
 

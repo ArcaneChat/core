@@ -10,6 +10,7 @@ use tokio::fs;
 
 use crate::blob::BlobObject;
 use crate::context::Context;
+use crate::log::{info, warn};
 use crate::net::proxy::ProxyConfig;
 use crate::net::session::SessionStream;
 use crate::net::tls::wrap_rustls;
@@ -259,6 +260,18 @@ async fn fetch_url(context: &Context, original_url: &str) -> Result<Response> {
             info!(context, "Following redirect to {}", header);
             url = header.to_string();
             continue;
+        }
+
+        if !response.status().is_success() {
+            return Err(anyhow!(
+                "The server returned a non-successful response code: {}{}",
+                response.status().as_u16(),
+                response
+                    .status()
+                    .canonical_reason()
+                    .map(|s| format!(" {s}"))
+                    .unwrap_or("".to_string())
+            ));
         }
 
         let content_type = response

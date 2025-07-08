@@ -10,6 +10,7 @@ use crate::constants::{
 };
 use crate::contact::{Contact, ContactId};
 use crate::context::Context;
+use crate::log::warn;
 use crate::message::{Message, MessageState, MsgId};
 use crate::param::{Param, Params};
 use crate::stock_str;
@@ -322,7 +323,7 @@ impl Chatlist {
                     (chat_id, MessageState::OutDraft),
                 )
                 .await
-                .with_context(|| format!("failed to get msg ID for chat {}", chat_id))?;
+                .with_context(|| format!("failed to get msg ID for chat {chat_id}"))?;
             ids.push((chat_id, msg_id));
         }
         Ok(Chatlist { ids })

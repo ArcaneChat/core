@@ -25,11 +25,11 @@ use crate::blob::BlobObject;
 use crate::chat::{ChatId, ChatIdBlocked, ProtectionStatus};
 use crate::color::str_to_color;
 use crate::config::Config;
-use crate::constants::{Blocked, Chattype, DC_GCL_ADD_SELF, DC_GCL_VERIFIED_ONLY};
+use crate::constants::{Blocked, Chattype, DC_GCL_ADD_SELF};
 use crate::context::Context;
 use crate::events::EventType;
 use crate::key::{load_self_public_key, DcKey, SignedPublicKey};
-use crate::log::LogExt;
+use crate::log::{info, warn, LogExt};
 use crate::message::MessageState;
 use crate::mimeparser::AvatarAction;
 use crate::param::{Param, Params};
@@ -243,7 +243,7 @@ impl fmt::Display for ContactId {
 
 /// Allow converting [`ContactId`] to an SQLite type.
 impl rusqlite::types::ToSql for ContactId {
-    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput> {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
         let val = rusqlite::types::Value::Integer(i64::from(self.0));
         let out = rusqlite::types::ToSqlOutput::Owned(val);
         Ok(out)
@@ -287,6 +287,7 @@ pub async fn make_vcard(context: &Context, contacts: &[ContactId]) -> Result<Str
             authname: c.authname,
             key,
             profile_image,
+            biography: Some(c.status).filter(|s| !s.is_empty()),
             // Use the current time to not reveal our or contact's online time.
             timestamp: Ok(now),
         });
@@ -420,6 +421,14 @@ async fn import_vcard_contact(context: &Context, contact: &VcardContact) -> Resu
             warn!(
                 context,
                 "import_vcard_contact: Could not set avatar for {}: {e:#}.", contact.addr
+            );
+        }
+    }
+    if let Some(biography) = &contact.biography {
+        if let Err(e) = set_status(context, id, biography.to_owned(), false, false).await {
+            warn!(
+                context,
+                "import_vcard_contact: Could not set biography for {}: {e:#}.", contact.addr
             );
         }
     }
@@ -1041,9 +1050,8 @@ impl Contact {
     ///
     /// `listflags` is a combination of flags:
     /// - if the flag DC_GCL_ADD_SELF is set, SELF is added to the list unless filtered by other parameters
-    /// - if the flag DC_GCL_VERIFIED_ONLY is set, only verified contacts are returned.
-    ///   if DC_GCL_VERIFIED_ONLY is not set, verified and unverified contacts are returned.
-    ///   `query` is a string to filter the list.
+    ///
+    /// `query` is a string to filter the list.
     pub async fn get_all(
         context: &Context,
         listflags: u32,
@@ -1056,14 +1064,13 @@ impl Contact {
             .collect::<HashSet<_>>();
         let mut add_self = false;
         let mut ret = Vec::new();
-        let flag_verified_only = (listflags & DC_GCL_VERIFIED_ONLY) != 0;
         let flag_add_self = (listflags & DC_GCL_ADD_SELF) != 0;
         let minimal_origin = if context.get_config_bool(Config::Bot).await? {
             Origin::Unknown
         } else {
             Origin::IncomingReplyTo
         };
-        if flag_verified_only || query.is_some() {
+        if query.is_some() {
             let s3str_like_cmd = format!("%{}%", query.unwrap_or(""));
             context
                 .sql
@@ -1074,14 +1081,12 @@ impl Contact {
                  AND c.origin>=? \
                  AND c.blocked=0 \
                  AND (iif(c.name='',c.authname,c.name) LIKE ? OR c.addr LIKE ?) \
-                 AND (1=? OR LENGTH(ps.verified_key_fingerprint)!=0)  \
                  ORDER BY c.last_seen DESC, c.id DESC;",
                     (
                         ContactId::LAST_SPECIAL,
                         minimal_origin,
                         &s3str_like_cmd,
                         &s3str_like_cmd,
-                        if flag_verified_only { 0i32 } else { 1i32 },
                     ),
                     |row| {
                         let id: ContactId = row.get(0)?;

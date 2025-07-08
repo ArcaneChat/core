@@ -10,6 +10,7 @@ use crate::constants::Blocked;
 use crate::contact::ContactId;
 use crate::context::Context;
 use crate::log::LogExt;
+use crate::log::{info, warn};
 use crate::message::{Message, MsgId, Viewtype};
 use crate::mimeparser::SystemMessage;
 use crate::param::Param;
@@ -298,7 +299,7 @@ impl Context {
 
     async fn save_message(&self, src_rfc724_mid: &str, dest_rfc724_mid: &String) -> Result<()> {
         if let Some((src_msg_id, _)) = message::rfc724_mid_exists(self, src_rfc724_mid).await? {
-            chat::save_copy_in_self_talk(self, &src_msg_id, dest_rfc724_mid).await?;
+            chat::save_copy_in_self_talk(self, src_msg_id, dest_rfc724_mid).await?;
         }
         Ok(())
     }

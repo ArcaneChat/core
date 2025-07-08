@@ -26,6 +26,7 @@ use crate::headerdef::{HeaderDef, HeaderDefMap};
 use crate::imap::{markseen_on_imap_table, GENERATED_PREFIX};
 use crate::key::DcKey;
 use crate::log::LogExt;
+use crate::log::{info, warn};
 use crate::message::{
     self, rfc724_mid_exists, Message, MessageState, MessengerMessage, MsgId, Viewtype,
 };
@@ -2138,11 +2139,14 @@ async fn create_group(
 
     let create_protected = if mime_parser.get_header(HeaderDef::ChatVerified).is_some() {
         if let VerifiedEncryption::NotVerified(err) = verified_encryption {
-            warn!(context, "Verification problem: {err:#}.");
-            let s = format!("{err}. See 'Info' for more details");
-            mime_parser.replace_msg_by_error(&s);
+            warn!(
+                context,
+                "Creating unprotected group because of the verification problem: {err:#}."
+            );
+            ProtectionStatus::Unprotected
+        } else {
+            ProtectionStatus::Protected
         }
-        ProtectionStatus::Protected
     } else {
         ProtectionStatus::Unprotected
     };
@@ -2381,12 +2385,17 @@ async fn apply_group_changes(
 
     if mime_parser.get_header(HeaderDef::ChatVerified).is_some() {
         if let VerifiedEncryption::NotVerified(err) = verified_encryption {
-            warn!(context, "Verification problem: {err:#}.");
-            let s = format!("{err}. See 'Info' for more details");
-            mime_parser.replace_msg_by_error(&s);
-        }
-
-        if !chat.is_protected() {
+            if chat.is_protected() {
+                warn!(context, "Verification problem: {err:#}.");
+                let s = format!("{err}. See 'Info' for more details");
+                mime_parser.replace_msg_by_error(&s);
+            } else {
+                warn!(
+                    context,
+                    "Not marking chat {chat_id} as protected due to verification problem: {err:#}."
+                );
+            }
+        } else if !chat.is_protected() {
             chat_id
                 .set_protection(
                     context,

@@ -5,7 +5,7 @@ use anyhow::{Context as _, Result};
 use super::{get_folder_meaning_by_attrs, get_folder_meaning_by_name};
 use crate::config::Config;
 use crate::imap::{session::Session, Imap};
-use crate::log::LogExt;
+use crate::log::{info, LogExt};
 use crate::tools::{self, time_elapsed};
 use crate::{context::Context, imap::FolderMeaning};
 
@@ -17,16 +17,24 @@ impl Imap {
         session: &mut Session,
     ) -> Result<bool> {
         // First of all, debounce to once per minute:
-        let mut last_scan = context.last_full_folder_scan.lock().await;
-        if let Some(last_scan) = *last_scan {
-            let elapsed_secs = time_elapsed(&last_scan).as_secs();
-            let debounce_secs = context
-                .get_config_u64(Config::ScanAllFoldersDebounceSecs)
-                .await?;
+        {
+            let mut last_scan = context.last_full_folder_scan.lock().await;
+            if let Some(last_scan) = *last_scan {
+                let elapsed_secs = time_elapsed(&last_scan).as_secs();
+                let debounce_secs = context
+                    .get_config_u64(Config::ScanAllFoldersDebounceSecs)
+                    .await?;
 
-            if elapsed_secs < debounce_secs {
-                return Ok(false);
+                if elapsed_secs < debounce_secs {
+                    return Ok(false);
+                }
             }
+
+            // Update the timestamp before scanning the folders
+            // to avoid holding the lock for too long.
+            // This means next scan is delayed even if
+            // the current one fails.
+            last_scan.replace(tools::Time::now());
         }
         info!(context, "Starting full folder scan");
 
@@ -94,7 +102,6 @@ impl Imap {
         }
 
         info!(context, "Found folders: {folder_names:?}.");
-        last_scan.replace(tools::Time::now());
         Ok(true)
     }
 }

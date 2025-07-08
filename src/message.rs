@@ -27,6 +27,7 @@ use crate::events::EventType;
 use crate::imap::markseen_on_imap_table;
 use crate::location::delete_poi_location;
 use crate::location::get_poi_location;
+use crate::log::{error, info, warn};
 use crate::mimeparser::{parse_message_id, SystemMessage};
 use crate::param::{Param, Params};
 use crate::pgp::split_armored_data;
@@ -362,7 +363,7 @@ impl std::fmt::Display for MsgId {
 /// This **does** ensure that no special message IDs are written into
 /// the database and the conversion will fail if this is not the case.
 impl rusqlite::types::ToSql for MsgId {
-    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput> {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
         if self.0 <= DC_MSG_ID_LAST_SPECIAL {
             return Err(rusqlite::Error::ToSqlConversionFailure(
                 format_err!("Invalid MsgId {}", self.0).into(),

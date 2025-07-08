@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use anyhow::{bail, ensure, Context as _, Result};
 use async_channel::{self as channel, Receiver, Sender};
+use pgp::composed::SignedPublicKey;
 use pgp::types::PublicKeyTrait;
-use pgp::SignedPublicKey;
 use ratelimit::Ratelimit;
 use tokio::sync::{Mutex, Notify, RwLock};
 
@@ -28,6 +28,7 @@ use crate::download::DownloadState;
 use crate::events::{Event, EventEmitter, EventType, Events};
 use crate::imap::{FolderMeaning, Imap, ServerMetadata};
 use crate::key::{load_self_public_key, load_self_secret_key, DcKey as _};
+use crate::log::{info, warn};
 use crate::login_param::{ConfiguredLoginParam, EnteredLoginParam};
 use crate::message::{self, Message, MessageState, MsgId};
 use crate::param::{Param, Params};
@@ -1066,21 +1067,21 @@ impl Context {
             )
             .await?
             .unwrap_or_default();
-        res += &format!("num_msgs {}\n", num_msgs);
+        res += &format!("num_msgs {num_msgs}\n");
 
         let num_chats: u32 = self
             .sql
             .query_get_value("SELECT COUNT(*) FROM chats WHERE id>9 AND blocked!=1", ())
             .await?
             .unwrap_or_default();
-        res += &format!("num_chats {}\n", num_chats);
+        res += &format!("num_chats {num_chats}\n");
 
         let db_size = tokio::fs::metadata(&self.sql.dbfile).await?.len();
-        res += &format!("db_size_bytes {}\n", db_size);
+        res += &format!("db_size_bytes {db_size}\n");
 
         let secret_key = &load_self_secret_key(self).await?.primary_key;
-        let key_created = secret_key.created_at().timestamp();
-        res += &format!("key_created {}\n", key_created);
+        let key_created = secret_key.public_key().created_at().timestamp();
+        res += &format!("key_created {key_created}\n");
 
         // how many of the chats active in the last months are:
         // - protected
@@ -1160,7 +1161,7 @@ impl Context {
                 id
             }
         };
-        res += &format!("self_reporting_id {}", self_reporting_id);
+        res += &format!("self_reporting_id {self_reporting_id}");
 
         Ok(res)
     }

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "deltachat"
-version = "1.159.5"
+version = "1.160.0"
 description = "Python bindings for the Delta Chat Core library using CFFI against the Rust-implemented libdeltachat"
 readme = "README.rst"
 requires-python = ">=3.8"
@@ -47,6 +47,10 @@ line-length = 120
 
 [tool.ruff]
 lint.select = ["E", "F", "W", "YTT", "C4", "ISC", "ICN", "TID", "DTZ", "PLC", "PLE", "PLW", "PIE", "COM", "UP004", "UP010", "UP031", "UP032", "ANN204"]
+lint.ignore = [
+  "PLC0415", # `import` should be at the top-level of a file
+  "PLW1641" # Object does not implement `__hash__` method
+]
 line-length = 120
 
 [tool.isort]

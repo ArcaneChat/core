@@ -9,16 +9,17 @@ use mailparse::ParsedMail;
 use crate::aheader::Aheader;
 use crate::context::Context;
 use crate::key::{DcKey, Fingerprint, SignedPublicKey, SignedSecretKey};
+use crate::log::info;
 use crate::peerstate::Peerstate;
 use crate::pgp;
 
 /// Tries to decrypt a message, but only if it is structured as an Autocrypt message.
 ///
 /// If successful and the message is encrypted, returns decrypted body.
-pub fn try_decrypt(
-    mail: &ParsedMail<'_>,
-    private_keyring: &[SignedSecretKey],
-) -> Result<Option<::pgp::composed::Message>> {
+pub fn try_decrypt<'a>(
+    mail: &'a ParsedMail<'a>,
+    private_keyring: &'a [SignedSecretKey],
+) -> Result<Option<::pgp::composed::Message<'static>>> {
     let Some(encrypted_data_part) = get_encrypted_mime(mail) else {
         return Ok(None);
     };
