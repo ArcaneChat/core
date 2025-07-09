@@ -4,7 +4,7 @@ use super::*;
 use crate::message::{Message, Viewtype};
 use crate::param::Param;
 use crate::sql;
-use crate::test_utils::{self, TestContext};
+use crate::test_utils::{self, AVATAR_64x64_BYTES, AVATAR_64x64_DEDUPLICATED, TestContext};
 use crate::tools::SystemTime;
 
 fn check_image_size(path: impl AsRef<Path>, width: u32, height: u32) -> image::DynamicImage {
@@ -140,9 +140,9 @@ async fn test_add_white_bg() {
 
         let mut blob = BlobObject::create_and_deduplicate(&t, &avatar_src, &avatar_src).unwrap();
         let img_wh = 128;
-        let maybe_sticker = &mut false;
+        let viewtype = &mut Viewtype::Image;
         let strict_limits = true;
-        blob.recode_to_size(&t, None, maybe_sticker, img_wh, 20_000, strict_limits)
+        blob.check_or_recode_to_size(&t, None, viewtype, img_wh, 20_000, strict_limits)
             .unwrap();
         tokio::task::block_in_place(move || {
             let img = ImageReader::open(blob.to_abs_path())
@@ -188,9 +188,9 @@ async fn test_selfavatar_outside_blobdir() {
     );
 
     let mut blob = BlobObject::create_and_deduplicate(&t, avatar_path, avatar_path).unwrap();
-    let maybe_sticker = &mut false;
+    let viewtype = &mut Viewtype::Image;
     let strict_limits = true;
-    blob.recode_to_size(&t, None, maybe_sticker, 1000, 3000, strict_limits)
+    blob.check_or_recode_to_size(&t, None, viewtype, 1000, 3000, strict_limits)
         .unwrap();
     let new_file_size = file_size(&blob.to_abs_path()).await;
     assert!(new_file_size <= 3000);
@@ -241,9 +241,8 @@ async fn test_selfavatar_in_blobdir() {
 async fn test_selfavatar_copy_without_recode() {
     let t = TestContext::new().await;
     let avatar_src = t.dir.path().join("avatar.png");
-    let avatar_bytes = include_bytes!("../../test-data/image/avatar64x64.png");
-    fs::write(&avatar_src, avatar_bytes).await.unwrap();
-    let avatar_blob = t.get_blobdir().join("e9b6c7a78aa2e4f415644f55a553e73.png");
+    fs::write(&avatar_src, AVATAR_64x64_BYTES).await.unwrap();
+    let avatar_blob = t.get_blobdir().join(AVATAR_64x64_DEDUPLICATED);
     assert!(!avatar_blob.exists());
     t.set_config(Config::Selfavatar, Some(avatar_src.to_str().unwrap()))
         .await
@@ -251,7 +250,7 @@ async fn test_selfavatar_copy_without_recode() {
     assert!(avatar_blob.exists());
     assert_eq!(
         fs::metadata(&avatar_blob).await.unwrap().len(),
-        avatar_bytes.len() as u64
+        AVATAR_64x64_BYTES.len() as u64
     );
     let avatar_cfg = t.get_config(Config::Selfavatar).await.unwrap();
     assert_eq!(avatar_cfg, avatar_blob.to_str().map(|s| s.to_string()));
@@ -400,7 +399,7 @@ async fn test_recode_image_balanced_png() {
     .await
     .unwrap();
 
-    // This will be sent as Image, see [`BlobObject::maybe_sticker`] for explanation.
+    // This will be sent as Image, see [`BlobObject::check_or_recode_image()`] for explanation.
     SendImageCheckMediaquality {
         viewtype: Viewtype::Sticker,
         media_quality_config: "0",
@@ -580,20 +579,23 @@ impl SendImageCheckMediaquality<'_> {
 }
 
 fn assert_extension(context: &TestContext, msg: Message, extension: &str) {
-    assert!(msg
-        .param
-        .get(Param::File)
-        .unwrap()
-        .ends_with(&format!(".{extension}")));
-    assert!(msg
-        .param
-        .get(Param::Filename)
-        .unwrap()
-        .ends_with(&format!(".{extension}")));
-    assert!(msg
-        .get_filename()
-        .unwrap()
-        .ends_with(&format!(".{extension}")));
+    assert!(
+        msg.param
+            .get(Param::File)
+            .unwrap()
+            .ends_with(&format!(".{extension}"))
+    );
+    assert!(
+        msg.param
+            .get(Param::Filename)
+            .unwrap()
+            .ends_with(&format!(".{extension}"))
+    );
+    assert!(
+        msg.get_filename()
+            .unwrap()
+            .ends_with(&format!(".{extension}"))
+    );
     assert_eq!(
         msg.get_file(context)
             .unwrap()

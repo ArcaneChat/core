@@ -30,6 +30,30 @@ pub enum ChatListItemFetchResult {
         /// showing preview if last chat message is image
         summary_preview_image: Option<String>,
         is_protected: bool,
+
+        /// True if the chat is encrypted.
+        /// This means that all messages in the chat are encrypted,
+        /// and all contacts in the chat are "key-contacts",
+        /// i.e. identified by the PGP key fingerprint.
+        ///
+        /// False if the chat is unencrypted.
+        /// This means that all messages in the chat are unencrypted,
+        /// and all contacts in the chat are "address-contacts",
+        /// i.e. identified by the email address.
+        /// The UI should mark this chat e.g. with a mail-letter icon.
+        ///
+        /// Unencrypted groups are called "ad-hoc groups"
+        /// and the user can't add/remove members,
+        /// create a QR invite code,
+        /// or set an avatar.
+        /// These options should therefore be disabled in the UI.
+        ///
+        /// Note that it can happen that an encrypted chat
+        /// contains unencrypted messages that were received in core <= v1.159.*
+        /// and vice versa.
+        ///
+        /// See also `is_key_contact` on `Contact`.
+        is_encrypted: bool,
         is_group: bool,
         fresh_message_counter: usize,
         is_self_talk: bool,
@@ -40,8 +64,10 @@ pub enum ChatListItemFetchResult {
         is_pinned: bool,
         is_muted: bool,
         is_contact_request: bool,
-        /// true when chat is a broadcastlist
+        /// Deprecated 2025-07, alias for is_out_broadcast
         is_broadcast: bool,
+        /// true if the chat type is OutBroadcast
+        is_out_broadcast: bool,
         /// contact id if this is a dm chat (for view profile entry in context menu)
         dm_chat_contact: Option<u32>,
         was_seen_recently: bool,
@@ -137,6 +163,7 @@ pub(crate) async fn get_chat_list_item_by_id(
         summary_status: summary.state.to_u32().expect("impossible"), // idea and a function to transform the constant to strings? or return string enum
         summary_preview_image,
         is_protected: chat.is_protected(),
+        is_encrypted: chat.is_encrypted(ctx).await?,
         is_group: chat.get_type() == Chattype::Group,
         fresh_message_counter,
         is_self_talk: chat.is_self_talk(),
@@ -147,7 +174,8 @@ pub(crate) async fn get_chat_list_item_by_id(
         is_pinned: visibility == ChatVisibility::Pinned,
         is_muted: chat.is_muted(),
         is_contact_request: chat.is_contact_request(),
-        is_broadcast: chat.get_type() == Chattype::Broadcast,
+        is_broadcast: chat.get_type() == Chattype::OutBroadcast,
+        is_out_broadcast: chat.get_type() == Chattype::OutBroadcast,
         dm_chat_contact,
         was_seen_recently,
         last_message_type: message_type,

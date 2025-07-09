@@ -15,28 +15,27 @@ use deltachat_contact_tools::{ContactAddress, EmailAddress};
 use nu_ansi_term::Color;
 use pretty_assertions::assert_eq;
 use rand::Rng;
-use tempfile::{tempdir, TempDir};
+use tempfile::{TempDir, tempdir};
 use tokio::runtime::Handle;
 use tokio::{fs, task};
 
 use crate::chat::{
-    self, add_to_chat_contacts_table, create_group_chat, Chat, ChatId, ChatIdBlocked,
-    MessageListOptions, ProtectionStatus,
+    self, Chat, ChatId, ChatIdBlocked, MessageListOptions, ProtectionStatus,
+    add_to_chat_contacts_table, create_group_chat,
 };
 use crate::chatlist::Chatlist;
 use crate::config::Config;
-use crate::constants::DC_CHAT_ID_TRASH;
-use crate::constants::DC_GCL_NO_SPECIALS;
 use crate::constants::{Blocked, Chattype};
-use crate::contact::{import_vcard, make_vcard, Contact, ContactId, Modifier, Origin};
+use crate::constants::{DC_CHAT_ID_TRASH, DC_GCL_NO_SPECIALS};
+use crate::contact::{
+    Contact, ContactId, Modifier, Origin, import_vcard, make_vcard, mark_contact_id_as_verified,
+};
 use crate::context::Context;
-use crate::e2ee::EncryptHelper;
 use crate::events::{Event, EventEmitter, EventType, Events};
-use crate::key::{self, DcKey, DcSecretKey};
+use crate::key::{self, DcKey, DcSecretKey, self_fingerprint};
 use crate::log::warn;
-use crate::message::{update_msg_state, Message, MessageState, MsgId, Viewtype};
+use crate::message::{Message, MessageState, MsgId, Viewtype, update_msg_state};
 use crate::mimeparser::{MimeMessage, SystemMessage};
-use crate::peerstate::Peerstate;
 use crate::pgp::KeyPair;
 use crate::receive_imf::receive_imf;
 use crate::securejoin::{get_securejoin_qr, join_securejoin};
@@ -45,6 +44,15 @@ use crate::tools::time;
 
 #[allow(non_upper_case_globals)]
 pub const AVATAR_900x900_BYTES: &[u8] = include_bytes!("../test-data/image/avatar900x900.png");
+
+#[allow(non_upper_case_globals)]
+pub const AVATAR_64x64_BYTES: &[u8] = include_bytes!("../test-data/image/avatar64x64.png");
+
+/// The filename of [`AVATAR_64x64_BYTES`],
+/// after it has been saved
+/// by [`crate::blob::BlobObject::create_and_deduplicate`].
+#[allow(non_upper_case_globals)]
+pub const AVATAR_64x64_DEDUPLICATED: &str = "e9b6c7a78aa2e4f415644f55a553e73.png";
 
 /// Map of context IDs to names for [`TestContext`]s.
 static CONTEXT_NAMES: LazyLock<std::sync::RwLock<BTreeMap<u32, String>>> =
@@ -144,7 +152,8 @@ impl TestContextManager {
     ) -> Message {
         let received_msg = self.send_recv(from, to, msg).await;
         assert_eq!(
-            received_msg.chat_blocked, Blocked::Request,
+            received_msg.chat_blocked,
+            Blocked::Request,
             "`send_recv_accept()` is meant to be used for chat requests. Use `send_recv()` if the chat is already accepted."
         );
         received_msg.chat_id.accept(to).await.unwrap();
@@ -419,7 +428,7 @@ impl TestContext {
     async fn new_internal(name: Option<String>, log_sink: Option<LogSink>) -> Self {
         let dir = tempdir().unwrap();
         let dbfile = dir.path().join("db.sqlite");
-        let id = rand::thread_rng().gen();
+        let id = rand::thread_rng().r#gen();
         if let Some(name) = name {
             let mut context_names = CONTEXT_NAMES.write().unwrap();
             context_names.insert(id, name);
@@ -628,9 +637,9 @@ impl TestContext {
     /// Parses a message.
     ///
     /// Parsing a message does not run the entire receive pipeline, but is not without
-    /// side-effects either.  E.g. if the message includes autocrypt headers the relevant
-    /// peerstates will be updated.  Later receiving the message using [Self.recv_msg()] is
-    /// unlikely to be affected as the peerstate would be processed again in exactly the
+    /// side-effects either.  E.g. if the message includes autocrypt headers,
+    /// gossiped public keys will be saved.  Later receiving the message using [Self.recv_msg()] is
+    /// unlikely to be affected as the message would be processed again in exactly the
     /// same way.
     pub(crate) async fn parse_msg(&self, msg: &SentMessage<'_>) -> MimeMessage {
         MimeMessage::from_bytes(&self.ctx, msg.payload().as_bytes(), None)
@@ -723,7 +732,7 @@ impl TestContext {
     }
 
     /// Returns the [`ContactId`] for the other [`TestContext`], creating a contact if necessary.
-    pub async fn add_or_lookup_email_contact_id(&self, other: &TestContext) -> ContactId {
+    pub async fn add_or_lookup_address_contact_id(&self, other: &TestContext) -> ContactId {
         let primary_self_addr = other.ctx.get_primary_self_addr().await.unwrap();
         let addr = ContactAddress::new(&primary_self_addr).unwrap();
         // MailinglistAddress is the lowest allowed origin, we'd prefer to not modify the
@@ -741,9 +750,11 @@ impl TestContext {
     }
 
     /// Returns the [`Contact`] for the other [`TestContext`], creating it if necessary.
-    pub async fn add_or_lookup_email_contact(&self, other: &TestContext) -> Contact {
-        let contact_id = self.add_or_lookup_email_contact_id(other).await;
-        Contact::get_by_id(&self.ctx, contact_id).await.unwrap()
+    pub async fn add_or_lookup_address_contact(&self, other: &TestContext) -> Contact {
+        let contact_id = self.add_or_lookup_address_contact_id(other).await;
+        let contact = Contact::get_by_id(&self.ctx, contact_id).await.unwrap();
+        debug_assert_eq!(contact.is_key_contact(), false);
+        contact
     }
 
     /// Returns the [`ContactId`] for the other [`TestContext`], creating it if necessary.
@@ -755,18 +766,38 @@ impl TestContext {
     }
 
     /// Returns the [`Contact`] for the other [`TestContext`], creating it if necessary.
+    ///
+    /// This function imports a vCard, so will transfer the public key
+    /// as a side effect.
     pub async fn add_or_lookup_contact(&self, other: &TestContext) -> Contact {
         let contact_id = self.add_or_lookup_contact_id(other).await;
         Contact::get_by_id(&self.ctx, contact_id).await.unwrap()
     }
 
-    /// Returns 1:1 [`Chat`] with another account. Panics if it doesn't exist.
+    /// Returns the [`Contact`] for the other [`TestContext`], creating it if necessary.
+    ///
+    /// If the contact does not exist yet, a new contact will be created
+    /// with the correct fingerprint, but without the public key.
+    pub async fn add_or_lookup_contact_no_key(&self, other: &TestContext) -> Contact {
+        let primary_self_addr = other.ctx.get_primary_self_addr().await.unwrap();
+        let addr = ContactAddress::new(&primary_self_addr).unwrap();
+        let fingerprint = self_fingerprint(other).await.unwrap();
+
+        let (contact_id, _modified) =
+            Contact::add_or_lookup_ex(self, "", &addr, fingerprint, Origin::MailinglistAddress)
+                .await
+                .expect("add_or_lookup");
+        Contact::get_by_id(&self.ctx, contact_id).await.unwrap()
+    }
+
+    /// Returns 1:1 [`Chat`] with another account address-contact.
+    /// Panics if it doesn't exist.
     /// May return a blocked chat.
     ///
     /// This first creates a contact using the configured details on the other account, then
     /// gets the 1:1 chat with this contact.
-    pub async fn get_chat(&self, other: &TestContext) -> Chat {
-        let contact = self.add_or_lookup_email_contact(other).await;
+    pub async fn get_email_chat(&self, other: &TestContext) -> Chat {
+        let contact = self.add_or_lookup_address_contact(other).await;
 
         let chat_id = ChatIdBlocked::lookup_by_contact(&self.ctx, contact.id)
             .await
@@ -774,7 +805,28 @@ impl TestContext {
             .map(|chat_id_blocked| chat_id_blocked.id)
             .expect(
                 "There is no chat with this contact. \
-                Hint: Use create_chat() instead of get_chat() if this is expected.",
+                Hint: Use create_email_chat() instead of get_email_chat() if this is expected.",
+            );
+
+        Chat::load_from_db(&self.ctx, chat_id).await.unwrap()
+    }
+
+    /// Returns 1:1 [`Chat`] with another account key-contact.
+    /// Panics if the chat does not exist.
+    ///
+    /// This first creates a contact, but does not import the key,
+    /// so may create a key-contact with a fingerprint
+    /// but without the key.
+    pub async fn get_chat(&self, other: &TestContext) -> Chat {
+        let contact = self.add_or_lookup_contact_id(other).await;
+
+        let chat_id = ChatIdBlocked::lookup_by_contact(&self.ctx, contact)
+            .await
+            .unwrap()
+            .map(|chat_id_blocked| chat_id_blocked.id)
+            .expect(
+                "There is no chat with this contact. \
+                 Hint: Use create_chat() instead of get_chat() if this is expected.",
             );
 
         Chat::load_from_db(&self.ctx, chat_id).await.unwrap()
@@ -786,11 +838,8 @@ impl TestContext {
     /// and importing it into `self`,
     /// then creates a 1:1 chat with this contact.
     pub async fn create_chat(&self, other: &TestContext) -> Chat {
-        let vcard = make_vcard(other, &[ContactId::SELF]).await.unwrap();
-        let contact_ids = import_vcard(self, &vcard).await.unwrap();
-        assert_eq!(contact_ids.len(), 1);
-        let contact_id = contact_ids.first().unwrap();
-        let chat_id = ChatId::create_for_contact(self, *contact_id).await.unwrap();
+        let contact_id = self.add_or_lookup_contact_id(other).await;
+        let chat_id = ChatId::create_for_contact(self, contact_id).await.unwrap();
         Chat::load_from_db(self, chat_id).await.unwrap()
     }
 
@@ -799,7 +848,7 @@ impl TestContext {
     ///
     /// This function can be used to create unencrypted chats.
     pub async fn create_email_chat(&self, other: &TestContext) -> Chat {
-        let contact = self.add_or_lookup_email_contact(other).await;
+        let contact = self.add_or_lookup_address_contact(other).await;
         let chat_id = ChatId::create_for_contact(self, contact.id).await.unwrap();
 
         Chat::load_from_db(self, chat_id).await.unwrap()
@@ -827,11 +876,13 @@ impl TestContext {
 
     pub async fn assert_no_chat(&self, id: ChatId) {
         assert!(Chat::load_from_db(self, id).await.is_err());
-        assert!(!self
-            .sql
-            .exists("SELECT COUNT(*) FROM chats WHERE id=?", (id,))
-            .await
-            .unwrap());
+        assert!(
+            !self
+                .sql
+                .exists("SELECT COUNT(*) FROM chats WHERE id=?", (id,))
+                .await
+                .unwrap()
+        );
     }
 
     /// Sends out the text message.
@@ -914,7 +965,11 @@ impl TestContext {
             "device-talk".to_string()
         } else if sel_chat.get_type() == Chattype::Single && !members.is_empty() {
             let contact = Contact::get_by_id(self, members[0]).await.unwrap();
-            contact.get_addr().to_string()
+            if contact.is_key_contact() {
+                format!("KEY {}", contact.get_addr())
+            } else {
+                contact.get_addr().to_string()
+            }
         } else if sel_chat.get_type() == Chattype::Mailinglist && !members.is_empty() {
             "mailinglist".to_string()
         } else {
@@ -934,7 +989,7 @@ impl TestContext {
                 ""
             },
             match sel_chat.get_profile_image(self).await.unwrap() {
-                Some(icon) => match icon.to_str() {
+                Some(icon) => match icon.strip_prefix(self.get_blobdir()).unwrap().to_str() {
                     Some(icon) => format!(" Icon: {icon}"),
                     _ => " Icon: Err".to_string(),
                 },
@@ -982,8 +1037,8 @@ impl TestContext {
         let chat_id = create_group_chat(self, protect, chat_name).await.unwrap();
         let mut to_add = vec![];
         for member in members {
-            let contact = self.add_or_lookup_contact(member).await;
-            to_add.push(contact.id);
+            let contact_id = self.add_or_lookup_contact_id(member).await;
+            to_add.push(contact_id);
         }
         add_to_chat_contacts_table(self, time(), chat_id, &to_add)
             .await
@@ -1101,7 +1156,7 @@ impl Drop for InnerLogSink {
 #[derive(Debug, Clone)]
 pub struct SentMessage<'a> {
     pub payload: String,
-    recipients: String,
+    pub recipients: String,
     pub sender_msg_id: MsgId,
     sender_context: &'a Context,
 }
@@ -1268,7 +1323,7 @@ impl EventTracker {
     /// Consumes events looking for an [`EventType::Info`] with substring matching.
     pub async fn get_info_contains(&self, s: &str) -> EventType {
         self.get_matching(|evt| match evt {
-            EventType::Info(ref msg) => msg.contains(s),
+            EventType::Info(msg) => msg.contains(s),
             _ => false,
         })
         .await
@@ -1296,7 +1351,13 @@ pub(crate) async fn get_chat_msg(
     asserted_msgs_count: usize,
 ) -> Message {
     let msgs = chat::get_chat_msgs(&t.ctx, chat_id).await.unwrap();
-    assert_eq!(msgs.len(), asserted_msgs_count);
+    assert_eq!(
+        msgs.len(),
+        asserted_msgs_count,
+        "expected {} messages in a chat but {} found",
+        asserted_msgs_count,
+        msgs.len()
+    );
     let msg_id = if let ChatItem::Message { msg_id } = msgs[index] {
         msg_id
     } else {
@@ -1313,27 +1374,11 @@ fn print_logevent(logevent: &LogEvent) {
 }
 
 /// Saves the other account's public key as verified
-/// and peerstate as backwards verified.
 pub(crate) async fn mark_as_verified(this: &TestContext, other: &TestContext) {
-    let mut peerstate = Peerstate::from_header(
-        &EncryptHelper::new(other).await.unwrap().get_aheader(),
-        // We have to give 0 as the time, not the current time:
-        // The time is going to be saved in peerstate.last_seen.
-        // The code in `peerstate.rs` then compares `if message_time > self.last_seen`,
-        // and many similar checks in peerstate.rs, and doesn't allow changes otherwise.
-        // Giving the current time would mean that message_time == peerstate.last_seen,
-        // so changes would not be allowed.
-        // This might lead to flaky tests.
-        0,
-    );
-
-    peerstate.verified_key.clone_from(&peerstate.public_key);
-    peerstate
-        .verified_key_fingerprint
-        .clone_from(&peerstate.public_key_fingerprint);
-    peerstate.backward_verified_key_id = Some(this.get_config_i64(Config::KeyId).await.unwrap());
-
-    peerstate.save_to_db(&this.sql).await.unwrap();
+    let contact_id = this.add_or_lookup_contact_id(other).await;
+    mark_contact_id_as_verified(this, contact_id, ContactId::SELF)
+        .await
+        .unwrap();
 }
 
 /// Pops a sync message from alice0 and receives it on alice1. Should be used after an action on

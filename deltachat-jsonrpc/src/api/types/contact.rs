@@ -19,6 +19,16 @@ pub struct ContactObject {
     profile_image: Option<String>, // BLOBS
     name_and_addr: String,
     is_blocked: bool,
+
+    /// Is the contact a key contact.
+    is_key_contact: bool,
+
+    /// Is encryption available for this contact.
+    ///
+    /// This can only be true for key-contacts.
+    /// However, it is possible to have a key-contact
+    /// for which encryption is not available because we don't have a key yet,
+    /// e.g. if we just scanned the fingerprint from a QR code.
     e2ee_avail: bool,
 
     /// True if the contact can be added to verified groups.
@@ -67,6 +77,7 @@ impl ContactObject {
         let verifier_id = contact
             .get_verifier_id(context)
             .await?
+            .flatten()
             .map(|contact_id| contact_id.to_u32());
 
         Ok(ContactObject {
@@ -80,6 +91,7 @@ impl ContactObject {
             profile_image, //BLOBS
             name_and_addr: contact.get_name_n_addr(),
             is_blocked: contact.is_blocked(),
+            is_key_contact: contact.is_key_contact(),
             e2ee_avail: contact.e2ee_avail(context).await?,
             is_verified,
             is_profile_verified,

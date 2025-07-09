@@ -1,4 +1,4 @@
-use crate::{chat::ChatId, contact::ContactId, context::Context, EventType};
+use crate::{EventType, chat::ChatId, contact::ContactId, context::Context};
 
 /// order or content of chatlist changes (chat ids, not the actual chatlist item)
 pub(crate) fn emit_chatlist_changed(context: &Context) {
@@ -64,9 +64,10 @@ mod test_chatlist_events {
     };
 
     use crate::{
+        EventType,
         chat::{
-            self, create_broadcast_list, create_group_chat, set_muted, ChatId, ChatVisibility,
-            MuteDuration, ProtectionStatus,
+            self, ChatId, ChatVisibility, MuteDuration, ProtectionStatus, create_broadcast,
+            create_group_chat, set_muted,
         },
         config::Config,
         constants::*,
@@ -76,7 +77,6 @@ mod test_chatlist_events {
         receive_imf::receive_imf,
         securejoin::{get_securejoin_qr, join_securejoin},
         test_utils::{TestContext, TestContextManager},
-        EventType,
     };
 
     use crate::tools::SystemTime;
@@ -247,8 +247,7 @@ mod test_chatlist_events {
 
         bob.evtracker.clear_events();
         // set name
-        let addr = alice_on_bob.get_addr();
-        Contact::create(&bob, "Alice2", addr).await?;
+        alice_on_bob.id.set_name(&bob, "Alice2").await?;
         assert!(bob.add_or_lookup_contact(&alice).await.get_display_name() == "Alice2");
 
         wait_for_chatlist_all_items(&bob).await;
@@ -309,13 +308,13 @@ mod test_chatlist_events {
         Ok(())
     }
 
-    /// Create broadcastlist
+    /// Create broadcast channel
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_create_broadcastlist() -> Result<()> {
+    async fn test_create_broadcast() -> Result<()> {
         let mut tcm = TestContextManager::new();
         let alice = tcm.alice().await;
         alice.evtracker.clear_events();
-        create_broadcast_list(&alice).await?;
+        create_broadcast(&alice, "Channel".to_string()).await?;
         wait_for_chatlist(&alice).await;
         Ok(())
     }

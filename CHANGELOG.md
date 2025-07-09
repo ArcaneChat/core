@@ -1,5 +1,74 @@
 # Changelog
 
+## [2.0.0] - 2025-07-09
+
+This release changes the way the core handles contact keys.
+Instead of tracking OpenPGP keys corresponding to the
+contacts in [Autocrypt](https://autocrypt.org/) peerstate,
+the core creates a new "key-contact" for each known public key.
+Reception of a message signed with a new unknown key
+no longer results in warnings about setup changes,
+but creates a new contact and a new 1:1 chat if necessary.
+Additionally, there are "address-contacts" corresponding
+to the e-mail addresses.
+
+### Features / Changes
+
+- Key-contacts ([#6796](https://github.com/chatmail/core/pull/6796), [#6941](https://github.com/chatmail/core/pull/6941)).
+- Increase event channel size from 1000 to 10000.
+- Minimize the amount of data preserved for trashed messages.
+- Show broadcast channels in their own, proper "Channel" chat ([#6901](https://github.com/chatmail/core/pull/6901), [#6975](https://github.com/chatmail/core/pull/6975)).
+- Check images passed as `File` before making them `Image`.
+
+### API-Changes
+
+- CFFI: Add dc_contact_is_key_contact() ([#6955](https://github.com/chatmail/core/pull/6955)).
+- Contact::get_all(): Support listing address-contacts.
+- [**breaking**] Add InBroadcastChannel, OutBroadcastChannel chattypes, add create_broadcast_channel() ([#6901](https://github.com/chatmail/core/pull/6901)).
+- deltachat-rpc-client: Add Message.get_read_receipts().
+
+### Fixes
+
+- Remove display name from get_info(). This information usually goes at the top of the log and we don't want users to include it in bug reports.
+- Wait for scheduler tasks shutdown in parallel.
+- Update deltachat-repl help and autocomplete to match implementation ([#6978](https://github.com/chatmail/core/pull/6978), ([#6979](https://github.com/chatmail/core/pull/6979)).
+- Send Autocrypt header in MDNs. This is needed to assign MDNs to key-contacts.
+- Prefer encrypted List-Id header ([#6983](https://github.com/chatmail/core/pull/6983)).
+- Treat "tgs" as Viewtype::File.
+- Treat and send images that can't be decoded as Viewtype::File.
+- Decide on filename used for sending depending on the original Viewtype.
+- Migrate_key_contacts(): Remove "id>9" from encrypted messages SELECT.
+- Save msgs to key-contacts migration state and run migration periodically ([#6956](https://github.com/chatmail/core/pull/6956)).
+- Do not try to lookup key-contacts for unencrypted 1:1 messages.
+- Add query to post request for account creation ([#6989](https://github.com/chatmail/core/pull/6989)).
+
+### CI
+
+- Update Rust to 1.88.0.
+
+### Documentation
+
+- Remove outdated comment that says MDNs are unencrypted.
+
+### Refactor
+
+- Upgrade to Rust 2024.
+- Build_body_file(): Remove guessing mimetype by file extension.
+
+### Tests
+
+- Add online test for read receipts.
+- Add a test reproducing chat assignment bug.
+
+### Miscellaneous Tasks
+
+- cargo: Bump smallvec from 1.15.0 to 1.15.1.
+- cargo: Bump syn from 2.0.101 to 2.0.104.
+- cargo: Bump hyper-util from 0.1.13 to 0.1.14.
+- cargo: Bump toml from 0.8.19 to 0.8.23.
+- cargo: Bump proptest from 1.6.0 to 1.7.0.
+- cargo: Bump libc from 0.2.172 to 0.2.174.
+
 ## [1.160.0] - 2025-06-22
 
 ### API-Changes
@@ -289,8 +358,8 @@
 
 - Use vCard in TestContext.add_or_lookup_contact().
 - Remove test_group_with_removed_message_id.
-- Use add_or_lookup_email_contact() in get_chat().
-- Use add_or_lookup_email_contact in test_setup_contact_ex.
+- Use add_or_lookup_address_contact() in get_chat().
+- Use add_or_lookup_address_contact in test_setup_contact_ex.
 - Use vCards more in Python tests.
 - Use TestContextManager in more tests.
 - Use vCards to create contacts in more Rust tests.
@@ -6356,3 +6425,4 @@ https://github.com/chatmail/core/pulls?q=is%3Apr+is%3Aclosed
 [1.159.4]: https://github.com/chatmail/core/compare/v1.159.3..v1.159.4
 [1.159.5]: https://github.com/chatmail/core/compare/v1.159.4..v1.159.5
 [1.160.0]: https://github.com/chatmail/core/compare/v1.159.5..v1.160.0
+[2.0.0]: https://github.com/chatmail/core/compare/v1.160.0..v2.0.0

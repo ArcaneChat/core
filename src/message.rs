@@ -5,30 +5,30 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::str;
 
-use anyhow::{ensure, format_err, Context as _, Result};
-use deltachat_contact_tools::{parse_vcard, VcardContact};
+use anyhow::{Context as _, Result, ensure, format_err};
+use deltachat_contact_tools::{VcardContact, parse_vcard};
 use deltachat_derive::{FromSql, ToSql};
 use serde::{Deserialize, Serialize};
 use tokio::{fs, io};
 
 use crate::blob::BlobObject;
-use crate::chat::{send_msg, Chat, ChatId, ChatIdBlocked, ChatVisibility};
+use crate::chat::{Chat, ChatId, ChatIdBlocked, ChatVisibility, send_msg};
 use crate::chatlist_events;
 use crate::config::Config;
 use crate::constants::{
-    Blocked, Chattype, VideochatType, DC_CHAT_ID_TRASH, DC_MSG_ID_LAST_SPECIAL,
+    Blocked, Chattype, DC_CHAT_ID_TRASH, DC_MSG_ID_LAST_SPECIAL, VideochatType,
 };
 use crate::contact::{self, Contact, ContactId};
 use crate::context::Context;
 use crate::debug_logging::set_debug_logging_xdc;
 use crate::download::DownloadState;
-use crate::ephemeral::{start_ephemeral_timers_msgids, Timer as EphemeralTimer};
+use crate::ephemeral::{Timer as EphemeralTimer, start_ephemeral_timers_msgids};
 use crate::events::EventType;
 use crate::imap::markseen_on_imap_table;
 use crate::location::delete_poi_location;
 use crate::location::get_poi_location;
 use crate::log::{error, info, warn};
-use crate::mimeparser::{parse_message_id, SystemMessage};
+use crate::mimeparser::{SystemMessage, parse_message_id};
 use crate::param::{Param, Params};
 use crate::pgp::split_armored_data;
 use crate::reaction::get_msg_reactions;
@@ -126,27 +126,16 @@ impl MsgId {
     ///   if all parts of the message are trashed with this flag. `true` if the user explicitly
     ///   deletes the message. As for trashing a partially downloaded message when replacing it with
     ///   a fully downloaded one, see `receive_imf::add_parts()`.
-    pub async fn trash(self, context: &Context, on_server: bool) -> Result<()> {
-        let chat_id = DC_CHAT_ID_TRASH;
-        let deleted_subst = match on_server {
-            true => ", deleted=1",
-            false => "",
-        };
+    pub(crate) async fn trash(self, context: &Context, on_server: bool) -> Result<()> {
         context
             .sql
             .execute(
-                // If you change which information is removed here, also change delete_expired_messages() and
-                // which information receive_imf::add_parts() still adds to the db if the chat_id is TRASH
-                &format!(
-                    "UPDATE msgs SET \
-                     chat_id=?, txt='', txt_normalized=NULL, \
-                     subject='', txt_raw='', \
-                     mime_headers='', \
-                     from_id=0, to_id=0, \
-                     param=''{deleted_subst} \
-                     WHERE id=?"
-                ),
-                (chat_id, self),
+                // If you change which information is preserved here, also change
+                // `delete_expired_messages()` and which information `receive_imf::add_parts()`
+                // still adds to the db if chat_id is TRASH.
+                "INSERT OR REPLACE INTO msgs (id, rfc724_mid, timestamp, chat_id, deleted)
+                 SELECT ?1, rfc724_mid, timestamp, ?, ? FROM msgs WHERE id=?1",
+                (self, DC_CHAT_ID_TRASH, on_server),
             )
             .await?;
 
@@ -847,6 +836,7 @@ impl Message {
     /// Returns true if padlock indicating message encryption should be displayed in the UI.
     pub fn get_showpadlock(&self) -> bool {
         self.param.get_int(Param::GuaranteeE2ee).unwrap_or_default() != 0
+            || self.from_id == ContactId::DEVICE
     }
 
     /// Returns true if message is auto-generated.
@@ -877,9 +867,10 @@ impl Message {
 
         let contact = if self.from_id != ContactId::SELF {
             match chat.typ {
-                Chattype::Group | Chattype::Broadcast | Chattype::Mailinglist => {
-                    Some(Contact::get_by_id(context, self.from_id).await?)
-                }
+                Chattype::Group
+                | Chattype::OutBroadcast
+                | Chattype::InBroadcast
+                | Chattype::Mailinglist => Some(Contact::get_by_id(context, self.from_id).await?),
                 Chattype::Single => None,
             }
         } else {

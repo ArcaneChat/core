@@ -22,7 +22,7 @@ use std::cmp::max;
 use std::collections::HashMap;
 use std::path::Path;
 
-use anyhow::{anyhow, bail, ensure, format_err, Context as _, Result};
+use anyhow::{Context as _, Result, anyhow, bail, ensure, format_err};
 
 use async_zip::tokio::read::seek::ZipFileReader as SeekZipFileReader;
 use deltachat_contact_tools::sanitize_bidi_characters;
@@ -39,7 +39,7 @@ use crate::constants::Chattype;
 use crate::contact::ContactId;
 use crate::context::Context;
 use crate::events::EventType;
-use crate::key::{load_self_public_key, DcKey};
+use crate::key::self_fingerprint;
 use crate::log::{info, warn};
 use crate::message::{Message, MessageState, MsgId, Viewtype};
 use crate::mimefactory::RECOMMENDED_FILE_SIZE;
@@ -524,7 +524,9 @@ impl Context {
             })?;
         let viewtype = instance.viewtype;
         if viewtype != Viewtype::Webxdc {
-            bail!("send_webxdc_status_update: message {instance_msg_id} is not a webxdc message, but a {viewtype} message.");
+            bail!(
+                "send_webxdc_status_update: message {instance_msg_id} is not a webxdc message, but a {viewtype} message."
+            );
         }
 
         if instance.param.get_int(Param::WebxdcIntegration).is_some() {
@@ -689,7 +691,9 @@ impl Context {
                 .await?
                 .with_context(|| format!("Chat type for chat {chat_id} not found"))?;
             if chat_type != Chattype::Mailinglist {
-                bail!("receive_status_update: status sender {from_id} is not a member of chat {chat_id}")
+                bail!(
+                    "receive_status_update: status sender {from_id} is not a member of chat {chat_id}"
+                )
             }
         }
 
@@ -973,7 +977,7 @@ impl Message {
     }
 
     async fn get_webxdc_self_addr(&self, context: &Context) -> Result<String> {
-        let fingerprint = load_self_public_key(context).await?.dc_fingerprint().hex();
+        let fingerprint = self_fingerprint(context).await?;
         let data = format!("{}-{}", fingerprint, self.rfc724_mid);
         let hash = Sha256::digest(data.as_bytes());
         Ok(format!("{hash:x}"))

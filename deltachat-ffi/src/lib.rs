@@ -1692,8 +1692,8 @@ pub unsafe extern "C" fn dc_create_broadcast_list(context: *mut dc_context_t) ->
         return 0;
     }
     let ctx = &*context;
-    block_on(chat::create_broadcast_list(ctx))
-        .context("Failed to create broadcast list")
+    block_on(chat::create_broadcast(ctx, "Channel".to_string()))
+        .context("Failed to create broadcast channel")
         .log_err(ctx)
         .map(|id| id.to_u32())
         .unwrap_or(0)
@@ -3154,6 +3154,18 @@ pub unsafe extern "C" fn dc_chat_is_protected(chat: *mut dc_chat_t) -> libc::c_i
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn dc_chat_is_encrypted(chat: *mut dc_chat_t) -> libc::c_int {
+    if chat.is_null() {
+        eprintln!("ignoring careless call to dc_chat_is_encrypted()");
+        return 0;
+    }
+    let ffi_chat = &*chat;
+
+    block_on(ffi_chat.chat.is_encrypted(&ffi_chat.context))
+        .unwrap_or_log_default(&ffi_chat.context, "Failed dc_chat_is_encrypted") as libc::c_int
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn dc_chat_is_protection_broken(chat: *mut dc_chat_t) -> libc::c_int {
     if chat.is_null() {
         eprintln!("ignoring careless call to dc_chat_is_protection_broken()");
@@ -4312,6 +4324,15 @@ pub unsafe extern "C" fn dc_contact_is_bot(contact: *mut dc_contact_t) -> libc::
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn dc_contact_is_key_contact(contact: *mut dc_contact_t) -> libc::c_int {
+    if contact.is_null() {
+        eprintln!("ignoring careless call to dc_contact_is_key_contact()");
+        return 0;
+    }
+    (*contact).contact.is_key_contact() as libc::c_int
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn dc_contact_get_verifier_id(contact: *mut dc_contact_t) -> u32 {
     if contact.is_null() {
         eprintln!("ignoring careless call to dc_contact_get_verifier_id()");
@@ -4322,6 +4343,7 @@ pub unsafe extern "C" fn dc_contact_get_verifier_id(contact: *mut dc_contact_t) 
     let verifier_contact_id = block_on(ffi_contact.contact.get_verifier_id(ctx))
         .context("failed to get verifier")
         .log_err(ctx)
+        .unwrap_or_default()
         .unwrap_or_default()
         .unwrap_or_default();
 

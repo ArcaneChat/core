@@ -21,13 +21,13 @@ use std::fmt;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::chat::{send_msg, Chat, ChatId};
+use crate::chat::{Chat, ChatId, send_msg};
 use crate::chatlist_events;
 use crate::contact::ContactId;
 use crate::context::Context;
 use crate::events::EventType;
 use crate::log::info;
-use crate::message::{rfc724_mid_exists, Message, MsgId};
+use crate::message::{Message, MsgId, rfc724_mid_exists};
 use crate::param::Param;
 
 /// A single reaction consisting of multiple emoji sequences.
@@ -404,7 +404,7 @@ mod tests {
     use crate::config::Config;
     use crate::contact::{Contact, Origin};
     use crate::download::DownloadState;
-    use crate::message::{delete_msgs, MessageState};
+    use crate::message::{MessageState, delete_msgs};
     use crate::receive_imf::{receive_imf, receive_imf_from_inbox};
     use crate::sql::housekeeping;
     use crate::test_utils::TestContext;
@@ -981,10 +981,11 @@ Here's my footer -- bob@example.net"
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_send_reaction_multidevice() -> Result<()> {
-        let alice0 = TestContext::new_alice().await;
-        let alice1 = TestContext::new_alice().await;
-        let bob_id = Contact::create(&alice0, "", "bob@example.net").await?;
-        let chat_id = ChatId::create_for_contact(&alice0, bob_id).await?;
+        let mut tcm = TestContextManager::new();
+        let alice0 = tcm.alice().await;
+        let alice1 = tcm.alice().await;
+        let bob = tcm.bob().await;
+        let chat_id = alice0.create_chat(&bob).await.id;
 
         let alice0_msg_id = send_text_msg(&alice0, chat_id, "foo".to_string()).await?;
         let alice1_msg = alice1.recv_msg(&alice0.pop_sent_msg().await).await;

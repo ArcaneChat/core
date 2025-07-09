@@ -2,19 +2,19 @@
 
 use anyhow::{Context as _, Result};
 
-use super::qrinvite::QrInvite;
 use super::HandshakeMessage;
-use crate::chat::{self, is_contact_in_chat, ChatId, ProtectionStatus};
-use crate::constants::{self, Blocked, Chattype};
+use super::qrinvite::QrInvite;
+use crate::chat::{self, ChatId, ProtectionStatus, is_contact_in_chat};
+use crate::constants::{Blocked, Chattype};
 use crate::contact::Origin;
 use crate::context::Context;
 use crate::events::EventType;
-use crate::key::{load_self_public_key, DcKey};
+use crate::key::self_fingerprint;
 use crate::log::info;
 use crate::message::{Message, Viewtype};
 use crate::mimeparser::{MimeMessage, SystemMessage};
 use crate::param::Param;
-use crate::securejoin::{encrypted_and_signed, verify_sender_by_fingerprint, ContactId};
+use crate::securejoin::{ContactId, encrypted_and_signed, verify_sender_by_fingerprint};
 use crate::stock_str;
 use crate::sync::Sync::*;
 use crate::tools::{create_smeared_timestamp, time};
@@ -57,11 +57,18 @@ pub(super) async fn start_protocol(context: &Context, invite: QrInvite) -> Resul
 
     // Now start the protocol and initialise the state.
     {
-        let peer_verified =
-            verify_sender_by_fingerprint(context, invite.fingerprint(), invite.contact_id())
-                .await?;
+        let has_key = context
+            .sql
+            .exists(
+                "SELECT COUNT(*) FROM public_keys WHERE fingerprint=?",
+                (invite.fingerprint().hex(),),
+            )
+            .await?;
 
-        if peer_verified {
+        if has_key
+            && verify_sender_by_fingerprint(context, invite.fingerprint(), invite.contact_id())
+                .await?
+        {
             // The scanned fingerprint matches Alice's key, we can proceed to step 4b.
             info!(context, "Taking securejoin protocol shortcut");
             send_handshake_message(context, &invite, chat_id, BobHandshakeMsg::RequestWithAuth)
@@ -130,7 +137,6 @@ pub(super) async fn start_protocol(context: &Context, invite: QrInvite) -> Resul
                     None,
                 )
                 .await?;
-                chat_id.spawn_securejoin_wait(context, constants::SECUREJOIN_WAIT_TIMEOUT);
             }
             Ok(chat_id)
         }
@@ -268,8 +274,8 @@ pub(crate) async fn send_handshake_message(
             msg.param.set_int(Param::GuaranteeE2ee, 1);
 
             // Sends our own fingerprint in the Secure-Join-Fingerprint header.
-            let bob_fp = load_self_public_key(context).await?.dc_fingerprint();
-            msg.param.set(Param::Arg3, bob_fp.hex());
+            let bob_fp = self_fingerprint(context).await?;
+            msg.param.set(Param::Arg3, bob_fp);
 
             // Sends the grpid in the Secure-Join-Group header.
             //
@@ -279,7 +285,7 @@ pub(crate) async fn send_handshake_message(
             // Previous Delta Chat core also sent `Secure-Join-Group` header
             // in `vg-request` messages,
             // but it was not used on the receiver.
-            if let QrInvite::Group { ref grpid, .. } = invite {
+            if let QrInvite::Group { grpid, .. } = invite {
                 msg.param.set(Param::Arg4, grpid);
             }
         }
@@ -340,11 +346,7 @@ async fn joining_chat_id(
 ) -> Result<ChatId> {
     match invite {
         QrInvite::Contact { .. } => Ok(alice_chat_id),
-        QrInvite::Group {
-            ref grpid,
-            ref name,
-            ..
-        } => {
+        QrInvite::Group { grpid, name, .. } => {
             let group_chat_id = match chat::get_chat_id_by_grpid(context, grpid).await? {
                 Some((chat_id, _protected, _blocked)) => {
                     chat_id.unblock_ex(context, Nosync).await?;

@@ -4,24 +4,21 @@ mod dclogin_scheme;
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
-use anyhow::{anyhow, bail, ensure, Context as _, Result};
+use anyhow::{Context as _, Result, anyhow, bail, ensure};
 pub use dclogin_scheme::LoginOptions;
-use deltachat_contact_tools::{addr_normalize, may_be_valid_addr, ContactAddress};
-use percent_encoding::{percent_decode_str, percent_encode, NON_ALPHANUMERIC};
+use deltachat_contact_tools::{ContactAddress, addr_normalize, may_be_valid_addr};
+use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, percent_encode};
 use serde::Deserialize;
 
 pub(crate) use self::dclogin_scheme::configure_from_login_qr;
-use crate::chat::ChatIdBlocked;
 use crate::config::Config;
-use crate::constants::Blocked;
 use crate::contact::{Contact, ContactId, Origin};
 use crate::context::Context;
 use crate::events::EventType;
 use crate::key::Fingerprint;
 use crate::message::Message;
 use crate::net::http::post_empty;
-use crate::net::proxy::{ProxyConfig, DEFAULT_SOCKS_PORT};
-use crate::peerstate::Peerstate;
+use crate::net::proxy::{DEFAULT_SOCKS_PORT, ProxyConfig};
 use crate::token;
 use crate::tools::validate_id;
 
@@ -44,7 +41,7 @@ pub(crate) const DCBACKUP_SCHEME_PREFIX: &str = "DCBACKUP";
 
 /// Version written to Backups and Backup-QR-Codes.
 /// Imports will fail when they have a larger version.
-pub(crate) const DCBACKUP_VERSION: i32 = 2;
+pub(crate) const DCBACKUP_VERSION: i32 = 3;
 
 /// Scanned QR code.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -370,8 +367,8 @@ pub async fn check_qr(context: &Context, qr: &str) -> Result<Qr> {
 pub fn format_backup(qr: &Qr) -> Result<String> {
     match qr {
         Qr::Backup2 {
-            ref node_addr,
-            ref auth_token,
+            node_addr,
+            auth_token,
         } => {
             let node_addr = serde_json::to_string(node_addr)?;
             Ok(format!(
@@ -457,17 +454,17 @@ async fn decode_openpgp(context: &Context, qr: &str) -> Result<Qr> {
         None
     };
 
-    // retrieve known state for this fingerprint
-    let peerstate = Peerstate::from_fingerprint(context, &fingerprint)
-        .await
-        .context("Can't load peerstate")?;
-
     if let (Some(addr), Some(invitenumber), Some(authcode)) = (&addr, invitenumber, authcode) {
         let addr = ContactAddress::new(addr)?;
-        let (contact_id, _) =
-            Contact::add_or_lookup(context, &name, &addr, Origin::UnhandledSecurejoinQrScan)
-                .await
-                .with_context(|| format!("failed to add or lookup contact for address {addr:?}"))?;
+        let (contact_id, _) = Contact::add_or_lookup_ex(
+            context,
+            &name,
+            &addr,
+            &fingerprint.hex(),
+            Origin::UnhandledSecurejoinQrScan,
+        )
+        .await
+        .with_context(|| format!("failed to add or lookup contact for address {addr:?}"))?;
 
         if let (Some(grpid), Some(grpname)) = (grpid, grpname) {
             if context
@@ -529,21 +526,18 @@ async fn decode_openpgp(context: &Context, qr: &str) -> Result<Qr> {
             })
         }
     } else if let Some(addr) = addr {
-        if let Some(peerstate) = peerstate {
-            let peerstate_addr = ContactAddress::new(&peerstate.addr)?;
-            let (contact_id, _) =
-                Contact::add_or_lookup(context, &name, &peerstate_addr, Origin::UnhandledQrScan)
-                    .await
-                    .context("add_or_lookup")?;
-            ChatIdBlocked::get_for_contact(context, contact_id, Blocked::Request)
-                .await
-                .context("Failed to create (new) chat for contact")?;
+        let fingerprint = fingerprint.hex();
+        let (contact_id, _) =
+            Contact::add_or_lookup_ex(context, "", &addr, &fingerprint, Origin::UnhandledQrScan)
+                .await?;
+        let contact = Contact::get_by_id(context, contact_id).await?;
+
+        if contact.public_key(context).await?.is_some() {
             Ok(Qr::FprOk { contact_id })
         } else {
-            let contact_id = Contact::lookup_id_by_addr(context, &addr, Origin::Unknown)
-                .await
-                .with_context(|| format!("Error looking up contact {addr:?}"))?;
-            Ok(Qr::FprMismatch { contact_id })
+            Ok(Qr::FprMismatch {
+                contact_id: Some(contact_id),
+            })
         }
     } else {
         Ok(Qr::FprWithoutAddr {

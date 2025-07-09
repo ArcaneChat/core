@@ -89,6 +89,7 @@ pub const DC_GCL_ADD_ALLDONE_HINT: usize = 0x04;
 pub const DC_GCL_FOR_FORWARDING: usize = 0x08;
 
 pub const DC_GCL_ADD_SELF: u32 = 0x02;
+pub const DC_GCL_ADDRESS: u32 = 0x04;
 
 // unchanged user avatars are resent to the recipients every some days
 pub(crate) const DC_RESEND_USER_AVATAR_DAYS: i64 = 14;
@@ -126,17 +127,46 @@ pub const DC_CHAT_ID_LAST_SPECIAL: ChatId = ChatId::new(9);
 )]
 #[repr(u32)]
 pub enum Chattype {
-    /// 1:1 chat.
+    /// A 1:1 chat, i.e. a normal chat with a single contact.
+    ///
+    /// Created by [`ChatId::create_for_contact`].
     Single = 100,
 
     /// Group chat.
+    ///
+    /// Created by [`crate::chat::create_group_chat`].
     Group = 120,
 
-    /// Mailing list.
+    /// An (unencrypted) mailing list,
+    /// created by an incoming mailing list email.
     Mailinglist = 140,
 
-    /// Broadcast list.
-    Broadcast = 160,
+    /// Outgoing broadcast channel, called "Channel" in the UI.
+    ///
+    /// The user can send into this chat,
+    /// and all recipients will receive messages
+    /// in an `InBroadcast`.
+    ///
+    /// Called `broadcast` here rather than `channel`,
+    /// because the word "channel" already appears a lot in the code,
+    /// which would make it hard to grep for it.
+    ///
+    /// Created by [`crate::chat::create_broadcast`].
+    OutBroadcast = 160,
+
+    /// Incoming broadcast channel, called "Channel" in the UI.
+    ///
+    /// This chat is read-only,
+    /// and we do not know who the other recipients are.
+    ///
+    /// This is similar to a `MailingList`,
+    /// with the main difference being that
+    /// `InBroadcast`s are encrypted.
+    ///
+    /// Called `broadcast` here rather than `channel`,
+    /// because the word "channel" already appears a lot in the code,
+    /// which would make it hard to grep for it.
+    InBroadcast = 165,
 }
 
 pub const DC_MSG_ID_DAYMARKER: u32 = 9;
@@ -210,11 +240,6 @@ pub(crate) const DC_BACKGROUND_FETCH_QUOTA_CHECK_RATELIMIT: u64 = 12 * 60 * 60; 
 /// in the group membership consistency algo to reject outdated membership changes.
 pub(crate) const TIMESTAMP_SENT_TOLERANCE: i64 = 60;
 
-/// How long a 1:1 chat can't be used for sending while the SecureJoin is in progress. This should
-/// be 10-20 seconds so that we are reasonably sure that the app remains active and receiving also
-/// on mobile devices. See also [`crate::chat::CantSendReason::SecurejoinWait`].
-pub(crate) const SECUREJOIN_WAIT_TIMEOUT: u64 = 15;
-
 // To make text edits clearer for Non-Delta-MUA or old Delta Chats, edited text will be prefixed by EDITED_PREFIX.
 // Newer Delta Chats will remove the prefix as needed.
 pub(crate) const EDITED_PREFIX: &str = "✏️";
@@ -232,6 +257,9 @@ pub(crate) const ASM_BODY: &str = "This is the Autocrypt Setup Message \
     If you see this message in a chatmail client (Delta Chat, Arcane Chat, Delta Touch ...), \
     use \"Settings / Add Second Device\" instead.";
 
+/// Period between `sql::housekeeping()` runs.
+pub(crate) const HOUSEKEEPING_PERIOD: i64 = 24 * 60 * 60;
+
 #[cfg(test)]
 mod tests {
     use num_traits::FromPrimitive;
@@ -244,7 +272,7 @@ mod tests {
         assert_eq!(Chattype::Single, Chattype::from_i32(100).unwrap());
         assert_eq!(Chattype::Group, Chattype::from_i32(120).unwrap());
         assert_eq!(Chattype::Mailinglist, Chattype::from_i32(140).unwrap());
-        assert_eq!(Chattype::Broadcast, Chattype::from_i32(160).unwrap());
+        assert_eq!(Chattype::OutBroadcast, Chattype::from_i32(160).unwrap());
     }
 
     #[test]

@@ -3,27 +3,29 @@ use std::iter::{self, once};
 use std::num::NonZeroUsize;
 use std::sync::atomic::Ordering;
 
-use anyhow::{bail, Context as _, Error, Result};
+use anyhow::{Context as _, Error, Result, bail};
 use async_channel::{self as channel, Receiver, Sender};
 use futures::future::try_join_all;
 use futures_lite::FutureExt;
 use rand::Rng;
-use tokio::sync::{oneshot, RwLock, RwLockWriteGuard};
+use tokio::sync::{RwLock, RwLockWriteGuard, oneshot};
 use tokio::task;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use self::connectivity::ConnectivityStore;
 use crate::config::{self, Config};
+use crate::constants;
 use crate::contact::{ContactId, RecentlySeenLoop};
 use crate::context::Context;
-use crate::download::{download_msg, DownloadState};
+use crate::download::{DownloadState, download_msg};
 use crate::ephemeral::{self, delete_expired_imap_messages};
 use crate::events::EventType;
-use crate::imap::{session::Session, FolderMeaning, Imap};
+use crate::imap::{FolderMeaning, Imap, session::Session};
 use crate::location;
-use crate::log::{error, info, warn, LogExt};
+use crate::log::{LogExt, error, info, warn};
 use crate::message::MsgId;
-use crate::smtp::{send_smtp_messages, Smtp};
+use crate::smtp::{Smtp, send_smtp_messages};
 use crate::sql;
 use crate::tools::{self, duration_to_str, maybe_add_time_based_warnings, time, time_elapsed};
 
@@ -496,7 +498,8 @@ async fn inbox_fetch_idle(ctx: &Context, imap: &mut Imap, mut session: Session) 
 
     match ctx.get_config_i64(Config::LastHousekeeping).await {
         Ok(last_housekeeping_time) => {
-            let next_housekeeping_time = last_housekeeping_time.saturating_add(60 * 60 * 24);
+            let next_housekeeping_time =
+                last_housekeeping_time.saturating_add(constants::HOUSEKEEPING_PERIOD);
             if next_housekeeping_time <= time() {
                 sql::housekeeping(ctx).await.log_err(ctx).ok();
             }
@@ -989,16 +992,26 @@ impl Scheduler {
 
         // Actually shutdown tasks.
         let timeout_duration = std::time::Duration::from_secs(30);
+
+        let tracker = TaskTracker::new();
         for b in once(self.inbox).chain(self.oboxes) {
-            tokio::time::timeout(timeout_duration, b.handle)
-                .await
-                .log_err(context)
-                .ok();
+            let context = context.clone();
+            tracker.spawn(async move {
+                tokio::time::timeout(timeout_duration, b.handle)
+                    .await
+                    .log_err(&context)
+            });
         }
-        tokio::time::timeout(timeout_duration, self.smtp_handle)
-            .await
-            .log_err(context)
-            .ok();
+        {
+            let context = context.clone();
+            tracker.spawn(async move {
+                tokio::time::timeout(timeout_duration, self.smtp_handle)
+                    .await
+                    .log_err(&context)
+            });
+        }
+        tracker.close();
+        tracker.wait().await;
 
         // Abort tasks, then await them to ensure the `Future` is dropped.
         // Just aborting the task may keep resources such as `Context` clone

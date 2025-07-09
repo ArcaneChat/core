@@ -69,23 +69,23 @@ use std::num::ParseIntError;
 use std::str::FromStr;
 use std::time::{Duration, UNIX_EPOCH};
 
-use anyhow::{ensure, Context as _, Result};
+use anyhow::{Context as _, Result, ensure};
 use async_channel::Receiver;
 use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
 
-use crate::chat::{send_msg, ChatId, ChatIdBlocked};
+use crate::chat::{ChatId, ChatIdBlocked, send_msg};
 use crate::constants::{DC_CHAT_ID_LAST_SPECIAL, DC_CHAT_ID_TRASH};
 use crate::contact::ContactId;
 use crate::context::Context;
 use crate::download::MIN_DELETE_SERVER_AFTER;
 use crate::events::EventType;
 use crate::location;
-use crate::log::{error, info, warn, LogExt};
+use crate::log::{LogExt, error, info, warn};
 use crate::message::{Message, MessageState, MsgId, Viewtype};
 use crate::mimeparser::SystemMessage;
 use crate::stock_str;
-use crate::tools::{duration_to_str, time, SystemTime};
+use crate::tools::{SystemTime, duration_to_str, time};
 
 /// Ephemeral timer value.
 #[derive(Debug, PartialEq, Eq, Copy, Clone, Serialize, Deserialize)]
@@ -466,23 +466,18 @@ pub(crate) async fn delete_expired_messages(context: &Context, now: i64) -> Resu
             .transaction(|transaction| {
                 let mut msgs_changed = Vec::with_capacity(rows.len());
                 let mut webxdc_deleted = Vec::new();
-
-                // If you change which information is removed here, also change MsgId::trash() and
-                // which information receive_imf::add_parts() still adds to the db if the chat_id is TRASH
+                // If you change which information is preserved here, also change `MsgId::trash()`
+                // and other places it references.
+                let mut del_msg_stmt = transaction.prepare(
+                    "INSERT OR REPLACE INTO msgs (id, rfc724_mid, timestamp, chat_id)
+                     SELECT ?1, rfc724_mid, timestamp, ? FROM msgs WHERE id=?1",
+                )?;
+                let mut del_location_stmt =
+                    transaction.prepare("DELETE FROM locations WHERE independent=1 AND id=?")?;
                 for (msg_id, chat_id, viewtype, location_id) in rows {
-                    transaction.execute(
-                        "UPDATE msgs
-                     SET chat_id=?, txt='', txt_normalized=NULL, subject='', txt_raw='',
-                         mime_headers='', from_id=0, to_id=0, param=''
-                     WHERE id=?",
-                        (DC_CHAT_ID_TRASH, msg_id),
-                    )?;
-
+                    del_msg_stmt.execute((msg_id, DC_CHAT_ID_TRASH))?;
                     if location_id > 0 {
-                        transaction.execute(
-                            "DELETE FROM locations WHERE independent=1 AND id=?",
-                            (location_id,),
-                        )?;
+                        del_location_stmt.execute((location_id,))?;
                     }
 
                     msgs_changed.push((chat_id, msg_id));

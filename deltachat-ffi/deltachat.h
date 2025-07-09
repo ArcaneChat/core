@@ -2137,6 +2137,7 @@ uint32_t        dc_create_contact            (dc_context_t* context, const char*
 #define         DC_GCL_DEPRECATED_VERIFIED_ONLY         0x01
 
 #define         DC_GCL_ADD_SELF              0x02
+#define         DC_GCL_ADDRESS               0x04
 
 
 /**
@@ -2192,11 +2193,13 @@ dc_array_t*     dc_import_vcard              (dc_context_t* context, const char*
  * Returns known and unblocked contacts.
  *
  * To get information about a single contact, see dc_get_contact().
+ * By default, key-contacts are listed.
  *
  * @memberof dc_context_t
  * @param context The context object.
  * @param flags A combination of flags:
- *     - if the flag DC_GCL_ADD_SELF is set, SELF is added to the list unless filtered by other parameters
+ *     - DC_GCL_ADD_SELF: SELF is added to the list unless filtered by other parameters
+ *     - DC_GCL_ADDRESS: List address-contacts instead of key-contacts.
  * @param query A string to filter the list. Typically used to implement an
  *     incremental search. NULL for no filtering.
  * @return An array containing all contact IDs. Must be dc_array_unref()'d
@@ -3839,6 +3842,21 @@ int             dc_chat_is_protected         (const dc_chat_t* chat);
 
 
 /**
+ * Check if the chat is encrypted.
+ *
+ * 1:1 chats with key-contacts and group chats with key-contacts
+ * are encrypted.
+ * 1:1 chats with emails contacts and ad-hoc groups
+ * created for email threads are not encrypted.
+ *
+ * @memberof dc_chat_t
+ * @param chat The chat object.
+ * @return 1=chat is encrypted, 0=chat is not encrypted.
+ */
+int             dc_chat_is_encrypted         (const dc_chat_t *chat);
+
+
+/**
  * Checks if the chat was protected, and then an incoming message broke this protection.
  *
  * This function is only useful if the UI enabled the `verified_one_on_one_chats` feature flag,
@@ -5274,6 +5292,20 @@ int             dc_contact_is_bot            (dc_contact_t* contact);
 
 
 /**
+ * Returns whether contact is a key-contact,
+ * i.e. it is identified by the public key
+ * rather than the email address.
+ *
+ * If so, all messages to and from this contact are encrypted.
+ *
+ * @memberof dc_contact_t
+ * @param contact The contact object.
+ * @return 1 if the contact is a key-contact, 0 if it is an address-contact.
+ */
+int             dc_contact_is_key_contact    (dc_contact_t* contact);
+
+
+/**
  * Return the contact ID that verified a contact.
  *
  * If the function returns non-zero result,
@@ -5718,9 +5750,33 @@ int64_t         dc_lot_get_timestamp     (const dc_lot_t* lot);
 #define         DC_CHAT_TYPE_MAILINGLIST     140
 
 /**
- * A broadcast list. See dc_chat_get_type() for details.
+ * Outgoing broadcast channel, called "Channel" in the UI.
+ *
+ * The user can send into this chat,
+ * and all recipients will receive messages
+ * in a `DC_CHAT_TYPE_IN_BROADCAST`.
+ *
+ * Called `broadcast` here rather than `channel`,
+ * because the word "channel" already appears a lot in the code,
+ * which would make it hard to grep for it.
  */
-#define         DC_CHAT_TYPE_BROADCAST       160
+#define         DC_CHAT_TYPE_OUT_BROADCAST   160
+
+/**
+ * Incoming broadcast channel, called "Channel" in the UI.
+ *
+ * This chat is read-only,
+ * and we do not know who the other recipients are.
+ *
+ * This is similar to `DC_CHAT_TYPE_MAILINGLIST`,
+ * with the main difference being that
+ * broadcasts are encrypted.
+ *
+ * Called `broadcast` here rather than `channel`,
+ * because the word "channel" already appears a lot in the code,
+ * which would make it hard to grep for it.
+ */
+#define         DC_CHAT_TYPE_IN_BROADCAST    165
 
 /**
  * @}
@@ -6889,6 +6945,7 @@ void dc_event_unref(dc_event_t* event);
 /// "End-to-end encryption preferred."
 ///
 /// Used to build the string returned by dc_get_contact_encrinfo().
+/// @deprecated 2025-06-05
 #define DC_STR_E2E_PREFERRED              34
 
 /// "%1$s verified"
@@ -6901,12 +6958,14 @@ void dc_event_unref(dc_event_t* event);
 ///
 /// Used in status messages.
 /// - %1$s will be replaced by the name of the contact that cannot be verified
+/// @deprecated 2025-06-05
 #define DC_STR_CONTACT_NOT_VERIFIED       36
 
 /// "Changed setup for %1$s."
 ///
 /// Used in status messages.
 /// - %1$s will be replaced by the name of the contact with the changed setup
+/// @deprecated 2025-06-05
 #define DC_STR_CONTACT_SETUP_CHANGED      37
 
 /// "Archived chats"
@@ -7296,6 +7355,7 @@ void dc_event_unref(dc_event_t* event);
 /// "%1$s changed their address from %2$s to %3$s"
 ///
 /// Used as an info message to chats with contacts that changed their address.
+/// @deprecated 2025-06-05
 #define DC_STR_AEAP_ADDR_CHANGED          122
 
 /// "You changed your email address from %1$s to %2$s.
@@ -7602,6 +7662,7 @@ void dc_event_unref(dc_event_t* event);
 /// "The contact must be online to proceed. This process will continue automatically in background."
 ///
 /// Used as info message.
+/// @deprecated 2025-06-05
 #define DC_STR_SECUREJOIN_TAKES_LONGER 192
 
 /// "Contact". Deprecated, currently unused.

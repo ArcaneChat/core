@@ -1,9 +1,9 @@
 //! # Key transfer via Autocrypt Setup Message.
 use std::io::BufReader;
 
-use rand::{thread_rng, Rng};
+use rand::{Rng, thread_rng};
 
-use anyhow::{bail, ensure, Result};
+use anyhow::{Result, bail, ensure};
 
 use crate::blob::BlobObject;
 use crate::chat::{self, ChatId};
@@ -12,7 +12,7 @@ use crate::constants::{ASM_BODY, ASM_SUBJECT};
 use crate::contact::ContactId;
 use crate::context::Context;
 use crate::imex::set_self_key;
-use crate::key::{load_self_secret_key, DcKey};
+use crate::key::{DcKey, load_self_secret_key};
 use crate::message::{Message, MsgId, Viewtype};
 use crate::mimeparser::SystemMessage;
 use crate::param::Param;
@@ -141,7 +141,7 @@ fn create_setup_code(_context: &Context) -> String {
 
     for i in 0..9 {
         loop {
-            random_val = rng.gen();
+            random_val = rng.r#gen();
             if random_val as usize <= 60000 {
                 break;
             }
@@ -184,7 +184,7 @@ fn normalize_setup_code(s: &str) -> String {
 mod tests {
     use super::*;
 
-    use crate::pgp::{split_armored_data, HEADER_AUTOCRYPT, HEADER_SETUPCODE};
+    use crate::pgp::{HEADER_AUTOCRYPT, HEADER_SETUPCODE, split_armored_data};
     use crate::receive_imf::receive_imf;
     use crate::test_utils::{TestContext, TestContextManager};
     use ::pgp::armor::BlockType;
@@ -290,10 +290,12 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_key_transfer() -> Result<()> {
-        let alice = TestContext::new_alice().await;
+        let mut tcm = TestContextManager::new();
+        let alice = &tcm.alice().await;
 
+        tcm.section("Alice sends Autocrypt setup message");
         alice.set_config(Config::BccSelf, Some("0")).await?;
-        let setup_code = initiate_key_transfer(&alice).await?;
+        let setup_code = initiate_key_transfer(alice).await?;
 
         // Test that sending Autocrypt Setup Message enables `bcc_self`.
         assert_eq!(alice.get_config_bool(Config::BccSelf).await?, true);
@@ -301,26 +303,21 @@ mod tests {
         // Get Autocrypt Setup Message.
         let sent = alice.pop_sent_msg().await;
 
-        // Alice sets up a second device.
-        let alice2 = TestContext::new().await;
+        tcm.section("Alice sets up a second device");
+        let alice2 = &tcm.unconfigured().await;
         alice2.set_name("alice2");
         alice2.configure_addr("alice@example.org").await;
         alice2.recv_msg(&sent).await;
         let msg = alice2.get_last_msg().await;
         assert!(msg.is_setupmessage());
-        assert_eq!(
-            crate::key::load_self_secret_keyring(&alice2).await?.len(),
-            0
-        );
+        assert_eq!(crate::key::load_self_secret_keyring(alice2).await?.len(), 0);
 
         // Transfer the key.
+        tcm.section("Alice imports a key from Autocrypt Setup Message");
         alice2.set_config(Config::BccSelf, Some("0")).await?;
-        continue_key_transfer(&alice2, msg.id, &setup_code).await?;
+        continue_key_transfer(alice2, msg.id, &setup_code).await?;
         assert_eq!(alice2.get_config_bool(Config::BccSelf).await?, true);
-        assert_eq!(
-            crate::key::load_self_secret_keyring(&alice2).await?.len(),
-            1
-        );
+        assert_eq!(crate::key::load_self_secret_keyring(alice2).await?.len(), 1);
 
         // Alice sends a message to self from the new device.
         let sent = alice2.send_text(msg.chat_id, "Test").await;

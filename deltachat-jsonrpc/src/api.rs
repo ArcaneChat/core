@@ -354,6 +354,20 @@ impl CommandApi {
         Ok(ctx.get_blobdir().to_str().map(|s| s.to_owned()))
     }
 
+    /// If there was an error while the account was opened
+    /// and migrated to the current version,
+    /// then this function returns it.
+    ///
+    /// This function is useful because the key-contacts migration could fail due to bugs
+    /// and then the account will not work properly.
+    ///
+    /// After opening an account, the UI should call this function
+    /// and show the error string if one is returned.
+    async fn get_migration_error(&self, account_id: u32) -> Result<Option<String>> {
+        let ctx = self.get_context(account_id).await?;
+        Ok(ctx.get_migration_error())
+    }
+
     /// Copy file to blob dir.
     async fn copy_to_blob_dir(&self, account_id: u32, path: String) -> Result<PathBuf> {
         let ctx = self.get_context(account_id).await?;
@@ -912,7 +926,7 @@ impl CommandApi {
     ///   explicitly as it may happen that oneself gets removed from a still existing
     ///   group
     ///
-    /// - for broadcasts, all recipients are returned, DC_CONTACT_ID_SELF is not included
+    /// - for broadcast channels, all recipients are returned, DC_CONTACT_ID_SELF is not included
     ///
     /// - for mailing lists, the behavior is not documented currently, we will decide on that later.
     ///   for now, the UI should not show the list for mailing lists.
@@ -961,18 +975,30 @@ impl CommandApi {
             .map(|id| id.to_u32())
     }
 
-    /// Create a new broadcast list.
-    ///
-    /// Broadcast lists are similar to groups on the sending device,
-    /// however, recipients get the messages in a read-only chat
-    /// and will see who the other members are.
-    ///
-    /// For historical reasons, this function does not take a name directly,
-    /// instead you have to set the name using dc_set_chat_name()
-    /// after creating the broadcast list.
+    /// Deprecated 2025-07 in favor of create_broadcast().
     async fn create_broadcast_list(&self, account_id: u32) -> Result<u32> {
+        self.create_broadcast(account_id, "Channel".to_string())
+            .await
+    }
+
+    /// Create a new **broadcast channel**
+    /// (called "Channel" in the UI).
+    ///
+    /// Broadcast channels are similar to groups on the sending device,
+    /// however, recipients get the messages in a read-only chat
+    /// and will not see who the other members are.
+    ///
+    /// Called `broadcast` here rather than `channel`,
+    /// because the word "channel" already appears a lot in the code,
+    /// which would make it hard to grep for it.
+    ///
+    /// After creation, the chat contains no recipients and is in _unpromoted_ state;
+    /// see [`CommandApi::create_group_chat`] for more information on the unpromoted state.
+    ///
+    /// Returns the created chat's id.
+    async fn create_broadcast(&self, account_id: u32, chat_name: String) -> Result<u32> {
         let ctx = self.get_context(account_id).await?;
-        chat::create_broadcast_list(&ctx)
+        chat::create_broadcast(&ctx, chat_name)
             .await
             .map(|id| id.to_u32())
     }
@@ -1479,6 +1505,14 @@ impl CommandApi {
         Ok(contacts)
     }
 
+    /// Returns ids of known and unblocked contacts.
+    ///
+    /// By default, key-contacts are listed.
+    ///
+    /// * `list_flags` - A combination of flags:
+    ///   - `DC_GCL_ADD_SELF` - Add SELF unless filtered by other parameters.
+    ///   - `DC_GCL_ADDRESS` - List address-contacts instead of key-contacts.
+    /// * `query` - A string to filter the list.
     async fn get_contact_ids(
         &self,
         account_id: u32,
@@ -1490,8 +1524,10 @@ impl CommandApi {
         Ok(contacts.into_iter().map(|c| c.to_u32()).collect())
     }
 
-    /// Get a list of contacts.
-    /// (formerly called getContacts2 in desktop)
+    /// Returns known and unblocked contacts.
+    ///
+    /// Formerly called `getContacts2` in Desktop.
+    /// See [`Self::get_contact_ids`] for parameters and more info.
     async fn get_contacts(
         &self,
         account_id: u32,
@@ -1539,15 +1575,6 @@ impl CommandApi {
         let contact_id = ContactId::new(contact_id);
 
         Contact::delete(&ctx, contact_id).await?;
-        Ok(())
-    }
-
-    /// Resets contact encryption.
-    async fn reset_contact_encryption(&self, account_id: u32, contact_id: u32) -> Result<()> {
-        let ctx = self.get_context(account_id).await?;
-        let contact_id = ContactId::new(contact_id);
-
-        contact_id.reset_encryption(&ctx).await?;
         Ok(())
     }
 

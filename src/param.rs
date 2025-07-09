@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::str;
 
 use anyhow::ensure;
-use anyhow::{bail, Error, Result};
+use anyhow::{Error, Result, bail};
 use num_traits::FromPrimitive;
 use serde::{Deserialize, Serialize};
 
@@ -98,6 +98,11 @@ pub enum Param {
     Cmd = b'S',
 
     /// For Messages
+    ///
+    /// For "MemberRemovedFromGroup" this is the email address
+    /// removed from the group.
+    ///
+    /// For "MemberAddedToGroup" this is the email address added to the group.
     Arg = b'E',
 
     /// For Messages

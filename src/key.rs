@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Cursor;
 
-use anyhow::{bail, ensure, Context as _, Result};
+use anyhow::{Context as _, Result, bail, ensure};
 use base64::Engine as _;
 use deltachat_contact_tools::EmailAddress;
 use pgp::composed::Deserializable;
@@ -15,7 +15,7 @@ use rand::thread_rng;
 use tokio::runtime::Handle;
 
 use crate::context::Context;
-use crate::log::{info, LogExt};
+use crate::log::{LogExt, info};
 use crate::pgp::KeyPair;
 use crate::tools::{self, time_elapsed};
 
@@ -129,8 +129,11 @@ pub(crate) trait DcKey: Serialize + Deserializable + Clone {
     fn key_id(&self) -> KeyId;
 }
 
-pub(crate) async fn load_self_public_key(context: &Context) -> Result<SignedPublicKey> {
-    let public_key = context
+/// Attempts to load own public key.
+///
+/// Returns `None` if no key is generated yet.
+pub(crate) async fn load_self_public_key_opt(context: &Context) -> Result<Option<SignedPublicKey>> {
+    let Some(public_key_bytes) = context
         .sql
         .query_row_optional(
             "SELECT public_key
@@ -142,9 +145,20 @@ pub(crate) async fn load_self_public_key(context: &Context) -> Result<SignedPubl
                 Ok(bytes)
             },
         )
-        .await?;
-    match public_key {
-        Some(bytes) => SignedPublicKey::from_slice(&bytes),
+        .await?
+    else {
+        return Ok(None);
+    };
+    let public_key = SignedPublicKey::from_slice(&public_key_bytes)?;
+    Ok(Some(public_key))
+}
+
+/// Loads own public key.
+///
+/// If no key is generated yet, generates a new one.
+pub(crate) async fn load_self_public_key(context: &Context) -> Result<SignedPublicKey> {
+    match load_self_public_key_opt(context).await? {
+        Some(public_key) => Ok(public_key),
         None => {
             let keypair = generate_keypair(context).await?;
             Ok(keypair.public)
@@ -169,6 +183,38 @@ pub(crate) async fn load_self_public_keyring(context: &Context) -> Result<Vec<Si
         .filter_map(|bytes| SignedPublicKey::from_slice(&bytes).log_err(context).ok())
         .collect();
     Ok(keys)
+}
+
+/// Returns own public key fingerprint in (not human-readable) hex representation.
+/// This is the fingerprint format that is used in the database.
+///
+/// If no key is generated yet, generates a new one.
+///
+/// For performance reasons, the fingerprint is cached after the first invocation.
+pub(crate) async fn self_fingerprint(context: &Context) -> Result<&str> {
+    if let Some(fp) = context.self_fingerprint.get() {
+        Ok(fp)
+    } else {
+        let fp = load_self_public_key(context).await?.dc_fingerprint().hex();
+        Ok(context.self_fingerprint.get_or_init(|| fp))
+    }
+}
+
+/// Returns own public key fingerprint in (not human-readable) hex representation.
+/// This is the fingerprint format that is used in the database.
+///
+/// Returns `None` if no key is generated yet.
+///
+/// For performance reasons, the fingerprint is cached after the first invocation.
+pub(crate) async fn self_fingerprint_opt(context: &Context) -> Result<Option<&str>> {
+    if let Some(fp) = context.self_fingerprint.get() {
+        Ok(Some(fp))
+    } else if let Some(key) = load_self_public_key_opt(context).await? {
+        let fp = key.dc_fingerprint().hex();
+        Ok(Some(context.self_fingerprint.get_or_init(|| fp)))
+    } else {
+        Ok(None)
+    }
 }
 
 pub(crate) async fn load_self_secret_key(context: &Context) -> Result<SignedSecretKey> {
@@ -480,7 +526,7 @@ mod tests {
 
     use super::*;
     use crate::config::Config;
-    use crate::test_utils::{alice_keypair, TestContext};
+    use crate::test_utils::{TestContext, alice_keypair};
 
     static KEYPAIR: LazyLock<KeyPair> = LazyLock::new(alice_keypair);
 

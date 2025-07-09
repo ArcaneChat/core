@@ -20,7 +20,6 @@ use deltachat::log::LogExt;
 use deltachat::message::{self, Message, MessageState, MsgId, Viewtype};
 use deltachat::mimeparser::SystemMessage;
 use deltachat::peer_channels::{send_webxdc_realtime_advertisement, send_webxdc_realtime_data};
-use deltachat::peerstate::*;
 use deltachat::qr::*;
 use deltachat::qr_code_generator::create_qr_svg;
 use deltachat::reaction::send_reaction;
@@ -35,14 +34,6 @@ use tokio::fs;
 /// e.g. bitmask 7 triggers actions defined with bits 1, 2 and 4.
 async fn reset_tables(context: &Context, bits: i32) {
     println!("Resetting tables ({bits})...");
-    if 0 != bits & 2 {
-        context
-            .sql()
-            .execute("DELETE FROM acpeerstates;", ())
-            .await
-            .unwrap();
-        println!("(2) Peerstates reset.");
-    }
     if 0 != bits & 4 {
         context
             .sql()
@@ -277,7 +268,7 @@ async fn log_msglist(context: &Context, msglist: &[MsgId]) -> Result<()> {
 
 async fn log_contactlist(context: &Context, contacts: &[ContactId]) -> Result<()> {
     for contact_id in contacts {
-        let mut line2 = "".to_string();
+        let line2 = "".to_string();
         let contact = Contact::get_by_id(context, *contact_id).await?;
         let name = contact.get_display_name();
         let addr = contact.get_addr();
@@ -296,15 +287,6 @@ async fn log_contactlist(context: &Context, contacts: &[ContactId]) -> Result<()
             verified_str,
             if !addr.is_empty() { addr } else { "addr unset" }
         );
-        let peerstate = Peerstate::from_addr(context, addr)
-            .await
-            .expect("peerstate error");
-        if peerstate.is_some() && *contact_id != ContactId::SELF {
-            line2 = format!(
-                ", prefer-encrypt={}",
-                peerstate.as_ref().unwrap().prefer_encrypt
-            );
-        }
 
         println!("Contact#{}: {}{}", *contact_id, line, line2);
     }
@@ -342,7 +324,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
                  send-backup\n\
                  receive-backup <qr>\n\
                  export-keys\n\
-                 import-keys\n\
+                 import-keys <key-file>\n\
                  poke [<eml-file>|<folder>|<addr> <key-file>]\n\
                  reset <flags>\n\
                  stop\n\
@@ -351,8 +333,6 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             _ => println!(
                 "==========================Database commands==\n\
                  info\n\
-                 open <file to open or create>\n\
-                 close\n\
                  set <configuration-key> [<value>]\n\
                  get <configuration-key>\n\
                  oauth2\n\
@@ -367,21 +347,24 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
                  ==============================Chat commands==\n\
                  listchats [<query>]\n\
                  listarchived\n\
+                 start-realtime <msg-id>\n\
+                 send-realtime <msg-id> <data>\n\
                  chat [<chat-id>|0]\n\
                  createchat <contact-id>\n\
                  creategroup <name>\n\
-                 createbroadcast\n\
+                 createbroadcast <name>\n\
                  createprotected <name>\n\
                  addmember <contact-id>\n\
                  removemember <contact-id>\n\
                  groupname <name>\n\
-                 groupimage [<file>]\n\
+                 groupimage <image>\n\
                  chatinfo\n\
                  sendlocations <seconds>\n\
                  setlocation <lat> <lng>\n\
                  dellocations\n\
                  getlocations [<contact-id>]\n\
                  send <text>\n\
+                 sendempty\n\
                  sendimage <file> [<text>]\n\
                  sendsticker <file> [<text>]\n\
                  sendfile <file> [<text>]\n\
@@ -400,7 +383,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
                  unmute <chat-id>\n\
                  delchat <chat-id>\n\
                  accept <chat-id>\n\
-                 decline <chat-id>\n\
+                 blockchat <chat-id>\n\
                  ===========================Message commands==\n\
                  listmsgs <query>\n\
                  msginfo <msg-id>\n\
@@ -414,11 +397,9 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
                  react <msg-id> [<reaction>]\n\
                  ===========================Contact commands==\n\
                  listcontacts [<query>]\n\
-                 listverified [<query>]\n\
                  addcontact [<name>] <addr>\n\
                  contactinfo <contact-id>\n\
                  delcontact <contact-id>\n\
-                 cleanupcontacts\n\
                  block <contact-id>\n\
                  unblock <contact-id>\n\
                  listblocked\n\
@@ -508,13 +489,17 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             println!("Exported to {}.", dir.to_string_lossy());
         }
         "import-keys" => {
+            ensure!(!arg1.is_empty(), "Argument <key-file> missing.");
             imex(&context, ImexMode::ImportSelfKeys, arg1.as_ref(), None).await?;
         }
         "poke" => {
             ensure!(poke_spec(&context, Some(arg1)).await, "Poke failed");
         }
         "reset" => {
-            ensure!(!arg1.is_empty(), "Argument <bits> missing: 1=jobs, 2=peerstates, 4=private keys, 8=rest but server config");
+            ensure!(
+                !arg1.is_empty(),
+                "Argument <bits> missing: 4=private keys, 8=rest but server config"
+            );
             let bits: i32 = arg1.parse()?;
             ensure!(bits < 16, "<bits> must be lower than 16.");
             reset_tables(&context, bits).await;
@@ -765,7 +750,8 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             println!("Group#{chat_id} created successfully.");
         }
         "createbroadcast" => {
-            let chat_id = chat::create_broadcast_list(&context).await?;
+            ensure!(!arg1.is_empty(), "Argument <name> missing.");
+            let chat_id = chat::create_broadcast(&context, arg1.to_string()).await?;
 
             println!("Broadcast#{chat_id} created successfully.");
         }

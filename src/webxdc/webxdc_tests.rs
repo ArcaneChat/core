@@ -5,12 +5,11 @@ use serde_json::json;
 
 use super::*;
 use crate::chat::{
-    add_contact_to_chat, create_broadcast_list, create_group_chat, forward_msgs,
-    remove_contact_from_chat, resend_msgs, send_msg, send_text_msg, ChatId, ProtectionStatus,
+    ChatId, ProtectionStatus, add_contact_to_chat, create_broadcast, create_group_chat,
+    forward_msgs, remove_contact_from_chat, resend_msgs, send_msg, send_text_msg,
 };
 use crate::chatlist::Chatlist;
 use crate::config::Config;
-use crate::contact::Contact;
 use crate::download::DownloadState;
 use crate::ephemeral;
 use crate::receive_imf::{receive_imf, receive_imf_from_inbox};
@@ -297,14 +296,17 @@ async fn test_webxdc_contact_request() -> Result<()> {
     let bob_instance = bob.get_last_msg().await;
     let bob_chat = Chat::load_from_db(&bob, bob_instance.chat_id).await?;
     assert!(bob_chat.is_contact_request());
-    assert!(bob_instance
-        .get_webxdc_blob(&bob, "index.html")
-        .await
-        .is_ok());
-    assert!(bob
-        .send_webxdc_status_update(bob_instance.id, r#"{"payload":42}"#)
-        .await
-        .is_err());
+    assert!(
+        bob_instance
+            .get_webxdc_blob(&bob, "index.html")
+            .await
+            .is_ok()
+    );
+    assert!(
+        bob.send_webxdc_status_update(bob_instance.id, r#"{"payload":42}"#)
+            .await
+            .is_err()
+    );
     assert_eq!(
         bob.get_webxdc_status_updates(bob_instance.id, StatusUpdateSerial(0))
             .await?,
@@ -313,10 +315,11 @@ async fn test_webxdc_contact_request() -> Result<()> {
 
     // Once the contact request is accepted, Bob can send updates
     bob_chat.id.accept(&bob).await?;
-    assert!(bob
-        .send_webxdc_status_update(bob_instance.id, r#"{"payload":42}"#)
-        .await
-        .is_ok());
+    assert!(
+        bob.send_webxdc_status_update(bob_instance.id, r#"{"payload":42}"#)
+            .await
+            .is_ok()
+    );
     assert_eq!(
         bob.get_webxdc_status_updates(bob_instance.id, StatusUpdateSerial(0))
             .await?,
@@ -549,15 +552,17 @@ async fn test_create_status_update_record() -> Result<()> {
         .await?;
     assert_eq!(update_id1_duplicate, None);
 
-    assert!(t
-        .send_webxdc_status_update(instance.id, "\n\n\n")
-        .await
-        .is_err());
+    assert!(
+        t.send_webxdc_status_update(instance.id, "\n\n\n")
+            .await
+            .is_err()
+    );
 
-    assert!(t
-        .send_webxdc_status_update(instance.id, "bad json")
-        .await
-        .is_err());
+    assert!(
+        t.send_webxdc_status_update(instance.id, "bad json")
+            .await
+            .is_err()
+    );
 
     assert_eq!(
         t.get_webxdc_status_updates(instance.id, StatusUpdateSerial(0))
@@ -632,12 +637,13 @@ async fn test_receive_status_update() -> Result<()> {
     let instance = send_webxdc_instance(&t, chat_id).await?;
     let now = tools::time();
 
-    assert!(t
-        .receive_status_update(ContactId::SELF, &instance, now, true, r#"foo: bar"#)
-        .await
-        .is_err()); // no json
-    assert!(t
-        .receive_status_update(
+    assert!(
+        t.receive_status_update(ContactId::SELF, &instance, now, true, r#"foo: bar"#)
+            .await
+            .is_err()
+    ); // no json
+    assert!(
+        t.receive_status_update(
             ContactId::SELF,
             &instance,
             now,
@@ -645,9 +651,10 @@ async fn test_receive_status_update() -> Result<()> {
             r#"{"updada":[{"payload":{"foo":"bar"}}]}"#
         )
         .await
-        .is_err()); // "updates" object missing
-    assert!(t
-        .receive_status_update(
+        .is_err()
+    ); // "updates" object missing
+    assert!(
+        t.receive_status_update(
             ContactId::SELF,
             &instance,
             now,
@@ -655,9 +662,10 @@ async fn test_receive_status_update() -> Result<()> {
             r#"{"updates":[{"foo":"bar"}]}"#
         )
         .await
-        .is_err()); // "payload" field missing
-    assert!(t
-        .receive_status_update(
+        .is_err()
+    ); // "payload" field missing
+    assert!(
+        t.receive_status_update(
             ContactId::SELF,
             &instance,
             now,
@@ -665,7 +673,8 @@ async fn test_receive_status_update() -> Result<()> {
             r#"{"updates":{"payload":{"foo":"bar"}}}"#
         )
         .await
-        .is_err()); // not an array
+        .is_err()
+    ); // not an array
 
     t.receive_status_update(
         ContactId::SELF,
@@ -1102,10 +1111,11 @@ async fn test_send_webxdc_status_update_to_non_webxdc() -> Result<()> {
     let t = TestContext::new_alice().await;
     let chat_id = create_group_chat(&t, ProtectionStatus::Unprotected, "foo").await?;
     let msg_id = send_text_msg(&t, chat_id, "ho!".to_string()).await?;
-    assert!(t
-        .send_webxdc_status_update(msg_id, r#"{"foo":"bar"}"#)
-        .await
-        .is_err());
+    assert!(
+        t.send_webxdc_status_update(msg_id, r#"{"foo":"bar"}"#)
+            .await
+            .is_err()
+    );
     Ok(())
 }
 
@@ -1119,10 +1129,12 @@ async fn test_get_webxdc_blob() -> Result<()> {
     assert_eq!(buf.len(), 188);
     assert!(String::from_utf8_lossy(&buf).contains("document.write"));
 
-    assert!(instance
-        .get_webxdc_blob(&t, "not-existent.html")
-        .await
-        .is_err());
+    assert!(
+        instance
+            .get_webxdc_blob(&t, "not-existent.html")
+            .await
+            .is_err()
+    );
     Ok(())
 }
 
@@ -1601,58 +1613,6 @@ async fn test_webxdc_info_msg_no_cleanup_on_interrupted_series() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_webxdc_opportunistic_encryption() -> Result<()> {
-    let alice = TestContext::new_alice().await;
-    let bob = TestContext::new_bob().await;
-
-    // Bob sends sth. to Alice, Alice has Bob's key
-    let bob_chat_id = create_group_chat(&bob, ProtectionStatus::Unprotected, "chat").await?;
-    add_contact_to_chat(
-        &bob,
-        bob_chat_id,
-        Contact::create(&bob, "", "alice@example.org").await?,
-    )
-    .await?;
-    send_text_msg(&bob, bob_chat_id, "populate".to_string()).await?;
-    alice.recv_msg(&bob.pop_sent_msg().await).await;
-
-    // Alice sends instance+update to Bob
-    let alice_chat_id = alice.get_last_msg().await.chat_id;
-    alice_chat_id.accept(&alice).await?;
-    let alice_instance = send_webxdc_instance(&alice, alice_chat_id).await?;
-    let sent1 = &alice.pop_sent_msg().await;
-    alice
-        .send_webxdc_status_update(alice_instance.id, r#"{"payload":42}"#)
-        .await?;
-    alice.flush_status_updates().await?;
-    let sent2 = &alice.pop_sent_msg().await;
-    let update_msg = sent2.load_from_db().await;
-    assert!(alice_instance.get_showpadlock());
-    assert!(update_msg.get_showpadlock());
-
-    // Bob receives instance+update
-    let bob_instance = bob.recv_msg(sent1).await;
-    bob.recv_msg_trash(sent2).await;
-    assert!(bob_instance.get_showpadlock());
-
-    // Bob adds Claire with unknown key, update to Alice+Claire cannot be encrypted
-    add_contact_to_chat(
-        &bob,
-        bob_chat_id,
-        Contact::create(&bob, "", "claire@example.org").await?,
-    )
-    .await?;
-    bob.send_webxdc_status_update(bob_instance.id, r#"{"payload":43}"#)
-        .await?;
-    bob.flush_status_updates().await?;
-    let sent3 = bob.pop_sent_msg().await;
-    let update_msg = sent3.load_from_db().await;
-    assert!(!update_msg.get_showpadlock());
-
-    Ok(())
-}
-
 // check that `info.internet_access` is not set for normal, non-integrated webxdc -
 // even if they use the deprecated option `request_internet_access` in manifest.toml
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1661,7 +1621,7 @@ async fn test_webxdc_no_internet_access() -> Result<()> {
     let self_id = t.get_self_chat().await.id;
     let single_id = t.create_chat_with_contact("bob", "bob@e.com").await.id;
     let group_id = create_group_chat(&t, ProtectionStatus::Unprotected, "chat").await?;
-    let broadcast_id = create_broadcast_list(&t).await?;
+    let broadcast_id = create_broadcast(&t, "Channel".to_string()).await?;
 
     for chat_id in [self_id, single_id, group_id, broadcast_id] {
         for internet_xdc in [true, false] {
