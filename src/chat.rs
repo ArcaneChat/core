@@ -3618,7 +3618,7 @@ pub async fn get_chat_media(
     msg_type2: Viewtype,
     msg_type3: Viewtype,
 ) -> Result<Vec<MsgId>> {
-    let list = if msg_type == Viewtype::Webxdc
+    let list = if false && msg_type == Viewtype::Webxdc
         && msg_type2 == Viewtype::Unknown
         && msg_type3 == Viewtype::Unknown
     {
