@@ -14,7 +14,9 @@ use mailparse::SingleInfo;
 use num_traits::FromPrimitive;
 use regex::Regex;
 
-use crate::chat::{self, Chat, ChatId, ChatIdBlocked, ProtectionStatus};
+use crate::chat::{
+    self, Chat, ChatId, ChatIdBlocked, ProtectionStatus, remove_from_chat_contacts_table,
+};
 use crate::config::Config;
 use crate::constants::{Blocked, Chattype, DC_CHAT_ID_TRASH, EDITED_PREFIX, ShowEmails};
 use crate::contact::{Contact, ContactId, Origin, mark_contact_id_as_verified};
@@ -29,6 +31,7 @@ use crate::key::self_fingerprint_opt;
 use crate::key::{DcKey, Fingerprint, SignedPublicKey};
 use crate::log::LogExt;
 use crate::log::{info, warn};
+use crate::logged_debug_assert;
 use crate::message::{
     self, Message, MessageState, MessengerMessage, MsgId, Viewtype, rfc724_mid_exists,
 };
@@ -42,7 +45,7 @@ use crate::simplify;
 use crate::stock_str;
 use crate::sync::Sync::*;
 use crate::tools::{self, buf_compress, remove_subject_prefix};
-use crate::{chatlist_events, location};
+use crate::{chatlist_events, ensure_and_debug_assert, ensure_and_debug_assert_eq, location};
 use crate::{contact, imap};
 
 /// This is the struct that is returned after receiving one email (aka MIME message).
@@ -1454,7 +1457,10 @@ async fn do_chat_assignment(
                     false => None,
                 };
                 if let Some(chat) = chat {
-                    debug_assert!(chat.typ == Chattype::Single);
+                    ensure_and_debug_assert!(
+                        chat.typ == Chattype::Single,
+                        "Chat {chat_id} is not Single",
+                    );
                     let mut new_protection = match verified_encryption {
                         VerifiedEncryption::Verified => ProtectionStatus::Protected,
                         VerifiedEncryption::NotVerified(_) => ProtectionStatus::Unprotected,
@@ -1687,7 +1693,9 @@ async fn add_parts(
         _ if chat.id.is_special() => GroupChangesInfo::default(),
         Chattype::Single => GroupChangesInfo::default(),
         Chattype::Mailinglist => GroupChangesInfo::default(),
-        Chattype::OutBroadcast => GroupChangesInfo::default(),
+        Chattype::OutBroadcast => {
+            apply_out_broadcast_changes(context, mime_parser, &mut chat, from_id).await?
+        }
         Chattype::Group => {
             apply_group_changes(
                 context,
@@ -1701,7 +1709,7 @@ async fn add_parts(
             .await?
         }
         Chattype::InBroadcast => {
-            apply_broadcast_changes(context, mime_parser, &mut chat, from_id).await?
+            apply_in_broadcast_changes(context, mime_parser, &mut chat, from_id).await?
         }
     };
 
@@ -2137,7 +2145,7 @@ RETURNING id
         // afterwards insert additional parts.
         replace_msg_id = None;
 
-        debug_assert!(!row_id.is_special());
+        ensure_and_debug_assert!(!row_id.is_special(), "Rowid {row_id} is special");
         created_db_entries.push(row_id);
     }
 
@@ -2400,7 +2408,11 @@ async fn lookup_chat_by_reply(
     // lookup by reply should never be needed
     // as we can directly assign the message to the chat
     // by its group ID.
-    debug_assert!(mime_parser.get_chat_group_id().is_none() || !mime_parser.was_encrypted());
+    ensure_and_debug_assert!(
+        mime_parser.get_chat_group_id().is_none() || !mime_parser.was_encrypted(),
+        "Encrypted message has group ID {}",
+        mime_parser.get_chat_group_id().unwrap_or_default(),
+    );
 
     // Try to assign message to the same chat as the parent message.
     let Some(parent_chat_id) = ChatId::lookup_by_message(parent) else {
@@ -2899,17 +2911,17 @@ async fn apply_group_changes(
         }
     }
 
-    apply_chat_name_and_avatar_changes(
-        context,
-        mime_parser,
-        from_id,
-        chat,
-        &mut send_event_chat_modified,
-        &mut better_msg,
-    )
-    .await?;
-
     if is_from_in_chat {
+        apply_chat_name_and_avatar_changes(
+            context,
+            mime_parser,
+            from_id,
+            chat,
+            &mut send_event_chat_modified,
+            &mut better_msg,
+        )
+        .await?;
+
         if chat.member_list_is_stale(context).await? {
             info!(context, "Member list is stale.");
             let mut new_members: HashSet<ContactId> =
@@ -3438,7 +3450,30 @@ async fn apply_mailinglist_changes(
     Ok(())
 }
 
-async fn apply_broadcast_changes(
+async fn apply_out_broadcast_changes(
+    context: &Context,
+    mime_parser: &MimeMessage,
+    chat: &mut Chat,
+    from_id: ContactId,
+) -> Result<GroupChangesInfo> {
+    ensure!(chat.typ == Chattype::OutBroadcast);
+
+    if let Some(_removed_addr) = mime_parser.get_header(HeaderDef::ChatGroupMemberRemoved) {
+        // The sender of the message left the broadcast channel
+        remove_from_chat_contacts_table(context, chat.id, from_id).await?;
+
+        return Ok(GroupChangesInfo {
+            better_msg: Some("".to_string()),
+            added_removed_id: None,
+            silent: true,
+            extra_msgs: vec![],
+        });
+    }
+
+    Ok(GroupChangesInfo::default())
+}
+
+async fn apply_in_broadcast_changes(
     context: &Context,
     mime_parser: &MimeMessage,
     chat: &mut Chat,
@@ -3458,6 +3493,15 @@ async fn apply_broadcast_changes(
         &mut better_msg,
     )
     .await?;
+
+    if let Some(_removed_addr) = mime_parser.get_header(HeaderDef::ChatGroupMemberRemoved) {
+        // The only member added/removed message that is ever sent is "I left.",
+        // so, this is the only case we need to handle here
+        if from_id == ContactId::SELF {
+            better_msg
+                .get_or_insert(stock_str::msg_group_left_local(context, ContactId::SELF).await);
+        }
+    }
 
     if send_event_chat_modified {
         context.emit_event(EventType::ChatModified(chat.id));
@@ -3727,7 +3771,7 @@ async fn add_or_lookup_key_contacts_by_address_list(
         }
     }
 
-    debug_assert_eq!(contact_ids.len(), address_list.len());
+    ensure_and_debug_assert_eq!(contact_ids.len(), address_list.len(),);
     Ok(contact_ids)
 }
 
@@ -3797,7 +3841,11 @@ async fn lookup_key_contact_by_fingerprint(
     context: &Context,
     fingerprint: &str,
 ) -> Result<Option<ContactId>> {
-    debug_assert!(!fingerprint.is_empty());
+    logged_debug_assert!(
+        context,
+        !fingerprint.is_empty(),
+        "lookup_key_contact_by_fingerprint: fingerprint is empty."
+    );
     if fingerprint.is_empty() {
         // Avoid accidentally looking up a non-key-contact.
         return Ok(None);
@@ -3881,7 +3929,7 @@ async fn lookup_key_contacts_by_address_list(
             contact_ids.push(contact_id);
         }
     }
-    debug_assert_eq!(address_list.len(), contact_ids.len());
+    ensure_and_debug_assert_eq!(address_list.len(), contact_ids.len(),);
     Ok(contact_ids)
 }
 

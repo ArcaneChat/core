@@ -5,10 +5,10 @@ use crate::ephemeral::Timer;
 use crate::headerdef::HeaderDef;
 use crate::imex::{ImexMode, has_backup, imex};
 use crate::message::{MessengerMessage, delete_msgs};
-use crate::mimeparser;
+use crate::mimeparser::{self, MimeMessage};
 use crate::receive_imf::receive_imf;
 use crate::test_utils::{
-    AVATAR_64x64_BYTES, AVATAR_64x64_DEDUPLICATED, TestContext, TestContextManager,
+    AVATAR_64x64_BYTES, AVATAR_64x64_DEDUPLICATED, E2EE_INFO_MSGS, TestContext, TestContextManager,
     TimeShiftFalsePositiveNote, sync,
 };
 use pretty_assertions::assert_eq;
@@ -374,7 +374,10 @@ async fn test_member_add_remove() -> Result<()> {
     // Alice leaves the chat.
     remove_contact_from_chat(&alice, alice_chat_id, ContactId::SELF).await?;
     let sent = alice.pop_sent_msg().await;
-    assert_eq!(sent.load_from_db().await.get_text(), "You left the group.");
+    assert_eq!(
+        sent.load_from_db().await.get_text(),
+        stock_str::msg_group_left_local(&alice, ContactId::SELF).await
+    );
 
     Ok(())
 }
@@ -2101,7 +2104,7 @@ async fn test_forward_basic() -> Result<()> {
     forward_msgs(&bob, &[msg.id], bob_chat.get_id()).await?;
 
     let forwarded_msg = bob.pop_sent_msg().await;
-    assert_eq!(bob_chat.id.get_msg_cnt(&bob).await?, 2);
+    assert_eq!(bob_chat.id.get_msg_cnt(&bob).await?, E2EE_INFO_MSGS + 2);
     assert_ne!(
         forwarded_msg.load_from_db().await.rfc724_mid,
         msg.rfc724_mid,
@@ -2129,7 +2132,7 @@ async fn test_forward_info_msg() -> Result<()> {
     assert!(msg1.get_text().contains("bob@example.net"));
 
     let chat_id2 = ChatId::create_for_contact(alice, bob_id).await?;
-    assert_eq!(get_chat_msgs(alice, chat_id2).await?.len(), 0);
+    assert_eq!(get_chat_msgs(alice, chat_id2).await?.len(), E2EE_INFO_MSGS);
     forward_msgs(alice, &[msg1.id], chat_id2).await?;
     let msg2 = alice.get_last_msg_in(chat_id2).await;
     assert!(!msg2.is_info()); // forwarded info-messages lose their info-state
@@ -2515,22 +2518,34 @@ async fn test_resend_own_message() -> Result<()> {
     let sent1_ts_sent = msg.timestamp_sent;
     assert_eq!(msg.get_text(), "alice->bob");
     assert_eq!(get_chat_contacts(&bob, msg.chat_id).await?.len(), 2);
-    assert_eq!(get_chat_msgs(&bob, msg.chat_id).await?.len(), 1);
+    assert_eq!(
+        get_chat_msgs(&bob, msg.chat_id).await?.len(),
+        E2EE_INFO_MSGS + 1
+    );
     bob.recv_msg(&sent2).await;
     assert_eq!(get_chat_contacts(&bob, msg.chat_id).await?.len(), 3);
-    assert_eq!(get_chat_msgs(&bob, msg.chat_id).await?.len(), 2);
+    assert_eq!(
+        get_chat_msgs(&bob, msg.chat_id).await?.len(),
+        E2EE_INFO_MSGS + 2
+    );
     let received = bob.recv_msg_opt(&sent3).await;
     // No message should actually be added since we already know this message:
     assert!(received.is_none());
     assert_eq!(get_chat_contacts(&bob, msg.chat_id).await?.len(), 3);
-    assert_eq!(get_chat_msgs(&bob, msg.chat_id).await?.len(), 2);
+    assert_eq!(
+        get_chat_msgs(&bob, msg.chat_id).await?.len(),
+        E2EE_INFO_MSGS + 2
+    );
 
     // Fiona does not receive the first message, however, due to resending, she has a similar view as Alice and Bob
     fiona.recv_msg(&sent2).await;
     let msg = fiona.recv_msg(&sent3).await;
     assert_eq!(msg.get_text(), "alice->bob");
     assert_eq!(get_chat_contacts(&fiona, msg.chat_id).await?.len(), 3);
-    assert_eq!(get_chat_msgs(&fiona, msg.chat_id).await?.len(), 2);
+    assert_eq!(
+        get_chat_msgs(&fiona, msg.chat_id).await?.len(),
+        E2EE_INFO_MSGS + 2
+    );
     let msg_from = Contact::get_by_id(&fiona, msg.get_from_id()).await?;
     assert_eq!(msg_from.get_addr(), "alice@example.org");
     assert!(sent1_ts_sent < msg.timestamp_sent);
@@ -2926,6 +2941,108 @@ async fn test_broadcast_channel_protected_listid() -> Result<()> {
     assert_eq!(
         Chat::load_from_db(bob, rcvd.chat_id).await?.grpid,
         alice_list_id
+    );
+
+    Ok(())
+}
+
+/// Test that if Bob leaves a broadcast channel,
+/// Alice (the channel owner) won't see him as a member anymore,
+/// but won't be notified about this in any way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_leave_broadcast() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+
+    tcm.section("Alice creates broadcast channel with Bob.");
+    let alice_chat_id = create_broadcast(alice, "foo".to_string()).await?;
+    let bob_contact = alice.add_or_lookup_contact(bob).await.id;
+    add_contact_to_chat(alice, alice_chat_id, bob_contact).await?;
+
+    tcm.section("Alice sends first message to broadcast.");
+    let sent_msg = alice.send_text(alice_chat_id, "Hello!").await;
+    let bob_msg = bob.recv_msg(&sent_msg).await;
+
+    assert_eq!(get_chat_contacts(alice, alice_chat_id).await?.len(), 1);
+
+    // Clear events so that we can later check
+    // that the 'Broadcast channel left' message didn't trigger IncomingMsg:
+    alice.evtracker.clear_events();
+
+    // Shift the time so that we can later check the "Broadcast channel left" message's timestamp:
+    SystemTime::shift(Duration::from_secs(60));
+
+    tcm.section("Bob leaves the broadcast channel.");
+    let bob_chat_id = bob_msg.chat_id;
+    bob_chat_id.accept(bob).await?;
+    remove_contact_from_chat(bob, bob_chat_id, ContactId::SELF).await?;
+
+    let leave_msg = bob.pop_sent_msg().await;
+    alice.recv_msg_trash(&leave_msg).await;
+
+    assert_eq!(get_chat_contacts(alice, alice_chat_id).await?.len(), 0);
+
+    alice.emit_event(EventType::Test);
+    alice
+        .evtracker
+        .get_matching(|ev| match ev {
+            EventType::Test => true,
+            EventType::IncomingMsg { .. } => {
+                panic!("'Broadcast channel left' message should be silent")
+            }
+            EventType::MsgsNoticed(..) => {
+                panic!("'Broadcast channel left' message shouldn't clear notifications")
+            }
+            EventType::MsgsChanged { .. } => {
+                panic!("Broadcast channels should be left silently, without any message");
+            }
+            _ => false,
+        })
+        .await;
+
+    Ok(())
+}
+
+/// Tests that if Bob leaves a broadcast channel with one device,
+/// the other device shows a correct info message "You left.".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_leave_broadcast_multidevice() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob0 = &tcm.bob().await;
+    let bob1 = &tcm.bob().await;
+
+    tcm.section("Alice creates broadcast channel with Bob.");
+    let alice_chat_id = create_broadcast(alice, "foo".to_string()).await?;
+    let bob_contact = alice.add_or_lookup_contact(bob0).await.id;
+    add_contact_to_chat(alice, alice_chat_id, bob_contact).await?;
+
+    tcm.section("Alice sends first message to broadcast.");
+    let sent_msg = alice.send_text(alice_chat_id, "Hello!").await;
+    let bob0_hello = bob0.recv_msg(&sent_msg).await;
+    let bob1_hello = bob1.recv_msg(&sent_msg).await;
+
+    tcm.section("Bob leaves the broadcast channel with his first device.");
+    let bob_chat_id = bob0_hello.chat_id;
+    bob_chat_id.accept(bob0).await?;
+    remove_contact_from_chat(bob0, bob_chat_id, ContactId::SELF).await?;
+
+    let leave_msg = bob0.pop_sent_msg().await;
+    let parsed = MimeMessage::from_bytes(bob1, leave_msg.payload().as_bytes(), None).await?;
+    assert_eq!(
+        parsed.parts[0].msg,
+        stock_str::msg_group_left_remote(bob0).await
+    );
+
+    let rcvd = bob1.recv_msg(&leave_msg).await;
+
+    assert_eq!(rcvd.chat_id, bob1_hello.chat_id);
+    assert!(rcvd.is_info());
+    assert_eq!(rcvd.get_info_type(), SystemMessage::MemberRemovedFromGroup);
+    assert_eq!(
+        rcvd.text,
+        stock_str::msg_group_left_local(bob1, ContactId::SELF).await
     );
 
     Ok(())
@@ -4349,13 +4466,13 @@ async fn test_receive_edit_request_after_removal() -> Result<()> {
     let bob_msg = bob.recv_msg(&sent1).await;
     let bob_chat_id = bob_msg.chat_id;
     assert_eq!(bob_msg.text, "zext me in delra.cat");
-    assert_eq!(bob_chat_id.get_msg_cnt(bob).await?, 1);
+    assert_eq!(bob_chat_id.get_msg_cnt(bob).await?, E2EE_INFO_MSGS + 1);
 
     delete_msgs(bob, &[bob_msg.id]).await?;
-    assert_eq!(bob_chat_id.get_msg_cnt(bob).await?, 0);
+    assert_eq!(bob_chat_id.get_msg_cnt(bob).await?, E2EE_INFO_MSGS);
 
     bob.recv_msg_trash(&sent2).await;
-    assert_eq!(bob_chat_id.get_msg_cnt(bob).await?, 0);
+    assert_eq!(bob_chat_id.get_msg_cnt(bob).await?, E2EE_INFO_MSGS);
 
     Ok(())
 }
@@ -4444,28 +4561,34 @@ async fn test_send_delete_request() -> Result<()> {
     // Alice sends a message, then sends a deletion request
     let sent1 = alice.send_text(alice_chat.id, "wtf").await;
     let alice_msg = sent1.load_from_db().await;
-    assert_eq!(alice_chat.id.get_msg_cnt(alice).await?, 2);
+    assert_eq!(alice_chat.id.get_msg_cnt(alice).await?, E2EE_INFO_MSGS + 2);
 
     message::delete_msgs_ex(alice, &[alice_msg.id], true).await?;
     let sent2 = alice.pop_sent_msg().await;
-    assert_eq!(alice_chat.id.get_msg_cnt(alice).await?, 1);
+    assert_eq!(alice_chat.id.get_msg_cnt(alice).await?, E2EE_INFO_MSGS + 1);
 
     // Bob receives both messages and has nothing the end
     let bob_msg = bob.recv_msg(&sent1).await;
     assert_eq!(bob_msg.text, "wtf");
-    assert_eq!(bob_msg.chat_id.get_msg_cnt(bob).await?, 2);
+    assert_eq!(bob_msg.chat_id.get_msg_cnt(bob).await?, E2EE_INFO_MSGS + 2);
 
     bob.recv_msg_opt(&sent2).await;
-    assert_eq!(bob_msg.chat_id.get_msg_cnt(bob).await?, 1);
+    assert_eq!(bob_msg.chat_id.get_msg_cnt(bob).await?, E2EE_INFO_MSGS + 1);
 
     // Alice has another device, and there is also nothing at the end
     let alice2 = &tcm.alice().await;
     alice2.recv_msg(&sent0).await;
     let alice2_msg = alice2.recv_msg(&sent1).await;
-    assert_eq!(alice2_msg.chat_id.get_msg_cnt(alice2).await?, 2);
+    assert_eq!(
+        alice2_msg.chat_id.get_msg_cnt(alice2).await?,
+        E2EE_INFO_MSGS + 2
+    );
 
     alice2.recv_msg_opt(&sent2).await;
-    assert_eq!(alice2_msg.chat_id.get_msg_cnt(alice2).await?, 1);
+    assert_eq!(
+        alice2_msg.chat_id.get_msg_cnt(alice2).await?,
+        E2EE_INFO_MSGS + 1
+    );
 
     Ok(())
 }
@@ -4590,6 +4713,32 @@ async fn test_no_key_contacts_in_adhoc_chats() -> Result<()> {
     let res = add_contact_to_chat(alice, chat_id, charlie_key_contact_id).await;
     assert!(res.is_err());
 
+    Ok(())
+}
+
+/// Tests that key-contacts cannot be added to an unencrypted (ad hoc) group and the group and
+/// messages report that they are unencrypted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_create_unencrypted_group_chat() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+    let charlie = &tcm.charlie().await;
+
+    let chat_id = create_group_ex(alice, None, "Group chat").await?;
+    let bob_key_contact_id = alice.add_or_lookup_contact_id(bob).await;
+    let charlie_address_contact_id = alice.add_or_lookup_address_contact_id(charlie).await;
+
+    let res = add_contact_to_chat(alice, chat_id, bob_key_contact_id).await;
+    assert!(res.is_err());
+
+    add_contact_to_chat(alice, chat_id, charlie_address_contact_id).await?;
+
+    let chat = Chat::load_from_db(alice, chat_id).await?;
+    assert!(!chat.is_encrypted(alice).await?);
+    let sent_msg = alice.send_text(chat_id, "Hello").await;
+    let msg = Message::load_from_db(alice, sent_msg.sender_msg_id).await?;
+    assert!(!msg.get_showpadlock());
     Ok(())
 }
 

@@ -33,6 +33,7 @@ use crate::ephemeral::{Timer as EphemeralTimer, start_chat_ephemeral_timers};
 use crate::events::EventType;
 use crate::location;
 use crate::log::{LogExt, error, info, warn};
+use crate::logged_debug_assert;
 use crate::message::{self, Message, MessageState, MsgId, Viewtype};
 use crate::mimefactory::MimeFactory;
 use crate::mimeparser::SystemMessage;
@@ -348,6 +349,8 @@ impl ChatId {
             chat_id
                 .add_protection_msg(context, ProtectionStatus::Protected, None, timestamp)
                 .await?;
+        } else {
+            chat_id.maybe_add_encrypted_msg(context, timestamp).await?;
         }
 
         info!(
@@ -620,6 +623,42 @@ impl ChatId {
         )
         .await?;
 
+        Ok(())
+    }
+
+    /// Adds message "Messages are end-to-end encrypted" if appropriate.
+    ///
+    /// This function is rather slow because it does a lot of database queries,
+    /// but this is fine because it is only called on chat creation.
+    async fn maybe_add_encrypted_msg(self, context: &Context, timestamp_sort: i64) -> Result<()> {
+        let chat = Chat::load_from_db(context, self).await?;
+
+        // as secure-join adds its own message on success (after some other messasges),
+        // we do not want to add "Messages are end-to-end encrypted" on chat creation.
+        // we detect secure join by `can_send` (for Bob, scanner side) and by `blocked` (for Alice, inviter side) below.
+        if !chat.is_encrypted(context).await?
+            || self <= DC_CHAT_ID_LAST_SPECIAL
+            || chat.is_device_talk()
+            || chat.is_self_talk()
+            || (!chat.can_send(context).await? && !chat.is_contact_request())
+            || chat.blocked == Blocked::Yes
+        {
+            return Ok(());
+        }
+
+        let text = stock_str::messages_e2e_encrypted(context).await;
+        add_info_msg_with_cmd(
+            context,
+            self,
+            &text,
+            SystemMessage::ChatE2ee,
+            timestamp_sort,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await?;
         Ok(())
     }
 
@@ -1359,14 +1398,18 @@ impl ChatId {
 
         let mut ret = stock_str::e2e_available(context).await + "\n";
 
-        for contact_id in get_chat_contacts(context, self)
+        for &contact_id in get_chat_contacts(context, self)
             .await?
             .iter()
             .filter(|&contact_id| !contact_id.is_special())
         {
-            let contact = Contact::get_by_id(context, *contact_id).await?;
+            let contact = Contact::get_by_id(context, contact_id).await?;
             let addr = contact.get_addr();
-            debug_assert!(contact.is_key_contact());
+            logged_debug_assert!(
+                context,
+                contact.is_key_contact(),
+                "get_encryption_info: contact {contact_id} is not a key-contact."
+            );
             let fingerprint = contact
                 .fingerprint()
                 .context("Contact does not have a fingerprint in encrypted chat")?;
@@ -2688,6 +2731,10 @@ impl ChatIdBlocked {
                     smeared_time,
                 )
                 .await?;
+        } else {
+            chat_id
+                .maybe_add_encrypted_msg(context, smeared_time)
+                .await?;
         }
 
         Ok(Self {
@@ -2925,10 +2972,12 @@ async fn prepare_send_msg(
             // If the chat is a contact request, let the user accept it later.
             msg.param.get_cmd() == SystemMessage::SecurejoinMessage
         }
-        // Allow to send "Member removed" messages so we can leave the group.
+        // Allow to send "Member removed" messages so we can leave the group/broadcast.
         // Necessary checks should be made anyway before removing contact
         // from the chat.
-        CantSendReason::NotAMember => msg.param.get_cmd() == SystemMessage::MemberRemovedFromGroup,
+        CantSendReason::NotAMember | CantSendReason::InBroadcast => {
+            msg.param.get_cmd() == SystemMessage::MemberRemovedFromGroup
+        }
         CantSendReason::MissingKey => msg
             .param
             .get_bool(Param::ForcePlaintext)
@@ -2980,6 +3029,9 @@ async fn prepare_send_msg(
     let row_ids = create_send_msg_jobs(context, msg)
         .await
         .context("Failed to create send jobs")?;
+    if !row_ids.is_empty() {
+        donation_request_maybe(context).await.log_err(context).ok();
+    }
     Ok(row_ids)
 }
 
@@ -3229,6 +3281,31 @@ pub async fn send_videochat_invitation(context: &Context, chat_id: ChatId) -> Re
         stock_str::videochat_invite_msg_body(context, &Message::parse_webrtc_instance(&instance).1)
             .await;
     send_msg(context, chat_id, &mut msg).await
+}
+
+async fn donation_request_maybe(context: &Context) -> Result<()> {
+    let secs_between_checks = 30 * 24 * 60 * 60;
+    let now = time();
+    let ts = context
+        .get_config_i64(Config::DonationRequestNextCheck)
+        .await?;
+    if ts > now {
+        return Ok(());
+    }
+    let msg_cnt = context.sql.count(
+        "SELECT COUNT(*) FROM msgs WHERE state>=? AND hidden=0",
+        (MessageState::OutDelivered,),
+    );
+    let ts = if ts == 0 || msg_cnt.await? < 100 {
+        now.saturating_add(secs_between_checks)
+    } else {
+        let mut msg = Message::new_text(stock_str::donation_request(context).await);
+        add_device_msg(context, None, Some(&mut msg)).await?;
+        i64::MAX
+    };
+    context
+        .set_config_internal(Config::DonationRequestNextCheck, Some(&ts.to_string()))
+        .await
 }
 
 /// Chat message list request options.
@@ -3649,15 +3726,31 @@ pub async fn get_past_chat_contacts(context: &Context, chat_id: ChatId) -> Resul
 }
 
 /// Creates a group chat with a given `name`.
+/// Deprecated on 2025-06-21, use `create_group_ex()`.
 pub async fn create_group_chat(
     context: &Context,
     protect: ProtectionStatus,
-    chat_name: &str,
+    name: &str,
 ) -> Result<ChatId> {
-    let chat_name = sanitize_single_line(chat_name);
+    create_group_ex(context, Some(protect), name).await
+}
+
+/// Creates a group chat.
+///
+/// * `encryption` - If `Some`, the chat is encrypted (with key-contacts) and can be protected.
+/// * `name` - Chat name.
+pub async fn create_group_ex(
+    context: &Context,
+    encryption: Option<ProtectionStatus>,
+    name: &str,
+) -> Result<ChatId> {
+    let chat_name = sanitize_single_line(name);
     ensure!(!chat_name.is_empty(), "Invalid chat name");
 
-    let grpid = create_id();
+    let grpid = match encryption {
+        Some(_) => create_id(),
+        None => String::new(),
+    };
 
     let timestamp = create_smeared_timestamp(context);
     let row_id = context
@@ -3677,7 +3770,8 @@ pub async fn create_group_chat(
     chatlist_events::emit_chatlist_changed(context);
     chatlist_events::emit_chatlist_item_changed(context, chat_id);
 
-    if protect == ProtectionStatus::Protected {
+    if encryption == Some(ProtectionStatus::Protected) {
+        let protect = ProtectionStatus::Protected;
         chat_id
             .set_protection_for_timestamp_sort(context, protect, timestamp, None)
             .await?;
@@ -4138,8 +4232,6 @@ pub async fn remove_contact_from_chat(
         "Cannot remove special contact"
     );
 
-    let mut msg = Message::new(Viewtype::default());
-
     let chat = Chat::load_from_db(context, chat_id).await?;
     if chat.typ == Chattype::Group || chat.typ == Chattype::OutBroadcast {
         if !chat.is_self_in_chat(context).await? {
@@ -4169,19 +4261,10 @@ pub async fn remove_contact_from_chat(
             // in case of the database becoming inconsistent due to a bug.
             if let Some(contact) = Contact::get_by_id_optional(context, contact_id).await? {
                 if chat.typ == Chattype::Group && chat.is_promoted() {
-                    msg.viewtype = Viewtype::Text;
-                    if contact_id == ContactId::SELF {
-                        msg.text = stock_str::msg_group_left_local(context, ContactId::SELF).await;
-                    } else {
-                        msg.text =
-                            stock_str::msg_del_member_local(context, contact_id, ContactId::SELF)
-                                .await;
-                    }
-                    msg.param.set_cmd(SystemMessage::MemberRemovedFromGroup);
-                    msg.param.set(Param::Arg, contact.get_addr().to_lowercase());
-                    msg.param
-                        .set(Param::ContactAddedRemoved, contact.id.to_u32() as i32);
-                    let res = send_msg(context, chat_id, &mut msg).await;
+                    let addr = contact.get_addr();
+
+                    let res = send_member_removal_msg(context, chat_id, contact_id, addr).await;
+
                     if contact_id == ContactId::SELF {
                         res?;
                         set_group_explicitly_left(context, &chat.grpid).await?;
@@ -4200,11 +4283,38 @@ pub async fn remove_contact_from_chat(
                 chat.sync_contacts(context).await.log_err(context).ok();
             }
         }
+    } else if chat.typ == Chattype::InBroadcast && contact_id == ContactId::SELF {
+        // For incoming broadcast channels, it's not possible to remove members,
+        // but it's possible to leave:
+        let self_addr = context.get_primary_self_addr().await?;
+        send_member_removal_msg(context, chat_id, contact_id, &self_addr).await?;
     } else {
         bail!("Cannot remove members from non-group chats.");
     }
 
     Ok(())
+}
+
+async fn send_member_removal_msg(
+    context: &Context,
+    chat_id: ChatId,
+    contact_id: ContactId,
+    addr: &str,
+) -> Result<MsgId> {
+    let mut msg = Message::new(Viewtype::Text);
+
+    if contact_id == ContactId::SELF {
+        msg.text = stock_str::msg_group_left_local(context, ContactId::SELF).await;
+    } else {
+        msg.text = stock_str::msg_del_member_local(context, contact_id, ContactId::SELF).await;
+    }
+
+    msg.param.set_cmd(SystemMessage::MemberRemovedFromGroup);
+    msg.param.set(Param::Arg, addr.to_lowercase());
+    msg.param
+        .set(Param::ContactAddedRemoved, contact_id.to_u32());
+
+    send_msg(context, chat_id, &mut msg).await
 }
 
 async fn set_group_explicitly_left(context: &Context, grpid: &str) -> Result<()> {

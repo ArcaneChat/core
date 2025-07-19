@@ -1,5 +1,71 @@
 # Changelog
 
+## [2.3.0] - 2025-07-19
+
+### Features / Changes
+
+- Add "e2ee encrypted" info message to all e2ee chats ([#7008](https://github.com/chatmail/core/pull/7008)).
+- repl: Print errors and debug logs to stderr.
+- `{ensure_and,logged}_debug_assert`: Don't evaluate condition twice.
+- Log when background fetch of all accounts finishes successfully.
+- Log the number of read/written bytes on IMAP stream read error ([#6924](https://github.com/chatmail/core/pull/6924)).
+
+### Fixes
+
+- Ignore protected headers in outer message part ([#6357](https://github.com/chatmail/core/pull/6357)).
+- List e-mail contacts in repl listcontacts command.
+- Save peer address for LoggingStream early.
+
+## [2.2.0] - 2025-07-14
+
+### API-Changes
+
+- Add chat::create_group_ex(), deprecate create_group_chat() ([#6927](https://github.com/chatmail/core/pull/6927)).
+- jsonrpc: Add CommandApi::create_group_chat_unencrypted() ([#6927](https://github.com/chatmail/core/pull/6927)).
+- [**breaking**] In ChatListItem, replace is_group and is_(out_)broadcast with chat_type property ([#7003](https://github.com/chatmail/core/pull/7003)).
+
+### Features / Changes
+
+- Log failed debug assertions in all configurations.
+- Donation request device message ([#6913](https://github.com/chatmail/core/pull/6913)).
+- Advance next UID even if connection fails while fetching.
+
+### Fixes
+
+- Always prefer the last header.
+
+### Tests
+
+- Tune down DELTACHAT_SAVE_TMP_DB hint ([#6998](https://github.com/chatmail/core/pull/6998)).
+- Unencrypted group creation ([#6927](https://github.com/chatmail/core/pull/6927)).
+
+## [2.1.0] - 2025-07-11
+
+### Features / Changes
+
+- Add account ordering functionality ([#6993](https://github.com/chatmail/core/pull/6993)).
+- feat: Make it possible to leave broadcast channels ([#6984](https://github.com/chatmail/core/pull/6984))
+- Migrations: Use tools::Time to measure time for logging.
+- Log emitted logging events with `tracing`.
+- Ensure_and_debug_assert{,_eq,_ne} macros combining `debug_assert*` and anyhow::ensure ([#6907](https://github.com/chatmail/core/pull/6907)).
+
+### Fixes
+
+- Use Viewtype::File for messages with invalid images, images of unknown size, images > 50 Mpx ([#6825](https://github.com/chatmail/core/pull/6825)).
+- Don't apply chat name and avatar changes from non-members.
+
+### Documentation
+
+- Update showpadlock ffi.
+
+### Miscellaneous Tasks
+
+- cargo: Update cordyceps from 0.3.2 to 0.3.4.
+
+### Tests
+
+- Add option to save database on test failure ([#6992](https://github.com/chatmail/core/pull/6992)).
+
 ## [2.0.0] - 2025-07-09
 
 This release changes the way the core handles contact keys.
@@ -6426,3 +6492,6 @@ https://github.com/chatmail/core/pulls?q=is%3Apr+is%3Aclosed
 [1.159.5]: https://github.com/chatmail/core/compare/v1.159.4..v1.159.5
 [1.160.0]: https://github.com/chatmail/core/compare/v1.159.5..v1.160.0
 [2.0.0]: https://github.com/chatmail/core/compare/v1.160.0..v2.0.0
+[2.1.0]: https://github.com/chatmail/core/compare/v2.0.0..v2.1.0
+[2.2.0]: https://github.com/chatmail/core/compare/v2.1.0..v2.2.0
+[2.3.0]: https://github.com/chatmail/core/compare/v2.2.0..v2.3.0

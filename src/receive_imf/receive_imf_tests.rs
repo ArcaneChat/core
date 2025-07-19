@@ -15,8 +15,9 @@ use crate::download::MIN_DOWNLOAD_LIMIT;
 use crate::imap::prefetch_should_download;
 use crate::imex::{ImexMode, imex};
 use crate::securejoin::get_securejoin_qr;
-use crate::test_utils::mark_as_verified;
-use crate::test_utils::{TestContext, TestContextManager, get_chat_msg};
+use crate::test_utils::{
+    E2EE_INFO_MSGS, TestContext, TestContextManager, get_chat_msg, mark_as_verified,
+};
 use crate::tools::{SystemTime, time};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -133,7 +134,7 @@ async fn test_adhoc_group_outgoing_show_accepted_contact_unaccepted() -> Result<
     let chats = Chatlist::try_load(bob, 0, None, None).await?;
     assert_eq!(chats.len(), 1);
     let chat_id = chats.get_chat_id(0)?;
-    assert_eq!(chat_id.get_msg_cnt(bob).await?, 1);
+    assert_eq!(chat_id.get_msg_cnt(bob).await?, E2EE_INFO_MSGS + 1);
     Ok(())
 }
 
@@ -3683,6 +3684,24 @@ async fn test_unsigned_chat_group_hdr() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_ignore_protected_headers_in_outer_msg() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+    let bob_chat_id = tcm.send_recv_accept(alice, bob, "hi").await.chat_id;
+    send_text_msg(bob, bob_chat_id, "hi all!".to_string()).await?;
+    let mut sent_msg = bob.pop_sent_msg().await;
+    sent_msg.payload = sent_msg.payload.replace(
+        "Chat-Version:",
+        "Auto-Submitted: auto-generated\r\nChat-Version:",
+    );
+    alice.recv_msg(&sent_msg).await;
+    let ab_contact = alice.add_or_lookup_contact(bob).await;
+    assert!(!ab_contact.is_bot());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_sync_member_list_on_rejoin() -> Result<()> {
     let mut tcm = TestContextManager::new();
     let alice = &tcm.alice().await;
@@ -4212,14 +4231,18 @@ async fn test_keep_member_list_if_possibly_nomember() -> Result<()> {
     let fiona_chat_id = fiona.recv_msg(&alice.pop_sent_msg().await).await.chat_id;
     fiona_chat_id.accept(&fiona).await?;
 
-    send_text_msg(&fiona, fiona_chat_id, "hi".to_string()).await?;
+    SystemTime::shift(Duration::from_secs(60));
+    chat::set_chat_name(&fiona, fiona_chat_id, "Renamed").await?;
     bob.recv_msg(&fiona.pop_sent_msg().await).await;
 
-    // Bob missed the message adding fiona, but mustn't recreate the member list.
+    // Bob missed the message adding fiona, but mustn't recreate the member list or apply the group
+    // name change.
     assert_eq!(get_chat_contacts(&bob, bob_chat_id).await?.len(), 2);
     assert!(is_contact_in_chat(&bob, bob_chat_id, ContactId::SELF).await?);
     let bob_alice_contact = bob.add_or_lookup_contact_id(&alice).await;
     assert!(is_contact_in_chat(&bob, bob_chat_id, bob_alice_contact).await?);
+    let chat = Chat::load_from_db(&bob, bob_chat_id).await?;
+    assert_eq!(chat.get_name(), "Group");
     Ok(())
 }
 
@@ -4388,7 +4411,7 @@ async fn test_create_group_with_big_msg() -> Result<()> {
 
     // The big message must go away from the 1:1 chat.
     let msgs = chat::get_chat_msgs(&alice, ab_chat_id).await?;
-    assert!(msgs.is_empty());
+    assert_eq!(msgs.len(), E2EE_INFO_MSGS);
 
     Ok(())
 }

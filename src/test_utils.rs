@@ -2,6 +2,7 @@
 //!
 //! This private module is only compiled for test runs.
 use std::collections::{BTreeMap, HashSet};
+use std::env::current_dir;
 use std::fmt::Write;
 use std::ops::{Deref, DerefMut};
 use std::panic;
@@ -41,6 +42,10 @@ use crate::receive_imf::receive_imf;
 use crate::securejoin::{get_securejoin_qr, join_securejoin};
 use crate::stock_str::StockStrings;
 use crate::tools::time;
+
+/// The number of info messages added to new e2ee chats.
+/// Currently this is "End-to-end encryption available", string `E2eAvailable`.
+pub const E2EE_INFO_MSGS: usize = 1;
 
 #[allow(non_upper_case_globals)]
 pub const AVATAR_900x900_BYTES: &[u8] = include_bytes!("../test-data/image/avatar900x900.png");
@@ -753,7 +758,7 @@ impl TestContext {
     pub async fn add_or_lookup_address_contact(&self, other: &TestContext) -> Contact {
         let contact_id = self.add_or_lookup_address_contact_id(other).await;
         let contact = Contact::get_by_id(&self.ctx, contact_id).await.unwrap();
-        debug_assert_eq!(contact.is_key_contact(), false);
+        assert_eq!(contact.is_key_contact(), false);
         contact
     }
 
@@ -1063,6 +1068,25 @@ impl Drop for TestContext {
                 // Print the chats if runtime still exists.
                 handle.block_on(async move {
                     self.print_chats().await;
+
+                    // If you set this to true, and a test fails,
+                    // the sql databases will be saved into the current working directory
+                    // so that you can examine them.
+                    if std::env::var("DELTACHAT_SAVE_TMP_DB").is_ok() {
+                        let _: u32 = self
+                            .sql
+                            .query_get_value("PRAGMA wal_checkpoint;", ())
+                            .await
+                            .unwrap()
+                            .unwrap();
+
+                        let from = self.get_dbfile();
+                        let target = current_dir()
+                            .unwrap()
+                            .join(format!("test-account-{}.db", self.name()));
+                        tokio::fs::copy(from, &target).await.unwrap();
+                        eprintln!("Copied database from {from:?} to {target:?}\n");
+                    }
                 });
             }
         });
@@ -1145,6 +1169,11 @@ impl Drop for InnerLogSink {
     fn drop(&mut self) {
         while let Ok(event) = self.events.try_recv() {
             print_logevent(&event);
+        }
+        if std::env::var("DELTACHAT_SAVE_TMP_DB").is_err() {
+            eprintln!(
+                "note: If you want to examine the database files, set environment variable DELTACHAT_SAVE_TMP_DB=1"
+            )
         }
     }
 }

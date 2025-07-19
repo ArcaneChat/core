@@ -14,7 +14,8 @@ use std::str::from_utf8;
 // `Instant` may use `libc::clock_gettime(CLOCK_MONOTONIC)`, e.g. on Android, and does not advance
 // while being in deep sleep mode, we use `SystemTime` instead, but add an alias for it to document
 // why `Instant` isn't used in those places. Also this can help to switch to another clock impl if
-// we find any.
+// we find any. Another reason is that `Instant` may reintroduce panics in the future versions:
+// https://doc.rust-lang.org/1.87.0/std/time/struct.Instant.html#method.elapsed.
 use std::time::Duration;
 pub use std::time::SystemTime as Time;
 #[cfg(not(test))]
@@ -760,6 +761,58 @@ pub(crate) fn inc_and_check<T: PrimInt + AddAssign + std::fmt::Debug>(
     *t += T::one();
     ensure!(*t == expected, "Incremented value != {expected:?}");
     Ok(())
+}
+
+/// Returns early with an error if a condition is not satisfied.
+/// In non-optimized builds, panics instead if so.
+#[macro_export]
+macro_rules! ensure_and_debug_assert {
+    ($cond:expr, $($arg:tt)*) => {
+        let cond_val = $cond;
+        debug_assert!(cond_val, $($arg)*);
+        anyhow::ensure!(cond_val, $($arg)*);
+    };
+}
+
+/// Returns early with an error on two expressions inequality.
+/// In non-optimized builds, panics instead if so.
+#[macro_export]
+macro_rules! ensure_and_debug_assert_eq {
+    ($left:expr, $right:expr, $($arg:tt)*) => {
+        match (&$left, &$right) {
+            (left_val, right_val) => {
+                debug_assert_eq!(left_val, right_val, $($arg)*);
+                anyhow::ensure!(left_val == right_val, $($arg)*);
+            }
+        }
+    };
+}
+
+/// Returns early with an error on two expressions equality.
+/// In non-optimized builds, panics instead if so.
+#[macro_export]
+macro_rules! ensure_and_debug_assert_ne {
+    ($left:expr, $right:expr, $($arg:tt)*) => {
+        match (&$left, &$right) {
+            (left_val, right_val) => {
+                debug_assert_ne!(left_val, right_val, $($arg)*);
+                anyhow::ensure!(left_val != right_val, $($arg)*);
+            }
+        }
+    };
+}
+
+/// Logs a warning if a condition is not satisfied.
+/// In non-optimized builds, panics also if so.
+#[macro_export]
+macro_rules! logged_debug_assert {
+    ($ctx:expr, $cond:expr, $($arg:tt)*) => {
+        let cond_val = $cond;
+        if !cond_val {
+            warn!($ctx, $($arg)*);
+        }
+        debug_assert!(cond_val, $($arg)*);
+    };
 }
 
 #[cfg(test)]

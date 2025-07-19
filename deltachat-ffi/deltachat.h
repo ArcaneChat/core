@@ -4303,11 +4303,16 @@ int             dc_msg_get_duration           (const dc_msg_t* msg);
 
 
 /**
- * Check if a padlock should be shown beside the message.
+ * Check if message was correctly encrypted and signed.
+ *
+ * Historically, UIs showed a small padlock on the message then.
+ * Today, the UIs should instead
+ * show a small email-icon on the message if the message is not encrypted or signed,
+ * and nothing otherwise.
  *
  * @memberof dc_msg_t
  * @param msg The message object.
- * @return 1=padlock should be shown beside message, 0=do not show a padlock beside the message.
+ * @return 1=message correctly encrypted and signed, no need to show anything; 0=show email-icon beside the message.
  */
 int             dc_msg_get_showpadlock        (const dc_msg_t* msg);
 
@@ -4530,12 +4535,12 @@ int             dc_msg_is_info                (const dc_msg_t* msg);
  * - DC_INFO_MEMBER_ADDED_TO_GROUP (4) - "Member CONTACT added by OTHER_CONTACT"
  * - DC_INFO_MEMBER_REMOVED_FROM_GROUP (5) - "Member CONTACT removed by OTHER_CONTACT"
  * - DC_INFO_EPHEMERAL_TIMER_CHANGED (10) - "Disappearing messages CHANGED_TO by CONTACT"
- * - DC_INFO_PROTECTION_ENABLED (11) - Info-message for "Chat is now protected"
- * - DC_INFO_PROTECTION_DISABLED (12) - Info-message for "Chat is no longer protected"
+ * - DC_INFO_PROTECTION_ENABLED (11) - Info-message for "Chat is protected"
  * - DC_INFO_INVALID_UNENCRYPTED_MAIL (13) - Info-message for "Provider requires end-to-end encryption which is not setup yet",
  *   the UI should change the corresponding string using #DC_STR_INVALID_UNENCRYPTED_MAIL
  *   and also offer a way to fix the encryption, eg. by a button offering a QR scan
  * - DC_INFO_WEBXDC_INFO_MESSAGE (32) - Info-message created by webxdc app sending `update.info`
+ * - DC_INFO_CHAT_E2EE (50) - Info-message for "Chat is end-to-end-encrypted"
  *
  * For the messages that refer to a CONTACT,
  * dc_msg_get_info_contact_id() returns the contact ID.
@@ -4588,9 +4593,10 @@ uint32_t        dc_msg_get_info_contact_id    (const dc_msg_t* msg);
 #define         DC_INFO_LOCATION_ONLY              9
 #define         DC_INFO_EPHEMERAL_TIMER_CHANGED   10
 #define         DC_INFO_PROTECTION_ENABLED        11
-#define         DC_INFO_PROTECTION_DISABLED       12
+#define         DC_INFO_PROTECTION_DISABLED       12 // deprecated 2025-07
 #define         DC_INFO_INVALID_UNENCRYPTED_MAIL  13
 #define         DC_INFO_WEBXDC_INFO_MESSAGE       32
+#define         DC_INFO_CHAT_E2EE                 50
 
 
 /**
@@ -6896,9 +6902,7 @@ void dc_event_unref(dc_event_t* event);
 /// Used in summaries.
 #define DC_STR_GIF                        23
 
-/// "Encrypted message"
-///
-/// Used in subjects of outgoing messages.
+/// @deprecated 2025-07, this string is no longer needed.
 #define DC_STR_ENCRYPTEDMSG               24
 
 /// "End-to-end encryption available."
@@ -7422,7 +7426,7 @@ void dc_event_unref(dc_event_t* event);
 /// Used in status messages.
 #define DC_STR_REMOVE_MEMBER_BY_OTHER 131
 
-/// "You left the group."
+/// "You left."
 ///
 /// Used in status messages.
 #define DC_STR_GROUP_LEFT_BY_YOU 132
@@ -7603,7 +7607,7 @@ void dc_event_unref(dc_event_t* event);
 /// Used as a device message after a successful backup transfer.
 #define DC_STR_BACKUP_TRANSFER_MSG_BODY 163
 
-/// "Messages are guaranteed to be end-to-end encrypted from now on."
+/// "Messages are end-to-end encrypted."
 ///
 /// Used in info messages.
 #define DC_STR_CHAT_PROTECTION_ENABLED 170
@@ -7611,6 +7615,7 @@ void dc_event_unref(dc_event_t* event);
 /// "%1$s sent a message from another device."
 ///
 /// Used in info messages.
+/// @deprecated 2025-07
 #define DC_STR_CHAT_PROTECTION_DISABLED 171
 
 /// "Others will only see this group after you sent a first message."
@@ -7664,6 +7669,9 @@ void dc_event_unref(dc_event_t* event);
 /// Used as info message.
 /// @deprecated 2025-06-05
 #define DC_STR_SECUREJOIN_TAKES_LONGER 192
+
+/// "❤️ Seems you're enjoying Delta Chat!"… (donation request device message)
+#define DC_STR_DONATION_REQUEST 193
 
 /// "Contact". Deprecated, currently unused.
 #define DC_STR_CONTACT 200

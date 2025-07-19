@@ -1,6 +1,6 @@
 //! # Account manager module.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 
@@ -51,6 +51,14 @@ impl Accounts {
         }
 
         Accounts::open(dir, writable).await
+    }
+
+    /// Get the ID used to log events.
+    ///
+    /// Account manager logs events with ID 0
+    /// which is not used by any accounts.
+    fn get_id(&self) -> u32 {
+        0
     }
 
     /// Creates a new default structure.
@@ -262,9 +270,51 @@ impl Accounts {
         }
     }
 
-    /// Get a list of all account ids.
+    /// Gets a list of all account ids in the user-configured order.
     pub fn get_all(&self) -> Vec<u32> {
-        self.accounts.keys().copied().collect()
+        let mut ordered_ids = Vec::new();
+        let mut all_ids: BTreeSet<u32> = self.accounts.keys().copied().collect();
+
+        // First, add accounts in the configured order
+        for &id in &self.config.inner.accounts_order {
+            if all_ids.remove(&id) {
+                ordered_ids.push(id);
+            }
+        }
+
+        // Then add any accounts not in the order list (newly added accounts)
+        for id in all_ids {
+            ordered_ids.push(id);
+        }
+
+        ordered_ids
+    }
+
+    /// Sets the order of accounts.
+    ///
+    /// The provided list should contain all account IDs in the desired order.
+    /// If an account ID is missing from the list, it will be appended at the end.
+    /// If the list contains non-existent account IDs, they will be ignored.
+    pub async fn set_accounts_order(&mut self, order: Vec<u32>) -> Result<()> {
+        let existing_ids: BTreeSet<u32> = self.accounts.keys().copied().collect();
+
+        // Filter out non-existent account IDs
+        let mut filtered_order: Vec<u32> = order
+            .into_iter()
+            .filter(|id| existing_ids.contains(id))
+            .collect();
+
+        // Add any missing account IDs at the end
+        for &id in &existing_ids {
+            if !filtered_order.contains(&id) {
+                filtered_order.push(id);
+            }
+        }
+
+        self.config.inner.accounts_order = filtered_order;
+        self.config.sync().await?;
+        self.emit_event(EventType::AccountsChanged);
+        Ok(())
     }
 
     /// Starts background tasks such as IMAP and SMTP loops for all accounts.
@@ -303,11 +353,11 @@ impl Accounts {
     /// This is an auxiliary function and not part of public API.
     /// Use [Accounts::background_fetch] instead.
     async fn background_fetch_no_timeout(accounts: Vec<Context>, events: Events) {
+        let n_accounts = accounts.len();
         events.emit(Event {
             id: 0,
             typ: EventType::Info(format!(
-                "Starting background fetch for {} accounts.",
-                accounts.len()
+                "Starting background fetch for {n_accounts} accounts."
             )),
         });
         let mut set = JoinSet::new();
@@ -319,6 +369,12 @@ impl Accounts {
             });
         }
         set.join_all().await;
+        events.emit(Event {
+            id: 0,
+            typ: EventType::Info(format!(
+                "Finished background fetch for {n_accounts} accounts."
+            )),
+        });
     }
 
     /// Auxiliary function for [Accounts::background_fetch].
@@ -407,6 +463,10 @@ struct InnerConfig {
     pub selected_account: u32,
     pub next_id: u32,
     pub accounts: Vec<AccountConfig>,
+    /// Ordered list of account IDs, representing the user's preferred order.
+    /// If an account ID is not in this list, it will be appended at the end.
+    #[serde(default)]
+    pub accounts_order: Vec<u32>,
 }
 
 impl Drop for Config {
@@ -473,6 +533,7 @@ impl Config {
             accounts: Vec::new(),
             selected_account: 0,
             next_id: 1,
+            accounts_order: Vec::new(),
         };
         if !lock {
             let cfg = Self {
@@ -605,6 +666,10 @@ impl Config {
                 uuid,
             });
             self.inner.next_id += 1;
+
+            // Add new account to the end of the order list
+            self.inner.accounts_order.push(id);
+
             id
         };
 
@@ -626,6 +691,10 @@ impl Config {
                 // remove account from the configs
                 self.inner.accounts.remove(idx);
             }
+
+            // Remove from order list as well
+            self.inner.accounts_order.retain(|&x| x != id);
+
             if self.inner.selected_account == id {
                 // reset selected account
                 self.inner.selected_account = self

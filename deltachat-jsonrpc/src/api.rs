@@ -224,6 +224,14 @@ impl CommandApi {
         self.accounts.read().await.get_selected_account_id()
     }
 
+    /// Set the order of accounts.
+    /// The provided list should contain all account IDs in the desired order.
+    /// If an account ID is missing from the list, it will be appended at the end.
+    /// If the list contains non-existent account IDs, they will be ignored.
+    async fn set_accounts_order(&self, order: Vec<u32>) -> Result<()> {
+        self.accounts.write().await.set_accounts_order(order).await
+    }
+
     /// Get a list of all configured accounts.
     async fn get_all_accounts(&self) -> Result<Vec<Account>> {
         let mut accounts = Vec::new();
@@ -945,7 +953,7 @@ impl CommandApi {
         Ok(contacts.iter().map(|id| id.to_u32()).collect::<Vec<u32>>())
     }
 
-    /// Create a new group chat.
+    /// Create a new encrypted group chat (with key-contacts).
     ///
     /// After creation,
     /// the group has one member with the ID DC_CONTACT_ID_SELF
@@ -963,14 +971,24 @@ impl CommandApi {
     ///
     /// @param protect If set to 1 the function creates group with protection initially enabled.
     ///     Only verified members are allowed in these groups
-    ///     and end-to-end-encryption is always enabled.
     async fn create_group_chat(&self, account_id: u32, name: String, protect: bool) -> Result<u32> {
         let ctx = self.get_context(account_id).await?;
         let protect = match protect {
             true => ProtectionStatus::Protected,
             false => ProtectionStatus::Unprotected,
         };
-        chat::create_group_chat(&ctx, protect, &name)
+        chat::create_group_ex(&ctx, Some(protect), &name)
+            .await
+            .map(|id| id.to_u32())
+    }
+
+    /// Create a new unencrypted group chat.
+    ///
+    /// Same as [`Self::create_group_chat`], but the chat is unencrypted and can only have
+    /// address-contacts.
+    async fn create_group_chat_unencrypted(&self, account_id: u32, name: String) -> Result<u32> {
+        let ctx = self.get_context(account_id).await?;
+        chat::create_group_ex(&ctx, None, &name)
             .await
             .map(|id| id.to_u32())
     }

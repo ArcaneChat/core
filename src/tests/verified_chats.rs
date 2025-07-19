@@ -15,7 +15,9 @@ use crate::mimeparser::SystemMessage;
 use crate::receive_imf::receive_imf;
 use crate::securejoin::{get_securejoin_qr, join_securejoin};
 use crate::stock_str;
-use crate::test_utils::{TestContext, TestContextManager, get_chat_msg, mark_as_verified};
+use crate::test_utils::{
+    E2EE_INFO_MSGS, TestContext, TestContextManager, get_chat_msg, mark_as_verified,
+};
 use crate::tools::SystemTime;
 use crate::{e2ee, message};
 
@@ -132,7 +134,7 @@ async fn test_create_verified_oneonone_chat() -> Result<()> {
         assert!(chat.is_protected());
 
         let msg = get_chat_msg(&alice, chat.id, 0, 1).await;
-        let expected_text = stock_str::chat_protection_enabled(&alice).await;
+        let expected_text = stock_str::messages_e2e_encrypted(&alice).await;
         assert_eq!(msg.text, expected_text);
     }
 
@@ -142,7 +144,7 @@ async fn test_create_verified_oneonone_chat() -> Result<()> {
         assert!(chat.is_protected());
 
         let msg0 = get_chat_msg(&fiona, chat.id, 0, 1).await;
-        let expected_text = stock_str::chat_protection_enabled(&fiona).await;
+        let expected_text = stock_str::messages_e2e_encrypted(&fiona).await;
         assert_eq!(msg0.text, expected_text);
     }
 
@@ -162,7 +164,7 @@ async fn test_create_verified_oneonone_chat() -> Result<()> {
         let chat = alice.get_chat(&fiona_new).await;
         assert!(!chat.is_protected());
 
-        let msg = get_chat_msg(&alice, chat.id, 0, 1).await;
+        let msg = get_chat_msg(&alice, chat.id, 1, E2EE_INFO_MSGS + 1).await;
         assert_eq!(msg.text, "I have a new device");
 
         // After recreating the chat, it should still be unprotected
@@ -268,7 +270,7 @@ async fn test_degrade_verified_oneonone_chat() -> Result<()> {
     .await?;
 
     let msg0 = get_chat_msg(&alice, alice_chat.id, 0, 1).await;
-    let enabled = stock_str::chat_protection_enabled(&alice).await;
+    let enabled = stock_str::messages_e2e_encrypted(&alice).await;
     assert_eq!(msg0.text, enabled);
     assert_eq!(msg0.param.get_cmd(), SystemMessage::ChatProtectionEnabled);
 

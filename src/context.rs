@@ -27,6 +27,7 @@ use crate::events::{Event, EventEmitter, EventType, Events};
 use crate::imap::{FolderMeaning, Imap, ServerMetadata};
 use crate::key::{load_self_secret_key, self_fingerprint};
 use crate::log::{info, warn};
+use crate::logged_debug_assert;
 use crate::login_param::{ConfiguredLoginParam, EnteredLoginParam};
 use crate::message::{self, Message, MessageState, MsgId};
 use crate::param::{Param, Params};
@@ -665,8 +666,16 @@ impl Context {
     /// or [`Self::emit_msgs_changed_without_msg_id`] should be used
     /// instead of this function.
     pub fn emit_msgs_changed(&self, chat_id: ChatId, msg_id: MsgId) {
-        debug_assert!(!chat_id.is_unset());
-        debug_assert!(!msg_id.is_unset());
+        logged_debug_assert!(
+            self,
+            !chat_id.is_unset(),
+            "emit_msgs_changed: chat_id is unset."
+        );
+        logged_debug_assert!(
+            self,
+            !msg_id.is_unset(),
+            "emit_msgs_changed: msg_id is unset."
+        );
 
         self.emit_event(EventType::MsgsChanged { chat_id, msg_id });
         chatlist_events::emit_chatlist_changed(self);
@@ -675,7 +684,11 @@ impl Context {
 
     /// Emits a MsgsChanged event with specified chat and without message id.
     pub fn emit_msgs_changed_without_msg_id(&self, chat_id: ChatId) {
-        debug_assert!(!chat_id.is_unset());
+        logged_debug_assert!(
+            self,
+            !chat_id.is_unset(),
+            "emit_msgs_changed_without_msg_id: chat_id is unset."
+        );
 
         self.emit_event(EventType::MsgsChanged {
             chat_id,
@@ -1043,6 +1056,12 @@ impl Context {
         res.insert(
             "webxdc_realtime_enabled",
             self.get_config_bool(Config::WebxdcRealtimeEnabled)
+                .await?
+                .to_string(),
+        );
+        res.insert(
+            "donation_request_next_check",
+            self.get_config_i64(Config::DonationRequestNextCheck)
                 .await?
                 .to_string(),
         );

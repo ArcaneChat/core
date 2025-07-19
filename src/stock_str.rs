@@ -65,9 +65,6 @@ pub enum StockMessage {
     #[strum(props(fallback = "GIF"))]
     Gif = 23,
 
-    #[strum(props(fallback = "Encrypted message"))]
-    EncryptedMsg = 24,
-
     #[strum(props(fallback = "End-to-end encryption available"))]
     E2eAvailable = 25,
 
@@ -285,7 +282,7 @@ pub enum StockMessage {
     #[strum(props(fallback = "Member %1$s removed by %2$s."))]
     MsgDelMemberBy = 131,
 
-    #[strum(props(fallback = "You left the group."))]
+    #[strum(props(fallback = "You left."))]
     MsgYouLeftGroup = 132,
 
     #[strum(props(fallback = "Group left by %1$s."))]
@@ -380,9 +377,10 @@ pub enum StockMessage {
     #[strum(props(fallback = "I left the group."))]
     MsgILeftGroup = 166,
 
-    #[strum(props(fallback = "Messages are guaranteed to be end-to-end encrypted from now on."))]
+    #[strum(props(fallback = "Messages are end-to-end encrypted."))]
     ChatProtectionEnabled = 170,
 
+    // deprecated 2025-07
     #[strum(props(fallback = "%1$s sent a message from another device."))]
     ChatProtectionDisabled = 171,
 
@@ -413,6 +411,16 @@ pub enum StockMessage {
 
     #[strum(props(fallback = "Establishing guaranteed end-to-end encryption, please wait…"))]
     SecurejoinWait = 190,
+
+    #[strum(props(fallback = "❤️ Seems you're enjoying Delta Chat!
+
+Please consider donating to help that Delta Chat stays free for everyone.
+
+While Delta Chat is free to use and open source, development costs money.
+Help keeping us to keep Delta Chat independent and make it more awesome in the future.
+
+https://delta.chat/donate"))]
+    DonationRequest = 193,
 }
 
 impl StockMessage {
@@ -685,7 +693,7 @@ pub(crate) async fn msg_group_left_remote(context: &Context) -> String {
     translated(context, StockMessage::MsgILeftGroup).await
 }
 
-/// Stock string: `You left the group.` or `Group left by %1$s.`.
+/// Stock string: `You left.` or `Group left by %1$s.`.
 pub(crate) async fn msg_group_left_local(context: &Context, by_contact: ContactId) -> String {
     if by_contact == ContactId::SELF {
         translated(context, StockMessage::MsgYouLeftGroup).await
@@ -783,6 +791,11 @@ pub(crate) async fn secure_join_replies(context: &Context, contact_id: ContactId
 /// Stock string: `Establishing guaranteed end-to-end encryption, please wait…`.
 pub(crate) async fn securejoin_wait(context: &Context) -> String {
     translated(context, StockMessage::SecurejoinWait).await
+}
+
+/// Stock string: `❤️ Seems you're enjoying Delta Chat!`…
+pub(crate) async fn donation_request(context: &Context) -> String {
+    translated(context, StockMessage::DonationRequest).await
 }
 
 /// Stock string: `Scan to chat with %1$s`.
@@ -1016,8 +1029,8 @@ pub(crate) async fn error_no_network(context: &Context) -> String {
     translated(context, StockMessage::ErrorNoNetwork).await
 }
 
-/// Stock string: `Messages are guaranteed to be end-to-end encrypted from now on.`
-pub(crate) async fn chat_protection_enabled(context: &Context) -> String {
+/// Stock string: `Messages are end-to-end encrypted.`
+pub(crate) async fn messages_e2e_encrypted(context: &Context) -> String {
     translated(context, StockMessage::ChatProtectionEnabled).await
 }
 
@@ -1288,7 +1301,7 @@ impl Context {
                     "[Error] No contact_id given".to_string()
                 }
             }
-            ProtectionStatus::Protected => chat_protection_enabled(self).await,
+            ProtectionStatus::Protected => messages_e2e_encrypted(self).await,
         }
     }
 
