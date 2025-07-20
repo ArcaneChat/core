@@ -3047,14 +3047,7 @@ pub(crate) async fn create_send_msg_jobs(context: &Context, msg: &mut Message) -
             .await?;
     }
 
-    let force_encryption = (context.get_ui_config("ui.force_encryption")
-        .await
-        .context("Can't get ui-config")
-        .unwrap_or_default()
-        .unwrap_or("1".to_string()) == "1"
-        && msg.param.get_cmd() != SystemMessage::SecurejoinMessage);
-    let guarantee_e2ee = msg.param.get_bool(Param::GuaranteeE2ee).unwrap_or_default();
-    let needs_encryption = force_encryption || guarantee_e2ee;
+    let needs_encryption = msg.param.get_bool(Param::GuaranteeE2ee).unwrap_or_default();
     let mimefactory = MimeFactory::from_msg(context, msg.clone()).await?;
     let attach_selfavatar = mimefactory.attach_selfavatar;
     let mut recipients = mimefactory.recipients();
@@ -3113,7 +3106,7 @@ pub(crate) async fn create_send_msg_jobs(context: &Context, msg: &mut Message) -
         message::set_msg_failed(
             context,
             msg,
-            "End-to-end-encryption unavailable.",
+            "End-to-end-encryption unavailable unexpectedly.",
         )
         .await?;
         bail!(
@@ -3137,7 +3130,7 @@ pub(crate) async fn create_send_msg_jobs(context: &Context, msg: &mut Message) -
         }
     }
 
-    if rendered_msg.is_encrypted && !guarantee_e2ee {
+    if rendered_msg.is_encrypted && !needs_encryption {
         msg.param.set_int(Param::GuaranteeE2ee, 1);
         msg.update_param(context).await?;
     }
