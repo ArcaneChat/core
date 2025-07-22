@@ -1,5 +1,20 @@
 # Changelog
 
+## [2.4.0] - 2025-07-21
+
+### Fixes
+
+- Do not ignore errors when draining FETCH responses. This avoids IMAP loop getting stuck in an infinite loop retrying reading from the connection.
+- Update `tokio-io-timeout` to 1.2.1. This release includes a fix to reset timeout after every error, so timeout error is returned at most once a minute if read is attempted after a timeout.
+
+### Miscellaneous Tasks
+
+- Update async-imap to 0.11.0.
+
+### Refactor
+
+- Use `try_next()` when processing FETCH responses.
+
 ## [2.3.0] - 2025-07-19
 
 ### Features / Changes
@@ -6495,3 +6510,4 @@ https://github.com/chatmail/core/pulls?q=is%3Apr+is%3Aclosed
 [2.1.0]: https://github.com/chatmail/core/compare/v2.0.0..v2.1.0
 [2.2.0]: https://github.com/chatmail/core/compare/v2.1.0..v2.2.0
 [2.3.0]: https://github.com/chatmail/core/compare/v2.2.0..v2.3.0
+[2.4.0]: https://github.com/chatmail/core/compare/v2.3.0..v2.4.0

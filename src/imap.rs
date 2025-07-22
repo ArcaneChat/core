@@ -1384,13 +1384,14 @@ impl Session {
 
                 // Try to find a requested UID in returned FETCH responses.
                 while fetch_response.is_none() {
-                    let Some(next_fetch_response) = fetch_responses.next().await else {
+                    let Some(next_fetch_response) = fetch_responses
+                        .try_next()
+                        .await
+                        .context("Failed to process IMAP FETCH result")?
+                    else {
                         // No more FETCH responses received from the server.
                         break;
                     };
-
-                    let next_fetch_response =
-                        next_fetch_response.context("Failed to process IMAP FETCH result")?;
 
                     if let Some(next_uid) = next_fetch_response.uid {
                         if next_uid == request_uid {
@@ -1491,7 +1492,16 @@ impl Session {
 
             // If we don't process the whole response, IMAP client is left in a broken state where
             // it will try to process the rest of response as the next response.
-            while fetch_responses.next().await.is_some() {}
+            //
+            // Make sure to not ignore the errors, because
+            // if connection times out, it will return
+            // infinite stream of `Some(Err(_))` results.
+            while fetch_responses
+                .try_next()
+                .await
+                .context("Failed to drain FETCH responses")?
+                .is_some()
+            {}
 
             if count != request_uids.len() {
                 warn!(
