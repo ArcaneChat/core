@@ -1505,19 +1505,28 @@ fn migrate_key_contacts(
             };
             let new_id = insert_contact(verified_key).context("Step 13")?;
             verified_key_contacts.insert(original_id.try_into().context("Step 14")?, new_id);
-            // If the original verifier is unknown, we represent this in the database
-            // by putting `new_id` into the place of the verifier,
-            // i.e. we say that this contact verified itself.
-            let verifier_id =
-                original_contact_id_from_addr(&verifier, new_id).context("Step 15")?;
+
+            let verifier_id = if addr_cmp(&verifier, &addr) {
+                // Earlier versions of Delta Chat signalled a direct verification
+                // by putting the contact's own address into the verifier column
+                1 // 1=ContactId::SELF
+            } else {
+                // If the original verifier is unknown, we represent this in the database
+                // by putting `new_id` into the place of the verifier,
+                // i.e. we say that this contact verified itself.
+                original_contact_id_from_addr(&verifier, new_id).context("Step 15")?
+            };
             verifications.insert(new_id, verifier_id);
 
             let Some(secondary_verified_key) = secondary_verified_key else {
                 continue;
             };
             let new_id = insert_contact(secondary_verified_key).context("Step 16")?;
-            let verifier_id: u32 =
-                original_contact_id_from_addr(&secondary_verifier, new_id).context("Step 17")?;
+            let verifier_id: u32 = if addr_cmp(&secondary_verifier, &addr) {
+                1 // 1=ContactId::SELF
+            } else {
+                original_contact_id_from_addr(&secondary_verifier, new_id).context("Step 17")?
+            };
             // Only use secondary verification if there is no primary verification:
             verifications.entry(new_id).or_insert(verifier_id);
         }
@@ -1642,7 +1651,7 @@ fn migrate_key_contacts(
                 .collect::<Result<Vec<_>, _>>()
                 .context("Step 26")?;
 
-            let mut keep_address_contacts = |reason: &str| {
+            let mut keep_address_contacts = |reason: &str| -> Result<()> {
                 info!(
                     context,
                     "Chat {chat_id} will be an unencrypted chat with contacts identified by email address: {reason}."
@@ -1650,6 +1659,15 @@ fn migrate_key_contacts(
                 for (m, _) in &old_members {
                     orphaned_contacts.remove(m);
                 }
+
+                // Unprotect this chat if it was protected.
+                //
+                // Otherwise we get protected chat with address-contact(s).
+                transaction
+                    .execute("UPDATE chats SET protected=0 WHERE id=?", (chat_id,))
+                    .context("Step 26.0")?;
+
+                Ok(())
             };
             let old_and_new_members: Vec<(u32, bool, Option<u32>)> = match typ {
                 // 1:1 chats retain:
@@ -1669,19 +1687,13 @@ fn migrate_key_contacts(
                     };
 
                     let Some(new_contact) = map_to_key_contact(old_member) else {
-                        keep_address_contacts("No peerstate, or peerstate in 'reset' state");
+                        keep_address_contacts("No peerstate, or peerstate in 'reset' state")?;
                         continue;
                     };
                     if !addr_cmp_stmt
                         .query_row((old_member, new_contact), |row| row.get::<_, bool>(0))?
                     {
-                        // Unprotect this 1:1 chat if it was protected.
-                        //
-                        // Otherwise we get protected chat with address-contact.
-                        transaction
-                            .execute("UPDATE chats SET protected=0 WHERE id=?", (chat_id,))?;
-
-                        keep_address_contacts("key contact has different email");
+                        keep_address_contacts("key contact has different email")?;
                         continue;
                     }
                     vec![(*old_member, true, Some(new_contact))]
@@ -1692,7 +1704,7 @@ fn migrate_key_contacts(
                     if grpid.is_empty() {
                         // Ad-hoc group that has empty Chat-Group-ID
                         // because it was created in response to receiving a non-chat email.
-                        keep_address_contacts("Empty chat-Group-ID");
+                        keep_address_contacts("Empty chat-Group-ID")?;
                         continue;
                     } else if protected == 1 {
                         old_members
@@ -1711,7 +1723,7 @@ fn migrate_key_contacts(
 
                 // Mailinglist
                 140 => {
-                    keep_address_contacts("Mailinglist");
+                    keep_address_contacts("Mailinglist")?;
                     continue;
                 }
 
@@ -1750,7 +1762,7 @@ fn migrate_key_contacts(
                 transaction
                     .execute("UPDATE chats SET grpid='' WHERE id=?", (chat_id,))
                     .context("Step 26.1")?;
-                keep_address_contacts("Group contains contact without peerstate");
+                keep_address_contacts("Group contains contact without peerstate")?;
                 continue;
             }
 

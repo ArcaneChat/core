@@ -1,5 +1,19 @@
 # Changelog
 
+## [2.5.0] - 2025-07-22
+
+### Fixes
+
+- Correctly migrate "verified by me".
+- Mark all email chats as unprotected in the migration ([#7026](https://github.com/chatmail/core/pull/7026)).
+- Do not ignore errors in add_flag_finalized_with_set.
+
+### Documentation
+
+- Deprecate protection-broken and related stuff ([#7018](https://github.com/chatmail/core/pull/7018)).
+- Clarify the meaning of is_verified() vs verifier_id() ([#7027](https://github.com/chatmail/core/pull/7027)).
+- STYLE.md: Prefer `try_next()` over `next()`.
+
 ## [2.4.0] - 2025-07-21
 
 ### Fixes
@@ -6511,3 +6525,4 @@ https://github.com/chatmail/core/pulls?q=is%3Apr+is%3Aclosed
 [2.2.0]: https://github.com/chatmail/core/compare/v2.1.0..v2.2.0
 [2.3.0]: https://github.com/chatmail/core/compare/v2.2.0..v2.3.0
 [2.4.0]: https://github.com/chatmail/core/compare/v2.3.0..v2.4.0
+[2.5.0]: https://github.com/chatmail/core/compare/v2.4.0..v2.5.0
