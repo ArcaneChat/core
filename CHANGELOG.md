@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.6.0] - 2025-07-23
+
+### Fixes
+
+- Fix crash when receiving a verification-gossiping message which a contact also sends to itself ([#7032](https://github.com/chatmail/core/pull/7032)).
+
 ## [2.5.0] - 2025-07-22
 
 ### Fixes
@@ -6526,3 +6532,4 @@ https://github.com/chatmail/core/pulls?q=is%3Apr+is%3Aclosed
 [2.3.0]: https://github.com/chatmail/core/compare/v2.2.0..v2.3.0
 [2.4.0]: https://github.com/chatmail/core/compare/v2.3.0..v2.4.0
 [2.5.0]: https://github.com/chatmail/core/compare/v2.4.0..v2.5.0
+[2.6.0]: https://github.com/chatmail/core/compare/v2.5.0..v2.6.0
