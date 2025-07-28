@@ -1461,19 +1461,16 @@ async fn do_chat_assignment(
                         chat.typ == Chattype::Single,
                         "Chat {chat_id} is not Single",
                     );
-                    let mut new_protection = match verified_encryption {
+                    let new_protection = match verified_encryption {
                         VerifiedEncryption::Verified => ProtectionStatus::Protected,
                         VerifiedEncryption::NotVerified(_) => ProtectionStatus::Unprotected,
                     };
 
-                    if chat.protected != ProtectionStatus::Unprotected
-                        && new_protection == ProtectionStatus::Unprotected
-                        // `chat.protected` must be maintained regardless of the `Config::VerifiedOneOnOneChats`.
-                        // That's why the config is checked here, and not above.
-                        && context.get_config_bool(Config::VerifiedOneOnOneChats).await?
-                    {
-                        new_protection = ProtectionStatus::ProtectionBroken;
-                    }
+                    ensure_and_debug_assert!(
+                        chat.protected == ProtectionStatus::Unprotected
+                            || new_protection == ProtectionStatus::Protected,
+                        "Chat {chat_id} can't downgrade to Unprotected",
+                    );
                     if chat.protected != new_protection {
                         // The message itself will be sorted under the device message since the device
                         // message is `MessageState::InNoticed`, which means that all following
@@ -2149,7 +2146,7 @@ RETURNING id
         created_db_entries.push(row_id);
     }
 
-    // check all parts whether they contain a new logging webxdc
+    // Maybe set logging xdc and add gossip topics for webxdcs.
     for (part, msg_id) in mime_parser.parts.iter().zip(&created_db_entries) {
         // check if any part contains a webxdc topic id
         if part.typ == Viewtype::Webxdc {
@@ -3750,6 +3747,9 @@ async fn add_or_lookup_key_contacts_by_address_list(
             fp.hex()
         } else if let Some(key) = gossiped_keys.get(addr) {
             key.dc_fingerprint().hex()
+        } else if context.is_self_addr(addr).await? {
+            contact_ids.push(Some(ContactId::SELF));
+            continue;
         } else {
             contact_ids.push(None);
             continue;

@@ -1251,6 +1251,16 @@ CREATE INDEX gossip_timestamp_index ON gossip_timestamp (chat_id, fingerprint);
             .await?;
     }
 
+    inc_and_check(&mut migration_version, 133)?;
+    if dbversion < migration_version {
+        // Make `ProtectionBroken` chats `Unprotected`. Chats can't break anymore.
+        sql.execute_migration(
+            "UPDATE chats SET protected=0 WHERE protected!=1",
+            migration_version,
+        )
+        .await?;
+    }
+
     let new_version = sql
         .get_raw_config_int(VERSION_CFG)
         .await?
@@ -1480,9 +1490,11 @@ fn migrate_key_contacts(
                 } else if addr.is_empty() {
                     Ok(default)
                 } else {
-                    original_contact_id_from_addr_stmt
+                    Ok(original_contact_id_from_addr_stmt
                         .query_row((addr,), |row| row.get(0))
-                        .with_context(|| format!("Original contact '{addr}' not found"))
+                        .optional()
+                        .with_context(|| format!("Original contact '{addr}' not found"))?
+                        .unwrap_or(default))
                 }
             };
 
