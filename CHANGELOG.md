@@ -1,5 +1,21 @@
 # Changelog
 
+## [2.9.0] - 2025-07-31
+
+### Features / Changes
+
+- repl: Add import-vcard and make-vcard commands ([#7048](https://github.com/chatmail/core/pull/7048)).
+
+### Fixes
+
+- Display correct timer value for ephemeral timer changes.
+- Get_chat_msgs_ex(): Report local midnight in ChatItem::DayMarker.
+
+### Refactor
+
+- Rename add_or_lookup_key_contacts_by_address_list() to add_or_lookup_key_contacts().
+- Don't call add_or_lookup_key_contacts() in advance.
+
 ## [2.8.0] - 2025-07-28
 
 ### Features / Changes
@@ -6561,3 +6577,4 @@ https://github.com/chatmail/core/pulls?q=is%3Apr+is%3Aclosed
 [2.6.0]: https://github.com/chatmail/core/compare/v2.5.0..v2.6.0
 [2.7.0]: https://github.com/chatmail/core/compare/v2.6.0..v2.7.0
 [2.8.0]: https://github.com/chatmail/core/compare/v2.7.0..v2.8.0
+[2.9.0]: https://github.com/chatmail/core/compare/v2.8.0..v2.9.0
