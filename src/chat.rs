@@ -1791,6 +1791,12 @@ impl Chat {
             return Ok(Some(get_device_icon(context).await?));
         } else if self.is_self_talk() {
             return Ok(Some(get_saved_messages_icon(context).await?));
+        } else if !self.is_encrypted(context).await? {
+            // This is an unencrypted chat, show a special avatar that marks it as such.
+            return Ok(Some(get_abs_path(
+                context,
+                Path::new(&get_unencrypted_icon(context).await?),
+            )));
         } else if self.typ == Chattype::Single {
             // For 1:1 chats, we always use the same avatar as for the contact
             // This is before the `self.is_encrypted()` check, because that function
@@ -1800,12 +1806,6 @@ impl Chat {
                 let contact = Contact::get_by_id(context, *contact_id).await?;
                 return contact.get_profile_image(context).await;
             }
-        } else if !self.is_encrypted(context).await? {
-            // This is an address-contact chat, show a special avatar that marks it as such
-            return Ok(Some(get_abs_path(
-                context,
-                Path::new(&get_address_contact_icon(context).await?),
-            )));
         } else if let Some(image_rel) = self.param.get(Param::ProfileImage) {
             // Load the group avatar, or the device-chat / saved-messages icon
             if !image_rel.is_empty() {
@@ -1906,16 +1906,25 @@ impl Chat {
         let is_encrypted = self.is_protected()
             || match self.typ {
                 Chattype::Single => {
-                    let chat_contact_ids = get_chat_contacts(context, self.id).await?;
-                    if let Some(contact_id) = chat_contact_ids.first() {
-                        if *contact_id == ContactId::DEVICE {
-                            true
-                        } else {
-                            let contact = Contact::get_by_id(context, *contact_id).await?;
-                            contact.is_key_contact()
-                        }
-                    } else {
-                        true
+                    match context
+                        .sql
+                        .query_row_optional(
+                            "SELECT cc.contact_id, c.fingerprint<>''
+                             FROM chats_contacts cc LEFT JOIN contacts c
+                                 ON c.id=cc.contact_id
+                             WHERE cc.chat_id=?
+                            ",
+                            (self.id,),
+                            |row| {
+                                let id: ContactId = row.get(0)?;
+                                let is_key: bool = row.get(1)?;
+                                Ok((id, is_key))
+                            },
+                        )
+                        .await?
+                    {
+                        Some((id, is_key)) => is_key || id == ContactId::DEVICE,
+                        None => true,
                     }
                 }
                 Chattype::Group => {
@@ -2510,11 +2519,13 @@ pub(crate) async fn get_archive_icon(context: &Context) -> Result<PathBuf> {
     .await
 }
 
-pub(crate) async fn get_address_contact_icon(context: &Context) -> Result<PathBuf> {
+/// Returns path to the icon
+/// indicating unencrypted chats and address-contacts.
+pub(crate) async fn get_unencrypted_icon(context: &Context) -> Result<PathBuf> {
     get_asset_icon(
         context,
-        "icon-address-contact",
-        include_bytes!("../assets/icon-address-contact.png"),
+        "icon-unencrypted",
+        include_bytes!("../assets/icon-unencrypted.png"),
     )
     .await
 }
@@ -2994,6 +3005,10 @@ async fn prepare_send_msg(
 
 /// Constructs jobs for sending a message and inserts them into the appropriate table.
 ///
+/// Updates the message `GuaranteeE2ee` parameter and persists it
+/// in the database depending on whether the message
+/// is added to the outgoing queue as encrypted or not.
+///
 /// Returns row ids if `smtp` table jobs were created or an empty `Vec` otherwise.
 ///
 /// The caller has to interrupt SMTP loop or otherwise process new rows.
@@ -3087,13 +3102,20 @@ pub(crate) async fn create_send_msg_jobs(context: &Context, msg: &mut Message) -
         }
     }
 
-    if rendered_msg.is_encrypted && !needs_encryption {
+    if rendered_msg.is_encrypted {
         msg.param.set_int(Param::GuaranteeE2ee, 1);
-        msg.update_param(context).await?;
+    } else {
+        msg.param.remove(Param::GuaranteeE2ee);
     }
-
     msg.subject.clone_from(&rendered_msg.subject);
-    msg.update_subject(context).await?;
+    context
+        .sql
+        .execute(
+            "UPDATE msgs SET subject=?, param=? WHERE id=?",
+            (&msg.subject, msg.param.to_string(), msg.id),
+        )
+        .await?;
+
     let chunk_size = context.get_max_smtp_rcpt_to().await?;
     let trans_fn = |t: &mut rusqlite::Transaction| {
         let mut row_ids = Vec::<i64>::new();
@@ -4533,15 +4555,24 @@ pub(crate) async fn save_copy_in_self_talk(
         bail!("message already saved.");
     }
 
-    let copy_fields = "from_id, to_id, timestamp_sent, timestamp_rcvd, type, txt, \
-                             mime_modified, mime_headers, mime_compressed, mime_in_reply_to, subject, msgrmsg";
+    let copy_fields = "from_id, to_id, timestamp_rcvd, type, txt,
+                       mime_modified, mime_headers, mime_compressed, mime_in_reply_to, subject, msgrmsg";
     let row_id = context
         .sql
         .insert(
             &format!(
-                "INSERT INTO msgs ({copy_fields}, chat_id, rfc724_mid, state, timestamp, param, starred) \
-                            SELECT {copy_fields}, ?, ?, ?, ?, ?, ? \
-                            FROM msgs WHERE id=?;"
+                "INSERT INTO msgs ({copy_fields},
+                                   timestamp_sent,
+                                   chat_id, rfc724_mid, state, timestamp, param, starred)
+                 SELECT            {copy_fields},
+                                   -- Outgoing messages on originating device
+                                   -- have timestamp_sent == 0.
+                                   -- We copy sort timestamp instead
+                                   -- so UIs display the same timestamp
+                                   -- for saved and original message.
+                                   IIF(timestamp_sent == 0, timestamp, timestamp_sent),
+                                   ?, ?, ?, ?, ?, ?
+                 FROM msgs WHERE id=?;"
             ),
             (
                 dest_chat_id,
@@ -4572,18 +4603,9 @@ pub(crate) async fn save_copy_in_self_talk(
 ///
 /// This is primarily intended to make existing webxdcs available to new chat members.
 pub async fn resend_msgs(context: &Context, msg_ids: &[MsgId]) -> Result<()> {
-    let mut chat_id = None;
     let mut msgs: Vec<Message> = Vec::new();
     for msg_id in msg_ids {
         let msg = Message::load_from_db(context, *msg_id).await?;
-        if let Some(chat_id) = chat_id {
-            ensure!(
-                chat_id == msg.chat_id,
-                "messages to resend needs to be in the same chat"
-            );
-        } else {
-            chat_id = Some(msg.chat_id);
-        }
         ensure!(
             msg.from_id == ContactId::SELF,
             "can resend only own messages"
@@ -4592,16 +4614,7 @@ pub async fn resend_msgs(context: &Context, msg_ids: &[MsgId]) -> Result<()> {
         msgs.push(msg)
     }
 
-    let Some(chat_id) = chat_id else {
-        return Ok(());
-    };
-
-    let chat = Chat::load_from_db(context, chat_id).await?;
     for mut msg in msgs {
-        if msg.get_showpadlock() && !chat.is_protected() {
-            msg.param.remove(Param::GuaranteeE2ee);
-            msg.update_param(context).await?;
-        }
         match msg.get_state() {
             // `get_state()` may return an outdated `OutPending`, so update anyway.
             MessageState::OutPending
@@ -4612,16 +4625,21 @@ pub async fn resend_msgs(context: &Context, msg_ids: &[MsgId]) -> Result<()> {
             }
             msg_state => bail!("Unexpected message state {msg_state}"),
         }
+        msg.timestamp_sort = create_smeared_timestamp(context);
+        if create_send_msg_jobs(context, &mut msg).await?.is_empty() {
+            continue;
+        }
+
+        // Emit the event only after `create_send_msg_jobs`
+        // because `create_send_msg_jobs` may change the message
+        // encryption status and call `msg.update_param`.
         context.emit_event(EventType::MsgsChanged {
             chat_id: msg.chat_id,
             msg_id: msg.id,
         });
-        msg.timestamp_sort = create_smeared_timestamp(context);
         // note(treefit): only matters if it is the last message in chat (but probably to expensive to check, debounce also solves it)
         chatlist_events::emit_chatlist_item_changed(context, msg.chat_id);
-        if create_send_msg_jobs(context, &mut msg).await?.is_empty() {
-            continue;
-        }
+
         if msg.viewtype == Viewtype::Webxdc {
             let conn_fn = |conn: &mut rusqlite::Connection| {
                 let range = conn.query_row(

@@ -18,7 +18,7 @@ use crate::chat::{
     self, Chat, ChatId, ChatIdBlocked, ProtectionStatus, remove_from_chat_contacts_table,
 };
 use crate::config::Config;
-use crate::constants::{Blocked, Chattype, DC_CHAT_ID_TRASH, EDITED_PREFIX, ShowEmails};
+use crate::constants::{self, Blocked, Chattype, DC_CHAT_ID_TRASH, EDITED_PREFIX, ShowEmails};
 use crate::contact::{Contact, ContactId, Origin, mark_contact_id_as_verified};
 use crate::context::Context;
 use crate::debug_logging::maybe_set_logging_xdc_inner;
@@ -630,8 +630,7 @@ pub(crate) async fn receive_imf_inner(
         return Ok(None);
     };
 
-    let prevent_rename = (mime_parser.is_mailinglist_message() && !mime_parser.was_encrypted())
-        || mime_parser.get_header(HeaderDef::Sender).is_some();
+    let prevent_rename = should_prevent_rename(&mime_parser);
 
     // get From: (it can be an address list!) and check if it is known (for known From:'s we add
     // the other To:/Cc: in the 3rd pass)
@@ -1272,11 +1271,15 @@ async fn decide_chat_assignment(
                 chat_id,
                 chat_id_blocked,
             }
+        } else if mime_parser.get_header(HeaderDef::ChatGroupName).is_some() {
+            ChatAssignment::AdHocGroup
         } else if num_recipients <= 1 {
             ChatAssignment::OneOneChat
         } else {
             ChatAssignment::AdHocGroup
         }
+    } else if mime_parser.get_header(HeaderDef::ChatGroupName).is_some() {
+        ChatAssignment::AdHocGroup
     } else if num_recipients <= 1 {
         ChatAssignment::OneOneChat
     } else {
@@ -1397,7 +1400,6 @@ async fn do_chat_assignment(
                     context,
                     mime_parser,
                     to_ids,
-                    from_id,
                     allow_creation || test_normal_chat.is_some(),
                     create_blocked,
                     is_partial_download.is_some(),
@@ -1567,7 +1569,6 @@ async fn do_chat_assignment(
                     context,
                     mime_parser,
                     to_ids,
-                    from_id,
                     allow_creation,
                     Blocked::Not,
                     is_partial_download.is_some(),
@@ -1672,12 +1673,12 @@ async fn add_parts(
         }
     }
 
+    let mut chat = Chat::load_from_db(context, chat_id).await?;
+
     if mime_parser.incoming && !chat_id.is_trash() {
         // It can happen that the message is put into a chat
         // but the From-address is not a member of this chat.
         if !chat::is_contact_in_chat(context, chat_id, from_id).await? {
-            let chat = Chat::load_from_db(context, chat_id).await?;
-
             // Mark the sender as overridden.
             // The UI will prepend `~` to the sender's name,
             // indicating that the sender is not part of the group.
@@ -1698,7 +1699,6 @@ async fn add_parts(
     let is_location_kml = mime_parser.location_kml.is_some();
     let is_mdn = !mime_parser.mdn_reports.is_empty();
 
-    let mut chat = Chat::load_from_db(context, chat_id).await?;
     let mut group_changes = match chat.typ {
         _ if chat.id.is_special() => GroupChangesInfo::default(),
         Chattype::Single => GroupChangesInfo::default(),
@@ -1863,10 +1863,8 @@ async fn add_parts(
         None
     };
 
-    // if a chat is protected and the message is fully downloaded, check additional properties
+    let mut verification_failed = false;
     if !chat_id.is_special() && is_partial_download.is_none() {
-        let chat = Chat::load_from_db(context, chat_id).await?;
-
         // For outgoing emails in the 1:1 chat we have an exception that
         // they are allowed to be unencrypted:
         // 1. They can't be an attack (they are outgoing, not incoming)
@@ -1877,12 +1875,14 @@ async fn add_parts(
         //    likely reinstalled DC" or similar) would be wrong.
         if chat.is_protected() && (mime_parser.incoming || chat.typ != Chattype::Single) {
             if let VerifiedEncryption::NotVerified(err) = verified_encryption {
+                verification_failed = true;
                 warn!(context, "Verification problem: {err:#}.");
-                let s = format!("{err}. See 'Info' for more details");
+                let s = format!("{err}. Re-download the message or see 'Info' for more details");
                 mime_parser.replace_msg_by_error(&s);
             }
         }
     }
+    drop(chat); // Avoid using stale `chat` object.
 
     let sort_timestamp = tweak_sort_timestamp(
         context,
@@ -2139,6 +2139,10 @@ RETURNING id
                         DownloadState::Available
                     } else if mime_parser.decrypting_failed {
                         DownloadState::Undecipherable
+                    } else if verification_failed {
+                        // Verification can fail because of message reordering. Re-downloading the
+                        // message should help if so.
+                        DownloadState::Available
                     } else {
                         DownloadState::Done
                     },
@@ -2464,7 +2468,6 @@ async fn lookup_or_create_adhoc_group(
     context: &Context,
     mime_parser: &MimeMessage,
     to_ids: &[Option<ContactId>],
-    from_id: ContactId,
     allow_creation: bool,
     create_blocked: Blocked,
     is_partial_download: bool,
@@ -2487,10 +2490,29 @@ async fn lookup_or_create_adhoc_group(
         return Ok(None);
     }
 
+    // Lookup address-contact by the From address.
+    let fingerprint = None;
+    let find_key_contact_by_addr = false;
+    let prevent_rename = should_prevent_rename(mime_parser);
+    let (from_id, _from_id_blocked, _incoming_origin) = from_field_to_contact_id(
+        context,
+        &mime_parser.from,
+        fingerprint,
+        prevent_rename,
+        find_key_contact_by_addr,
+    )
+    .await?
+    .context("Cannot lookup address-contact by the From field")?;
+
     let grpname = mime_parser
-        .get_subject()
-        .map(|s| remove_subject_prefix(&s))
-        .unwrap_or_else(|| "👥📧".to_string());
+        .get_header(HeaderDef::ChatGroupName)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            mime_parser
+                .get_subject()
+                .map(|s| remove_subject_prefix(&s))
+                .unwrap_or_else(|| "👥📧".to_string())
+        });
     let to_ids: Vec<ContactId> = to_ids.iter().filter_map(|x| *x).collect();
     let mut contact_ids = Vec::with_capacity(to_ids.len() + 1);
     contact_ids.extend(&to_ids);
@@ -2855,20 +2877,13 @@ async fn apply_group_changes(
     let is_from_in_chat =
         !chat_contacts.contains(&ContactId::SELF) || chat_contacts.contains(&from_id);
 
-    if mime_parser.get_header(HeaderDef::ChatVerified).is_some() {
+    if mime_parser.get_header(HeaderDef::ChatVerified).is_some() && !chat.is_protected() {
         if let VerifiedEncryption::NotVerified(err) = verified_encryption {
-            if chat.is_protected() {
-                warn!(context, "Verification problem: {err:#}.");
-                let s = format!("{err}. See 'Info' for more details");
-                mime_parser.replace_msg_by_error(&s);
-            } else {
-                warn!(
-                    context,
-                    "Not marking chat {} as protected due to verification problem: {err:#}.",
-                    chat.id
-                );
-            }
-        } else if !chat.is_protected() {
+            warn!(
+                context,
+                "Not marking chat {} as protected due to verification problem: {err:#}.", chat.id,
+            );
+        } else {
             chat.id
                 .set_protection(
                     context,
@@ -3793,13 +3808,16 @@ async fn add_or_lookup_key_contacts(
 /// Looks up a key-contact by email address.
 ///
 /// If provided, `chat_id` must be an encrypted chat ID that has key-contacts inside.
-/// Otherwise the function searches in all contacts, returning the recently seen one.
+/// Otherwise the function searches in all contacts, preferring accepted and most recently seen ones.
 async fn lookup_key_contact_by_address(
     context: &Context,
     addr: &str,
     chat_id: Option<ChatId>,
 ) -> Result<Option<ContactId>> {
     if context.is_self_addr(addr).await? {
+        if chat_id.is_none() {
+            return Ok(Some(ContactId::SELF));
+        }
         let is_self_in_chat = context
             .sql
             .exists(
@@ -3836,11 +3854,26 @@ async fn lookup_key_contact_by_address(
                 .sql
                 .query_row_optional(
                     "SELECT id FROM contacts
-                     WHERE contacts.addr=?1
+                     WHERE addr=?
                      AND fingerprint<>''
-                     ORDER BY last_seen DESC, id DESC
+                     ORDER BY
+                         (
+                             SELECT COUNT(*) FROM chats c
+                             INNER JOIN chats_contacts cc
+                             ON c.id=cc.chat_id
+                             WHERE c.type=?
+                                 AND c.id>?
+                                 AND c.blocked=?
+                                 AND cc.contact_id=contacts.id
+                         ) DESC,
+                         last_seen DESC, id DESC
                      ",
-                    (addr,),
+                    (
+                        addr,
+                        Chattype::Single,
+                        constants::DC_CHAT_ID_LAST_SPECIAL,
+                        Blocked::Not,
+                    ),
                     |row| {
                         let contact_id: ContactId = row.get(0)?;
                         Ok(contact_id)
@@ -3946,6 +3979,13 @@ async fn lookup_key_contacts_by_address_list(
     }
     ensure_and_debug_assert_eq!(address_list.len(), contact_ids.len(),);
     Ok(contact_ids)
+}
+
+/// Returns true if the message should not result in renaming
+/// of the sender contact.
+fn should_prevent_rename(mime_parser: &MimeMessage) -> bool {
+    (mime_parser.is_mailinglist_message() && !mime_parser.was_encrypted())
+        || mime_parser.get_header(HeaderDef::Sender).is_some()
 }
 
 #[cfg(test)]

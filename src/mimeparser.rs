@@ -1320,10 +1320,6 @@ impl MimeMessage {
         filename: &str,
         is_related: bool,
     ) -> Result<()> {
-        if decoded_data.is_empty() {
-            return Ok(());
-        }
-
         // Process attached PGP keys.
         if mime_type.type_() == mime::APPLICATION
             && mime_type.subtype().as_str() == "pgp-keys"

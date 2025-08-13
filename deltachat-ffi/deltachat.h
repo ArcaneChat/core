@@ -2089,8 +2089,18 @@ int             dc_may_be_valid_addr         (const char* addr);
 
 
 /**
- * Check if an e-mail address belongs to a known and unblocked contact.
+ * Looks up a known and unblocked contact with a given e-mail address.
  * To get a list of all known and unblocked contacts, use dc_get_contacts().
+ *
+ * **POTENTIAL SECURITY ISSUE**: If there are multiple contacts with this address
+ * (e.g. an address-contact and a key-contact),
+ * this looks up the most recently seen contact,
+ * i.e. which contact is returned depends on which contact last sent a message.
+ * If the user just clicked on a mailto: link, then this is the best thing you can do.
+ * But **DO NOT** internally represent contacts by their email address
+ * and do not use this function to look them up;
+ * otherwise this function will sometimes look up the wrong contact.
+ * Instead, you should internally represent contacts by their ids.
  *
  * To validate an e-mail address independently of the contact database
  * use dc_may_be_valid_addr().
@@ -2112,6 +2122,13 @@ uint32_t        dc_lookup_contact_id_by_addr (dc_context_t* context, const char*
  *
  * To add a number of contacts, see dc_add_address_book() which is much faster for adding
  * a bunch of addresses.
+ *
+ * This will always create or look up an address-contact,
+ * i.e. a contact identified by an email address,
+ * with all messages sent to and from this contact being unencrypted.
+ * If the user just clicked on an email address,
+ * you should first check `lookup_contact_id_by_addr`,
+ * and only if there is no contact yet, call this function here.
  *
  * May result in a #DC_EVENT_CONTACTS_CHANGED event.
  *
@@ -7583,6 +7600,18 @@ void dc_event_unref(dc_event_t* event);
 /// `%1$s` will be replaced by the number of weeks (always >1) the timer is set to.
 /// `%2$s` will be replaced by name and address of the contact.
 #define DC_STR_EPHEMERAL_TIMER_WEEKS_BY_OTHER 157
+
+/// "You set message deletion timer to 1 year."
+///
+/// Used in status messages.
+#define DC_STR_EPHEMERAL_TIMER_1_YEAR_BY_YOU 158
+
+/// "Message deletion timer is set to 1 year by %1$s."
+///
+/// `%1$s` will be replaced by name and address of the contact.
+///
+/// Used in status messages.
+#define DC_STR_EPHEMERAL_TIMER_1_YEAR_BY_OTHER 159
 
 /// "Scan to set up second device for %1$s"
 ///

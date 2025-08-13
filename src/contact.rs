@@ -755,7 +755,19 @@ impl Contact {
         self.is_bot
     }
 
-    /// Check if an e-mail address belongs to a known and unblocked contact.
+    /// Looks up a known and unblocked contact with a given e-mail address.
+    /// To get a list of all known and unblocked contacts, use contacts_get_contacts().
+    ///
+    ///
+    /// **POTENTIAL SECURITY ISSUE**: If there are multiple contacts with this address
+    /// (e.g. an address-contact and a key-contact),
+    /// this looks up the most recently seen contact,
+    /// i.e. which contact is returned depends on which contact last sent a message.
+    /// If the user just clicked on a mailto: link, then this is the best thing you can do.
+    /// But **DO NOT** internally represent contacts by their email address
+    /// and do not use this function to look them up;
+    /// otherwise this function will sometimes look up the wrong contact.
+    /// Instead, you should internally represent contacts by their ids.
     ///
     /// Known and unblocked contacts will be returned by `get_contacts()`.
     ///
@@ -795,14 +807,28 @@ impl Contact {
             .query_get_value(
                 "SELECT id FROM contacts
                  WHERE addr=?1 COLLATE NOCASE
-                 AND fingerprint='' -- Do not lookup key-contacts
-                 AND id>?2 AND origin>=?3 AND (? OR blocked=?)",
+                     AND id>?2 AND origin>=?3 AND (? OR blocked=?)
+                 ORDER BY
+                     (
+                         SELECT COUNT(*) FROM chats c
+                         INNER JOIN chats_contacts cc
+                         ON c.id=cc.chat_id
+                         WHERE c.type=?
+                             AND c.id>?
+                             AND c.blocked=?
+                             AND cc.contact_id=contacts.id
+                     ) DESC,
+                     last_seen DESC, fingerprint DESC
+                 LIMIT 1",
                 (
                     &addr_normalized,
                     ContactId::LAST_SPECIAL,
                     min_origin as u32,
                     blocked.is_none(),
-                    blocked.unwrap_or_default(),
+                    blocked.unwrap_or(Blocked::Not),
+                    Chattype::Single,
+                    constants::DC_CHAT_ID_LAST_SPECIAL,
+                    blocked.unwrap_or(Blocked::Not),
                 ),
             )
             .await?;
@@ -1538,7 +1564,7 @@ impl Contact {
             return Ok(Some(chat::get_device_icon(context).await?));
         }
         if show_fallback_icon && !self.id.is_special() && !self.is_key_contact() {
-            return Ok(Some(chat::get_address_contact_icon(context).await?));
+            return Ok(Some(chat::get_unencrypted_icon(context).await?));
         }
         if let Some(image_rel) = self.param.get(Param::ProfileImage) {
             if !image_rel.is_empty() {

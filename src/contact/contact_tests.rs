@@ -1035,6 +1035,50 @@ async fn test_was_seen_recently_event() -> Result<()> {
     Ok(())
 }
 
+async fn test_lookup_id_by_addr_recent_ex(accept_unencrypted_chat: bool) -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let bob = &tcm.bob().await;
+
+    let raw = include_bytes!("../../test-data/message/thunderbird_with_autocrypt.eml");
+    assert!(std::str::from_utf8(raw)?.contains("Date: Thu, 24 Nov 2022 20:05:57 +0100"));
+    let received_msg = receive_imf(bob, raw, false).await?.unwrap();
+    received_msg.chat_id.accept(bob).await?;
+
+    let raw = r#"From: Alice <alice@example.org>
+To: bob@example.net
+Message-ID: message$TIME@example.org
+Content-Type: text/plain; charset=utf-8; format=flowed; delsp=no
+Date: Thu, 24 Nov 2022 $TIME +0100
+
+Hi"#
+    .to_string();
+    for (time, is_key_contact) in [("20:05:57", true), ("20:05:58", !accept_unencrypted_chat)] {
+        let raw = raw.replace("$TIME", time);
+        let received_msg = receive_imf(bob, raw.as_bytes(), false).await?.unwrap();
+        if accept_unencrypted_chat {
+            received_msg.chat_id.accept(bob).await?;
+        }
+        let contact_id = Contact::lookup_id_by_addr(bob, "alice@example.org", Origin::Unknown)
+            .await?
+            .unwrap();
+        let contact = Contact::get_by_id(bob, contact_id).await?;
+        assert_eq!(contact.is_key_contact(), is_key_contact);
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_lookup_id_by_addr_recent() -> Result<()> {
+    let accept_unencrypted_chat = true;
+    test_lookup_id_by_addr_recent_ex(accept_unencrypted_chat).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_lookup_id_by_addr_recent_accepted() -> Result<()> {
+    let accept_unencrypted_chat = false;
+    test_lookup_id_by_addr_recent_ex(accept_unencrypted_chat).await
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_verified_by_none() -> Result<()> {
     let mut tcm = TestContextManager::new();
@@ -1072,6 +1116,7 @@ async fn test_sync_create() -> Result<()> {
             .unwrap();
     let a1b_contact = Contact::get_by_id(alice1, a1b_contact_id).await?;
     assert_eq!(a1b_contact.name, "Bob");
+    assert_eq!(a1b_contact.is_key_contact(), false);
 
     Contact::create(alice0, "Bob Renamed", "bob@example.net").await?;
     test_utils::sync(alice0, alice1).await;
@@ -1081,6 +1126,7 @@ async fn test_sync_create() -> Result<()> {
     assert_eq!(id, a1b_contact_id);
     let a1b_contact = Contact::get_by_id(alice1, a1b_contact_id).await?;
     assert_eq!(a1b_contact.name, "Bob Renamed");
+    assert_eq!(a1b_contact.is_key_contact(), false);
 
     Ok(())
 }

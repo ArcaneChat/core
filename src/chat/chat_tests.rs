@@ -2280,14 +2280,19 @@ async fn test_only_minimal_data_are_forwarded() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_save_msgs() -> Result<()> {
-    let alice = TestContext::new_alice().await;
-    let bob = TestContext::new_bob().await;
+    let mut tcm = TestContextManager::new();
+    let alice = tcm.alice().await;
+    let bob = tcm.bob().await;
     let alice_chat = alice.create_chat(&bob).await;
 
     let sent = alice.send_text(alice_chat.get_id(), "hi, bob").await;
     let sent_msg = Message::load_from_db(&alice, sent.sender_msg_id).await?;
     assert!(sent_msg.get_saved_msg_id(&alice).await?.is_none());
     assert!(sent_msg.get_original_msg_id(&alice).await?.is_none());
+    let sent_timestamp = sent_msg.get_timestamp();
+    assert!(sent_timestamp > 0);
+
+    SystemTime::shift(Duration::from_secs(60));
 
     let self_chat = alice.get_self_chat().await;
     save_msgs(&alice, &[sent.sender_msg_id]).await?;
@@ -2305,6 +2310,8 @@ async fn test_save_msgs() -> Result<()> {
     assert_eq!(saved_msg.get_from_id(), ContactId::SELF);
     assert_eq!(saved_msg.get_state(), MessageState::OutDelivered);
     assert_ne!(saved_msg.rfc724_mid(), sent_msg.rfc724_mid());
+    let saved_timestamp = saved_msg.get_timestamp();
+    assert_eq!(saved_timestamp, sent_timestamp);
 
     let sent_msg = Message::load_from_db(&alice, sent.sender_msg_id).await?;
     assert_eq!(
@@ -4769,6 +4776,28 @@ async fn test_no_avatar_in_adhoc_chats() -> Result<()> {
     tokio::fs::write(&file, bytes).await?;
     let res = set_chat_profile_image(alice, chat_id, file.to_str().unwrap()).await;
     assert!(res.is_err());
+
+    Ok(())
+}
+
+/// Tests that long group name with non-ASCII characters is correctly received
+/// by other members.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_long_group_name() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+
+    let group_name = "δδδδδδδδδδδδδδδδδδδδδδδδδδδδδδδδδδδδδδδδδδδδδδδδδδδδ";
+    let alice_chat_id = create_group_chat(alice, ProtectionStatus::Unprotected, group_name).await?;
+    let alice_bob_contact_id = alice.add_or_lookup_contact_id(bob).await;
+    add_contact_to_chat(alice, alice_chat_id, alice_bob_contact_id).await?;
+    let sent = alice
+        .send_text(alice_chat_id, "Hi! I created a group.")
+        .await;
+    let bob_chat_id = bob.recv_msg(&sent).await.chat_id;
+    let bob_chat = Chat::load_from_db(bob, bob_chat_id).await?;
+    assert_eq!(bob_chat.name, group_name);
 
     Ok(())
 }
