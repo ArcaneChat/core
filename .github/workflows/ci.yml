@@ -20,7 +20,7 @@ permissions: {}
 
 env:
   RUSTFLAGS: -Dwarnings
-  RUST_VERSION: 1.89.0
+  RUST_VERSION: 1.90.0
 
   # Minimum Supported Rust Version
   MSRV: 1.85.0
@@ -71,6 +71,8 @@ jobs:
         with:
           show-progress: false
           persist-credentials: false
+      - name: Install rustfmt
+        run: rustup component add --toolchain stable-x86_64-unknown-linux-gnu rustfmt
       - name: Check provider database
         run: scripts/update-provider-database.sh
 
@@ -137,12 +139,12 @@ jobs:
       - name: Tests
         env:
           RUST_BACKTRACE: 1
-        run: cargo nextest run --workspace
+        run: cargo nextest run --workspace --locked
 
       - name: Doc-Tests
         env:
           RUST_BACKTRACE: 1
-        run: cargo test --workspace --doc
+        run: cargo test --workspace --locked --doc
 
       - name: Test cargo vendor
         run: cargo vendor
@@ -256,7 +258,7 @@ jobs:
           path: target/debug
 
       - name: Install python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
 
@@ -303,7 +305,7 @@ jobs:
           persist-credentials: false
 
       - name: Install python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
 

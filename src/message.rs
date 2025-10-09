@@ -652,8 +652,10 @@ impl Message {
         if self.viewtype.has_file() {
             let file_param = self.param.get_file_path(context)?;
             if let Some(path_and_filename) = file_param {
-                if (self.viewtype == Viewtype::Image || self.viewtype == Viewtype::Gif)
-                    && !self.param.exists(Param::Width)
+                if matches!(
+                    self.viewtype,
+                    Viewtype::Image | Viewtype::Gif | Viewtype::Sticker
+                ) && !self.param.exists(Param::Width)
                 {
                     let buf = read_file(context, &path_and_filename).await?;
 
@@ -985,6 +987,8 @@ impl Message {
             | SystemMessage::WebxdcStatusUpdate
             | SystemMessage::WebxdcInfoMessage
             | SystemMessage::IrohNodeAddr
+            | SystemMessage::CallAccepted
+            | SystemMessage::CallEnded
             | SystemMessage::Unknown => Ok(None),
         }
     }
@@ -2288,6 +2292,9 @@ pub enum Viewtype {
     /// Message is an invitation to a videochat.
     VideochatInvitation = 70,
 
+    /// Message is an incoming or outgoing call.
+    Call = 71,
+
     /// Message is an webxdc instance.
     Webxdc = 80,
 
@@ -2311,6 +2318,7 @@ impl Viewtype {
             Viewtype::Video => true,
             Viewtype::File => true,
             Viewtype::VideochatInvitation => false,
+            Viewtype::Call => false,
             Viewtype::Webxdc => true,
             Viewtype::Vcard => true,
         }

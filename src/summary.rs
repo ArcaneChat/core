@@ -4,6 +4,7 @@ use std::borrow::Cow;
 use std::fmt;
 use std::str;
 
+use crate::calls::{CallState, call_state};
 use crate::chat::Chat;
 use crate::constants::Chattype;
 use crate::contact::{Contact, ContactId};
@@ -97,7 +98,7 @@ impl Summary {
         let prefix = if msg.state == MessageState::OutDraft {
             Some(SummaryPrefix::Draft(stock_str::draft(context).await))
         } else if msg.from_id == ContactId::SELF {
-            if msg.is_info() {
+            if msg.is_info() || msg.viewtype == Viewtype::Call {
                 None
             } else {
                 Some(SummaryPrefix::Me(stock_str::self_msg(context).await))
@@ -232,6 +233,26 @@ impl Message {
                 type_name = None;
                 type_file = self.param.get(Param::Summary1).map(|s| s.to_string());
                 append_text = true;
+            }
+            Viewtype::Call => {
+                let call_state = call_state(context, self.id)
+                    .await
+                    .unwrap_or(CallState::Alerting);
+                emoji = Some("📞");
+                type_name = Some(match call_state {
+                    CallState::Alerting | CallState::Active | CallState::Completed { .. } => {
+                        if self.from_id == ContactId::SELF {
+                            stock_str::outgoing_call(context).await
+                        } else {
+                            stock_str::incoming_call(context).await
+                        }
+                    }
+                    CallState::Missed => stock_str::missed_call(context).await,
+                    CallState::Declined => stock_str::declined_call(context).await,
+                    CallState::Canceled => stock_str::canceled_call(context).await,
+                });
+                type_file = None;
+                append_text = false
             }
             Viewtype::Text | Viewtype::Unknown => {
                 emoji = None;

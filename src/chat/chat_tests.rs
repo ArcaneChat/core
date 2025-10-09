@@ -11,7 +11,9 @@ use crate::test_utils::{
     AVATAR_64x64_BYTES, AVATAR_64x64_DEDUPLICATED, E2EE_INFO_MSGS, TestContext, TestContextManager,
     TimeShiftFalsePositiveNote, sync,
 };
+use crate::tools::SystemTime;
 use pretty_assertions::assert_eq;
+use std::time::Duration;
 use strum::IntoEnumIterator;
 use tokio::fs;
 
@@ -32,7 +34,7 @@ async fn test_chat_info() {
   "archived": false,
   "param": "",
   "is_sending_locations": false,
-  "color": 35391,
+  "color": 29377,
   "profile_image": {},
   "draft": "",
   "is_muted": false,
@@ -1644,7 +1646,7 @@ async fn test_set_mute_duration() {
 async fn test_add_info_msg() -> Result<()> {
     let t = TestContext::new().await;
     let chat_id = create_group_chat(&t, ProtectionStatus::Unprotected, "foo").await?;
-    add_info_msg(&t, chat_id, "foo info", 200000).await?;
+    add_info_msg(&t, chat_id, "foo info", time()).await?;
 
     let msg = t.get_last_msg_in(chat_id).await;
     assert_eq!(msg.get_chat_id(), chat_id);
@@ -1666,7 +1668,7 @@ async fn test_add_info_msg_with_cmd() -> Result<()> {
         chat_id,
         "foo bar info",
         SystemMessage::EphemeralTimerChanged,
-        10000,
+        time(),
         None,
         None,
         None,
@@ -1929,16 +1931,28 @@ async fn test_classic_email_chat() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_chat_get_color() -> Result<()> {
     let t = TestContext::new().await;
-    let chat_id = create_group_chat(&t, ProtectionStatus::Unprotected, "a chat").await?;
+    let chat_id = create_group_ex(&t, None, "a chat").await?;
     let color1 = Chat::load_from_db(&t, chat_id).await?.get_color(&t).await?;
-    assert_eq!(color1, 0x008772);
+    assert_eq!(color1, 0x613dd7);
 
     // upper-/lowercase makes a difference for the colors, these are different groups
     // (in contrast to email addresses, where upper-/lowercase is ignored in practise)
     let t = TestContext::new().await;
-    let chat_id = create_group_chat(&t, ProtectionStatus::Unprotected, "A CHAT").await?;
+    let chat_id = create_group_ex(&t, None, "A CHAT").await?;
     let color2 = Chat::load_from_db(&t, chat_id).await?.get_color(&t).await?;
     assert_ne!(color2, color1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_chat_get_color_encrypted() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let t = &tcm.alice().await;
+    let chat_id = create_group_ex(t, Some(ProtectionStatus::Unprotected), "a chat").await?;
+    let color1 = Chat::load_from_db(t, chat_id).await?.get_color(t).await?;
+    set_chat_name(t, chat_id, "A CHAT").await?;
+    let color2 = Chat::load_from_db(t, chat_id).await?.get_color(t).await?;
+    assert_eq!(color2, color1);
     Ok(())
 }
 
@@ -3012,7 +3026,7 @@ async fn test_leave_broadcast() -> Result<()> {
 }
 
 /// Tests that if Bob leaves a broadcast channel with one device,
-/// the other device shows a correct info message "You left.".
+/// the other device shows a correct info message "You left the channel.".
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_leave_broadcast_multidevice() -> Result<()> {
     let mut tcm = TestContextManager::new();
@@ -3047,10 +3061,7 @@ async fn test_leave_broadcast_multidevice() -> Result<()> {
     assert_eq!(rcvd.chat_id, bob1_hello.chat_id);
     assert!(rcvd.is_info());
     assert_eq!(rcvd.get_info_type(), SystemMessage::MemberRemovedFromGroup);
-    assert_eq!(
-        rcvd.text,
-        stock_str::msg_group_left_local(bob1, ContactId::SELF).await
-    );
+    assert_eq!(rcvd.text, stock_str::msg_you_left_broadcast(bob1).await);
 
     Ok(())
 }
@@ -3156,6 +3167,30 @@ async fn test_chat_get_encryption_info() -> Result<()> {
          65F1 DB18 B18C BCF7 0487"
     );
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_out_failed_on_all_keys_missing() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+    let fiona = &tcm.fiona().await;
+
+    let bob_chat_id = bob
+        .create_group_with_members(ProtectionStatus::Unprotected, "", &[alice, fiona])
+        .await;
+    bob.send_text(bob_chat_id, "Gossiping Fiona's key").await;
+    alice
+        .recv_msg(&bob.send_text(bob_chat_id, "No key gossip").await)
+        .await;
+    SystemTime::shift(Duration::from_secs(60));
+    remove_contact_from_chat(bob, bob_chat_id, ContactId::SELF).await?;
+    let alice_chat_id = alice.recv_msg(&bob.pop_sent_msg().await).await.chat_id;
+    alice_chat_id.accept(alice).await?;
+    let mut msg = Message::new_text("Hi".to_string());
+    send_msg(alice, alice_chat_id, &mut msg).await.ok();
+    assert_eq!(msg.id.get_state(alice).await?, MessageState::OutFailed);
     Ok(())
 }
 
@@ -4122,7 +4157,7 @@ async fn test_past_members() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn non_member_cannot_modify_member_list() -> Result<()> {
+async fn test_non_member_cannot_modify_member_list() -> Result<()> {
     let mut tcm = TestContextManager::new();
 
     let alice = &tcm.alice().await;
@@ -4154,6 +4189,12 @@ async fn non_member_cannot_modify_member_list() -> Result<()> {
     alice.recv_msg_trash(&bob_sent_add_msg).await;
     assert_eq!(get_chat_contacts(alice, alice_chat_id).await?.len(), 1);
 
+    // The same for removal.
+    let bob_alice_contact_id = bob.add_or_lookup_contact_id(alice).await;
+    remove_contact_from_chat(bob, bob_chat_id, bob_alice_contact_id).await?;
+    let bob_sent_add_msg = bob.pop_sent_msg().await;
+    alice.recv_msg_trash(&bob_sent_add_msg).await;
+    assert_eq!(get_chat_contacts(alice, alice_chat_id).await?.len(), 1);
     Ok(())
 }
 
@@ -4746,6 +4787,16 @@ async fn test_create_unencrypted_group_chat() -> Result<()> {
     let sent_msg = alice.send_text(chat_id, "Hello").await;
     let msg = Message::load_from_db(alice, sent_msg.sender_msg_id).await?;
     assert!(!msg.get_showpadlock());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_create_group_invalid_name() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let chat_id = create_group_ex(alice, None, " ").await?;
+    let chat = Chat::load_from_db(alice, chat_id).await?;
+    assert_eq!(chat.get_name(), "…");
     Ok(())
 }
 

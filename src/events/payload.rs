@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use crate::chat::ChatId;
 use crate::config::Config;
+use crate::constants::Chattype;
 use crate::contact::ContactId;
 use crate::ephemeral::Timer as EphemeralTimer;
 use crate::message::MsgId;
@@ -272,11 +273,13 @@ pub enum EventType {
         /// ID of the contact that wants to join.
         contact_id: ContactId,
 
-        /// Progress as:
-        /// 300=vg-/vc-request received, typically shown as "bob@addr joins".
-        /// 600=vg-/vc-request-with-auth received, vg-member-added/vc-contact-confirm sent, typically shown as "bob@addr verified".
-        /// 800=contact added to chat, shown as "bob@addr securely joined GROUP". Only for the verified-group-protocol.
-        /// 1000=Protocol finished for this contact.
+        /// ID of the chat in case of success.
+        chat_id: ChatId,
+
+        /// The type of the joined chat.
+        chat_type: Chattype,
+
+        /// Progress, always 1000.
         progress: usize,
     },
 
@@ -375,6 +378,44 @@ pub enum EventType {
     ///
     /// This event is emitted from the account whose property changed.
     AccountsItemChanged,
+
+    /// Incoming call.
+    IncomingCall {
+        /// ID of the message referring to the call.
+        msg_id: MsgId,
+        /// ID of the chat which the message belongs to.
+        chat_id: ChatId,
+        /// User-defined info as passed to place_outgoing_call()
+        place_call_info: String,
+        /// True if incoming call is a video call.
+        has_video: bool,
+    },
+
+    /// Incoming call accepted.
+    IncomingCallAccepted {
+        /// ID of the message referring to the call.
+        msg_id: MsgId,
+        /// ID of the chat which the message belongs to.
+        chat_id: ChatId,
+    },
+
+    /// Outgoing call accepted.
+    OutgoingCallAccepted {
+        /// ID of the message referring to the call.
+        msg_id: MsgId,
+        /// ID of the chat which the message belongs to.
+        chat_id: ChatId,
+        /// User-defined info as passed to accept_incoming_call()
+        accept_call_info: String,
+    },
+
+    /// Call ended.
+    CallEnded {
+        /// ID of the message referring to the call.
+        msg_id: MsgId,
+        /// ID of the chat which the message belongs to.
+        chat_id: ChatId,
+    },
 
     /// Event for using in tests, e.g. as a fence between normally generated events.
     #[cfg(test)]

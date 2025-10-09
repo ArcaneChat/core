@@ -1,5 +1,210 @@
 # Changelog
 
+## [2.17.0] - 2025-10-04
+
+### API-Changes
+
+- [**breaking**] Remove deprecated verified_one_on_one_chats config.
+
+### CI
+
+- Require that Cargo.lock is up to date.
+- Fix CI checking Nix formatting.
+
+### Documentation
+
+- Comment about outdated timespan.
+- Clarify CALL events ([#7188](https://github.com/chatmail/core/pull/7188)).
+- Add docs for JS `BaseDeltaChat`.
+
+### Features / Changes
+
+- Make `text/calendar` alternative available as an attachment.
+- Better summary for calls.
+- Add strings 'You left the channel.' and 'Scan to join Channel' ([#7266](https://github.com/chatmail/core/pull/7266)).
+- Stock strings for calls.
+- ffi: Add DC_STR_CANT_DECRYPT_OUTGOING_MSGS define.
+
+### Fixes
+
+- Prefer last part in `multipart/alternative`.
+- Prefetch messages in limited batches ([#6915](https://github.com/chatmail/core/pull/6915)).
+- Forward calls as text messages.
+- Consistent spelling of "canceled" with a single "l".
+- Lowercase "call" in "Missed call" and similar strings.
+
+### Refactor
+
+- Return the reason when failing to place calls.
+
+### Tests
+
+- Test reception of `multipart/alternative` with `text/calendar`.
+
+## [2.16.0] - 2025-10-01
+
+### API-Changes
+
+- [**breaking**] Get rid of inviter progress other than 0 and 1000.
+- Add has_video attribute to incoming call events.
+- Add JSON-RPC API to get ICE servers.
+- Add call_info() JSON-RPC API.
+- Add chat ID to SecureJoinInviterProgress.
+- deltachat-rpc-client: Add Chat.resend_messages().
+- Add `chat_id` to all call events ([#7216](https://github.com/chatmail/core/pull/7216)).
+
+### Build system
+
+- Update rPGP from 0.16.0 to 0.17.0.
+
+### CI
+
+- Update Rust to 1.90.0.
+- Install rustfmt before checking provider database.
+
+### Documentation
+
+- Add more `get_next_event` docs.
+- SecurejoinInviterProgress never returns an error.
+
+### Features / Changes
+
+- Don't fetch messages from unknown folders ([#7190](https://github.com/chatmail/core/pull/7190)).
+- Get ICE servers from IMAP METADATA.
+- Don't ignore receive_imf_inner() errors, try adding partially downloaded message instead ([#7196](https://github.com/chatmail/core/pull/7196)).
+- Set dimensions for outgoing Sticker messages.
+
+### Fixes
+
+- Create 1:1 chat only if auth token is for setup contact.
+- Ignore vc-/vg- prefix for SecurejoinInviterProgress.
+- Don't init Iroh on channel leave ([#7210](https://github.com/chatmail/core/pull/7210)).
+- Take the last valid Autocrypt header ([#7167](https://github.com/chatmail/core/pull/7167)).
+- Don't add "member removed" messages from nonmembers ([#7207](https://github.com/chatmail/core/pull/7207)).
+- Do not consider the call stale if it is not sent out yet.
+- Receive_imf: Report replaced message id in `MsgsChanged` if chat is the same.
+- Allow Exif for stickers, don't recode them because of that ([#6447](https://github.com/chatmail/core/pull/6447)).
+
+### Refactor
+
+- Remove unused prop (TS, `BaseDeltaChat`).
+- Remove unused FolderMeaning::Drafts.
+
+### Tests
+
+- Rename test_udpate_call_text into test_update_call_text.
+- Update timestamp_sent in pop_sent_msg_opt().
+- Do not match call ID from second alice with first alice event.
+
+## [2.15.0] - 2025-09-15
+
+### API-Changes
+
+- Add JSON-RPC API for calls ([#7194](https://github.com/chatmail/core/pull/7194)).
+
+### Build system
+
+- Remove unused `quoted_printable` dependency.
+
+## [2.14.0] - 2025-09-12
+
+### API-Changes
+
+- Put the chattype into the SecurejoinInviterProgress event ([#7181](https://github.com/chatmail/core/pull/7181)).
+
+### Fixes
+
+- param: Split params only on \n.
+- B-encode SDP offer and answer sent in headers.
+
+### Refactor
+
+- Use recv_msg_trash() instead of recv_msg_opt().
+- Prepare_msg_raw(): don't return MsgId.
+
+### Tests
+
+- Message is OutFailed if all keys are missing ([#6849](https://github.com/chatmail/core/pull/6849)).
+- Test sending SDP offer and answer with newlines.
+
+## [2.13.0] - 2025-09-09
+
+### API-Changes
+
+- [**breaking**] Remove `is_profile_verified` APIs.
+- [**breaking**] Remove deprecated `is_protection_broken`.
+- [**breaking**] Remove `e2ee_enabled` preference.
+
+### Features / Changes
+
+- Add call ringing API ([#6650](https://github.com/chatmail/core/pull/6650), [#7174](https://github.com/chatmail/core/pull/7174), [#7175](https://github.com/chatmail/core/pull/7175), [#7179](https://github.com/chatmail/core/pull/7179))
+- Warn for outdated versions after 6 months instead of 1 year ([#7144](https://github.com/chatmail/core/pull/7144)).
+- Do not set "unknown sender for this chat" error.
+- Do not replace messages with an error on verification failure.
+- Support receiving Autocrypt-Gossip with `_verified` attribute.
+- Withdraw all QR codes when one is withdrawn.
+
+### Fixes
+
+- Don't reverify contacts by SELF on receipt of a message from another device.
+- Don't verify contacts by others having an unknown verifier.
+- Update verifier_id if it's "unknown" and new verifier has known verifier.
+- Mark message as failed if it can't be sent ([#7143](https://github.com/chatmail/core/pull/7143)).
+- Add "Messages are end-to-end encrypted." to non-protected groups.
+
+### Documentation
+
+- Fix for SecurejoinInviterProgress with progress == 600.
+- STYLE.md: Prefer BTreeMap and BTreeSet over hash variants.
+
+### Miscellaneous Tasks
+
+- Update provider database.
+- Update dependencies.
+
+### Refactor
+
+- Check that verifier is verified in turn.
+- Remove unused `EncryptPreference::Reset`.
+- Remove `Aheader::new`.
+
+### Tests
+
+- Add another TimeShiftFalsePositiveNote ([#7142](https://github.com/chatmail/core/pull/7142)).
+- Add TestContext.create_chat_id.
+
+## [2.12.0] - 2025-08-26
+
+### API-Changes
+
+- api!(python): remove remaining broken API for reactions
+
+### Features / Changes
+
+- Use Group ID for chat color generation instead of the name for encrypted groups.
+- Use key fingerprints instead of addresses for key-contacts color generation.
+- Replace HSLuv colors with OKLCh.
+- `wal_checkpoint()`: Do `wal_checkpoint(PASSIVE)` and `wal_checkpoint(FULL)` before `wal_checkpoint(TRUNCATE)`.
+- Assign messages to key-contacts based on Issuer Fingerprint.
+- Create_group_ex(): Log and replace invalid chat name with "…".
+
+### Fixes
+
+- Do not create a group if the sender includes self in the `To` field.
+- Do not reverify already verified contacts via gossip.
+- `get_connectivity()`: Get rid of locking SchedulerState::inner ([#7124](https://github.com/chatmail/core/pull/7124)).
+- Make reaction message hidden only if there are no other parts.
+
+### Refactor
+
+- Do not return `Result` from `valid_signature_fingerprints()`.
+- Make `ConnectivityStore` use a non-async lock ([#7129](https://github.com/chatmail/core/pull/7129)).
+
+### Documentation
+
+- Remove broken link from documentation comments.
+- Remove the comment about Color Vision Deficiency correction.
+
 ## [2.11.0] - 2025-08-13
 
 ### Features / Changes
@@ -1600,7 +1805,7 @@ This reverts commit 6f22ce2722b51773d7fbb0d89e4764f963cafd91..
 ### Fixes
 
 - Reset quota on configured address change ([#5908](https://github.com/chatmail/core/pull/5908)).
-- Do not emit progress 1000 when configuration is cancelled.
+- Do not emit progress 1000 when configuration is canceled.
 - Assume file extensions are 32 chars max and don't contain whitespace ([#5338](https://github.com/chatmail/core/pull/5338)).
 - Re-add tokens.foreign_id column ([#6038](https://github.com/chatmail/core/pull/6038)).
 
@@ -4048,7 +4253,7 @@ Bugfix release attempting to fix the [iOS build error](https://github.com/chatma
 - Recreate `smtp` table with AUTOINCREMENT `id` ([#4390](https://github.com/chatmail/core/pull/4390)).
 - Do not return an error from `send_msg_to_smtp` if retry limit is exceeded.
 - Make the bots automatically accept group chat contact requests ([#4377](https://github.com/chatmail/core/pull/4377)).
-- Delete `smtp` rows when message sending is cancelled ([#4391](https://github.com/chatmail/core/pull/4391)).
+- Delete `smtp` rows when message sending is canceled ([#4391](https://github.com/chatmail/core/pull/4391)).
 
 ### Refactor
 
@@ -4059,7 +4264,7 @@ Bugfix release attempting to fix the [iOS build error](https://github.com/chatma
 ### Fixes
 
 - Fetch at most 100 existing messages even if EXISTS was not received.
-- Delete `smtp` rows when message sending is cancelled.
+- Delete `smtp` rows when message sending is canceled.
 
 ### Changes
 
@@ -4146,14 +4351,14 @@ Bugfix release attempting to fix the [iOS build error](https://github.com/chatma
 ## [1.112.3] - 2023-03-30
 
 ### Fixes
-- `transfer::get_backup` now frees ongoing process when cancelled. #4249
+- `transfer::get_backup` now frees ongoing process when canceled. #4249
 
 ## [1.112.2] - 2023-03-30
 
 ### Changes
 - Update iroh, remove `default-net` from `[patch.crates-io]` section.
 - transfer backup: Connect to multiple provider addresses concurrently.  This should speed up connection time significantly on the getter side.  #4240
-- Make sure BackupProvider is cancelled on drop (or `dc_backup_provider_unref`).  The BackupProvider will now always finish with an IMEX event of 1000 or 0, previously it would sometimes finished with 1000 (success) when it really was 0 (failure). #4242
+- Make sure BackupProvider is canceled on drop (or `dc_backup_provider_unref`).  The BackupProvider will now always finish with an IMEX event of 1000 or 0, previously it would sometimes finished with 1000 (success) when it really was 0 (failure). #4242
 
 ### Fixes
 - Do not return media from trashed messages in the "All media" view. #4247
@@ -6646,3 +6851,9 @@ https://github.com/chatmail/core/pulls?q=is%3Apr+is%3Aclosed
 [2.9.0]: https://github.com/chatmail/core/compare/v2.8.0..v2.9.0
 [2.10.0]: https://github.com/chatmail/core/compare/v2.9.0..v2.10.0
 [2.11.0]: https://github.com/chatmail/core/compare/v2.10.0..v2.11.0
+[2.12.0]: https://github.com/chatmail/core/compare/v2.11.0..v2.12.0
+[2.13.0]: https://github.com/chatmail/core/compare/v2.12.0..v2.13.0
+[2.14.0]: https://github.com/chatmail/core/compare/v2.13.0..v2.14.0
+[2.15.0]: https://github.com/chatmail/core/compare/v2.14.0..v2.15.0
+[2.16.0]: https://github.com/chatmail/core/compare/v2.15.0..v2.16.0
+[2.17.0]: https://github.com/chatmail/core/compare/v2.16.0..v2.17.0

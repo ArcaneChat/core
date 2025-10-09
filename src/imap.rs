@@ -24,6 +24,7 @@ use rand::Rng;
 use ratelimit::Ratelimit;
 use url::Url;
 
+use crate::calls::{create_fallback_ice_servers, create_ice_servers_from_metadata};
 use crate::chat::{self, ChatId, ChatIdBlocked};
 use crate::chatlist_events;
 use crate::config::Config;
@@ -47,7 +48,7 @@ use crate::receive_imf::{
 };
 use crate::scheduler::connectivity::ConnectivityStore;
 use crate::stock_str;
-use crate::tools::{self, create_id, duration_to_str};
+use crate::tools::{self, create_id, duration_to_str, time};
 
 pub(crate) mod capabilities;
 mod client;
@@ -123,6 +124,18 @@ pub(crate) struct ServerMetadata {
     pub admin: Option<String>,
 
     pub iroh_relay: Option<Url>,
+
+    /// JSON with ICE servers for WebRTC calls
+    /// and the expiration timestamp.
+    ///
+    /// If JSON is about to expire, new TURN credentials
+    /// should be fetched from the server
+    /// to be ready for WebRTC calls.
+    pub ice_servers: String,
+
+    /// Timestamp when ICE servers are considered
+    /// expired and should be updated.
+    pub ice_servers_expiration_timestamp: i64,
 }
 
 impl async_imap::Authenticator for OAuth2 {
@@ -146,7 +159,6 @@ pub enum FolderMeaning {
     Mvbox,
     Sent,
     Trash,
-    Drafts,
 
     /// Virtual folders.
     ///
@@ -166,7 +178,6 @@ impl FolderMeaning {
             FolderMeaning::Mvbox => Some(Config::ConfiguredMvboxFolder),
             FolderMeaning::Sent => Some(Config::ConfiguredSentboxFolder),
             FolderMeaning::Trash => Some(Config::ConfiguredTrashFolder),
-            FolderMeaning::Drafts => None,
             FolderMeaning::Virtual => None,
         }
     }
@@ -325,7 +336,7 @@ impl Imap {
         }
 
         info!(context, "Connecting to IMAP server.");
-        self.connectivity.set_connecting(context).await;
+        self.connectivity.set_connecting(context);
 
         self.conn_last_try = tools::Time::now();
         const BACKOFF_MIN_MS: u64 = 2000;
@@ -408,7 +419,7 @@ impl Imap {
                         "IMAP-LOGIN as {}",
                         lp.user
                     )));
-                    self.connectivity.set_preparing(context).await;
+                    self.connectivity.set_preparing(context);
                     info!(context, "Successfully logged into IMAP server.");
                     return Ok(session);
                 }
@@ -466,7 +477,7 @@ impl Imap {
         let mut session = match self.connect(context, configuring).await {
             Ok(session) => session,
             Err(err) => {
-                self.connectivity.set_err(context, &err).await;
+                self.connectivity.set_err(context, &err);
                 return Err(err);
             }
         };
@@ -555,10 +566,38 @@ impl Imap {
         }
         session.new_mail = false;
 
+        let mut read_cnt = 0;
+        loop {
+            let (n, fetch_more) = self
+                .fetch_new_msg_batch(context, session, folder, folder_meaning)
+                .await?;
+            read_cnt += n;
+            if !fetch_more {
+                return Ok(read_cnt > 0);
+            }
+        }
+    }
+
+    /// Returns number of messages processed and whether the function should be called again.
+    async fn fetch_new_msg_batch(
+        &mut self,
+        context: &Context,
+        session: &mut Session,
+        folder: &str,
+        folder_meaning: FolderMeaning,
+    ) -> Result<(usize, bool)> {
         let uid_validity = get_uidvalidity(context, folder).await?;
         let old_uid_next = get_uid_next(context, folder).await?;
+        info!(
+            context,
+            "fetch_new_msg_batch({folder}): UIDVALIDITY={uid_validity}, UIDNEXT={old_uid_next}."
+        );
 
-        let msgs = session.prefetch(old_uid_next).await.context("prefetch")?;
+        let uids_to_prefetch = 500;
+        let msgs = session
+            .prefetch(old_uid_next, uids_to_prefetch)
+            .await
+            .context("prefetch")?;
         let read_cnt = msgs.len();
 
         let download_limit = context.download_limit().await?;
@@ -692,7 +731,7 @@ impl Imap {
         }
 
         if !uids_fetch.is_empty() {
-            self.connectivity.set_working(context).await;
+            self.connectivity.set_working(context);
         }
 
         let (sender, receiver) = async_channel::unbounded();
@@ -718,7 +757,8 @@ impl Imap {
             largest_uid_fetched
         };
 
-        let actually_download_messages_future = async move {
+        let actually_download_messages_future = async {
+            let sender = sender;
             let mut uids_fetch_in_batch = Vec::with_capacity(max(uids_fetch.len(), 1));
             let mut fetch_partially = false;
             uids_fetch.push((0, !uids_fetch.last().unwrap_or(&(0, false)).1));
@@ -753,14 +793,17 @@ impl Imap {
         // if the message has arrived after selecting mailbox
         // and determining its UIDNEXT and before prefetch.
         let mut new_uid_next = largest_uid_fetched + 1;
-        if fetch_res.is_ok() {
+        let fetch_more = fetch_res.is_ok() && {
+            let prefetch_uid_next = old_uid_next + uids_to_prefetch;
             // If we have successfully fetched all messages we planned during prefetch,
             // then we have covered at least the range between old UIDNEXT
             // and UIDNEXT of the mailbox at the time of selecting it.
-            new_uid_next = max(new_uid_next, mailbox_uid_next);
+            new_uid_next = max(new_uid_next, min(prefetch_uid_next, mailbox_uid_next));
 
             new_uid_next = max(new_uid_next, largest_uid_skipped.unwrap_or(0) + 1);
-        }
+
+            prefetch_uid_next < mailbox_uid_next
+        };
         if new_uid_next > old_uid_next {
             set_uid_next(context, folder, new_uid_next).await?;
         }
@@ -777,7 +820,7 @@ impl Imap {
         // establish a new session if this one is broken.
         fetch_res?;
 
-        Ok(read_cnt > 0)
+        Ok((read_cnt, fetch_more))
     }
 
     /// Read the recipients from old emails sent by the user and add them as contacts.
@@ -814,7 +857,10 @@ impl Session {
             .context("listing folders for resync")?;
         for folder in all_folders {
             let folder_meaning = get_folder_meaning(&folder);
-            if folder_meaning != FolderMeaning::Virtual {
+            if !matches!(
+                folder_meaning,
+                FolderMeaning::Virtual | FolderMeaning::Unknown
+            ) {
                 self.resync_folder_uids(context, folder.name(), folder_meaning)
                     .await?;
             }
@@ -1466,7 +1512,7 @@ impl Session {
                     context,
                     "Passing message UID {} to receive_imf().", request_uid
                 );
-                match receive_imf_inner(
+                let res = receive_imf_inner(
                     context,
                     folder,
                     uidvalidity,
@@ -1474,20 +1520,31 @@ impl Session {
                     rfc724_mid,
                     body,
                     is_seen,
-                    partial,
+                    partial.map(|msg_size| (msg_size, None)),
                 )
-                .await
-                {
-                    Ok(received_msg) => {
-                        received_msgs_channel
-                            .send((request_uid, received_msg))
-                            .await?;
+                .await;
+                let received_msg = if let Err(err) = res {
+                    warn!(context, "receive_imf error: {:#}.", err);
+                    if partial.is_some() {
+                        return Err(err);
                     }
-                    Err(err) => {
-                        warn!(context, "receive_imf error: {:#}.", err);
-                        received_msgs_channel.send((request_uid, None)).await?;
-                    }
+                    receive_imf_inner(
+                        context,
+                        folder,
+                        uidvalidity,
+                        request_uid,
+                        rfc724_mid,
+                        body,
+                        is_seen,
+                        Some((body.len().try_into()?, Some(format!("{err:#}")))),
+                    )
+                    .await?
+                } else {
+                    res?
                 };
+                received_msgs_channel
+                    .send((request_uid, received_msg))
+                    .await?;
             }
 
             // If we don't process the whole response, IMAP client is left in a broken state where
@@ -1534,7 +1591,43 @@ impl Session {
         }
 
         let mut lock = context.metadata.write().await;
-        if (*lock).is_some() {
+        if let Some(ref mut old_metadata) = *lock {
+            let now = time();
+
+            // Refresh TURN server credentials if they expire in 12 hours.
+            if now + 3600 * 12 < old_metadata.ice_servers_expiration_timestamp {
+                return Ok(());
+            }
+
+            info!(context, "ICE servers expired, requesting new credentials.");
+            let mailbox = "";
+            let options = "";
+            let metadata = self
+                .get_metadata(mailbox, options, "(/shared/vendor/deltachat/turn)")
+                .await?;
+            let mut got_turn_server = false;
+            for m in metadata {
+                if m.entry == "/shared/vendor/deltachat/turn" {
+                    if let Some(value) = m.value {
+                        match create_ice_servers_from_metadata(context, &value).await {
+                            Ok((parsed_timestamp, parsed_ice_servers)) => {
+                                old_metadata.ice_servers_expiration_timestamp = parsed_timestamp;
+                                old_metadata.ice_servers = parsed_ice_servers;
+                                got_turn_server = false;
+                            }
+                            Err(err) => {
+                                warn!(context, "Failed to parse TURN server metadata: {err:#}.");
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !got_turn_server {
+                // Set expiration timestamp 7 days in the future so we don't request it again.
+                old_metadata.ice_servers_expiration_timestamp = time() + 3600 * 24 * 7;
+                old_metadata.ice_servers = create_fallback_ice_servers(context).await?;
+            }
             return Ok(());
         }
 
@@ -1546,6 +1639,8 @@ impl Session {
         let mut comment = None;
         let mut admin = None;
         let mut iroh_relay = None;
+        let mut ice_servers = None;
+        let mut ice_servers_expiration_timestamp = 0;
 
         let mailbox = "";
         let options = "";
@@ -1553,7 +1648,7 @@ impl Session {
             .get_metadata(
                 mailbox,
                 options,
-                "(/shared/comment /shared/admin /shared/vendor/deltachat/irohrelay)",
+                "(/shared/comment /shared/admin /shared/vendor/deltachat/irohrelay /shared/vendor/deltachat/turn)",
             )
             .await?;
         for m in metadata {
@@ -1576,13 +1671,36 @@ impl Session {
                         }
                     }
                 }
+                "/shared/vendor/deltachat/turn" => {
+                    if let Some(value) = m.value {
+                        match create_ice_servers_from_metadata(context, &value).await {
+                            Ok((parsed_timestamp, parsed_ice_servers)) => {
+                                ice_servers_expiration_timestamp = parsed_timestamp;
+                                ice_servers = Some(parsed_ice_servers);
+                            }
+                            Err(err) => {
+                                warn!(context, "Failed to parse TURN server metadata: {err:#}.");
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
         }
+        let ice_servers = if let Some(ice_servers) = ice_servers {
+            ice_servers
+        } else {
+            // Set expiration timestamp 7 days in the future so we don't request it again.
+            ice_servers_expiration_timestamp = time() + 3600 * 24 * 7;
+            create_fallback_ice_servers(context).await?
+        };
+
         *lock = Some(ServerMetadata {
             comment,
             admin,
             iroh_relay,
+            ice_servers,
+            ice_servers_expiration_timestamp,
         });
         Ok(())
     }
@@ -2120,27 +2238,6 @@ fn get_folder_meaning_by_name(folder_name: &str) -> FolderMeaning {
         "迷惑メール",
         "스팸",
     ];
-    const DRAFT_NAMES: &[&str] = &[
-        "Drafts",
-        "Kladder",
-        "Entw?rfe",
-        "Borradores",
-        "Brouillons",
-        "Bozze",
-        "Concepten",
-        "Wersje robocze",
-        "Rascunhos",
-        "Entwürfe",
-        "Koncepty",
-        "Kopie robocze",
-        "Taslaklar",
-        "Utkast",
-        "Πρόχειρα",
-        "Черновики",
-        "下書き",
-        "草稿",
-        "임시보관함",
-    ];
     const TRASH_NAMES: &[&str] = &[
         "Trash",
         "Bin",
@@ -2167,8 +2264,6 @@ fn get_folder_meaning_by_name(folder_name: &str) -> FolderMeaning {
         FolderMeaning::Sent
     } else if SPAM_NAMES.iter().any(|s| s.to_lowercase() == lower) {
         FolderMeaning::Spam
-    } else if DRAFT_NAMES.iter().any(|s| s.to_lowercase() == lower) {
-        FolderMeaning::Drafts
     } else if TRASH_NAMES.iter().any(|s| s.to_lowercase() == lower) {
         FolderMeaning::Trash
     } else {
@@ -2182,7 +2277,6 @@ fn get_folder_meaning_by_attrs(folder_attrs: &[NameAttribute]) -> FolderMeaning 
             NameAttribute::Trash => return FolderMeaning::Trash,
             NameAttribute::Sent => return FolderMeaning::Sent,
             NameAttribute::Junk => return FolderMeaning::Spam,
-            NameAttribute::Drafts => return FolderMeaning::Drafts,
             NameAttribute::All | NameAttribute::Flagged => return FolderMeaning::Virtual,
             NameAttribute::Extension(label) => {
                 match label.as_ref() {

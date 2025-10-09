@@ -415,7 +415,6 @@ char*           dc_get_blobdir               (const dc_context_t* context);
  *                    As for `displayname` and `selfstatus`, also the avatar is sent to the recipients.
  *                    To save traffic, however, the avatar is attached only as needed
  *                    and also recoded to a reasonable size.
- * - `e2ee_enabled` = 0=no end-to-end-encryption, 1=prefer end-to-end-encryption (default)
  * - `mdns_enabled` = 0=do not send or request read receipts,
  *                    1=send and request read receipts
  *                    default=send and request read receipts, only send but not request if `bot` is set
@@ -1213,6 +1212,117 @@ void             dc_set_webxdc_integration (dc_context_t* context, const char* f
  *     UI can open a Webxdc as usual with this instance.
  */
 uint32_t        dc_init_webxdc_integration    (dc_context_t* context, uint32_t chat_id);
+
+
+/**
+ * Start an outgoing call.
+ * This sends a message of type #DC_MSG_CALL with all relevant information to the callee,
+ * who will get informed by an #DC_EVENT_INCOMING_CALL event and rings.
+ *
+ * Possible actions during ringing:
+ *
+ * - caller cancels the call using dc_end_call():
+ *   callee receives #DC_EVENT_CALL_ENDED and has a "Missed call"
+ *
+ * - callee accepts using dc_accept_incoming_call():
+ *   caller receives #DC_EVENT_OUTGOING_CALL_ACCEPTED.
+ *   callee's devices receive #DC_EVENT_INCOMING_CALL_ACCEPTED, call starts
+ *
+ * - callee declines using dc_end_call():
+ *   caller receives #DC_EVENT_CALL_ENDED and has a "Declinced Call".
+ *   callee's other devices receive #DC_EVENT_CALL_ENDED and have a "Canceled Call",
+ *
+ * - callee is already in a call:
+ *   what to do depends on the capabilities of UI to handle calls.
+ *   if UI cannot handle multiple calls, an easy approach would be to decline the new call automatically
+ *   and make that visble to the user in the call, e.g. by a notification
+ *
+ * - timeout:
+ *   after 1 minute without action,
+ *   caller and callee receive #DC_EVENT_CALL_ENDED
+ *   to prevent endless ringing of callee
+ *   in case caller got offline without being able to send cancellation message.
+ *   for caller, this is a "Canceled call";
+ *   for callee, this is a "Missed call"
+ *
+ * Actions during the call:
+ *
+ * - caller ends the call using dc_end_call():
+ *   callee receives #DC_EVENT_CALL_ENDED
+ *
+ * - callee ends the call using dc_end_call():
+ *   caller receives #DC_EVENT_CALL_ENDED
+ *
+ * Contact request handling:
+ *
+ * - placing or accepting calls implies accepting contact requests
+ *
+ * - ending a call does not accept a contact request;
+ *   instead, the call will timeout on all affected devices.
+ *
+ * Note, that the events are for updating the call screen,
+ * possible status messages are added and updated as usual, including the known events.
+ * In the UI, the sorted chatlist is used as an overview about calls as well as messages.
+ * To place a call with a contact that has no chat yet, use dc_create_chat_by_contact_id() first.
+ *
+ * UI will usually allow only one call at the same time,
+ * this has to be tracked by UI across profile, the core does not track this.
+ *
+ * @memberof dc_context_t
+ * @param context The context object.
+ * @param chat_id The chat to place a call for.
+ *     This needs to be a one-to-one chat.
+ * @param place_call_info any data that other devices receive
+ *     in #DC_EVENT_INCOMING_CALL.
+ * @return ID of the system message announcing the call.
+ */
+uint32_t        dc_place_outgoing_call       (dc_context_t* context, uint32_t chat_id, const char* place_call_info);
+
+
+/**
+ * Accept incoming call.
+ *
+ * This implicitly accepts the contact request, if not yet done.
+ * All affected devices will receive
+ * either #DC_EVENT_OUTGOING_CALL_ACCEPTED or #DC_EVENT_INCOMING_CALL_ACCEPTED.
+ *
+ * If the call is already accepted or ended, nothing happens.
+ * If the chat is a contact request, it is accepted implicitly.
+ *
+ * @memberof dc_context_t
+ * @param context The context object.
+ * @param msg_id The ID of the call to accept.
+ *     This is the ID reported by #DC_EVENT_INCOMING_CALL
+ *     and equals to the ID of the corresponding info message.
+ * @param accept_call_info any data that other devices receive
+ *     in #DC_EVENT_OUTGOING_CALL_ACCEPTED.
+ * @return 1=success, 0=error
+ */
+ int            dc_accept_incoming_call      (dc_context_t* context, uint32_t msg_id, const char* accept_call_info);
+
+
+ /**
+  * End incoming or outgoing call.
+  *
+  * For unaccepted calls ended by the caller, this is a "cancellation".
+  * Unaccepted calls ended by the callee are a "decline".
+  * If the call was accepted, this is a "hangup".
+  *
+  * All participant devices get informed about the ended call via #DC_EVENT_CALL_ENDED unless they are contact requests.
+  * For contact requests, the call times out on all other affected devices.
+  *
+  * If the message ID is wrong or does not exist for whatever reasons, nothing happens.
+  * Therefore, and for resilience, UI should remove the call UI directly when calling
+  * this function and not only on the event.
+  *
+  * If the call is already ended, nothing happens.
+  *
+  * @memberof dc_context_t
+  * @param context The context object.
+  * @param msg_id the ID of the call.
+  * @return 1=success, 0=error
+  */
+ int            dc_end_call                  (dc_context_t* context, uint32_t msg_id);
 
 
 /**
@@ -3860,28 +3970,6 @@ int             dc_chat_is_encrypted         (const dc_chat_t *chat);
 
 
 /**
- * Checks if the chat was protected, and then an incoming message broke this protection.
- *
- * This function is only useful if the UI enabled the `verified_one_on_one_chats` feature flag,
- * otherwise it will return false for all chats.
- *
- * 1:1 chats are automatically set as protected when a contact is verified.
- * When a message comes in that is not encrypted / signed correctly,
- * the chat is automatically set as unprotected again.
- * dc_chat_is_protection_broken() will return true until dc_accept_chat() is called.
- *
- * The UI should let the user confirm that this is OK with a message like
- * `Bob sent a message from another device. Tap to learn more` and then call dc_accept_chat().
- *
- * @deprecated 2025-07 chats protection cannot break any longer
- * @memberof dc_chat_t
- * @param chat The chat object.
- * @return 1=chat protection broken, 0=otherwise.
- */
-int             dc_chat_is_protection_broken (const dc_chat_t* chat);
-
-
-/**
  * Check if locations are sent to the chat
  * at the time the object was created using dc_get_chat().
  * To check if locations are sent to _any_ chat,
@@ -5642,6 +5730,24 @@ int64_t         dc_lot_get_timestamp     (const dc_lot_t* lot);
 
 
 /**
+ * Message indicating an incoming or outgoing call.
+ *
+ * These messages are created by dc_place_outgoing_call()
+ * and should be rendered by UI similar to text messages,
+ * maybe with some "phone icon" at the side.
+ *
+ * The message text is updated as needed
+ * and UI will be informed via #DC_EVENT_MSGS_CHANGED as usual.
+ *
+ * Do not start ringing when seeing this message;
+ * the mesage may belong e.g. to an old missed call.
+ *
+ * Instead, ringing should start on the event #DC_EVENT_INCOMING_CALL
+ */
+#define DC_MSG_CALL 71
+
+
+/**
  * The message is a webxdc instance.
  *
  * To send data to a webxdc instance, use dc_send_webxdc_status_update().
@@ -6483,11 +6589,7 @@ void dc_event_unref(dc_event_t* event);
  * generated by dc_get_securejoin_qr().
  *
  * @param data1 (int) The ID of the contact that wants to join.
- * @param data2 (int) The progress as:
- *     300=vg-/vc-request received, typically shown as "bob@addr joins".
- *     600=vg-/vc-request-with-auth received, vg-member-added/vc-contact-confirm sent, typically shown as "bob@addr verified".
- *     800=contact added to chat, shown as "bob@addr securely joined GROUP". Only for the verified-group-protocol.
- *     1000=Protocol finished for this contact.
+ * @param data2 (int) The progress, always 1000.
  */
 #define DC_EVENT_SECUREJOIN_INVITER_PROGRESS      2060
 
@@ -6638,6 +6740,60 @@ void dc_event_unref(dc_event_t* event);
  * @param data1 (int) number of events that have been skipped
  */
 #define DC_EVENT_CHANNEL_OVERFLOW              2400
+
+
+
+/**
+ * Incoming call.
+ * UI will usually start ringing,
+ * or show a notification if there is already a call in some profile.
+ *
+ * Together with this event,
+ * a message of type #DC_MSG_CALL is added to the corresponding chat;
+ * this message is announced and updated by the usual event as #DC_EVENT_MSGS_CHANGED,
+ * there is usually no need to take care of this message from any of the CALL events.
+ *
+ * If user takes action, dc_accept_incoming_call() or dc_end_call() should be called.
+ *
+ * Otherwise, ringing should end on #DC_EVENT_CALL_ENDED
+ * or #DC_EVENT_INCOMING_CALL_ACCEPTED
+ *
+ * @param data1 (int) msg_id ID of the message referring to the call.
+ * @param data2 (char*) place_call_info, text passed to dc_place_outgoing_call()
+ * @param data2 (int) 1 if incoming call is a video call, 0 otherwise
+ */
+#define DC_EVENT_INCOMING_CALL                            2550
+
+/**
+ * The callee accepted an incoming call on this or another device using dc_accept_incoming_call().
+ * The caller gets the event #DC_EVENT_OUTGOING_CALL_ACCEPTED at the same time.
+ *
+ * UI usually only takes action in case call UI was opened before, otherwise the event should be ignored.
+ *
+ * @param data1 (int) msg_id ID of the message referring to the call
+ */
+ #define DC_EVENT_INCOMING_CALL_ACCEPTED                  2560
+
+/**
+ * A call placed using dc_place_outgoing_call() was accepted by the callee using dc_accept_incoming_call().
+ *
+ * UI usually only takes action in case call UI was opened before, otherwise the event should be ignored.
+ *
+ * @param data1 (int) msg_id ID of the message referring to the call
+ * @param data2 (char*) accept_call_info, text passed to dc_accept_incoming_call()
+ */
+#define DC_EVENT_OUTGOING_CALL_ACCEPTED                   2570
+
+/**
+ * An incoming or outgoing call was ended using dc_end_call() on this or another device, by caller or callee.
+ * Moreover, the event is sent when the call was not accepted within 1 minute timeout.
+ *
+ * UI usually only takes action in case call UI was opened before, otherwise the event should be ignored.
+ *
+ * @param data1 (int) msg_id ID of the message referring to the call
+ */
+#define DC_EVENT_CALL_ENDED                               2580
+
 
 /**
  * @}
@@ -7059,6 +7215,8 @@ void dc_event_unref(dc_event_t* event);
 /// "Unknown sender for this chat. See 'info' for more details."
 ///
 /// Use as message text if assigning the message to a chat is not totally correct.
+///
+/// @deprecated 2025-08-18
 #define DC_STR_UNKNOWN_SENDER_FOR_CHAT    72
 
 /// "Message from %1$s"
@@ -7430,7 +7588,7 @@ void dc_event_unref(dc_event_t* event);
 /// Used in status messages.
 #define DC_STR_REMOVE_MEMBER_BY_OTHER 131
 
-/// "You left."
+/// "You left the group."
 ///
 /// Used in status messages.
 #define DC_STR_GROUP_LEFT_BY_YOU 132
@@ -7653,6 +7811,12 @@ void dc_event_unref(dc_event_t* event);
 /// `%1$s` will be replaced by the provider's domain.
 #define DC_STR_INVALID_UNENCRYPTED_MAIL 174
 
+/// "⚠️ It seems you are using Delta Chat on multiple devices that cannot decrypt each other's outgoing messages. To fix this, on the older device use \"Settings / Add Second Device\" and follow the instructions."
+///
+/// Added to the device chat if could not decrypt a new outgoing message (i.e. not when fetching
+/// existing messages). But no more than once a day.
+#define DC_STR_CANT_DECRYPT_OUTGOING_MSGS 175
+
 /// "You reacted %1$s to '%2$s'"
 ///
 /// `%1$s` will be replaced by the reaction, usually an emoji
@@ -7689,8 +7853,32 @@ void dc_event_unref(dc_event_t* event);
 /// "❤️ Seems you're enjoying Delta Chat!"… (donation request device message)
 #define DC_STR_DONATION_REQUEST 193
 
-/// "Contact". Deprecated, currently unused.
-#define DC_STR_CONTACT 200
+/// "Outgoing call"
+#define DC_STR_OUTGOING_CALL 194
+
+/// "Incoming call"
+#define DC_STR_INCOMING_CALL 195
+
+/// "Declined call"
+#define DC_STR_DECLINED_CALL 196
+
+/// "Canceled call"
+#define DC_STR_CANCELED_CALL 197
+
+/// "Missed call"
+#define DC_STR_MISSED_CALL 198
+
+/// "You left the channel."
+///
+/// Used in status messages.
+#define DC_STR_CHANNEL_LEFT_BY_YOU 200
+
+/// "Scan to join channel %1$s"
+///
+/// Subtitle for channel join qrcode svg image generated by the core.
+///
+/// `%1$s` will be replaced with the channel name.
+#define DC_STR_SECURE_JOIN_CHANNEL_QR_DESC  201
 
 /**
  * @}

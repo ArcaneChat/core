@@ -168,6 +168,11 @@ class Chat:
         msg_id = self._rpc.send_sticker(self.account.id, self.id, path)
         return Message(self.account, msg_id)
 
+    def resend_messages(self, messages: list[Message]) -> None:
+        """Resend a list of messages to this chat."""
+        msg_ids = [msg.id for msg in messages]
+        self._rpc.resend_messages(self.account.id, msg_ids)
+
     def forward_messages(self, messages: list[Message]) -> None:
         """Forward a list of messages to this chat."""
         msg_ids = [msg.id for msg in messages]
@@ -289,3 +294,8 @@ class Chat:
             f.write(vcard.encode())
             f.flush()
             self._rpc.send_msg(self.account.id, self.id, {"viewtype": ViewType.VCARD, "file": f.name})
+
+    def place_outgoing_call(self, place_call_info: str) -> Message:
+        """Starts an outgoing call."""
+        msg_id = self._rpc.place_outgoing_call(self.account.id, self.id, place_call_info)
+        return Message(self.account, msg_id)

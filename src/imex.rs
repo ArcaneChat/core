@@ -90,7 +90,7 @@ pub async fn imex(
     let cancel = context.alloc_ongoing().await?;
 
     let res = {
-        let _guard = context.scheduler.pause(context.clone()).await?;
+        let _guard = context.scheduler.pause(context).await?;
         imex_inner(context, what, path, passphrase)
             .race(async {
                 cancel.recv().await.ok();
@@ -140,32 +140,8 @@ pub async fn has_backup(_context: &Context, dir_name: &Path) -> Result<String> {
 }
 
 async fn set_self_key(context: &Context, armored: &str) -> Result<()> {
-    // try hard to only modify key-state
-    let (private_key, header) = SignedSecretKey::from_asc(armored)?;
+    let private_key = SignedSecretKey::from_asc(armored)?;
     let public_key = private_key.split_public_key()?;
-    if let Some(preferencrypt) = header.get("Autocrypt-Prefer-Encrypt") {
-        let e2ee_enabled = match preferencrypt.as_str() {
-            "nopreference" => 0,
-            "mutual" => 1,
-            _ => {
-                bail!("invalid Autocrypt-Prefer-Encrypt header: {:?}", header);
-            }
-        };
-        context
-            .sql
-            .set_raw_config_int("e2ee_enabled", e2ee_enabled)
-            .await?;
-    } else {
-        // `Autocrypt-Prefer-Encrypt` is not included
-        // in keys exported to file.
-        //
-        // `Autocrypt-Prefer-Encrypt` also SHOULD be sent
-        // in Autocrypt Setup Message according to Autocrypt specification,
-        // but K-9 6.802 does not include this header.
-        //
-        // We keep current setting in this case.
-        info!(context, "No Autocrypt-Prefer-Encrypt header.");
-    };
 
     let keypair = pgp::KeyPair {
         public: public_key,
@@ -952,75 +928,56 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_export_and_import_backup() -> Result<()> {
-        for set_verified_oneonone_chats in [true, false] {
-            let backup_dir = tempfile::tempdir().unwrap();
+        let backup_dir = tempfile::tempdir().unwrap();
 
-            let context1 = TestContext::new_alice().await;
-            assert!(context1.is_configured().await?);
-            if set_verified_oneonone_chats {
-                context1
-                    .set_config_bool(Config::VerifiedOneOnOneChats, true)
-                    .await?;
-            }
+        let context1 = TestContext::new_alice().await;
+        assert!(context1.is_configured().await?);
 
-            let context2 = TestContext::new().await;
-            assert!(!context2.is_configured().await?);
-            assert!(has_backup(&context2, backup_dir.path()).await.is_err());
+        let context2 = TestContext::new().await;
+        assert!(!context2.is_configured().await?);
+        assert!(has_backup(&context2, backup_dir.path()).await.is_err());
 
-            // export from context1
-            assert!(
-                imex(&context1, ImexMode::ExportBackup, backup_dir.path(), None)
-                    .await
-                    .is_ok()
-            );
-            let _event = context1
-                .evtracker
-                .get_matching(|evt| matches!(evt, EventType::ImexProgress(1000)))
-                .await;
-
-            // import to context2
-            let backup = has_backup(&context2, backup_dir.path()).await?;
-
-            // Import of unencrypted backup with incorrect "foobar" backup passphrase fails.
-            assert!(
-                imex(
-                    &context2,
-                    ImexMode::ImportBackup,
-                    backup.as_ref(),
-                    Some("foobar".to_string())
-                )
+        // export from context1
+        assert!(
+            imex(&context1, ImexMode::ExportBackup, backup_dir.path(), None)
                 .await
-                .is_err()
-            );
+                .is_ok()
+        );
+        let _event = context1
+            .evtracker
+            .get_matching(|evt| matches!(evt, EventType::ImexProgress(1000)))
+            .await;
 
-            assert!(
-                imex(&context2, ImexMode::ImportBackup, backup.as_ref(), None)
-                    .await
-                    .is_ok()
-            );
-            let _event = context2
-                .evtracker
-                .get_matching(|evt| matches!(evt, EventType::ImexProgress(1000)))
-                .await;
+        // import to context2
+        let backup = has_backup(&context2, backup_dir.path()).await?;
 
-            assert!(context2.is_configured().await?);
-            assert_eq!(
-                context2.get_config(Config::Addr).await?,
-                Some("alice@example.org".to_string())
-            );
-            assert_eq!(
-                context2
-                    .get_config_bool(Config::VerifiedOneOnOneChats)
-                    .await?,
-                false
-            );
-            assert_eq!(
-                context1
-                    .get_config_bool(Config::VerifiedOneOnOneChats)
-                    .await?,
-                set_verified_oneonone_chats
-            );
-        }
+        // Import of unencrypted backup with incorrect "foobar" backup passphrase fails.
+        assert!(
+            imex(
+                &context2,
+                ImexMode::ImportBackup,
+                backup.as_ref(),
+                Some("foobar".to_string())
+            )
+            .await
+            .is_err()
+        );
+
+        assert!(
+            imex(&context2, ImexMode::ImportBackup, backup.as_ref(), None)
+                .await
+                .is_ok()
+        );
+        let _event = context2
+            .evtracker
+            .get_matching(|evt| matches!(evt, EventType::ImexProgress(1000)))
+            .await;
+
+        assert!(context2.is_configured().await?);
+        assert_eq!(
+            context2.get_config(Config::Addr).await?,
+            Some("alice@example.org".to_string())
+        );
         Ok(())
     }
 

@@ -34,7 +34,7 @@ use crate::param::{Param, Params};
 use crate::peer_channels::Iroh;
 use crate::push::PushSubscriber;
 use crate::quota::QuotaInfo;
-use crate::scheduler::{SchedulerState, convert_folder_meaning};
+use crate::scheduler::{ConnectivityStore, SchedulerState, convert_folder_meaning};
 use crate::sql::Sql;
 use crate::stock_str::StockStrings;
 use crate::timesmearing::SmearedTimestamp;
@@ -304,6 +304,10 @@ pub struct InnerContext {
     /// tokio::sync::OnceCell would be possible to use, but overkill for our usecase;
     /// the standard library's OnceLock is enough, and it's a lot smaller in memory.
     pub(crate) self_fingerprint: OnceLock<String>,
+
+    /// `Connectivity` values for mailboxes, unordered. Used to compute the aggregate connectivity,
+    /// see [`Context::get_connectivity()`].
+    pub(crate) connectivities: parking_lot::Mutex<Vec<ConnectivityStore>>,
 }
 
 /// The state of ongoing process.
@@ -473,6 +477,7 @@ impl Context {
             push_subscribed: AtomicBool::new(false),
             iroh: Arc::new(RwLock::new(None)),
             self_fingerprint: OnceLock::new(),
+            connectivities: parking_lot::Mutex::new(Vec::new()),
         };
 
         let ctx = Context {
@@ -502,7 +507,7 @@ impl Context {
         // Now, some configs may have changed, so, we need to invalidate the cache.
         self.sql.config_cache.write().await.clear();
 
-        self.scheduler.start(self.clone()).await;
+        self.scheduler.start(self).await;
     }
 
     /// Stops the IO scheduler.
@@ -584,7 +589,7 @@ impl Context {
         } else {
             // Pause the scheduler to ensure another connection does not start
             // while we are fetching on a dedicated connection.
-            let _pause_guard = self.scheduler.pause(self.clone()).await?;
+            let _pause_guard = self.scheduler.pause(self).await?;
 
             // Start a new dedicated connection.
             let mut connection = Imap::new_configured(self, channel::bounded(1).1).await?;
@@ -833,7 +838,6 @@ impl Context {
             .query_get_value("PRAGMA journal_mode;", ())
             .await?
             .unwrap_or_else(|| "unknown".to_string());
-        let e2ee_enabled = self.get_config_int(Config::E2eeEnabled).await?;
         let mdns_enabled = self.get_config_int(Config::MdnsEnabled).await?;
         let bcc_self = self.get_config_int(Config::BccSelf).await?;
         let sync_msgs = self.get_config_int(Config::SyncMsgs).await?;
@@ -967,7 +971,6 @@ impl Context {
         res.insert("configured_mvbox_folder", configured_mvbox_folder);
         res.insert("configured_trash_folder", configured_trash_folder);
         res.insert("mdns_enabled", mdns_enabled.to_string());
-        res.insert("e2ee_enabled", e2ee_enabled.to_string());
         res.insert("bcc_self", bcc_self.to_string());
         res.insert("sync_msgs", sync_msgs.to_string());
         res.insert("disable_idle", disable_idle.to_string());
@@ -1057,12 +1060,6 @@ impl Context {
             self.get_config_int(Config::GossipPeriod).await?.to_string(),
         );
         res.insert(
-            "verified_one_on_one_chats", // deprecated 2025-07
-            self.get_config_bool(Config::VerifiedOneOnOneChats)
-                .await?
-                .to_string(),
-        );
-        res.insert(
             "webxdc_realtime_enabled",
             self.get_config_bool(Config::WebxdcRealtimeEnabled)
                 .await?
@@ -1078,6 +1075,13 @@ impl Context {
             "first_key_contacts_msg_id",
             self.sql
                 .get_raw_config("first_key_contacts_msg_id")
+                .await?
+                .unwrap_or_default(),
+        );
+        res.insert(
+            "fail_on_receiving_full_msg",
+            self.sql
+                .get_raw_config("fail_on_receiving_full_msg")
                 .await?
                 .unwrap_or_default(),
         );
@@ -1215,7 +1219,7 @@ impl Context {
             .await?
             .first()
             .context("Self reporting bot vCard does not contain a contact")?;
-        mark_contact_id_as_verified(self, contact_id, ContactId::SELF).await?;
+        mark_contact_id_as_verified(self, contact_id, Some(ContactId::SELF)).await?;
 
         let chat_id = ChatId::create_for_contact(self, contact_id).await?;
         chat_id

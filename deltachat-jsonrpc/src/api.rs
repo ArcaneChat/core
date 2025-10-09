@@ -8,6 +8,7 @@ use std::{collections::HashMap, str::FromStr};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 pub use deltachat::accounts::Accounts;
 use deltachat::blob::BlobObject;
+use deltachat::calls::ice_servers;
 use deltachat::chat::{
     self, add_contact_to_chat, forward_msgs, get_chat_media, get_chat_msgs, get_chat_msgs_ex,
     marknoticed_chat, remove_contact_from_chat, Chat, ChatId, ChatItem, MessageListOptions,
@@ -47,6 +48,7 @@ pub mod types;
 
 use num_traits::FromPrimitive;
 use types::account::Account;
+use types::calls::JsonrpcCallInfo;
 use types::chat::FullChat;
 use types::contact::{ContactObject, VcardContact};
 use types::events::Event;
@@ -91,7 +93,8 @@ pub struct CommandApi {
 
     /// Receiver side of the event channel.
     ///
-    /// Events from it can be received by calling `get_next_event` method.
+    /// Events from it can be received by calling
+    /// [`CommandApi::get_next_event`] method.
     event_emitter: Arc<EventEmitter>,
 
     states: Arc<Mutex<BTreeMap<u32, AccountState>>>,
@@ -173,7 +176,15 @@ impl CommandApi {
         get_info()
     }
 
-    /// Get the next event.
+    /// Get the next event, and remove it from the event queue.
+    ///
+    /// If no events have happened since the last `get_next_event`
+    /// (i.e. if the event queue is empty), the response will be returned
+    /// only when a new event fires.
+    ///
+    /// Note that if you are using the `BaseDeltaChat` JavaScript class
+    /// or the `Rpc` Python class, this function will be invoked
+    /// by those classes internally and should not be used manually.
     async fn get_next_event(&self) -> Result<Event> {
         self.event_emitter
             .recv()
@@ -1798,13 +1809,13 @@ impl CommandApi {
 
     /// Offers a backup for remote devices to retrieve.
     ///
-    /// Can be cancelled by stopping the ongoing process.  Success or failure can be tracked
+    /// Can be canceled by stopping the ongoing process.  Success or failure can be tracked
     /// via the `ImexProgress` event which should either reach `1000` for success or `0` for
     /// failure.
     ///
     /// This **stops IO** while it is running.
     ///
-    /// Returns once a remote device has retrieved the backup, or is cancelled.
+    /// Returns once a remote device has retrieved the backup, or is canceled.
     async fn provide_backup(&self, account_id: u32) -> Result<()> {
         let ctx = self.get_context(account_id).await?;
 
@@ -1870,7 +1881,7 @@ impl CommandApi {
     /// This retrieves the backup from a remote device over the network and imports it into
     /// the current device.
     ///
-    /// Can be cancelled by stopping the ongoing process.
+    /// Can be canceled by stopping the ongoing process.
     ///
     /// Do not forget to call start_io on the account after a successful import,
     /// otherwise it will not connect to the email server.
@@ -1908,7 +1919,7 @@ impl CommandApi {
     /// If the connectivity changes, a #DC_EVENT_CONNECTIVITY_CHANGED will be emitted.
     async fn get_connectivity(&self, account_id: u32) -> Result<u32> {
         let ctx = self.get_context(account_id).await?;
-        Ok(ctx.get_connectivity().await as u32)
+        Ok(ctx.get_connectivity() as u32)
     }
 
     /// Get an overview of the current connectivity, and possibly more statistics.
@@ -1991,6 +2002,11 @@ impl CommandApi {
         Ok(())
     }
 
+    /// Leaves the gossip of the webxdc with the given message id.
+    ///
+    /// NB: When this is called before closing a webxdc app in UIs, it must be guaranteed that
+    /// `send_webxdc_realtime_*()` functions aren't called for the given `instance_message_id`
+    /// anymore until the app is open again.
     async fn leave_webxdc_realtime(&self, account_id: u32, instance_message_id: u32) -> Result<()> {
         let ctx = self.get_context(account_id).await?;
         leave_webxdc_realtime(&ctx, MsgId::new(instance_message_id)).await
@@ -2066,6 +2082,53 @@ impl CommandApi {
             .init_webxdc_integration(chat_id.map(ChatId::new))
             .await?
             .map(|msg_id| msg_id.to_u32()))
+    }
+
+    /// Starts an outgoing call.
+    async fn place_outgoing_call(
+        &self,
+        account_id: u32,
+        chat_id: u32,
+        place_call_info: String,
+    ) -> Result<u32> {
+        let ctx = self.get_context(account_id).await?;
+        let msg_id = ctx
+            .place_outgoing_call(ChatId::new(chat_id), place_call_info)
+            .await?;
+        Ok(msg_id.to_u32())
+    }
+
+    /// Accepts an incoming call.
+    async fn accept_incoming_call(
+        &self,
+        account_id: u32,
+        msg_id: u32,
+        accept_call_info: String,
+    ) -> Result<()> {
+        let ctx = self.get_context(account_id).await?;
+        ctx.accept_incoming_call(MsgId::new(msg_id), accept_call_info)
+            .await?;
+        Ok(())
+    }
+
+    /// Ends incoming or outgoing call.
+    async fn end_call(&self, account_id: u32, msg_id: u32) -> Result<()> {
+        let ctx = self.get_context(account_id).await?;
+        ctx.end_call(MsgId::new(msg_id)).await?;
+        Ok(())
+    }
+
+    /// Returns information about the call.
+    async fn call_info(&self, account_id: u32, msg_id: u32) -> Result<JsonrpcCallInfo> {
+        let ctx = self.get_context(account_id).await?;
+        let call_info = JsonrpcCallInfo::from_msg_id(&ctx, MsgId::new(msg_id)).await?;
+        Ok(call_info)
+    }
+
+    /// Returns JSON with ICE servers, to be used for WebRTC video calls.
+    async fn ice_servers(&self, account_id: u32) -> Result<String> {
+        let ctx = self.get_context(account_id).await?;
+        ice_servers(&ctx).await
     }
 
     /// Makes an HTTP GET request and returns a response.

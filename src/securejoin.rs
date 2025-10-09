@@ -16,7 +16,6 @@ use crate::events::EventType;
 use crate::headerdef::HeaderDef;
 use crate::key::{DcKey, Fingerprint, load_self_public_key};
 use crate::log::{error, info, warn};
-use crate::logged_debug_assert;
 use crate::message::{Message, Viewtype};
 use crate::mimeparser::{MimeMessage, SystemMessage};
 use crate::param::Param;
@@ -32,16 +31,28 @@ use qrinvite::QrInvite;
 
 use crate::token::Namespace;
 
-fn inviter_progress(context: &Context, contact_id: ContactId, progress: usize) {
-    logged_debug_assert!(
-        context,
-        progress <= 1000,
-        "inviter_progress: contact {contact_id}, progress={progress}, but value in range 0..1000 expected with: 0=error, 1..999=progress, 1000=success."
-    );
+fn inviter_progress(
+    context: &Context,
+    contact_id: ContactId,
+    chat_id: ChatId,
+    is_group: bool,
+) -> Result<()> {
+    let chat_type = if is_group {
+        Chattype::Group
+    } else {
+        Chattype::Single
+    };
+
+    // No other values are used.
+    let progress = 1000;
     context.emit_event(EventType::SecurejoinInviterProgress {
         contact_id,
+        chat_id,
+        chat_type,
         progress,
     });
+
+    Ok(())
 }
 
 /// Generates a Secure Join QR code.
@@ -210,7 +221,7 @@ async fn verify_sender_by_fingerprint(
     let contact = Contact::get_by_id(context, contact_id).await?;
     let is_verified = contact.fingerprint().is_some_and(|fp| &fp == fingerprint);
     if is_verified {
-        mark_contact_id_as_verified(context, contact_id, ContactId::SELF).await?;
+        mark_contact_id_as_verified(context, contact_id, Some(ContactId::SELF)).await?;
     }
     Ok(is_verified)
 }
@@ -266,13 +277,13 @@ pub(crate) async fn handle_securejoin_handshake(
 
     info!(context, "Received secure-join message {step:?}.");
 
-    let join_vg = step.starts_with("vg-");
-
     if !matches!(step, "vg-request" | "vc-request") {
         let mut self_found = false;
         let self_fingerprint = load_self_public_key(context).await?.dc_fingerprint();
         for (addr, key) in &mime_message.gossiped_keys {
-            if key.dc_fingerprint() == self_fingerprint && context.is_self_addr(addr).await? {
+            if key.public_key.dc_fingerprint() == self_fingerprint
+                && context.is_self_addr(addr).await?
+            {
                 self_found = true;
                 break;
             }
@@ -307,8 +318,6 @@ pub(crate) async fn handle_securejoin_handshake(
                 warn!(context, "Secure-join denied (bad invitenumber).");
                 return Ok(HandshakeMessage::Ignore);
             }
-
-            inviter_progress(context, contact_id, 300);
 
             let from_addr = ContactAddress::new(&mime_message.from.addr)?;
             let autocrypt_fingerprint = mime_message.autocrypt_fingerprint.as_deref().unwrap_or("");
@@ -399,11 +408,10 @@ pub(crate) async fn handle_securejoin_handshake(
             ContactId::scaleup_origin(context, &[contact_id], Origin::SecurejoinInvited).await?;
             // for setup-contact, make Alice's one-to-one chat with Bob visible
             // (secure-join-information are shown in the group chat)
-            if !join_vg {
+            if grpid.is_empty() {
                 ChatId::create_for_contact(context, contact_id).await?;
             }
             context.emit_event(EventType::ContactsChanged(Some(contact_id)));
-            inviter_progress(context, contact_id, 600);
             if let Some(group_chat_id) = group_chat_id {
                 // Join group.
                 secure_connection_established(
@@ -415,17 +423,18 @@ pub(crate) async fn handle_securejoin_handshake(
                 .await?;
                 chat::add_contact_to_chat_ex(context, Nosync, group_chat_id, contact_id, true)
                     .await?;
-                inviter_progress(context, contact_id, 800);
-                inviter_progress(context, contact_id, 1000);
+                let is_group = true;
+                inviter_progress(context, contact_id, group_chat_id, is_group)?;
                 // IMAP-delete the message to avoid handling it by another device and adding the
                 // member twice. Another device will know the member's key from Autocrypt-Gossip.
                 Ok(HandshakeMessage::Done)
             } else {
+                let chat_id = info_chat_id(context, contact_id).await?;
                 // Setup verified contact.
                 secure_connection_established(
                     context,
                     contact_id,
-                    info_chat_id(context, contact_id).await?,
+                    chat_id,
                     mime_message.timestamp_sent,
                 )
                 .await?;
@@ -433,7 +442,8 @@ pub(crate) async fn handle_securejoin_handshake(
                     .await
                     .context("failed sending vc-contact-confirm message")?;
 
-                inviter_progress(context, contact_id, 1000);
+                let is_group = false;
+                inviter_progress(context, contact_id, chat_id, is_group)?;
                 Ok(HandshakeMessage::Ignore) // "Done" would delete the message and break multi-device (the key from Autocrypt-header is needed)
             }
         }
@@ -542,21 +552,30 @@ pub(crate) async fn observe_securejoin_on_other_device(
         return Ok(HandshakeMessage::Ignore);
     };
 
-    if key.dc_fingerprint() != contact_fingerprint {
+    if key.public_key.dc_fingerprint() != contact_fingerprint {
         // Fingerprint does not match, ignore.
         warn!(context, "Fingerprint does not match.");
         return Ok(HandshakeMessage::Ignore);
     }
 
-    mark_contact_id_as_verified(context, contact_id, ContactId::SELF).await?;
+    mark_contact_id_as_verified(context, contact_id, Some(ContactId::SELF)).await?;
 
     ChatId::set_protection_for_contact(context, contact_id, mime_message.timestamp_sent).await?;
 
-    if step == "vg-member-added" {
-        inviter_progress(context, contact_id, 800);
-    }
     if step == "vg-member-added" || step == "vc-contact-confirm" {
-        inviter_progress(context, contact_id, 1000);
+        let is_group = mime_message
+            .get_header(HeaderDef::ChatGroupMemberAdded)
+            .is_some();
+
+        // We don't know the chat ID
+        // as we may not know about the group yet.
+        //
+        // Event is mostly used for bots
+        // which only have a single device
+        // and tests which don't care about the chat ID,
+        // so we pass invalid chat ID here.
+        let chat_id = ChatId::new(0);
+        inviter_progress(context, contact_id, chat_id, is_group)?;
     }
 
     if step == "vg-request-with-auth" || step == "vc-request-with-auth" {
