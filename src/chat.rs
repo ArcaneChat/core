@@ -393,7 +393,7 @@ impl ChatId {
     /// Returns true if the value was modified.
     pub(crate) async fn set_blocked(self, context: &Context, new_blocked: Blocked) -> Result<bool> {
         if self.is_special() {
-            bail!("ignoring setting of Block-status for {}", self);
+            bail!("ignoring setting of Block-status for {self}");
         }
         let count = context
             .sql
@@ -722,8 +722,7 @@ impl ChatId {
     ) -> Result<()> {
         ensure!(
             !self.is_special(),
-            "bad chat_id, can not be special chat: {}",
-            self
+            "bad chat_id, can not be special chat: {self}"
         );
 
         context
@@ -833,8 +832,7 @@ impl ChatId {
     pub(crate) async fn delete_ex(self, context: &Context, sync: sync::Sync) -> Result<()> {
         ensure!(
             !self.is_special(),
-            "bad chat_id, can not be a special chat: {}",
-            self
+            "bad chat_id, can not be a special chat: {self}"
         );
 
         let chat = Chat::load_from_db(context, self).await?;
@@ -2711,10 +2709,7 @@ impl ChatIdBlocked {
 }
 
 async fn prepare_msg_blob(context: &Context, msg: &mut Message) -> Result<()> {
-    if msg.viewtype == Viewtype::Text
-        || msg.viewtype == Viewtype::VideochatInvitation
-        || msg.viewtype == Viewtype::Call
-    {
+    if msg.viewtype == Viewtype::Text || msg.viewtype == Viewtype::Call {
         // the caller should check if the message text is empty
     } else if msg.viewtype.has_file() {
         let viewtype_orig = msg.viewtype;
@@ -3168,8 +3163,7 @@ pub async fn send_text_msg(
 ) -> Result<MsgId> {
     ensure!(
         !chat_id.is_special(),
-        "bad chat_id, can not be a special chat: {}",
-        chat_id
+        "bad chat_id, can not be a special chat: {chat_id}"
     );
 
     let mut msg = Message::new_text(text_to_send);
@@ -3185,10 +3179,6 @@ pub async fn send_edit_request(context: &Context, msg_id: MsgId, new_text: Strin
     );
     ensure!(!original_msg.is_info(), "Cannot edit info messages");
     ensure!(!original_msg.has_html(), "Cannot edit HTML messages");
-    ensure!(
-        original_msg.viewtype != Viewtype::VideochatInvitation,
-        "Cannot edit videochat invitations"
-    );
     ensure!(original_msg.viewtype != Viewtype::Call, "Cannot edit calls");
     ensure!(
         !original_msg.text.is_empty(), // avoid complexity in UI element changes. focus is typos and rewordings
@@ -3235,34 +3225,6 @@ pub(crate) async fn save_text_edit_to_db(
         .await?;
     context.emit_msgs_changed(original_msg.chat_id, original_msg.id);
     Ok(())
-}
-
-/// Sends invitation to a videochat.
-pub async fn send_videochat_invitation(context: &Context, chat_id: ChatId) -> Result<MsgId> {
-    ensure!(
-        !chat_id.is_special(),
-        "video chat invitation cannot be sent to special chat: {}",
-        chat_id
-    );
-
-    let instance = if let Some(instance) = context.get_config(Config::WebrtcInstance).await? {
-        if !instance.is_empty() {
-            instance
-        } else {
-            bail!("webrtc_instance is empty");
-        }
-    } else {
-        bail!("webrtc_instance not set");
-    };
-
-    let instance = Message::create_webrtc_instance(&instance, &create_id());
-
-    let mut msg = Message::new(Viewtype::VideochatInvitation);
-    msg.param.set(Param::WebrtcRoom, &instance);
-    msg.text =
-        stock_str::videochat_invite_msg_body(context, &Message::parse_webrtc_instance(&instance).1)
-            .await;
-    send_msg(context, chat_id, &mut msg).await
 }
 
 async fn donation_request_maybe(context: &Context) -> Result<()> {
@@ -3969,13 +3931,11 @@ pub(crate) async fn add_contact_to_chat_ex(
     let mut chat = Chat::load_from_db(context, chat_id).await?;
     ensure!(
         chat.typ == Chattype::Group || chat.typ == Chattype::OutBroadcast,
-        "{} is not a group/broadcast where one can add members",
-        chat_id
+        "{chat_id} is not a group/broadcast where one can add members"
     );
     ensure!(
         Contact::real_exists_by_id(context, contact_id).await? || contact_id == ContactId::SELF,
-        "invalid contact_id {} for adding to group",
-        contact_id
+        "invalid contact_id {contact_id} for adding to group"
     );
     ensure!(!chat.is_mailing_list(), "Mailing lists can't be changed");
     ensure!(
@@ -4220,8 +4180,7 @@ pub async fn remove_contact_from_chat(
 ) -> Result<()> {
     ensure!(
         !chat_id.is_special(),
-        "bad chat_id, can not be special chat: {}",
-        chat_id
+        "bad chat_id, can not be special chat: {chat_id}"
     );
     ensure!(
         !contact_id.is_special() || contact_id == ContactId::SELF,
@@ -4235,7 +4194,7 @@ pub async fn remove_contact_from_chat(
                 "Cannot remove contact {contact_id} from chat {chat_id}: self not in group."
             );
             context.emit_event(EventType::ErrorSelfNotInGroup(err_msg.clone()));
-            bail!("{}", err_msg);
+            bail!("{err_msg}");
         } else {
             let mut sync = Nosync;
 
@@ -4455,7 +4414,7 @@ pub async fn set_chat_profile_image(
         msg.text = stock_str::msg_grp_img_changed(context, ContactId::SELF).await;
     }
     chat.update_param(context).await?;
-    if chat.is_promoted() && !chat.is_mailing_list() {
+    if chat.is_promoted() {
         msg.id = send_msg(context, chat_id, &mut msg).await?;
         context.emit_msgs_changed(chat_id, msg.id);
     }
@@ -4477,7 +4436,7 @@ pub async fn forward_msgs(context: &Context, msg_ids: &[MsgId], chat_id: ChatId)
         .await?;
     let mut chat = Chat::load_from_db(context, chat_id).await?;
     if let Some(reason) = chat.why_cant_send(context).await? {
-        bail!("cannot send to {}: {}", chat_id, reason);
+        bail!("cannot send to {chat_id}: {reason}");
     }
     curr_timestamp = create_smeared_timestamps(context, msg_ids.len());
     let mut msgs = Vec::with_capacity(msg_ids.len());

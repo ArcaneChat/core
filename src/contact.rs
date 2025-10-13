@@ -1582,6 +1582,8 @@ impl Contact {
     pub fn get_color(&self) -> u32 {
         if let Some(fingerprint) = self.fingerprint() {
             str_to_color(&fingerprint.hex())
+        } else if self.id == ContactId::SELF {
+            0x808080
         } else {
             str_to_color(&self.addr.to_lowercase())
         }
@@ -1742,8 +1744,7 @@ pub(crate) async fn set_blocked(
 ) -> Result<()> {
     ensure!(
         !contact_id.is_special(),
-        "Can't block special contact {}",
-        contact_id
+        "Can't block special contact {contact_id}"
     );
     let contact = Contact::get_by_id(context, contact_id).await?;
 
