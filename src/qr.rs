@@ -6,20 +6,23 @@ use std::sync::LazyLock;
 
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
 pub use dclogin_scheme::LoginOptions;
+pub(crate) use dclogin_scheme::login_param_from_login_qr;
 use deltachat_contact_tools::{ContactAddress, addr_normalize, may_be_valid_addr};
 use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, percent_encode};
+use rand::TryRngCore as _;
+use rand::distr::{Alphanumeric, SampleString};
 use serde::Deserialize;
 
-pub(crate) use self::dclogin_scheme::configure_from_login_qr;
 use crate::config::Config;
 use crate::contact::{Contact, ContactId, Origin};
 use crate::context::Context;
 use crate::events::EventType;
 use crate::key::Fingerprint;
+use crate::login_param::{EnteredCertificateChecks, EnteredLoginParam, EnteredServerLoginParam};
 use crate::net::http::post_empty;
 use crate::net::proxy::{DEFAULT_SOCKS_PORT, ProxyConfig};
 use crate::token;
-use crate::tools::validate_id;
+use crate::tools::{time, validate_id};
 
 const OPENPGP4FPR_SCHEME: &str = "OPENPGP4FPR:"; // yes: uppercase
 const IDELTACHAT_SCHEME: &str = "https://i.delta.chat/#";
@@ -78,6 +81,30 @@ pub enum Qr {
         /// Invite number.
         invitenumber: String,
 
+        /// Authentication code.
+        authcode: String,
+    },
+
+    /// Ask whether to join the broadcast channel.
+    AskJoinBroadcast {
+        /// The user-visible name of this broadcast channel
+        name: String,
+
+        /// A string of random characters,
+        /// uniquely identifying this broadcast channel across all databases/clients.
+        /// Called `grpid` for historic reasons:
+        /// The id of multi-user chats is always called `grpid` in the database
+        /// because groups were once the only multi-user chats.
+        grpid: String,
+
+        /// ID of the contact who owns the channel and created the QR code.
+        contact_id: ContactId,
+
+        /// Fingerprint of the contact's key as scanned from the QR code.
+        fingerprint: Fingerprint,
+
+        /// Invite number.
+        invitenumber: String,
         /// Authentication code.
         authcode: String,
     },
@@ -368,6 +395,7 @@ pub fn format_backup(qr: &Qr) -> Result<String> {
 
 /// scheme: `OPENPGP4FPR:FINGERPRINT#a=ADDR&n=NAME&i=INVITENUMBER&s=AUTH`
 ///     or: `OPENPGP4FPR:FINGERPRINT#a=ADDR&g=GROUPNAME&x=GROUPID&i=INVITENUMBER&s=AUTH`
+///     or: `OPENPGP4FPR:FINGERPRINT#a=ADDR&b=BROADCAST_NAME&x=BROADCAST_ID&j=INVITENUMBER&s=AUTH`
 ///     or: `OPENPGP4FPR:FINGERPRINT#a=ADDR`
 async fn decode_openpgp(context: &Context, qr: &str) -> Result<Qr> {
     let payload = qr
@@ -404,18 +432,12 @@ async fn decode_openpgp(context: &Context, qr: &str) -> Result<Qr> {
         None
     };
 
-    let name = if let Some(encoded_name) = param.get("n") {
-        let encoded_name = encoded_name.replace('+', "%20"); // sometimes spaces are encoded as `+`
-        match percent_decode_str(&encoded_name).decode_utf8() {
-            Ok(name) => name.to_string(),
-            Err(err) => bail!("Invalid name: {err}"),
-        }
-    } else {
-        "".to_string()
-    };
+    let name = decode_name(&param, "n")?.unwrap_or_default();
 
     let invitenumber = param
         .get("i")
+        // For historic reansons, broadcasts currently use j instead of i for the invitenumber:
+        .or_else(|| param.get("j"))
         .filter(|&s| validate_id(s))
         .map(|s| s.to_string());
     let authcode = param
@@ -427,19 +449,8 @@ async fn decode_openpgp(context: &Context, qr: &str) -> Result<Qr> {
         .filter(|&s| validate_id(s))
         .map(|s| s.to_string());
 
-    let grpname = if grpid.is_some() {
-        if let Some(encoded_name) = param.get("g") {
-            let encoded_name = encoded_name.replace('+', "%20"); // sometimes spaces are encoded as `+`
-            match percent_decode_str(&encoded_name).decode_utf8() {
-                Ok(name) => Some(name.to_string()),
-                Err(err) => bail!("Invalid group name: {err}"),
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let grpname = decode_name(&param, "g")?;
+    let broadcast_name = decode_name(&param, "b")?;
 
     if let (Some(addr), Some(invitenumber), Some(authcode)) = (&addr, invitenumber, authcode) {
         let addr = ContactAddress::new(addr)?;
@@ -453,7 +464,7 @@ async fn decode_openpgp(context: &Context, qr: &str) -> Result<Qr> {
         .await
         .with_context(|| format!("failed to add or lookup contact for address {addr:?}"))?;
 
-        if let (Some(grpid), Some(grpname)) = (grpid, grpname) {
+        if let (Some(grpid), Some(grpname)) = (grpid.clone(), grpname) {
             if context
                 .is_self_addr(&addr)
                 .await
@@ -488,6 +499,15 @@ async fn decode_openpgp(context: &Context, qr: &str) -> Result<Qr> {
                     authcode,
                 })
             }
+        } else if let (Some(grpid), Some(name)) = (grpid, broadcast_name) {
+            Ok(Qr::AskJoinBroadcast {
+                name,
+                grpid,
+                contact_id,
+                fingerprint,
+                invitenumber,
+                authcode,
+            })
         } else if context.is_self_addr(&addr).await? {
             if token::exists(context, token::Namespace::InviteNumber, &invitenumber).await? {
                 Ok(Qr::WithdrawVerifyContact {
@@ -533,6 +553,18 @@ async fn decode_openpgp(context: &Context, qr: &str) -> Result<Qr> {
     }
 }
 
+fn decode_name(param: &BTreeMap<&str, &str>, key: &str) -> Result<Option<String>> {
+    if let Some(encoded_name) = param.get(key) {
+        let encoded_name = encoded_name.replace('+', "%20"); // sometimes spaces are encoded as `+`
+        match percent_decode_str(&encoded_name).decode_utf8() {
+            Ok(name) => Ok(Some(name.to_string())),
+            Err(err) => bail!("Invalid QR param {key}: {err}"),
+        }
+    } else {
+        Ok(None)
+    }
+}
+
 /// scheme: `https://i.delta.chat[/]#FINGERPRINT&a=ADDR[&OPTIONAL_PARAMS]`
 async fn decode_ideltachat(context: &Context, prefix: &str, qr: &str) -> Result<Qr> {
     let qr = qr.replacen(prefix, OPENPGP4FPR_SCHEME, 1);
@@ -542,21 +574,29 @@ async fn decode_ideltachat(context: &Context, prefix: &str, qr: &str) -> Result<
         .with_context(|| format!("failed to decode {prefix} QR code"))
 }
 
-/// scheme: `DCACCOUNT:https://example.org/new_email?t=1w_7wDjgjelxeX884x96v3`
+/// scheme: `DCACCOUNT:example.org`
+/// or `DCACCOUNT:https://example.org/new`
+/// or `DCACCOUNT:https://example.org/new_email?t=1w_7wDjgjelxeX884x96v3`
 fn decode_account(qr: &str) -> Result<Qr> {
     let payload = qr
         .get(DCACCOUNT_SCHEME.len()..)
         .context("Invalid DCACCOUNT payload")?;
-    let url = url::Url::parse(payload).context("Invalid account URL")?;
-    if url.scheme() == "http" || url.scheme() == "https" {
-        Ok(Qr::Account {
-            domain: url
-                .host_str()
-                .context("can't extract account setup domain")?
-                .to_string(),
-        })
+    if payload.starts_with("https://") {
+        let url = url::Url::parse(payload).context("Invalid account URL")?;
+        if url.scheme() == "https" {
+            Ok(Qr::Account {
+                domain: url
+                    .host_str()
+                    .context("can't extract account setup domain")?
+                    .to_string(),
+            })
+        } else {
+            bail!("Bad scheme for account URL: {:?}.", url.scheme());
+        }
     } else {
-        bail!("Bad scheme for account URL: {:?}.", url.scheme());
+        Ok(Qr::Account {
+            domain: payload.to_string(),
+        })
     }
 }
 
@@ -651,32 +691,55 @@ struct CreateAccountErrorResponse {
     reason: String,
 }
 
-/// take a qr of the type DC_QR_ACCOUNT, parse it's parameters,
-/// download additional information from the contained url and set the parameters.
-/// on success, a configure::configure() should be able to log in to the account
-pub(crate) async fn set_account_from_qr(context: &Context, qr: &str) -> Result<()> {
-    let url_str = qr
+/// Takes a QR with `DCACCOUNT:` scheme, parses its parameters,
+/// downloads additional information from the contained URL
+/// and returns the login parameters.
+pub(crate) async fn login_param_from_account_qr(
+    context: &Context,
+    qr: &str,
+) -> Result<EnteredLoginParam> {
+    let payload = qr
         .get(DCACCOUNT_SCHEME.len()..)
         .context("Invalid DCACCOUNT scheme")?;
 
-    if !url_str.starts_with(HTTPS_SCHEME) {
-        bail!("DCACCOUNT QR codes must use HTTPS scheme");
+    if !payload.starts_with(HTTPS_SCHEME) {
+        let rng = &mut rand::rngs::OsRng.unwrap_err();
+        let username = Alphanumeric.sample_string(rng, 9);
+        let addr = username + "@" + payload;
+        let password = Alphanumeric.sample_string(rng, 50);
+
+        let param = EnteredLoginParam {
+            addr,
+            imap: EnteredServerLoginParam {
+                password,
+                ..Default::default()
+            },
+            smtp: Default::default(),
+            certificate_checks: EnteredCertificateChecks::Strict,
+            oauth2: false,
+        };
+        return Ok(param);
     }
 
-    let (response_text, response_success) = post_empty(context, url_str).await?;
+    let (response_text, response_success) = post_empty(context, payload).await?;
     if response_success {
         let CreateAccountSuccessResponse { password, email } = serde_json::from_str(&response_text)
             .with_context(|| {
                 format!("Cannot create account, response is malformed:\n{response_text:?}")
             })?;
-        context
-            .set_config_internal(Config::Addr, Some(&email))
-            .await?;
-        context
-            .set_config_internal(Config::MailPw, Some(&password))
-            .await?;
 
-        Ok(())
+        let param = EnteredLoginParam {
+            addr: email,
+            imap: EnteredServerLoginParam {
+                password,
+                ..Default::default()
+            },
+            smtp: Default::default(),
+            certificate_checks: EnteredCertificateChecks::Strict,
+            oauth2: false,
+        };
+
+        Ok(param)
     } else {
         match serde_json::from_str::<CreateAccountErrorResponse>(&response_text) {
             Ok(error) => Err(anyhow!(error.reason)),
@@ -693,7 +756,10 @@ pub(crate) async fn set_account_from_qr(context: &Context, qr: &str) -> Result<(
 /// Sets configuration values from a QR code.
 pub async fn set_config_from_qr(context: &Context, qr: &str) -> Result<()> {
     match check_qr(context, qr).await? {
-        Qr::Account { .. } => set_account_from_qr(context, qr).await?,
+        Qr::Account { .. } => {
+            let mut param = login_param_from_account_qr(context, qr).await?;
+            context.add_transport_inner(&mut param).await?
+        }
         Qr::Proxy { url, .. } => {
             let old_proxy_url_value = context
                 .get_config(Config::ProxyUrl)
@@ -741,8 +807,16 @@ pub async fn set_config_from_qr(context: &Context, qr: &str) -> Result<()> {
             authcode,
             ..
         } => {
-            token::save(context, token::Namespace::InviteNumber, None, &invitenumber).await?;
-            token::save(context, token::Namespace::Auth, None, &authcode).await?;
+            let timestamp = time();
+            token::save(
+                context,
+                token::Namespace::InviteNumber,
+                None,
+                &invitenumber,
+                timestamp,
+            )
+            .await?;
+            token::save(context, token::Namespace::Auth, None, &authcode, timestamp).await?;
             context.sync_qr_code_tokens(None).await?;
             context.scheduler.interrupt_inbox().await;
         }
@@ -752,19 +826,29 @@ pub async fn set_config_from_qr(context: &Context, qr: &str) -> Result<()> {
             grpid,
             ..
         } => {
+            let timestamp = time();
             token::save(
                 context,
                 token::Namespace::InviteNumber,
                 Some(&grpid),
                 &invitenumber,
+                timestamp,
             )
             .await?;
-            token::save(context, token::Namespace::Auth, Some(&grpid), &authcode).await?;
+            token::save(
+                context,
+                token::Namespace::Auth,
+                Some(&grpid),
+                &authcode,
+                timestamp,
+            )
+            .await?;
             context.sync_qr_code_tokens(Some(&grpid)).await?;
             context.scheduler.interrupt_inbox().await;
         }
         Qr::Login { address, options } => {
-            configure_from_login_qr(context, &address, options).await?
+            let mut param = login_param_from_login_qr(&address, options)?;
+            context.add_transport_inner(&mut param).await?
         }
         _ => bail!("QR code does not contain config"),
     }

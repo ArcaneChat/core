@@ -171,17 +171,13 @@ impl MsgId {
     ) -> Result<Vec<String>> {
         context
             .sql
-            .query_map(
+            .query_map_vec(
                 "SELECT folder, uid FROM imap WHERE rfc724_mid=?",
                 (rfc724_mid,),
                 |row| {
                     let folder: String = row.get("folder")?;
                     let uid: u32 = row.get("uid")?;
                     Ok(format!("</{folder}/;UID={uid}>"))
-                },
-                |rows| {
-                    rows.collect::<std::result::Result<Vec<_>, _>>()
-                        .map_err(Into::into)
                 },
             )
             .await
@@ -241,7 +237,7 @@ impl MsgId {
 
         if let Ok(rows) = context
             .sql
-            .query_map(
+            .query_map_vec(
                 "SELECT contact_id, timestamp_sent FROM msgs_mdns WHERE msg_id=?",
                 (self,),
                 |row| {
@@ -249,7 +245,6 @@ impl MsgId {
                     let ts: i64 = row.get(1)?;
                     Ok((contact_id, ts))
                 },
-                |rows| rows.collect::<Result<Vec<_>, _>>().map_err(Into::into),
             )
             .await
         {
@@ -387,20 +382,16 @@ impl rusqlite::types::FromSql for MsgId {
     ToSql,
     Serialize,
     Deserialize,
+    Default,
 )]
 #[repr(u8)]
 pub(crate) enum MessengerMessage {
+    #[default]
     No = 0,
     Yes = 1,
 
     /// No, but reply to messenger message.
     Reply = 2,
-}
-
-impl Default for MessengerMessage {
-    fn default() -> Self {
-        Self::No
-    }
 }
 
 /// An object representing a single message in memory.
@@ -1246,7 +1237,7 @@ impl Message {
     /// `References` header is not taken into account.
     pub async fn parent(&self, context: &Context) -> Result<Option<Message>> {
         if let Some(in_reply_to) = &self.in_reply_to {
-            if let Some((msg_id, _ts_sent)) = rfc724_mid_exists(context, in_reply_to).await? {
+            if let Some(msg_id) = rfc724_mid_exists(context, in_reply_to).await? {
                 let msg = Message::load_from_db_optional(context, msg_id).await?;
                 return Ok(msg);
             }
@@ -1438,7 +1429,7 @@ pub async fn get_msg_read_receipts(
 ) -> Result<Vec<(ContactId, i64)>> {
     context
         .sql
-        .query_map(
+        .query_map_vec(
             "SELECT contact_id, timestamp_sent FROM msgs_mdns WHERE msg_id=?",
             (msg_id,),
             |row| {
@@ -1446,7 +1437,6 @@ pub async fn get_msg_read_receipts(
                 let ts: i64 = row.get(1)?;
                 Ok((contact_id, ts))
             },
-            |rows| rows.collect::<Result<Vec<_>, _>>().map_err(Into::into),
         )
         .await
 }
@@ -2055,13 +2045,13 @@ pub async fn estimate_deletion_cnt(
 pub(crate) async fn rfc724_mid_exists(
     context: &Context,
     rfc724_mid: &str,
-) -> Result<Option<(MsgId, i64)>> {
+) -> Result<Option<MsgId>> {
     Ok(rfc724_mid_exists_ex(context, rfc724_mid, "1")
         .await?
-        .map(|(id, ts_sent, _)| (id, ts_sent)))
+        .map(|(id, _)| id))
 }
 
-/// Returns [MsgId] and "sent" timestamp of the most recent message with given `rfc724_mid`
+/// Returns [MsgId] of the most recent message with given `rfc724_mid`
 /// (Message-ID header) and bool `expr` result if such messages exists in the db.
 ///
 /// * `expr`: SQL expression additionally passed into `SELECT`. Evaluated to `true` iff it is true
@@ -2070,7 +2060,7 @@ pub(crate) async fn rfc724_mid_exists_ex(
     context: &Context,
     rfc724_mid: &str,
     expr: &str,
-) -> Result<Option<(MsgId, i64, bool)>> {
+) -> Result<Option<(MsgId, bool)>> {
     let rfc724_mid = rfc724_mid.trim_start_matches('<').trim_end_matches('>');
     if rfc724_mid.is_empty() {
         warn!(context, "Empty rfc724_mid passed to rfc724_mid_exists");
@@ -2088,9 +2078,8 @@ pub(crate) async fn rfc724_mid_exists_ex(
             (rfc724_mid,),
             |row| {
                 let msg_id: MsgId = row.get(0)?;
-                let timestamp_sent: i64 = row.get(1)?;
                 let expr_res: bool = row.get(2)?;
-                Ok((msg_id, timestamp_sent, expr_res))
+                Ok((msg_id, expr_res))
             },
         )
         .await?;
@@ -2110,7 +2099,7 @@ pub(crate) async fn get_by_rfc724_mids(
 ) -> Result<Option<Message>> {
     let mut latest = None;
     for id in mids.iter().rev() {
-        let Some((msg_id, _)) = rfc724_mid_exists(context, id).await? else {
+        let Some(msg_id) = rfc724_mid_exists(context, id).await? else {
             continue;
         };
         let Some(msg) = Message::load_from_db_optional(context, msg_id).await? else {

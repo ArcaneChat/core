@@ -235,7 +235,7 @@ impl Context {
     /// Create iroh endpoint and gossip.
     async fn init_peer_channels(&self) -> Result<Iroh> {
         info!(self, "Initializing peer channels.");
-        let secret_key = SecretKey::generate(rand::rngs::OsRng);
+        let secret_key = SecretKey::generate(rand_old::rngs::OsRng);
         let public_key = secret_key.public();
 
         let relay_mode = if let Some(relay_url) = self
@@ -574,7 +574,7 @@ mod tests {
     use super::*;
     use crate::{
         EventType,
-        chat::{self, ChatId, ProtectionStatus, add_contact_to_chat, resend_msgs, send_msg},
+        chat::{self, ChatId, add_contact_to_chat, resend_msgs, send_msg},
         message::{Message, Viewtype},
         test_utils::{TestContext, TestContextManager},
     };
@@ -616,7 +616,7 @@ mod tests {
         loop {
             let event = bob.evtracker.recv().await.unwrap();
             if let EventType::WebxdcRealtimeAdvertisementReceived { msg_id } = event.typ {
-                assert!(msg_id == alice_webxdc.id);
+                assert!(msg_id == bob_webxdc.id);
                 break;
             }
         }
@@ -962,9 +962,7 @@ mod tests {
         let mut tcm = TestContextManager::new();
         let alice = &mut tcm.alice().await;
         let bob = &mut tcm.bob().await;
-        let group = chat::create_group_chat(alice, ProtectionStatus::Unprotected, "group chat")
-            .await
-            .unwrap();
+        let group = chat::create_group(alice, "group chat").await.unwrap();
 
         // Alice sends webxdc to bob
         let mut instance = Message::new(Viewtype::File);

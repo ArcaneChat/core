@@ -126,6 +126,11 @@ class Account:
         yield self._rpc.add_or_update_transport.future(self.id, params)
 
     @futuremethod
+    def add_transport_from_qr(self, qr: str):
+        """Add a new transport using a QR code."""
+        yield self._rpc.add_transport_from_qr.future(self.id, qr)
+
+    @futuremethod
     def list_transports(self):
         """Return the list of all email accounts that are used as a transport in the current profile."""
         transports = yield self._rpc.list_transports.future(self.id)
@@ -300,7 +305,7 @@ class Account:
             chats.append(AttrDict(item))
         return chats
 
-    def create_group(self, name: str, protect: bool = False) -> Chat:
+    def create_group(self, name: str) -> Chat:
         """Create a new group chat.
 
         After creation,
@@ -317,15 +322,11 @@ class Account:
         To check, if a chat is still unpromoted, you can look at the `is_unpromoted` property of a chat
         (see `get_full_snapshot()` / `get_basic_snapshot()`).
         This may be useful if you want to show some help for just created groups.
-
-        :param protect: If set to 1 the function creates group with protection initially enabled.
-                        Only verified members are allowed in these groups
-                        and end-to-end-encryption is always enabled.
         """
-        return Chat(self, self._rpc.create_group_chat(self.id, name, protect))
+        return Chat(self, self._rpc.create_group_chat(self.id, name, False))
 
     def create_broadcast(self, name: str) -> Chat:
-        """Create a new **broadcast channel**
+        """Create a new, outgoing **broadcast channel**
         (called "Channel" in the UI).
 
         Broadcast channels are similar to groups on the sending device,

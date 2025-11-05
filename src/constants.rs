@@ -101,6 +101,8 @@ pub const DC_CHAT_ID_LAST_SPECIAL: ChatId = ChatId::new(9);
     Copy,
     PartialEq,
     Eq,
+    PartialOrd,
+    Ord,
     FromPrimitive,
     ToPrimitive,
     FromSql,
@@ -118,7 +120,7 @@ pub enum Chattype {
 
     /// Group chat.
     ///
-    /// Created by [`crate::chat::create_group_chat`].
+    /// Created by [`crate::chat::create_group`].
     Group = 120,
 
     /// An (unencrypted) mailing list,

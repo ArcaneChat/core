@@ -34,7 +34,7 @@ use crate::sync::SyncItems;
 use crate::tools::{
     get_filemeta, parse_receive_headers, smeared_time, time, truncate_msg_text, validate_id,
 };
-use crate::{chatlist_events, location, stock_str, tools};
+use crate::{chatlist_events, location, tools};
 
 /// Public key extracted from `Autocrypt-Gossip`
 /// header with associated information.
@@ -355,9 +355,13 @@ impl MimeMessage {
 
         let mail_raw; // Memory location for a possible decrypted message.
         let decrypted_msg; // Decrypted signed OpenPGP message.
+        let secrets: Vec<String> = context
+            .sql
+            .query_map_vec("SELECT secret FROM broadcast_secrets", (), |row| row.get(0))
+            .await?;
 
         let (mail, is_encrypted) =
-            match tokio::task::block_in_place(|| try_decrypt(&mail, &private_keyring)) {
+            match tokio::task::block_in_place(|| try_decrypt(&mail, &private_keyring, &secrets)) {
                 Ok(Some(mut msg)) => {
                     mail_raw = msg.as_data_vec().unwrap_or_default();
 
@@ -622,13 +626,12 @@ impl MimeMessage {
                     parser.parse_mime_recursive(context, mail, false).await?;
                 }
                 Err(err) => {
-                    let msg_body = stock_str::cant_decrypt_msg_body(context).await;
-                    let txt = format!("[{msg_body}]");
+                    let txt = "[This message cannot be decrypted.\n\n• It might already help to simply reply to this message and ask the sender to send the message again.\n\n• If you just re-installed Delta Chat then it is best if you re-setup Delta Chat now and choose \"Add as second device\" or import a backup.]";
 
                     let part = Part {
                         typ: Viewtype::Text,
-                        msg_raw: Some(txt.clone()),
-                        msg: txt,
+                        msg_raw: Some(txt.to_string()),
+                        msg: txt.to_string(),
                         // Don't change the error prefix for now,
                         // receive_imf.rs:lookup_chat_by_reply() checks it.
                         error: Some(format!("Decrypting failed: {err:#}")),
@@ -853,6 +856,10 @@ impl MimeMessage {
                         .iter_mut()
                         .find(|part| !part.msg.is_empty() && !part.is_reaction);
                     if let Some(part) = part_with_text {
+                        // Message bubbles are small, so we use en dash to save space. In some
+                        // languages there may be em dashes in the message text added by the author,
+                        // they may look stronger than Subject separation, this is a known thing.
+                        // Anyway, classic email support isn't a priority as of 2025.
                         part.msg = format!("{} – {}", subject, part.msg);
                     }
                 }
@@ -1562,6 +1569,8 @@ impl MimeMessage {
             // The message belongs to a mailing list and has a `ListId:`-header
             // that should be used to get a unique id.
             return Some(list_id);
+        } else if let Some(chat_list_id) = self.get_header(HeaderDef::ChatListId) {
+            return Some(chat_list_id);
         } else if let Some(sender) = self.get_header(HeaderDef::Sender) {
             // the `Sender:`-header alone is no indicator for mailing list
             // as also used for bot-impersonation via `set_override_sender_name()`
@@ -2430,9 +2439,9 @@ async fn handle_ndn(
 
     // The NDN might be for a message-id that had attachments and was sent from a non-Delta Chat client.
     // In this case we need to mark multiple "msgids" as failed that all refer to the same message-id.
-    let msgs: Vec<_> = context
+    let msg_ids = context
         .sql
-        .query_map(
+        .query_map_vec(
             "SELECT id FROM msgs
                 WHERE rfc724_mid=? AND from_id=1",
             (&failed.rfc724_mid,),
@@ -2440,7 +2449,6 @@ async fn handle_ndn(
                 let msg_id: MsgId = row.get(0)?;
                 Ok(msg_id)
             },
-            |rows| Ok(rows.collect::<Vec<_>>()),
         )
         .await?;
 
@@ -2451,8 +2459,7 @@ async fn handle_ndn(
     };
     let err_msg = &error;
 
-    for msg in msgs {
-        let msg_id = msg?;
+    for msg_id in msg_ids {
         let mut message = Message::load_from_db(context, msg_id).await?;
         let aggregated_error = message
             .error

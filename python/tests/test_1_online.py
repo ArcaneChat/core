@@ -269,26 +269,28 @@ def test_enable_mvbox_move(acfactory, lp):
     assert ac2._evtracker.wait_next_incoming_message().text == "message1"
 
 
-def test_mvbox_sentbox_threads(acfactory, lp):
+def test_mvbox_thread_and_trash(acfactory, lp):
     lp.sec("ac1: start with mvbox thread")
-    ac1 = acfactory.new_online_configuring_account(mvbox_move=True, sentbox_watch=False)
+    ac1 = acfactory.new_online_configuring_account(mvbox_move=True)
 
-    lp.sec("ac2: start without mvbox/sentbox threads")
-    ac2 = acfactory.new_online_configuring_account(mvbox_move=False, sentbox_watch=False)
+    lp.sec("ac2: start without a mvbox thread")
+    ac2 = acfactory.new_online_configuring_account(mvbox_move=False)
 
     lp.sec("ac2 and ac1: waiting for configuration")
     acfactory.bring_accounts_online()
 
-    lp.sec("ac1: create and configure sentbox")
-    ac1.direct_imap.create_folder("Sent")
-    ac1.set_config("sentbox_watch", "1")
+    lp.sec("ac1: create trash")
+    ac1.direct_imap.create_folder("Trash")
+    ac1.set_config("scan_all_folders_debounce_secs", "0")
+    ac1.stop_io()
+    ac1.start_io()
 
     lp.sec("ac1: send message and wait for ac2 to receive it")
     acfactory.get_accepted_chat(ac1, ac2).send_text("message1")
     assert ac2._evtracker.wait_next_incoming_message().text == "message1"
 
     assert ac1.get_config("configured_mvbox_folder") == "DeltaChat"
-    while ac1.get_config("configured_sentbox_folder") != "Sent":
+    while ac1.get_config("configured_trash_folder") != "Trash":
         ac1._evtracker.get_matching("DC_EVENT_CONNECTIVITY_CHANGED")
 
 
@@ -308,7 +310,7 @@ def test_move_works(acfactory):
 
 
 def test_move_avoids_loop(acfactory):
-    """Test that the message is only moved once.
+    """Test that the message is only moved from INBOX to DeltaChat.
 
     This is to avoid busy loop if moved message reappears in the Inbox
     or some scanned folder later.
@@ -319,6 +321,14 @@ def test_move_avoids_loop(acfactory):
     ac1 = acfactory.new_online_configuring_account()
     ac2 = acfactory.new_online_configuring_account(mvbox_move=True)
     acfactory.bring_accounts_online()
+
+    # Create INBOX.DeltaChat folder and make sure
+    # it is detected by full folder scan.
+    ac2.direct_imap.create_folder("INBOX.DeltaChat")
+    ac2.stop_io()
+    ac2.start_io()
+    ac2._evtracker.get_info_contains("Found folders:")  #  Wait until the end of folder scan.
+
     ac1_chat = acfactory.get_accepted_chat(ac1, ac2)
     ac1_chat.send_text("Message 1")
 
@@ -326,19 +336,27 @@ def test_move_avoids_loop(acfactory):
     ac2_msg1 = ac2._evtracker.wait_next_incoming_message()
     assert ac2_msg1.text == "Message 1"
 
-    # Move the message to the INBOX again.
+    # Move the message to the INBOX.DeltaChat again.
+    # We assume that test server uses "." as the delimiter.
     ac2.direct_imap.select_folder("DeltaChat")
-    ac2.direct_imap.conn.move(["*"], "INBOX")
+    ac2.direct_imap.conn.move(["*"], "INBOX.DeltaChat")
 
     ac1_chat.send_text("Message 2")
     ac2_msg2 = ac2._evtracker.wait_next_incoming_message()
     assert ac2_msg2.text == "Message 2"
 
-    # Check that Message 1 is still in the INBOX folder
+    # Stop and start I/O to trigger folder scan.
+    ac2.stop_io()
+    ac2.start_io()
+    ac2._evtracker.get_info_contains("Found folders:")  #  Wait until the end of folder scan.
+
+    # Check that Message 1 is still in the INBOX.DeltaChat folder
     # and Message 2 is in the DeltaChat folder.
     ac2.direct_imap.select_folder("INBOX")
-    assert len(ac2.direct_imap.get_all_messages()) == 1
+    assert len(ac2.direct_imap.get_all_messages()) == 0
     ac2.direct_imap.select_folder("DeltaChat")
+    assert len(ac2.direct_imap.get_all_messages()) == 1
+    ac2.direct_imap.select_folder("INBOX.DeltaChat")
     assert len(ac2.direct_imap.get_all_messages()) == 1
 
 
@@ -442,7 +460,7 @@ def test_forward_own_message(acfactory, lp):
 
 def test_resend_message(acfactory, lp):
     ac1, ac2 = acfactory.get_online_accounts(2)
-    chat1 = ac1.create_chat(ac2)
+    chat1 = acfactory.get_accepted_chat(ac1, ac2)
 
     lp.sec("ac1: send message to ac2")
     chat1.send_text("message")
@@ -450,14 +468,19 @@ def test_resend_message(acfactory, lp):
     lp.sec("ac2: receive message")
     msg_in = ac2._evtracker.wait_next_incoming_message()
     assert msg_in.text == "message"
-    chat2 = msg_in.chat
-    chat2_msg_cnt = len(chat2.get_messages())
 
     lp.sec("ac1: resend message")
     ac1.resend_messages([msg_in])
 
-    lp.sec("ac2: check that message is deleted")
-    ac2._evtracker.get_matching("DC_EVENT_IMAP_MESSAGE_DELETED")
+    lp.sec("ac1: send another message")
+    chat1.send_text("another message")
+
+    lp.sec("ac2: receive another message")
+    msg_in = ac2._evtracker.wait_next_incoming_message()
+    assert msg_in.text == "another message"
+    chat2 = msg_in.chat
+    chat2_msg_cnt = len(chat2.get_messages())
+
     assert len(chat2.get_messages()) == chat2_msg_cnt
 
 
@@ -832,9 +855,9 @@ def test_no_draft_if_cant_send(acfactory):
 
 def test_dont_show_emails(acfactory, lp):
     """Most mailboxes have a "Drafts" folder where constantly new emails appear but we don't actually want to show them.
-    So: If it's outgoing AND there is no Received header AND it's not in the sentbox, then ignore the email.
+    So: If it's outgoing AND there is no Received header, then ignore the email.
 
-    If the draft email is sent out later (i.e. moved to "Sent"), it must be shown.
+    If the draft email is sent out and received later (i.e. it's in "Inbox"), it must be shown.
 
     Also, test that unknown emails in the Spam folder are not shown."""
     ac1 = acfactory.new_online_configuring_account()
@@ -843,7 +866,6 @@ def test_dont_show_emails(acfactory, lp):
 
     acfactory.wait_configured(ac1)
     ac1.direct_imap.create_folder("Drafts")
-    ac1.direct_imap.create_folder("Sent")
     ac1.direct_imap.create_folder("Spam")
     ac1.direct_imap.create_folder("Junk")
 
@@ -859,21 +881,7 @@ def test_dont_show_emails(acfactory, lp):
         Message-ID: <aepiors@example.org>
         Content-Type: text/plain; charset=utf-8
 
-        message in Drafts that is moved to Sent later
-    """.format(
-            ac1.get_config("configured_addr"),
-        ),
-    )
-    ac1.direct_imap.append(
-        "Sent",
-        """
-        From: ac1 <{}>
-        Subject: subj
-        To: alice@example.org
-        Message-ID: <hsabaeni@example.org>
-        Content-Type: text/plain; charset=utf-8
-
-        message in Sent
+        message in Drafts received later
     """.format(
             ac1.get_config("configured_addr"),
         ),
@@ -953,14 +961,13 @@ def test_dont_show_emails(acfactory, lp):
     lp.sec("All prepared, now let DC find the message")
     ac1.start_io()
 
-    msg = ac1._evtracker.wait_next_messages_changed()
-
     # Wait until each folder was scanned, this is necessary for this test to test what it should test:
     ac1._evtracker.wait_idle_inbox_ready()
 
-    assert msg.text == "subj – message in Sent"
+    fresh_msgs = list(ac1.get_fresh_messages())
+    msg = fresh_msgs[0]
     chat_msgs = msg.chat.get_messages()
-    assert len(chat_msgs) == 2
+    assert len(chat_msgs) == 1
     assert any(msg.text == "subj – Actually interesting message in Spam" for msg in chat_msgs)
 
     assert not any("unknown.address" in c.get_name() for c in ac1.get_chats())
@@ -968,16 +975,16 @@ def test_dont_show_emails(acfactory, lp):
     assert ac1.direct_imap.get_uid_by_message_id("spam.message@junk.org")
 
     ac1.stop_io()
-    lp.sec("'Send out' the draft, i.e. move it to the Sent folder, and wait for DC to display it this time")
+    lp.sec("'Send out' the draft by moving it to Inbox, and wait for DC to display it this time")
     ac1.direct_imap.select_folder("Drafts")
     uid = ac1.direct_imap.get_uid_by_message_id("aepiors@example.org")
-    ac1.direct_imap.conn.move(uid, "Sent")
+    ac1.direct_imap.conn.move(uid, "Inbox")
 
     ac1.start_io()
     msg2 = ac1._evtracker.wait_next_messages_changed()
 
-    assert msg2.text == "subj – message in Drafts that is moved to Sent later"
-    assert len(msg.chat.get_messages()) == 3
+    assert msg2.text == "subj – message in Drafts received later"
+    assert len(msg.chat.get_messages()) == 2
 
 
 def test_bot(acfactory, lp):
@@ -1204,7 +1211,7 @@ def test_import_export_online_all(acfactory, tmp_path, data, lp):
 
 def test_qr_email_capitalization(acfactory, lp):
     """Regression test for a bug
-    that resulted in failure to propagate verification via gossip in a verified group
+    that resulted in failure to propagate verification
     when the database already contained the contact with a different email address capitalization.
     """
 
@@ -1215,24 +1222,27 @@ def test_qr_email_capitalization(acfactory, lp):
     lp.sec(f"ac1 creates a contact for ac2 ({ac2_addr_uppercase})")
     ac1.create_contact(ac2_addr_uppercase)
 
-    lp.sec("ac3 creates a verified group with a QR code")
-    chat = ac3.create_group_chat("hello", verified=True)
+    lp.sec("ac3 creates a group with a QR code")
+    chat = ac3.create_group_chat("hello")
     qr = chat.get_join_qr()
 
-    lp.sec("ac1 joins a verified group via a QR code")
+    lp.sec("ac1 joins a group via a QR code")
     ac1_chat = ac1.qr_join_chat(qr)
     msg = ac1._evtracker.wait_next_incoming_message()
     assert msg.text == "Member Me added by {}.".format(ac3.get_config("addr"))
     assert len(ac1_chat.get_contacts()) == 2
 
-    lp.sec("ac2 joins a verified group via a QR code")
+    lp.sec("ac2 joins a group via a QR code")
     ac2.qr_join_chat(qr)
     ac1._evtracker.wait_next_incoming_message()
 
     # ac1 should see both ac3 and ac2 as verified.
     assert len(ac1_chat.get_contacts()) == 3
+    # Until we reset verifications and then send the _verified header,
+    # the verification of ac2 is not gossiped here:
     for contact in ac1_chat.get_contacts():
-        assert contact.is_verified()
+        is_ac2 = contact.addr == ac2.get_config("addr")
+        assert contact.is_verified() != is_ac2
 
 
 def test_set_get_contact_avatar(acfactory, data, lp):
@@ -1757,10 +1767,10 @@ def test_group_quote(acfactory, lp):
             "xyz",
         ),  # Test that emails aren't found in a random folder
         (
-            "Spam",
+            "xyz",
             True,
-            "DeltaChat",
-        ),  # ...emails are moved from the spam folder to "DeltaChat"
+            "xyz",
+        ),  # ...emails are found in a random folder and downloaded without moving
         (
             "Spam",
             False,

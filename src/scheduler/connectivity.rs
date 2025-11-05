@@ -90,7 +90,7 @@ impl DetailedConnectivity {
             DetailedConnectivity::Preparing => Some(Connectivity::Working),
 
             // Just don't return a connectivity, probably the folder is configured not to be
-            // watched or there is e.g. no "Sent" folder, so we are not interested in it
+            // watched, so we are not interested in it.
             DetailedConnectivity::NotConfigured => None,
 
             DetailedConnectivity::Idle => Some(Connectivity::Connected),
@@ -352,6 +352,19 @@ impl Context {
             .to_string();
 
         // =============================================================================================
+        //                              Get proxy state
+        // =============================================================================================
+
+        if self
+            .get_config_bool(crate::config::Config::ProxyEnabled)
+            .await?
+        {
+            let proxy_enabled = stock_str::proxy_enabled(self).await;
+            let proxy_description = stock_str::proxy_description(self).await;
+            ret += &format!("<h3>{proxy_enabled}</h3><ul><li>{proxy_description}</li></ul>");
+        }
+
+        // =============================================================================================
         //                              Get the states from the RwLock
         // =============================================================================================
 
@@ -378,7 +391,6 @@ impl Context {
         // Add e.g.
         //                              Incoming messages
         //                               - "Inbox": Connected
-        //                               - "Sent": Connected
         // =============================================================================================
 
         let watched_folders = get_watched_folder_configs(self).await?;

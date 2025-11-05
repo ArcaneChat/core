@@ -1763,9 +1763,7 @@ dc_chat_t*      dc_get_chat                  (dc_context_t* context, uint32_t ch
  *
  * @memberof dc_context_t
  * @param context The context object.
- * @param protect If set to 1 the function creates group with protection initially enabled.
- *     Only verified members are allowed in these groups
- *     and end-to-end-encryption is always enabled.
+ * @param protect Deprecated 2025-08-31, ignored.
  * @param name The name of the group chat to create.
  *     The name may be changed later using dc_set_chat_name().
  *     To find out the name of a group later, see dc_chat_get_name()
@@ -2565,6 +2563,7 @@ void            dc_stop_ongoing_process      (dc_context_t* context);
 
 #define         DC_QR_ASK_VERIFYCONTACT      200 // id=contact
 #define         DC_QR_ASK_VERIFYGROUP        202 // text1=groupname
+#define         DC_QR_ASK_VERIFYBROADCAST    204 // text1=broadcast name
 #define         DC_QR_FPR_OK                 210 // id=contact
 #define         DC_QR_FPR_MISMATCH           220 // id=contact
 #define         DC_QR_FPR_WITHOUT_ADDR       230 // test1=formatted fingerprint
@@ -2597,8 +2596,9 @@ void            dc_stop_ongoing_process      (dc_context_t* context);
  *   ask whether to verify the contact;
  *   if so, start the protocol with dc_join_securejoin().
  *
- * - DC_QR_ASK_VERIFYGROUP with dc_lot_t::text1=Group name:
- *   ask whether to join the group;
+ * - DC_QR_ASK_VERIFYGROUP or DC_QR_ASK_VERIFYBROADCAST
+ *   with dc_lot_t::text1=Group name:
+ *   ask whether to join the chat;
  *   if so, start the protocol with dc_join_securejoin().
  *
  * - DC_QR_FPR_OK with dc_lot_t::id=Contact ID:
@@ -2681,7 +2681,8 @@ dc_lot_t*       dc_check_qr                  (dc_context_t* context, const char*
  * Get QR code text that will offer an Setup-Contact or Verified-Group invitation.
  *
  * The scanning device will pass the scanned content to dc_check_qr() then;
- * if dc_check_qr() returns DC_QR_ASK_VERIFYCONTACT or DC_QR_ASK_VERIFYGROUP
+ * if dc_check_qr() returns
+ * DC_QR_ASK_VERIFYCONTACT, DC_QR_ASK_VERIFYGROUP or DC_QR_ASK_VERIFYBROADCAST
  * an out-of-band-verification can be joined using dc_join_securejoin()
  *
  * The returned text will also work as a normal https:-link,
@@ -2722,7 +2723,7 @@ char*           dc_get_securejoin_qr_svg         (dc_context_t* context, uint32_
  * Continue a Setup-Contact or Verified-Group-Invite protocol
  * started on another device with dc_get_securejoin_qr().
  * This function is typically called when dc_check_qr() returns
- * lot.state=DC_QR_ASK_VERIFYCONTACT or lot.state=DC_QR_ASK_VERIFYGROUP.
+ * lot.state=DC_QR_ASK_VERIFYCONTACT, lot.state=DC_QR_ASK_VERIFYGROUP or lot.state=DC_QR_ASK_VERIFYBROADCAST
  *
  * The function returns immediately and the handshake runs in background,
  * sending and receiving several messages.
@@ -3890,18 +3891,12 @@ int             dc_chat_can_send              (const dc_chat_t* chat);
 
 
 /**
- * Check if a chat is protected.
- *
- * Only verified contacts
- * as determined by dc_contact_is_verified()
- * can be added to protected chats.
- *
- * Protected chats are created using dc_create_group_chat()
- * by setting the 'protect' parameter to 1.
+ * Deprecated, always returns 0.
  *
  * @memberof dc_chat_t
  * @param chat The chat object.
- * @return 1=chat protected, 0=chat is not protected.
+ * @return Always 0.
+ * @deprecated 2025-09-09
  */
 int             dc_chat_is_protected         (const dc_chat_t* chat);
 
@@ -5353,11 +5348,9 @@ dc_provider_t*  dc_provider_new_from_email            (const dc_context_t* conte
 
 
 /**
- * Create a provider struct for the given e-mail address by local and DNS lookup.
+ * Create a provider struct for the given e-mail address by local lookup.
  *
- * First lookup is done from the local database as of dc_provider_new_from_email().
- * If the first lookup fails, an additional DNS lookup is done,
- * trying to figure out the provider belonging to custom domains.
+ * DNS lookup is not used anymore and this function is deprecated.
  *
  * @memberof dc_provider_t
  * @param context The context object.
@@ -5365,6 +5358,7 @@ dc_provider_t*  dc_provider_new_from_email            (const dc_context_t* conte
  * @return A dc_provider_t struct which can be used with the dc_provider_get_*
  *     accessor functions. If no provider info is found, NULL will be
  *     returned.
+ * @deprecated 2025-10-17 use dc_provider_new_from_email() instead.
  */
 dc_provider_t*  dc_provider_new_from_email_with_dns    (const dc_context_t* context, const char* email);
 
@@ -6968,11 +6962,6 @@ void dc_event_unref(dc_event_t* event);
 /// Used to build the string returned by dc_get_contact_encrinfo().
 #define DC_STR_ENCR_NONE                  28
 
-/// "This message was encrypted for another setup."
-///
-/// Used as message text if decryption fails.
-#define DC_STR_CANTDECRYPT_MSG_BODY       29
-
 /// "Fingerprints"
 ///
 /// Used to build the string returned by dc_get_contact_encrinfo().
@@ -7690,12 +7679,6 @@ void dc_event_unref(dc_event_t* event);
 /// `%1$s` will be replaced by the provider's domain.
 #define DC_STR_INVALID_UNENCRYPTED_MAIL 174
 
-/// "⚠️ It seems you are using Delta Chat on multiple devices that cannot decrypt each other's outgoing messages. To fix this, on the older device use \"Settings / Add Second Device\" and follow the instructions."
-///
-/// Added to the device chat if could not decrypt a new outgoing message (i.e. not when fetching
-/// existing messages). But no more than once a day.
-#define DC_STR_CANT_DECRYPT_OUTGOING_MSGS 175
-
 /// "You reacted %1$s to '%2$s'"
 ///
 /// `%1$s` will be replaced by the reaction, usually an emoji
@@ -7758,6 +7741,16 @@ void dc_event_unref(dc_event_t* event);
 ///
 /// `%1$s` will be replaced with the channel name.
 #define DC_STR_SECURE_JOIN_CHANNEL_QR_DESC  201
+
+/// "Proxy Enabled"
+///
+/// Title for proxy section in connectivity view.
+#define DC_STR_PROXY_ENABLED  220
+
+/// "You are using a proxy. If you're having trouble connecting, try a different proxy."
+///
+/// Description in connectivity view when proxy is enabled.
+#define DC_STR_PROXY_ENABLED_DESCRIPTION  221
 
 /**
  * @}

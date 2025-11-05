@@ -17,11 +17,11 @@ use crate::context::Context;
 use crate::imap;
 use crate::key::DcKey;
 use crate::log::{info, warn};
-use crate::login_param::ConfiguredLoginParam;
 use crate::message::MsgId;
-use crate::provider::get_provider_by_domain;
+use crate::provider::get_provider_info;
 use crate::sql::Sql;
 use crate::tools::{Time, inc_and_check, time_elapsed};
+use crate::transport::ConfiguredLoginParam;
 
 const DBVERSION: i32 = 68;
 const VERSION_CFG: &str = "dbversion";
@@ -382,7 +382,7 @@ UPDATE chats SET protected=1, type=120 WHERE type=130;"#,
                 context
                     .set_config_internal(
                         Config::ConfiguredProvider,
-                        get_provider_by_domain(&domain).map(|provider| provider.id),
+                        get_provider_info(&domain).map(|provider| provider.id),
                     )
                     .await?;
             } else {
@@ -401,19 +401,18 @@ UPDATE chats SET protected=1, type=120 WHERE type=130;"#,
         .await?;
     }
     if dbversion < 73 {
-        use Config::*;
         sql.execute(
             r#"
 CREATE TABLE imap_sync (folder TEXT PRIMARY KEY, uidvalidity INTEGER DEFAULT 0, uid_next INTEGER DEFAULT 0);"#,
 ()
         )
             .await?;
-        for c in &[
-            ConfiguredInboxFolder,
-            ConfiguredSentboxFolder,
-            ConfiguredMvboxFolder,
+        for c in [
+            "configured_inbox_folder",
+            "configured_sentbox_folder",
+            "configured_mvbox_folder",
         ] {
-            if let Some(folder) = context.get_config(*c).await? {
+            if let Some(folder) = context.sql.get_raw_config(c).await? {
                 let (uid_validity, last_seen_uid) =
                     imap::get_config_last_seen_uid(context, &folder).await?;
                 if last_seen_uid > 0 {
@@ -1256,6 +1255,85 @@ CREATE INDEX gossip_timestamp_index ON gossip_timestamp (chat_id, fingerprint);
         // Make `ProtectionBroken` chats `Unprotected`. Chats can't break anymore.
         sql.execute_migration(
             "UPDATE chats SET protected=0 WHERE protected!=1",
+            migration_version,
+        )
+        .await?;
+    }
+
+    inc_and_check(&mut migration_version, 134)?; // Migration 134 was removed
+
+    inc_and_check(&mut migration_version, 135)?;
+    if dbversion < migration_version {
+        sql.execute_migration(
+            "CREATE TABLE stats_securejoin_sources(
+                source INTEGER PRIMARY KEY,
+                count INTEGER NOT NULL DEFAULT 0
+            ) STRICT;
+            CREATE TABLE stats_securejoin_uipaths(
+                uipath INTEGER PRIMARY KEY,
+                count INTEGER NOT NULL DEFAULT 0
+            ) STRICT;
+            CREATE TABLE stats_securejoin_invites(
+                already_existed INTEGER NOT NULL,
+                already_verified INTEGER NOT NULL,
+                type TEXT NOT NULL
+            ) STRICT;
+            CREATE TABLE stats_msgs(
+                chattype INTEGER PRIMARY KEY,
+                verified INTEGER NOT NULL DEFAULT 0,
+                unverified_encrypted INTEGER NOT NULL DEFAULT 0,
+                unencrypted INTEGER NOT NULL DEFAULT 0,
+                only_to_self INTEGER NOT NULL DEFAULT 0,
+                last_counted_msg_id INTEGER NOT NULL DEFAULT 0
+            ) STRICT;",
+            migration_version,
+        )
+        .await?;
+    }
+
+    inc_and_check(&mut migration_version, 136)?;
+    if dbversion < migration_version {
+        sql.execute_migration(
+            "CREATE TABLE stats_sending_enabled_events(timestamp INTEGER NOT NULL) STRICT;
+            CREATE TABLE stats_sending_disabled_events(timestamp INTEGER NOT NULL) STRICT;",
+            migration_version,
+        )
+        .await?;
+    }
+
+    inc_and_check(&mut migration_version, 137)?;
+    if dbversion < migration_version {
+        sql.execute_migration(
+            "DELETE FROM config WHERE keyname IN (
+                'configured',
+                'configured_imap_certificate_checks',
+                'configured_imap_servers',
+                'configured_mail_port',
+                'configured_mail_pw',
+                'configured_mail_security',
+                'configured_mail_server',
+                'configured_mail_user',
+                'configured_send_port',
+                'configured_send_pw',
+                'configured_send_security',
+                'configured_send_server',
+                'configured_send_user',
+                'configured_server_flags',
+                'configured_smtp_certificate_checks',
+                'configured_smtp_servers'
+            )",
+            migration_version,
+        )
+        .await?;
+    }
+
+    inc_and_check(&mut migration_version, 138)?;
+    if dbversion < migration_version {
+        sql.execute_migration(
+            "CREATE TABLE broadcast_secrets(
+                chat_id INTEGER PRIMARY KEY NOT NULL,
+                secret TEXT NOT NULL
+            ) STRICT",
             migration_version,
         )
         .await?;

@@ -20,7 +20,6 @@ use deltachat_contact_tools::ContactAddress;
 use futures::{FutureExt as _, TryStreamExt};
 use futures_lite::FutureExt;
 use num_traits::FromPrimitive;
-use rand::Rng;
 use ratelimit::Ratelimit;
 use url::Url;
 
@@ -34,9 +33,6 @@ use crate::context::Context;
 use crate::events::EventType;
 use crate::headerdef::{HeaderDef, HeaderDefMap};
 use crate::log::{LogExt, error, info, warn};
-use crate::login_param::{
-    ConfiguredLoginParam, ConfiguredServerLoginParam, prioritize_server_login_params,
-};
 use crate::message::{self, Message, MessageState, MessengerMessage, MsgId};
 use crate::mimeparser;
 use crate::net::proxy::ProxyConfig;
@@ -49,6 +45,9 @@ use crate::receive_imf::{
 use crate::scheduler::connectivity::ConnectivityStore;
 use crate::stock_str;
 use crate::tools::{self, create_id, duration_to_str, time};
+use crate::transport::{
+    ConfiguredLoginParam, ConfiguredServerLoginParam, prioritize_server_login_params,
+};
 
 pub(crate) mod capabilities;
 mod client;
@@ -157,7 +156,6 @@ pub enum FolderMeaning {
     Spam,
     Inbox,
     Mvbox,
-    Sent,
     Trash,
 
     /// Virtual folders.
@@ -176,7 +174,6 @@ impl FolderMeaning {
             FolderMeaning::Spam => None,
             FolderMeaning::Inbox => Some(Config::ConfiguredInboxFolder),
             FolderMeaning::Mvbox => Some(Config::ConfiguredMvboxFolder),
-            FolderMeaning::Sent => Some(Config::ConfiguredSentboxFolder),
             FolderMeaning::Trash => Some(Config::ConfiguredTrashFolder),
             FolderMeaning::Virtual => None,
         }
@@ -342,9 +339,9 @@ impl Imap {
         const BACKOFF_MIN_MS: u64 = 2000;
         const BACKOFF_MAX_MS: u64 = 80_000;
         self.conn_backoff_ms = min(self.conn_backoff_ms, BACKOFF_MAX_MS / 2);
-        self.conn_backoff_ms = self.conn_backoff_ms.saturating_add(
-            rand::thread_rng().gen_range((self.conn_backoff_ms / 2)..=self.conn_backoff_ms),
-        );
+        self.conn_backoff_ms = self.conn_backoff_ms.saturating_add(rand::random_range(
+            (self.conn_backoff_ms / 2)..=self.conn_backoff_ms,
+        ));
         self.conn_backoff_ms = max(BACKOFF_MIN_MS, self.conn_backoff_ms);
 
         let login_params = prioritize_server_login_params(&context.sql, &self.lp, "imap").await?;
@@ -620,70 +617,37 @@ impl Imap {
 
             // Determine the target folder where the message should be moved to.
             //
-            // If we have seen the message on the IMAP server before, do not move it.
+            // We only move the messages from the INBOX and Spam folders.
             // This is required to avoid infinite MOVE loop on IMAP servers
             // that alias `DeltaChat` folder to other names.
             // For example, some Dovecot servers alias `DeltaChat` folder to `INBOX.DeltaChat`.
-            // In this case Delta Chat configured with `DeltaChat` as the destination folder
-            // would detect messages in the `INBOX.DeltaChat` folder
-            // and try to move them to the `DeltaChat` folder.
-            // Such move to the same folder results in the messages
-            // getting a new UID, so the messages will be detected as new
+            // In this case moving from `INBOX.DeltaChat` to `DeltaChat`
+            // results in the messages getting a new UID,
+            // so the messages will be detected as new
             // in the `INBOX.DeltaChat` folder again.
-            let _target;
-            let target = if let Some(message_id) = &message_id {
-                let msg_info =
-                    message::rfc724_mid_exists_ex(context, message_id, "deleted=1").await?;
-                let delete = if let Some((_, _, true)) = msg_info {
-                    info!(context, "Deleting locally deleted message {message_id}.");
-                    true
-                } else if let Some((_, ts_sent_old, _)) = msg_info {
-                    let is_chat_msg = headers.get_header_value(HeaderDef::ChatVersion).is_some();
-                    let ts_sent = headers
-                        .get_header_value(HeaderDef::Date)
-                        .and_then(|v| mailparse::dateparse(&v).ok())
-                        .unwrap_or_default();
-                    let is_dup = is_dup_msg(is_chat_msg, ts_sent, ts_sent_old);
-                    if is_dup {
-                        info!(context, "Deleting duplicate message {message_id}.");
-                    }
-                    is_dup
-                } else {
-                    false
-                };
-                if delete {
-                    &delete_target
-                } else if context
-                    .sql
-                    .exists(
-                        "SELECT COUNT (*) FROM imap WHERE rfc724_mid=?",
-                        (message_id,),
-                    )
+            let delete = if let Some(message_id) = &message_id {
+                message::rfc724_mid_exists_ex(context, message_id, "deleted=1")
                     .await?
-                {
-                    info!(
-                        context,
-                        "Not moving the message {} that we have seen before.", &message_id
-                    );
-                    folder
-                } else {
-                    _target = target_folder(context, folder, folder_meaning, &headers).await?;
-                    &_target
-                }
+                    .is_some_and(|(_msg_id, deleted)| deleted)
             } else {
-                // Do not move the messages without Message-ID.
-                // We cannot reliably determine if we have seen them before,
-                // so it is safer not to move them.
-                warn!(
-                    context,
-                    "Not moving the message that does not have a Message-ID."
-                );
-                folder
+                false
             };
 
             // Generate a fake Message-ID to identify the message in the database
             // if the message has no real Message-ID.
             let message_id = message_id.unwrap_or_else(create_message_id);
+
+            if delete {
+                info!(context, "Deleting locally deleted message {message_id}.");
+            }
+
+            let _target;
+            let target = if delete {
+                &delete_target
+            } else {
+                _target = target_folder(context, folder, folder_meaning, &headers).await?;
+                &_target
+            };
 
             context
                 .sql
@@ -768,7 +732,6 @@ impl Imap {
                         .fetch_many_msgs(
                             context,
                             folder,
-                            uid_validity,
                             uids_fetch_in_batch.split_off(0),
                             &uid_message_ids,
                             fetch_partially,
@@ -833,9 +796,6 @@ impl Imap {
         context: &Context,
         session: &mut Session,
     ) -> Result<()> {
-        add_all_recipients_as_contacts(context, session, Config::ConfiguredSentboxFolder)
-            .await
-            .context("failed to get recipients from the sentbox")?;
         add_all_recipients_as_contacts(context, session, Config::ConfiguredMvboxFolder)
             .await
             .context("failed to get recipients from the movebox")?;
@@ -1070,7 +1030,7 @@ impl Session {
     async fn move_delete_messages(&mut self, context: &Context, folder: &str) -> Result<()> {
         let rows = context
             .sql
-            .query_map(
+            .query_map_vec(
                 "SELECT id, uid, target FROM imap
         WHERE folder = ?
         AND target != folder
@@ -1082,7 +1042,6 @@ impl Session {
                     let target: String = row.get(2)?;
                     Ok((rowid, uid, target))
                 },
-                |rows| rows.collect::<Result<Vec<_>, _>>().map_err(Into::into),
             )
             .await?;
 
@@ -1173,7 +1132,7 @@ impl Session {
     pub(crate) async fn store_seen_flags_on_imap(&mut self, context: &Context) -> Result<()> {
         let rows = context
             .sql
-            .query_map(
+            .query_map_vec(
                 "SELECT imap.id, uid, folder FROM imap, imap_markseen
                  WHERE imap.id = imap_markseen.id AND target = folder
                  ORDER BY folder, uid",
@@ -1184,7 +1143,6 @@ impl Session {
                     let folder: String = row.get(2)?;
                     Ok((rowid, uid, folder))
                 },
-                |rows| rows.collect::<Result<Vec<_>, _>>().map_err(Into::into),
             )
             .await?;
 
@@ -1383,12 +1341,10 @@ impl Session {
     ///
     /// If the message is incorrect or there is a failure to write a message to the database,
     /// it is skipped and the error is logged.
-    #[expect(clippy::too_many_arguments)]
     pub(crate) async fn fetch_many_msgs(
         &mut self,
         context: &Context,
         folder: &str,
-        uidvalidity: u32,
         request_uids: Vec<u32>,
         uid_message_ids: &BTreeMap<u32, String>,
         fetch_partially: bool,
@@ -1514,9 +1470,6 @@ impl Session {
                 );
                 let res = receive_imf_inner(
                     context,
-                    folder,
-                    uidvalidity,
-                    request_uid,
                     rfc724_mid,
                     body,
                     is_seen,
@@ -1530,9 +1483,6 @@ impl Session {
                     }
                     receive_imf_inner(
                         context,
-                        folder,
-                        uidvalidity,
-                        request_uid,
                         rfc724_mid,
                         body,
                         is_seen,
@@ -2089,7 +2039,7 @@ async fn spam_target_folder_cfg(
 
     if needs_move_to_mvbox(context, headers).await?
         // If OnlyFetchMvbox is set, we don't want to move the message to
-        // the inbox or sentbox where we wouldn't fetch it again:
+        // the inbox where we wouldn't fetch it again:
         || context.get_config_bool(Config::OnlyFetchMvbox).await?
     {
         Ok(Some(Config::ConfiguredMvboxFolder))
@@ -2098,7 +2048,7 @@ async fn spam_target_folder_cfg(
     }
 }
 
-/// Returns `ConfiguredInboxFolder`, `ConfiguredMvboxFolder` or `ConfiguredSentboxFolder` if
+/// Returns `ConfiguredInboxFolder` or `ConfiguredMvboxFolder` if
 /// the message needs to be moved from `folder`. Otherwise returns `None`.
 pub async fn target_folder_cfg(
     context: &Context,
@@ -2112,7 +2062,9 @@ pub async fn target_folder_cfg(
 
     if folder_meaning == FolderMeaning::Spam {
         spam_target_folder_cfg(context, headers).await
-    } else if needs_move_to_mvbox(context, headers).await? {
+    } else if folder_meaning == FolderMeaning::Inbox
+        && needs_move_to_mvbox(context, headers).await?
+    {
         Ok(Some(Config::ConfiguredMvboxFolder))
     } else {
         Ok(None)
@@ -2185,38 +2137,6 @@ async fn needs_move_to_mvbox(
 // but sth. different in others - a hard job.
 fn get_folder_meaning_by_name(folder_name: &str) -> FolderMeaning {
     // source: <https://stackoverflow.com/questions/2185391/localized-gmail-imap-folders>
-    const SENT_NAMES: &[&str] = &[
-        "sent",
-        "sentmail",
-        "sent objects",
-        "gesendet",
-        "Sent Mail",
-        "Sendte e-mails",
-        "Enviados",
-        "Messages envoyés",
-        "Messages envoyes",
-        "Posta inviata",
-        "Verzonden berichten",
-        "Wyslane",
-        "E-mails enviados",
-        "Correio enviado",
-        "Enviada",
-        "Enviado",
-        "Gönderildi",
-        "Inviati",
-        "Odeslaná pošta",
-        "Sendt",
-        "Skickat",
-        "Verzonden",
-        "Wysłane",
-        "Éléments envoyés",
-        "Απεσταλμένα",
-        "Отправленные",
-        "寄件備份",
-        "已发送邮件",
-        "送信済み",
-        "보낸편지함",
-    ];
     const SPAM_NAMES: &[&str] = &[
         "spam",
         "junk",
@@ -2260,8 +2180,8 @@ fn get_folder_meaning_by_name(folder_name: &str) -> FolderMeaning {
     ];
     let lower = folder_name.to_lowercase();
 
-    if SENT_NAMES.iter().any(|s| s.to_lowercase() == lower) {
-        FolderMeaning::Sent
+    if lower == "inbox" {
+        FolderMeaning::Inbox
     } else if SPAM_NAMES.iter().any(|s| s.to_lowercase() == lower) {
         FolderMeaning::Spam
     } else if TRASH_NAMES.iter().any(|s| s.to_lowercase() == lower) {
@@ -2275,7 +2195,6 @@ fn get_folder_meaning_by_attrs(folder_attrs: &[NameAttribute]) -> FolderMeaning 
     for attr in folder_attrs {
         match attr {
             NameAttribute::Trash => return FolderMeaning::Trash,
-            NameAttribute::Sent => return FolderMeaning::Sent,
             NameAttribute::Junk => return FolderMeaning::Spam,
             NameAttribute::All | NameAttribute::Flagged => return FolderMeaning::Virtual,
             NameAttribute::Extension(label) => {
@@ -2414,15 +2333,6 @@ pub(crate) async fn prefetch_should_download(
 
     let should_download = (show && !blocked_contact) || maybe_ndn;
     Ok(should_download)
-}
-
-/// Returns whether a message is a duplicate (resent message).
-pub(crate) fn is_dup_msg(is_chat_msg: bool, ts_sent: i64, ts_sent_old: i64) -> bool {
-    // If the existing message has timestamp_sent == 0, that means we don't know its actual sent
-    // timestamp, so don't delete the new message. E.g. outgoing messages have zero timestamp_sent
-    // because they are stored to the db before sending. Also consider as duplicates only messages
-    // with greater timestamp to avoid deleting both messages in a multi-device setting.
-    is_chat_msg && ts_sent_old != 0 && ts_sent > ts_sent_old
 }
 
 /// Marks messages in `msgs` table as seen, searching for them by UID.
@@ -2617,10 +2527,6 @@ async fn should_ignore_folder(
 ) -> Result<bool> {
     if !context.get_config_bool(Config::OnlyFetchMvbox).await? {
         return Ok(false);
-    }
-    if context.is_sentbox(folder).await? {
-        // Still respect the SentboxWatch setting.
-        return Ok(!context.get_config_bool(Config::SentboxWatch).await?);
     }
     Ok(!(context.is_mvbox(folder).await? || folder_meaning == FolderMeaning::Spam))
 }

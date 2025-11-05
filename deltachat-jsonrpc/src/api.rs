@@ -12,7 +12,6 @@ use deltachat::calls::ice_servers;
 use deltachat::chat::{
     self, add_contact_to_chat, forward_msgs, get_chat_media, get_chat_msgs, get_chat_msgs_ex,
     marknoticed_chat, remove_contact_from_chat, Chat, ChatId, ChatItem, MessageListOptions,
-    ProtectionStatus,
 };
 use deltachat::chatlist::Chatlist;
 use deltachat::config::Config;
@@ -54,20 +53,21 @@ use types::contact::{ContactObject, VcardContact};
 use types::events::Event;
 use types::http::HttpResponse;
 use types::message::{MessageData, MessageObject, MessageReadReceipt};
+use types::notify_state::JsonrpcNotifyState;
 use types::provider_info::ProviderInfo;
-use types::reactions::JSONRPCReactions;
+use types::reactions::JsonrpcReactions;
 use types::webxdc::WebxdcMessageInfo;
 
 use self::types::message::{MessageInfo, MessageLoadResult};
 use self::types::{
-    chat::{BasicChat, JSONRPCChatVisibility, MuteDuration},
+    chat::{BasicChat, JsonrpcChatVisibility, MuteDuration},
     location::JsonrpcLocation,
     message::{
-        JSONRPCMessageListItem, MessageNotificationInfo, MessageSearchResult, MessageViewtype,
+        JsonrpcMessageListItem, MessageNotificationInfo, MessageSearchResult, MessageViewtype,
     },
 };
 use crate::api::types::chat_list::{get_chat_list_item_by_id, ChatListItemFetchResult};
-use crate::api::types::qr::QrObject;
+use crate::api::types::qr::{QrObject, SecurejoinSource, SecurejoinUiPath};
 
 #[derive(Debug)]
 struct AccountState {
@@ -313,6 +313,12 @@ impl CommandApi {
         }
     }
 
+    /// Get the current push notification state.
+    async fn get_push_state(&self, account_id: u32) -> Result<JsonrpcNotifyState> {
+        let ctx = self.get_context(account_id).await?;
+        Ok(ctx.push_state().await.into())
+    }
+
     /// Get the combined filesize of an account in bytes
     async fn get_account_file_size(&self, account_id: u32) -> Result<u64> {
         let ctx = self.get_context(account_id).await?;
@@ -336,21 +342,10 @@ impl CommandApi {
     /// instead of the domain.
     async fn get_provider_info(
         &self,
-        account_id: u32,
+        _account_id: u32,
         email: String,
     ) -> Result<Option<ProviderInfo>> {
-        let ctx = self.get_context(account_id).await?;
-
-        let proxy_enabled = ctx
-            .get_config_bool(deltachat::config::Config::ProxyEnabled)
-            .await?;
-
-        let provider_info = get_provider_info(
-            &ctx,
-            email.split('@').next_back().unwrap_or(""),
-            proxy_enabled,
-        )
-        .await;
+        let provider_info = get_provider_info(email.split('@').next_back().unwrap_or(""));
         Ok(ProviderInfo::from_dc_type(provider_info))
     }
 
@@ -391,11 +386,6 @@ impl CommandApi {
         let ctx = self.get_context(account_id).await?;
         let file = Path::new(&path);
         Ok(BlobObject::create_and_deduplicate(&ctx, file, file)?.to_abs_path())
-    }
-
-    async fn draft_self_report(&self, account_id: u32) -> Result<u32> {
-        let ctx = self.get_context(account_id).await?;
-        Ok(ctx.draft_self_report().await?.to_u32())
     }
 
     /// Sets the given configuration key.
@@ -896,6 +886,38 @@ impl CommandApi {
         Ok(chat_id.to_u32())
     }
 
+    /// Like `secure_join()`, but allows to pass a source and a UI-path.
+    /// You only need this if your UI has an option to send statistics
+    /// to Delta Chat's developers.
+    ///
+    /// **source**: The source where the QR code came from.
+    /// E.g. a link that was clicked inside or outside Delta Chat,
+    /// the "Paste from Clipboard" action,
+    /// the "Load QR code as image" action,
+    /// or a QR code scan.
+    ///
+    /// **uipath**: Which UI path did the user use to arrive at the QR code screen.
+    /// If the SecurejoinSource was ExternalLink or InternalLink,
+    /// pass `None` here, because the QR code screen wasn't even opened.
+    /// ```
+    async fn secure_join_with_ux_info(
+        &self,
+        account_id: u32,
+        qr: String,
+        source: Option<SecurejoinSource>,
+        uipath: Option<SecurejoinUiPath>,
+    ) -> Result<u32> {
+        let ctx = self.get_context(account_id).await?;
+        let chat_id = securejoin::join_securejoin_with_ux_info(
+            &ctx,
+            &qr,
+            source.map(Into::into),
+            uipath.map(Into::into),
+        )
+        .await?;
+        Ok(chat_id.to_u32())
+    }
+
     async fn leave_group(&self, account_id: u32, chat_id: u32) -> Result<()> {
         let ctx = self.get_context(account_id).await?;
         remove_contact_from_chat(&ctx, ChatId::new(chat_id), ContactId::SELF).await
@@ -979,17 +1001,16 @@ impl CommandApi {
     /// To check, if a chat is still unpromoted, you can look at the `is_unpromoted` property of `BasicChat` or `FullChat`.
     /// This may be useful if you want to show some help for just created groups.
     ///
-    /// @param protect If set to 1 the function creates group with protection initially enabled.
-    ///     Only verified members are allowed in these groups
-    async fn create_group_chat(&self, account_id: u32, name: String, protect: bool) -> Result<u32> {
+    /// `protect` argument is deprecated as of 2025-10-22 and is left for compatibility.
+    /// Pass `false` here.
+    async fn create_group_chat(
+        &self,
+        account_id: u32,
+        name: String,
+        _protect: bool,
+    ) -> Result<u32> {
         let ctx = self.get_context(account_id).await?;
-        let protect = match protect {
-            true => ProtectionStatus::Protected,
-            false => ProtectionStatus::Unprotected,
-        };
-        chat::create_group_ex(&ctx, Some(protect), &name)
-            .await
-            .map(|id| id.to_u32())
+        chat::create_group(&ctx, &name).await.map(|id| id.to_u32())
     }
 
     /// Create a new unencrypted group chat.
@@ -998,7 +1019,7 @@ impl CommandApi {
     /// address-contacts.
     async fn create_group_chat_unencrypted(&self, account_id: u32, name: String) -> Result<u32> {
         let ctx = self.get_context(account_id).await?;
-        chat::create_group_ex(&ctx, None, &name)
+        chat::create_group_unencrypted(&ctx, &name)
             .await
             .map(|id| id.to_u32())
     }
@@ -1009,7 +1030,7 @@ impl CommandApi {
             .await
     }
 
-    /// Create a new **broadcast channel**
+    /// Create a new, outgoing **broadcast channel**
     /// (called "Channel" in the UI).
     ///
     /// Broadcast channels are similar to groups on the sending device,
@@ -1070,7 +1091,7 @@ impl CommandApi {
         &self,
         account_id: u32,
         chat_id: u32,
-        visibility: JSONRPCChatVisibility,
+        visibility: JsonrpcChatVisibility,
     ) -> Result<()> {
         let ctx = self.get_context(account_id).await?;
 
@@ -1275,7 +1296,7 @@ impl CommandApi {
         chat_id: u32,
         info_only: bool,
         add_daymarker: bool,
-    ) -> Result<Vec<JSONRPCMessageListItem>> {
+    ) -> Result<Vec<JsonrpcMessageListItem>> {
         let ctx = self.get_context(account_id).await?;
         let msg = get_chat_msgs_ex(
             &ctx,
@@ -1289,7 +1310,7 @@ impl CommandApi {
         Ok(msg
             .iter()
             .map(|chat_item| (*chat_item).into())
-            .collect::<Vec<JSONRPCMessageListItem>>())
+            .collect::<Vec<JsonrpcMessageListItem>>())
     }
 
     async fn get_message(&self, account_id: u32, msg_id: u32) -> Result<MessageObject> {
@@ -2210,7 +2231,7 @@ impl CommandApi {
         &self,
         account_id: u32,
         message_id: u32,
-    ) -> Result<Option<JSONRPCReactions>> {
+    ) -> Result<Option<JsonrpcReactions>> {
         let ctx = self.get_context(account_id).await?;
         let reactions = get_msg_reactions(&ctx, MsgId::new(message_id)).await?;
         if reactions.is_empty() {

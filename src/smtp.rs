@@ -14,8 +14,6 @@ use crate::contact::{Contact, ContactId};
 use crate::context::Context;
 use crate::events::EventType;
 use crate::log::{error, info, warn};
-use crate::login_param::prioritize_server_login_params;
-use crate::login_param::{ConfiguredLoginParam, ConfiguredServerLoginParam};
 use crate::message::Message;
 use crate::message::{self, MsgId};
 use crate::mimefactory::MimeFactory;
@@ -24,6 +22,9 @@ use crate::net::session::SessionBufStream;
 use crate::scheduler::connectivity::ConnectivityStore;
 use crate::stock_str::unencrypted_email;
 use crate::tools::{self, time_elapsed};
+use crate::transport::{
+    ConfiguredLoginParam, ConfiguredServerLoginParam, prioritize_server_login_params,
+};
 
 #[derive(Default)]
 pub(crate) struct Smtp {
@@ -503,19 +504,10 @@ pub(crate) async fn send_smtp_messages(context: &Context, connection: &mut Smtp)
 
     let rowids = context
         .sql
-        .query_map(
-            "SELECT id FROM smtp ORDER BY id ASC",
-            (),
-            |row| {
-                let rowid: i64 = row.get(0)?;
-                Ok(rowid)
-            },
-            |rowids| {
-                rowids
-                    .collect::<std::result::Result<Vec<_>, _>>()
-                    .map_err(Into::into)
-            },
-        )
+        .query_map_vec("SELECT id FROM smtp ORDER BY id ASC", (), |row| {
+            let rowid: i64 = row.get(0)?;
+            Ok(rowid)
+        })
         .await?;
 
     info!(context, "Selected rows from SMTP queue: {rowids:?}.");
@@ -557,9 +549,9 @@ async fn send_mdn_rfc724_mid(
     }
 
     // Try to aggregate additional MDNs into this MDN.
-    let additional_rfc724_mids: Vec<String> = context
+    let additional_rfc724_mids = context
         .sql
-        .query_map(
+        .query_map_vec(
             "SELECT rfc724_mid
              FROM smtp_mdns
              WHERE from_id=? AND rfc724_mid!=?",
@@ -568,11 +560,8 @@ async fn send_mdn_rfc724_mid(
                 let rfc724_mid: String = row.get(0)?;
                 Ok(rfc724_mid)
             },
-            |rows| rows.collect::<Result<Vec<_>, _>>().map_err(Into::into),
         )
-        .await?
-        .into_iter()
-        .collect();
+        .await?;
 
     let mimefactory = MimeFactory::from_mdn(
         context,

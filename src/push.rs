@@ -13,7 +13,6 @@ use anyhow::{Context as _, Result};
 use base64::Engine as _;
 use pgp::crypto::aead::{AeadAlgorithm, ChunkSize};
 use pgp::crypto::sym::SymmetricKeyAlgorithm;
-use rand::thread_rng;
 use tokio::sync::RwLock;
 
 use crate::context::Context;
@@ -80,8 +79,7 @@ pub(crate) fn encrypt_device_token(device_token: &str) -> Result<String> {
         .first()
         .context("No encryption subkey found")?;
     let padded_device_token = pad_device_token(device_token);
-    let mut rng = thread_rng();
-
+    let mut rng = rand_old::thread_rng();
     let mut msg = pgp::composed::MessageBuilder::from_bytes("", padded_device_token).seipd_v2(
         &mut rng,
         SymmetricKeyAlgorithm::AES128,
@@ -172,6 +170,7 @@ pub(crate) struct PushSubscriberState {
     heartbeat_subscribed: bool,
 }
 
+/// Push notification state
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive)]
 #[repr(i8)]
 pub enum NotifyState {

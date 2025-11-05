@@ -80,17 +80,18 @@ use crate::contact::ContactId;
 use crate::context::Context;
 use crate::download::MIN_DELETE_SERVER_AFTER;
 use crate::events::EventType;
-use crate::location;
 use crate::log::{LogExt, error, info, warn};
 use crate::message::{Message, MessageState, MsgId, Viewtype};
 use crate::mimeparser::SystemMessage;
 use crate::stock_str;
 use crate::tools::{SystemTime, duration_to_str, time};
+use crate::{location, stats};
 
 /// Ephemeral timer value.
-#[derive(Debug, PartialEq, Eq, Copy, Clone, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone, Serialize, Deserialize, Default)]
 pub enum Timer {
     /// Timer is disabled.
+    #[default]
     Disabled,
 
     /// Timer is enabled.
@@ -122,12 +123,6 @@ impl Timer {
         } else {
             Self::Enabled { duration }
         }
-    }
-}
-
-impl Default for Timer {
-    fn default() -> Self {
-        Self::Disabled
     }
 }
 
@@ -386,7 +381,7 @@ async fn select_expired_messages(
 ) -> Result<Vec<(MsgId, ChatId, Viewtype, u32)>> {
     let mut rows = context
         .sql
-        .query_map(
+        .query_map_vec(
             r#"
 SELECT id, chat_id, type, location_id
 FROM msgs
@@ -407,7 +402,6 @@ WHERE
                 let location_id: u32 = row.get("location_id")?;
                 Ok((id, chat_id, viewtype, location_id))
             },
-            |rows| rows.collect::<Result<Vec<_>, _>>().map_err(Into::into),
         )
         .await?;
 
@@ -425,7 +419,7 @@ WHERE
 
         let rows_expired = context
             .sql
-            .query_map(
+            .query_map_vec(
                 r#"
 SELECT id, chat_id, type, location_id
 FROM msgs
@@ -453,7 +447,6 @@ WHERE
                     let location_id: u32 = row.get("location_id")?;
                     Ok((id, chat_id, viewtype, location_id))
                 },
-                |rows| rows.collect::<Result<Vec<_>, _>>().map_err(Into::into),
             )
             .await?;
 
@@ -610,7 +603,7 @@ pub(crate) async fn ephemeral_loop(context: &Context, interrupt_receiver: Receiv
                 + Duration::from_secs(1)
         } else {
             // no messages to be deleted for now, wait long for one to occur
-            now + Duration::from_secs(86400)
+            now + Duration::from_secs(86400) // 1 day
         };
 
         if let Ok(duration) = until.duration_since(now) {
@@ -636,6 +629,12 @@ pub(crate) async fn ephemeral_loop(context: &Context, interrupt_receiver: Receiv
                 }
             }
         }
+
+        // Make sure that the statistics stay correct by updating them _before_ deleting messages:
+        stats::maybe_update_message_stats(context)
+            .await
+            .log_err(context)
+            .ok();
 
         delete_expired_messages(context, time())
             .await

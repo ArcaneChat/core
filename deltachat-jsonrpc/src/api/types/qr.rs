@@ -1,4 +1,5 @@
 use deltachat::qr::Qr;
+use serde::Deserialize;
 use serde::Serialize;
 use typescript_type_def::TypeDef;
 
@@ -29,6 +30,26 @@ pub enum QrObject {
         contact_id: u32,
         /// Fingerprint of the contact key as scanned from the QR code.
         fingerprint: String,
+        /// Invite number.
+        invitenumber: String,
+        /// Authentication code.
+        authcode: String,
+    },
+    /// Ask the user whether to join the broadcast channel.
+    AskJoinBroadcast {
+        /// The user-visible name of this broadcast channel
+        name: String,
+        /// A string of random characters,
+        /// uniquely identifying this broadcast channel across all databases/clients.
+        /// Called `grpid` for historic reasons:
+        /// The id of multi-user chats is always called `grpid` in the database
+        /// because groups were once the only multi-user chats.
+        grpid: String,
+        /// ID of the contact who owns the broadcast channel and created the QR code.
+        contact_id: u32,
+        /// Fingerprint of the broadcast channel owner's key as scanned from the QR code.
+        fingerprint: String,
+
         /// Invite number.
         invitenumber: String,
         /// Authentication code.
@@ -207,6 +228,25 @@ impl From<Qr> for QrObject {
                     authcode,
                 }
             }
+            Qr::AskJoinBroadcast {
+                name,
+                grpid,
+                contact_id,
+                fingerprint,
+                authcode,
+                invitenumber,
+            } => {
+                let contact_id = contact_id.to_u32();
+                let fingerprint = fingerprint.to_string();
+                QrObject::AskJoinBroadcast {
+                    name,
+                    grpid,
+                    contact_id,
+                    fingerprint,
+                    authcode,
+                    invitenumber,
+                }
+            }
             Qr::FprOk { contact_id } => {
                 let contact_id = contact_id.to_u32();
                 QrObject::FprOk { contact_id }
@@ -301,6 +341,56 @@ impl From<Qr> for QrObject {
                 }
             }
             Qr::Login { address, .. } => QrObject::Login { address },
+        }
+    }
+}
+
+#[derive(Deserialize, TypeDef, schemars::JsonSchema)]
+pub enum SecurejoinSource {
+    /// Because of some problem, it is unknown where the QR code came from.
+    Unknown,
+    /// The user opened a link somewhere outside Delta Chat
+    ExternalLink,
+    /// The user clicked on a link in a message inside Delta Chat
+    InternalLink,
+    /// The user clicked "Paste from Clipboard" in the QR scan activity
+    Clipboard,
+    /// The user clicked "Load QR code as image" in the QR scan activity
+    ImageLoaded,
+    /// The user scanned a QR code
+    Scan,
+}
+
+#[derive(Deserialize, TypeDef, schemars::JsonSchema)]
+pub enum SecurejoinUiPath {
+    /// The UI path is unknown, or the user didn't open the QR code screen at all.
+    Unknown,
+    /// The user directly clicked on the QR icon in the main screen
+    QrIcon,
+    /// The user first clicked on the `+` button in the main screen,
+    /// and then on "New Contact"
+    NewContact,
+}
+
+impl From<SecurejoinSource> for deltachat::SecurejoinSource {
+    fn from(value: SecurejoinSource) -> Self {
+        match value {
+            SecurejoinSource::Unknown => deltachat::SecurejoinSource::Unknown,
+            SecurejoinSource::ExternalLink => deltachat::SecurejoinSource::ExternalLink,
+            SecurejoinSource::InternalLink => deltachat::SecurejoinSource::InternalLink,
+            SecurejoinSource::Clipboard => deltachat::SecurejoinSource::Clipboard,
+            SecurejoinSource::ImageLoaded => deltachat::SecurejoinSource::ImageLoaded,
+            SecurejoinSource::Scan => deltachat::SecurejoinSource::Scan,
+        }
+    }
+}
+
+impl From<SecurejoinUiPath> for deltachat::SecurejoinUiPath {
+    fn from(value: SecurejoinUiPath) -> Self {
+        match value {
+            SecurejoinUiPath::Unknown => deltachat::SecurejoinUiPath::Unknown,
+            SecurejoinUiPath::QrIcon => deltachat::SecurejoinUiPath::QrIcon,
+            SecurejoinUiPath::NewContact => deltachat::SecurejoinUiPath::NewContact,
         }
     }
 }

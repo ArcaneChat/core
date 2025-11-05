@@ -28,17 +28,20 @@ use crate::constants::NON_ALPHANUMERIC_WITHOUT_DOT;
 use crate::context::Context;
 use crate::imap::Imap;
 use crate::log::{LogExt, info, warn};
+use crate::login_param::EnteredCertificateChecks;
 pub use crate::login_param::EnteredLoginParam;
-use crate::login_param::{
-    ConfiguredCertificateChecks, ConfiguredLoginParam, ConfiguredServerLoginParam,
-    ConnectionCandidate, EnteredCertificateChecks, ProxyConfig,
-};
 use crate::message::Message;
+use crate::net::proxy::ProxyConfig;
 use crate::oauth2::get_oauth2_addr;
 use crate::provider::{Protocol, Provider, Socket, UsernamePattern};
+use crate::qr::{login_param_from_account_qr, login_param_from_login_qr};
 use crate::smtp::Smtp;
 use crate::sync::Sync::*;
 use crate::tools::time;
+use crate::transport::{
+    ConfiguredCertificateChecks, ConfiguredLoginParam, ConfiguredServerLoginParam,
+    ConnectionCandidate,
+};
 use crate::{EventType, stock_str};
 use crate::{chat, provider};
 use deltachat_contact_tools::addr_cmp;
@@ -117,7 +120,7 @@ impl Context {
         Ok(())
     }
 
-    async fn add_transport_inner(&self, param: &mut EnteredLoginParam) -> Result<()> {
+    pub(crate) async fn add_transport_inner(&self, param: &mut EnteredLoginParam) -> Result<()> {
         ensure!(
             !self.scheduler.is_running().await,
             "cannot configure, already running"
@@ -162,20 +165,15 @@ impl Context {
     pub async fn add_transport_from_qr(&self, qr: &str) -> Result<()> {
         self.stop_io().await;
 
-        // This code first sets the deprecated Config::Addr, Config::MailPw, etc.
-        // and then calls configure(), which loads them again.
-        // At some point, we will remove configure()
-        // and then simplify the code
-        // to directly create an EnteredLoginParam.
         let result = async move {
-            match crate::qr::check_qr(self, qr).await? {
-                crate::qr::Qr::Account { .. } => crate::qr::set_account_from_qr(self, qr).await?,
+            let mut param = match crate::qr::check_qr(self, qr).await? {
+                crate::qr::Qr::Account { .. } => login_param_from_account_qr(self, qr).await?,
                 crate::qr::Qr::Login { address, options } => {
-                    crate::qr::configure_from_login_qr(self, &address, options).await?
+                    login_param_from_login_qr(&address, options)?
                 }
                 _ => bail!("QR code does not contain account"),
-            }
-            self.configure().await?;
+            };
+            self.add_transport_inner(&mut param).await?;
             Ok(())
         }
         .await;
@@ -300,8 +298,6 @@ async fn get_configured_param(
         param.smtp.password.clone()
     };
 
-    let proxy_enabled = ctx.get_config_bool(Config::ProxyEnabled).await?;
-
     let mut addr = param.addr.clone();
     if param.oauth2 {
         // the used oauth2 addr may differ, check this.
@@ -343,7 +339,7 @@ async fn get_configured_param(
             "checking internal provider-info for offline autoconfig"
         );
 
-        provider = provider::get_provider_info(ctx, &param_domain, proxy_enabled).await;
+        provider = provider::get_provider_info(&param_domain);
         if let Some(provider) = provider {
             if provider.server.is_empty() {
                 info!(ctx, "Offline autoconfig found, but no servers defined.");
@@ -555,7 +551,6 @@ async fn configure(ctx: &Context, param: &EnteredLoginParam) -> Result<Option<&'
         true => ctx.get_config_bool(Config::IsChatmail).await?,
     };
     if is_chatmail {
-        ctx.set_config(Config::SentboxWatch, None).await?;
         ctx.set_config(Config::MvboxMove, Some("0")).await?;
         ctx.set_config(Config::OnlyFetchMvbox, None).await?;
         ctx.set_config(Config::ShowEmails, None).await?;

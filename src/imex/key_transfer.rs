@@ -1,8 +1,6 @@
 //! # Key transfer via Autocrypt Setup Message.
 use std::io::BufReader;
 
-use rand::{Rng, thread_rng};
-
 use anyhow::{Result, bail, ensure};
 
 use crate::blob::BlobObject;
@@ -95,7 +93,7 @@ pub async fn render_setup_file(context: &Context, passphrase: &str) -> Result<St
     let private_key = load_self_secret_key(context).await?;
     let ac_headers = Some(("Autocrypt-Prefer-Encrypt", "mutual"));
     let private_key_asc = private_key.to_asc(ac_headers);
-    let encr = pgp::symm_encrypt(passphrase, private_key_asc.into_bytes())
+    let encr = pgp::symm_encrypt_autocrypt_setup(passphrase, private_key_asc.into_bytes())
         .await?
         .replace('\n', "\r\n");
 
@@ -133,12 +131,11 @@ pub async fn render_setup_file(context: &Context, passphrase: &str) -> Result<St
 /// Creates a new setup code for Autocrypt Setup Message.
 fn create_setup_code(_context: &Context) -> String {
     let mut random_val: u16;
-    let mut rng = thread_rng();
     let mut ret = String::new();
 
     for i in 0..9 {
         loop {
-            random_val = rng.r#gen();
+            random_val = rand::random();
             if random_val as usize <= 60000 {
                 break;
             }

@@ -43,10 +43,9 @@ class ACFactory:
     @futuremethod
     def new_configured_account(self):
         """Create a new configured account."""
-        addr, password = self.get_credentials()
         account = self.get_unconfigured_account()
-        params = {"addr": addr, "password": password}
-        yield account.add_or_update_transport.future(params)
+        domain = os.getenv("CHATMAIL_DOMAIN")
+        yield account.add_transport_from_qr.future(f"dcaccount:{domain}")
 
         assert account.is_configured()
         return account
@@ -73,11 +72,11 @@ class ACFactory:
     def resetup_account(self, ac: Account) -> Account:
         """Resetup account from scratch, losing the encryption key."""
         ac.stop_io()
-        ac_clone = self.get_unconfigured_account()
-        for i in ["addr", "mail_pw"]:
-            ac_clone.set_config(i, ac.get_config(i))
+        transports = ac.list_transports()
         ac.remove()
-        ac_clone.configure()
+        ac_clone = self.get_unconfigured_account()
+        for transport in transports:
+            ac_clone.add_or_update_transport(transport)
         return ac_clone
 
     def get_accepted_chat(self, ac1: Account, ac2: Account) -> Chat:

@@ -1,6 +1,8 @@
 use super::*;
-use crate::chat::{ProtectionStatus, create_group_chat};
+use crate::chat::create_group;
 use crate::config::Config;
+use crate::login_param::EnteredCertificateChecks;
+use crate::provider::Socket;
 use crate::securejoin::get_securejoin_qr;
 use crate::test_utils::{TestContext, TestContextManager, sync};
 
@@ -479,7 +481,7 @@ async fn test_withdraw_verifycontact() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_withdraw_verifygroup() -> Result<()> {
     let alice = TestContext::new_alice().await;
-    let chat_id = create_group_chat(&alice, ProtectionStatus::Unprotected, "foo").await?;
+    let chat_id = create_group(&alice, "foo").await?;
     let qr = get_securejoin_qr(&alice, Some(chat_id)).await?;
 
     // scanning own verify-group code offers withdrawing
@@ -520,8 +522,8 @@ async fn test_withdraw_multidevice() -> Result<()> {
 
     // Alice creates two QR codes on the first device:
     // group QR code and contact QR code.
-    let chat_id = create_group_chat(alice, ProtectionStatus::Unprotected, "Group").await?;
-    let chat2_id = create_group_chat(alice, ProtectionStatus::Unprotected, "Group 2").await?;
+    let chat_id = create_group(alice, "Group").await?;
+    let chat2_id = create_group(alice, "Group 2").await?;
     let contact_qr = get_securejoin_qr(alice, None).await?;
     let group_qr = get_securejoin_qr(alice, Some(chat_id)).await?;
     let group2_qr = get_securejoin_qr(alice, Some(chat2_id)).await?;
@@ -581,101 +583,58 @@ async fn test_withdraw_multidevice() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_decode_and_apply_dclogin() -> Result<()> {
-    let ctx = TestContext::new().await;
+async fn test_decode_dclogin() -> Result<()> {
+    let ctx = &TestContext::new().await;
 
-    let result = check_qr(&ctx.ctx, "dclogin:usename+extension@host?p=1234&v=1").await?;
-    if let Qr::Login { address, options } = result {
-        assert_eq!(address, "usename+extension@host".to_owned());
+    let Qr::Login { address, options } =
+        check_qr(ctx, "dclogin:username+extension@host?p=1234&v=1").await?
+    else {
+        unreachable!();
+    };
 
-        if let LoginOptions::V1 { mail_pw, .. } = options {
-            assert_eq!(mail_pw, "1234".to_owned());
-        } else {
-            bail!("wrong type")
-        }
+    assert_eq!(address, "username+extension@host".to_owned());
+
+    if let LoginOptions::V1 { ref mail_pw, .. } = options {
+        assert_eq!(mail_pw, "1234");
     } else {
         bail!("wrong type")
     }
 
-    assert!(ctx.ctx.get_config(Config::Addr).await?.is_none());
-    assert!(ctx.ctx.get_config(Config::MailPw).await?.is_none());
-
-    set_config_from_qr(&ctx.ctx, "dclogin:username+extension@host?p=1234&v=1").await?;
-    assert_eq!(
-        ctx.ctx.get_config(Config::Addr).await?,
-        Some("username+extension@host".to_owned())
-    );
-    assert_eq!(
-        ctx.ctx.get_config(Config::MailPw).await?,
-        Some("1234".to_owned())
-    );
+    let param = login_param_from_login_qr(&address, options)?;
+    assert_eq!(param.addr, "username+extension@host");
+    assert_eq!(param.imap.password, "1234");
 
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_decode_and_apply_dclogin_advanced_options() -> Result<()> {
-    let ctx = TestContext::new().await;
-    set_config_from_qr(&ctx.ctx, "dclogin:username+extension@host?p=1234&spw=4321&sh=send.host&sp=7273&su=SendUser&ih=host.tld&ip=4343&iu=user&ipw=password&is=ssl&ic=1&sc=3&ss=plain&v=1").await?;
-    assert_eq!(
-        ctx.ctx.get_config(Config::Addr).await?,
-        Some("username+extension@host".to_owned())
-    );
+async fn test_decode_dclogin_advanced_options() -> Result<()> {
+    let ctx = &TestContext::new().await;
+
+    let Qr::Login { address, options } = check_qr(ctx, "dclogin:username+extension@host?p=1234&spw=4321&sh=send.host&sp=7273&su=SendUser&ih=host.tld&ip=4343&iu=user&ipw=password&is=ssl&ic=1&sc=3&ss=plain&v=1").await? else {
+        unreachable!();
+    };
+
+    assert_eq!(address, "username+extension@host");
+
+    let param = login_param_from_login_qr(&address, options)?;
+    assert_eq!(param.imap.server, "host.tld");
+    assert_eq!(param.imap.port, 4343);
+    assert_eq!(param.imap.user, "user");
 
     // `p=1234` is ignored, because `ipw=password` is set
+    assert_eq!(param.imap.password, "password");
+    assert_eq!(param.imap.security, Socket::Ssl);
 
-    assert_eq!(
-        ctx.ctx.get_config(Config::MailServer).await?,
-        Some("host.tld".to_owned())
-    );
-    assert_eq!(
-        ctx.ctx.get_config(Config::MailPort).await?,
-        Some("4343".to_owned())
-    );
-    assert_eq!(
-        ctx.ctx.get_config(Config::MailUser).await?,
-        Some("user".to_owned())
-    );
-    assert_eq!(
-        ctx.ctx.get_config(Config::MailPw).await?,
-        Some("password".to_owned())
-    );
-    assert_eq!(
-        ctx.ctx.get_config(Config::MailSecurity).await?,
-        Some("1".to_owned()) // ssl
-    );
-    assert_eq!(
-        ctx.ctx.get_config(Config::ImapCertificateChecks).await?,
-        Some("1".to_owned())
-    );
-
-    assert_eq!(
-        ctx.ctx.get_config(Config::SendPw).await?,
-        Some("4321".to_owned())
-    );
-    assert_eq!(
-        ctx.ctx.get_config(Config::SendServer).await?,
-        Some("send.host".to_owned())
-    );
-    assert_eq!(
-        ctx.ctx.get_config(Config::SendPort).await?,
-        Some("7273".to_owned())
-    );
-    assert_eq!(
-        ctx.ctx.get_config(Config::SendUser).await?,
-        Some("SendUser".to_owned())
-    );
+    assert_eq!(param.smtp.password, "4321");
+    assert_eq!(param.smtp.server, "send.host");
+    assert_eq!(param.smtp.port, 7273);
+    assert_eq!(param.smtp.user, "SendUser");
+    assert_eq!(param.smtp.security, Socket::Plain);
 
     // `sc` option is actually ignored and `ic` is used instead
     // because `smtp_certificate_checks` is deprecated.
-    assert_eq!(
-        ctx.ctx.get_config(Config::SmtpCertificateChecks).await?,
-        Some("1".to_owned())
-    );
-    assert_eq!(
-        ctx.ctx.get_config(Config::SendSecurity).await?,
-        Some("3".to_owned()) // plain
-    );
+    assert_eq!(param.certificate_checks, EnteredCertificateChecks::Strict);
 
     Ok(())
 }
@@ -684,30 +643,20 @@ async fn test_decode_and_apply_dclogin_advanced_options() -> Result<()> {
 async fn test_decode_account() -> Result<()> {
     let ctx = TestContext::new().await;
 
-    let qr = check_qr(
-        &ctx.ctx,
+    for text in [
+        "DCACCOUNT:example.org",
+        "dcaccount:example.org",
         "DCACCOUNT:https://example.org/new_email?t=1w_7wDjgjelxeX884x96v3",
-    )
-    .await?;
-    assert_eq!(
-        qr,
-        Qr::Account {
-            domain: "example.org".to_string()
-        }
-    );
-
-    // Test it again with lowercased "dcaccount:" uri scheme
-    let qr = check_qr(
-        &ctx.ctx,
         "dcaccount:https://example.org/new_email?t=1w_7wDjgjelxeX884x96v3",
-    )
-    .await?;
-    assert_eq!(
-        qr,
-        Qr::Account {
-            domain: "example.org".to_string()
-        }
-    );
+    ] {
+        let qr = check_qr(&ctx.ctx, text).await?;
+        assert_eq!(
+            qr,
+            Qr::Account {
+                domain: "example.org".to_string()
+            }
+        );
+    }
 
     Ok(())
 }
@@ -773,25 +722,6 @@ async fn test_decode_tg_socks_proxy() -> Result<()> {
     assert!(qr.is_err());
 
     Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_decode_account_bad_scheme() {
-    let ctx = TestContext::new().await;
-    let res = check_qr(
-        &ctx.ctx,
-        "DCACCOUNT:ftp://example.org/new_email?t=1w_7wDjgjelxeX884x96v3",
-    )
-    .await;
-    assert!(res.is_err());
-
-    // Test it again with lowercased "dcaccount:" uri scheme
-    let res = check_qr(
-        &ctx.ctx,
-        "dcaccount:ftp://example.org/new_email?t=1w_7wDjgjelxeX884x96v3",
-    )
-    .await;
-    assert!(res.is_err());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

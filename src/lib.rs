@@ -75,7 +75,10 @@ mod mimefactory;
 pub mod mimeparser;
 pub mod oauth2;
 mod param;
+#[cfg(not(feature = "internals"))]
 mod pgp;
+#[cfg(feature = "internals")]
+pub mod pgp;
 pub mod provider;
 pub mod qr;
 pub mod qr_code_generator;
@@ -89,6 +92,7 @@ pub mod stock_str;
 mod sync;
 mod timesmearing;
 mod token;
+mod transport;
 mod update_helper;
 pub mod webxdc;
 #[macro_use]
@@ -98,7 +102,10 @@ pub mod color;
 pub mod html;
 pub mod net;
 pub mod plaintext;
-mod push;
+pub mod push;
+mod stats;
+pub use stats::SecurejoinSource;
+pub use stats::SecurejoinUiPath;
 pub mod summary;
 
 mod debug_logging;
@@ -108,6 +115,9 @@ pub mod tools;
 pub mod accounts;
 pub mod peer_channels;
 pub mod reaction;
+
+#[cfg(feature = "internals")]
+pub mod internals_for_benches;
 
 /// If set IMAP/incoming and SMTP/outgoing MIME messages will be printed.
 pub const DCC_MIME_DEBUG: &str = "DCC_MIME_DEBUG";

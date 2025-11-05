@@ -10,28 +10,22 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail, ensure};
 use async_channel::{self as channel, Receiver, Sender};
-use pgp::types::PublicKeyTrait;
 use ratelimit::Ratelimit;
 use tokio::sync::{Mutex, Notify, RwLock};
 
-use crate::chat::{ChatId, ProtectionStatus, get_chat_cnt};
-use crate::chatlist_events;
+use crate::chat::{ChatId, get_chat_cnt};
 use crate::config::Config;
-use crate::constants::{
-    self, DC_BACKGROUND_FETCH_QUOTA_CHECK_RATELIMIT, DC_CHAT_ID_TRASH, DC_VERSION_STR,
-};
-use crate::contact::{Contact, ContactId, import_vcard, mark_contact_id_as_verified};
+use crate::constants::{self, DC_BACKGROUND_FETCH_QUOTA_CHECK_RATELIMIT, DC_VERSION_STR};
+use crate::contact::{Contact, ContactId};
 use crate::debug_logging::DebugLogging;
-use crate::download::DownloadState;
 use crate::events::{Event, EventEmitter, EventType, Events};
 use crate::imap::{FolderMeaning, Imap, ServerMetadata};
-use crate::key::{load_self_secret_key, self_fingerprint};
+use crate::key::self_fingerprint;
 use crate::log::{info, warn};
 use crate::logged_debug_assert;
-use crate::login_param::{ConfiguredLoginParam, EnteredLoginParam};
-use crate::message::{self, Message, MessageState, MsgId};
+use crate::login_param::EnteredLoginParam;
+use crate::message::{self, MessageState, MsgId};
 use crate::net::tls::TlsSessionStore;
-use crate::param::{Param, Params};
 use crate::peer_channels::Iroh;
 use crate::push::PushSubscriber;
 use crate::quota::QuotaInfo;
@@ -39,7 +33,9 @@ use crate::scheduler::{ConnectivityStore, SchedulerState, convert_folder_meaning
 use crate::sql::Sql;
 use crate::stock_str::StockStrings;
 use crate::timesmearing::SmearedTimestamp;
-use crate::tools::{self, create_id, duration_to_str, time, time_elapsed};
+use crate::tools::{self, duration_to_str, time, time_elapsed};
+use crate::transport::ConfiguredLoginParam;
+use crate::{chatlist_events, stats};
 
 /// Builder for the [`Context`].
 ///
@@ -263,8 +259,6 @@ pub struct InnerContext {
     /// IMAP METADATA.
     pub(crate) metadata: RwLock<Option<ServerMetadata>>,
 
-    pub(crate) last_full_folder_scan: Mutex<Option<tools::Time>>,
-
     /// ID for this `Context` in the current process.
     ///
     /// This allows for multiple `Context`s open in a single process where each context can
@@ -315,7 +309,7 @@ pub struct InnerContext {
 }
 
 /// The state of ongoing process.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 enum RunningState {
     /// Ongoing process is allocated.
     Running { cancel_sender: Sender<()> },
@@ -324,13 +318,8 @@ enum RunningState {
     ShallStop { request: tools::Time },
 
     /// There is no ongoing process, a new one can be allocated.
+    #[default]
     Stopped,
-}
-
-impl Default for RunningState {
-    fn default() -> Self {
-        Self::Stopped
-    }
 }
 
 /// Return some info about deltachat-core
@@ -473,7 +462,6 @@ impl Context {
             server_id: RwLock::new(None),
             metadata: RwLock::new(None),
             creation_time: tools::Time::now(),
-            last_full_folder_scan: Mutex::new(None),
             last_error: parking_lot::RwLock::new("".to_string()),
             migration_error: parking_lot::RwLock::new(None),
             debug_logging: std::sync::RwLock::new(None),
@@ -831,7 +819,6 @@ impl Context {
         let unblocked_msgs = message::get_unblocked_msg_cnt(self).await;
         let request_msgs = message::get_request_msg_cnt(self).await;
         let contacts = Contact::get_real_cnt(self).await?;
-        let is_configured = self.get_config_int(Config::Configured).await?;
         let proxy_enabled = self.get_config_int(Config::ProxyEnabled).await?;
         let dbversion = self
             .sql
@@ -859,7 +846,6 @@ impl Context {
             Err(err) => format!("<key failure: {err}>"),
         };
 
-        let sentbox_watch = self.get_config_int(Config::SentboxWatch).await?;
         let mvbox_move = self.get_config_int(Config::MvboxMove).await?;
         let only_fetch_mvbox = self.get_config_int(Config::OnlyFetchMvbox).await?;
         let folders_configured = self
@@ -870,10 +856,6 @@ impl Context {
 
         let configured_inbox_folder = self
             .get_config(Config::ConfiguredInboxFolder)
-            .await?
-            .unwrap_or_else(|| "<unset>".to_string());
-        let configured_sentbox_folder = self
-            .get_config(Config::ConfiguredSentboxFolder)
             .await?
             .unwrap_or_else(|| "<unset>".to_string());
         let configured_mvbox_folder = self
@@ -910,7 +892,6 @@ impl Context {
                 .await?
                 .unwrap_or_else(|| "<unset>".to_string()),
         );
-        res.insert("is_configured", is_configured.to_string());
         res.insert("proxy_enabled", proxy_enabled.to_string());
         res.insert("entered_account_settings", l.to_string());
         res.insert("used_account_settings", l2);
@@ -964,7 +945,6 @@ impl Context {
                 .await?
                 .to_string(),
         );
-        res.insert("sentbox_watch", sentbox_watch.to_string());
         res.insert("mvbox_move", mvbox_move.to_string());
         res.insert("only_fetch_mvbox", only_fetch_mvbox.to_string());
         res.insert(
@@ -972,7 +952,6 @@ impl Context {
             folders_configured.to_string(),
         );
         res.insert("configured_inbox_folder", configured_inbox_folder);
-        res.insert("configured_sentbox_folder", configured_sentbox_folder);
         res.insert("configured_mvbox_folder", configured_mvbox_folder);
         res.insert("configured_trash_folder", configured_trash_folder);
         res.insert("mdns_enabled", mdns_enabled.to_string());
@@ -1041,12 +1020,6 @@ impl Context {
                 .to_string(),
         );
         res.insert(
-            "protect_autocrypt",
-            self.get_config_int(Config::ProtectAutocrypt)
-                .await?
-                .to_string(),
-        );
-        res.insert(
             "debug_logging",
             self.get_config_int(Config::DebugLogging).await?.to_string(),
         );
@@ -1078,6 +1051,22 @@ impl Context {
                 .unwrap_or_default(),
         );
         res.insert(
+            "stats_id",
+            self.get_config(Config::StatsId)
+                .await?
+                .unwrap_or_else(|| "<unset>".to_string()),
+        );
+        res.insert(
+            "stats_sending",
+            stats::should_send_stats(self).await?.to_string(),
+        );
+        res.insert(
+            "stats_last_sent",
+            self.get_config_i64(Config::StatsLastSent)
+                .await?
+                .to_string(),
+        );
+        res.insert(
             "fail_on_receiving_full_msg",
             self.sql
                 .get_raw_config("fail_on_receiving_full_msg")
@@ -1091,147 +1080,6 @@ impl Context {
         Ok(res)
     }
 
-    async fn get_self_report(&self) -> Result<String> {
-        #[derive(Default)]
-        struct ChatNumbers {
-            protected: u32,
-            opportunistic_dc: u32,
-            opportunistic_mua: u32,
-            unencrypted_dc: u32,
-            unencrypted_mua: u32,
-        }
-
-        let mut res = String::new();
-        res += &format!("core_version ArcaneChat-{}\n", get_version_str());
-
-        let num_msgs: u32 = self
-            .sql
-            .query_get_value(
-                "SELECT COUNT(*) FROM msgs WHERE hidden=0 AND chat_id!=?",
-                (DC_CHAT_ID_TRASH,),
-            )
-            .await?
-            .unwrap_or_default();
-        res += &format!("num_msgs {num_msgs}\n");
-
-        let num_chats: u32 = self
-            .sql
-            .query_get_value("SELECT COUNT(*) FROM chats WHERE id>9 AND blocked!=1", ())
-            .await?
-            .unwrap_or_default();
-        res += &format!("num_chats {num_chats}\n");
-
-        let db_size = tokio::fs::metadata(&self.sql.dbfile).await?.len();
-        res += &format!("db_size_bytes {db_size}\n");
-
-        let secret_key = &load_self_secret_key(self).await?.primary_key;
-        let key_created = secret_key.public_key().created_at().timestamp();
-        res += &format!("key_created {key_created}\n");
-
-        // how many of the chats active in the last months are:
-        // - protected
-        // - opportunistic-encrypted and the contact uses Delta Chat
-        // - opportunistic-encrypted and the contact uses a classical MUA
-        // - unencrypted and the contact uses Delta Chat
-        // - unencrypted and the contact uses a classical MUA
-        let three_months_ago = time().saturating_sub(3600 * 24 * 30 * 3);
-        let chats = self
-            .sql
-            .query_map(
-                "SELECT c.protected, m.param, m.msgrmsg
-                    FROM chats c
-                    JOIN msgs m
-                        ON c.id=m.chat_id
-                        AND m.id=(
-                                SELECT id
-                                FROM msgs
-                                WHERE chat_id=c.id
-                                AND hidden=0
-                                AND download_state=?
-                                AND to_id!=?
-                                ORDER BY timestamp DESC, id DESC LIMIT 1)
-                    WHERE c.id>9
-                    AND (c.blocked=0 OR c.blocked=2)
-                    AND IFNULL(m.timestamp,c.created_timestamp) > ?
-                    GROUP BY c.id",
-                (DownloadState::Done, ContactId::INFO, three_months_ago),
-                |row| {
-                    let protected: ProtectionStatus = row.get(0)?;
-                    let message_param: Params =
-                        row.get::<_, String>(1)?.parse().unwrap_or_default();
-                    let is_dc_message: bool = row.get(2)?;
-                    Ok((protected, message_param, is_dc_message))
-                },
-                |rows| {
-                    let mut chats = ChatNumbers::default();
-                    for row in rows {
-                        let (protected, message_param, is_dc_message) = row?;
-                        let encrypted = message_param
-                            .get_bool(Param::GuaranteeE2ee)
-                            .unwrap_or(false);
-
-                        if protected == ProtectionStatus::Protected {
-                            chats.protected += 1;
-                        } else if encrypted {
-                            if is_dc_message {
-                                chats.opportunistic_dc += 1;
-                            } else {
-                                chats.opportunistic_mua += 1;
-                            }
-                        } else if is_dc_message {
-                            chats.unencrypted_dc += 1;
-                        } else {
-                            chats.unencrypted_mua += 1;
-                        }
-                    }
-                    Ok(chats)
-                },
-            )
-            .await?;
-        res += &format!("chats_protected {}\n", chats.protected);
-        res += &format!("chats_opportunistic_dc {}\n", chats.opportunistic_dc);
-        res += &format!("chats_opportunistic_mua {}\n", chats.opportunistic_mua);
-        res += &format!("chats_unencrypted_dc {}\n", chats.unencrypted_dc);
-        res += &format!("chats_unencrypted_mua {}\n", chats.unencrypted_mua);
-
-        let self_reporting_id = match self.get_config(Config::SelfReportingId).await? {
-            Some(id) => id,
-            None => {
-                let id = create_id();
-                self.set_config(Config::SelfReportingId, Some(&id)).await?;
-                id
-            }
-        };
-        res += &format!("self_reporting_id {self_reporting_id}");
-
-        Ok(res)
-    }
-
-    /// Drafts a message with statistics about the usage of Delta Chat.
-    /// The user can inspect the message if they want, and then hit "Send".
-    ///
-    /// On the other end, a bot will receive the message and make it available
-    /// to Delta Chat's developers.
-    pub async fn draft_self_report(&self) -> Result<ChatId> {
-        const SELF_REPORTING_BOT_VCARD: &str = include_str!("../assets/self-reporting-bot.vcf");
-        let contact_id: ContactId = *import_vcard(self, SELF_REPORTING_BOT_VCARD)
-            .await?
-            .first()
-            .context("Self reporting bot vCard does not contain a contact")?;
-        mark_contact_id_as_verified(self, contact_id, Some(ContactId::SELF)).await?;
-
-        let chat_id = ChatId::create_for_contact(self, contact_id).await?;
-        chat_id
-            .set_protection(self, ProtectionStatus::Protected, time(), Some(contact_id))
-            .await?;
-
-        let mut msg = Message::new_text(self.get_self_report().await?);
-
-        chat_id.set_draft(self, Some(&mut msg)).await?;
-
-        Ok(chat_id)
-    }
-
     /// Get a list of fresh, unmuted messages in unblocked chats.
     ///
     /// The list starts with the most recent message
@@ -1241,7 +1089,7 @@ impl Context {
     pub async fn get_fresh_msgs(&self) -> Result<Vec<MsgId>> {
         let list = self
             .sql
-            .query_map(
+            .query_map_vec(
                 concat!(
                     "SELECT m.id",
                     " FROM msgs m",
@@ -1259,13 +1107,6 @@ impl Context {
                 ),
                 (MessageState::InFresh, time()),
                 |row| row.get::<_, MsgId>(0),
-                |rows| {
-                    let mut list = Vec::new();
-                    for row in rows {
-                        list.push(row?);
-                    }
-                    Ok(list)
-                },
             )
             .await?;
         Ok(list)
@@ -1298,7 +1139,7 @@ impl Context {
 
         let list = self
             .sql
-            .query_map(
+            .query_map_vec(
                 "SELECT m.id
                      FROM msgs m
                      LEFT JOIN contacts ct
@@ -1317,13 +1158,6 @@ impl Context {
                 |row| {
                     let msg_id: MsgId = row.get(0)?;
                     Ok(msg_id)
-                },
-                |rows| {
-                    let mut list = Vec::new();
-                    for row in rows {
-                        list.push(row?);
-                    }
-                    Ok(list)
                 },
             )
             .await?;
@@ -1365,7 +1199,7 @@ impl Context {
 
         let list = if let Some(chat_id) = chat_id {
             self.sql
-                .query_map(
+                .query_map_vec(
                     "SELECT m.id AS id
                  FROM msgs m
                  LEFT JOIN contacts ct
@@ -1377,13 +1211,6 @@ impl Context {
                  ORDER BY m.timestamp,m.id;",
                     (chat_id, str_like_in_text),
                     |row| row.get::<_, MsgId>("id"),
-                    |rows| {
-                        let mut ret = Vec::new();
-                        for id in rows {
-                            ret.push(id?);
-                        }
-                        Ok(ret)
-                    },
                 )
                 .await?
         } else {
@@ -1398,7 +1225,7 @@ impl Context {
             // According to some tests, this limit speeds up eg. 2 character searches by factor 10.
             // The limit is documented and UI may add a hint when getting 1000 results.
             self.sql
-                .query_map(
+                .query_map_vec(
                     "SELECT m.id AS id
                  FROM msgs m
                  LEFT JOIN contacts ct
@@ -1413,13 +1240,6 @@ impl Context {
                  ORDER BY m.id DESC LIMIT 1000",
                     (str_like_in_text,),
                     |row| row.get::<_, MsgId>("id"),
-                    |rows| {
-                        let mut ret = Vec::new();
-                        for id in rows {
-                            ret.push(id?);
-                        }
-                        Ok(ret)
-                    },
                 )
                 .await?
         };
@@ -1431,12 +1251,6 @@ impl Context {
     pub async fn is_inbox(&self, folder_name: &str) -> Result<bool> {
         let inbox = self.get_config(Config::ConfiguredInboxFolder).await?;
         Ok(inbox.as_deref() == Some(folder_name))
-    }
-
-    /// Returns true if given folder name is the name of the "sent" folder.
-    pub async fn is_sentbox(&self, folder_name: &str) -> Result<bool> {
-        let sentbox = self.get_config(Config::ConfiguredSentboxFolder).await?;
-        Ok(sentbox.as_deref() == Some(folder_name))
     }
 
     /// Returns true if given folder name is the name of the "DeltaChat" folder.

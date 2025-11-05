@@ -11,7 +11,7 @@ use tokio::sync::RwLock;
 
 use crate::accounts::Accounts;
 use crate::blob::BlobObject;
-use crate::chat::{self, Chat, ChatId, ProtectionStatus};
+use crate::chat::{self, Chat, ChatId};
 use crate::config::Config;
 use crate::contact::{Contact, ContactId, Origin};
 use crate::context::Context;
@@ -70,9 +70,6 @@ pub enum StockMessage {
 
     #[strum(props(fallback = "No encryption"))]
     EncrNone = 28,
-
-    #[strum(props(fallback = "This message was encrypted for another setup."))]
-    CantDecryptMsgBody = 29,
 
     #[strum(props(fallback = "Fingerprints"))]
     FingerPrints = 30,
@@ -392,11 +389,6 @@ pub enum StockMessage {
     ))]
     InvalidUnencryptedMail = 174,
 
-    #[strum(props(
-        fallback = "⚠️ It seems you are using Delta Chat on multiple devices that cannot decrypt each other's outgoing messages. To fix this, on the older device use \"Settings / Add Second Device\" and follow the instructions."
-    ))]
-    CantDecryptOutgoingMsgs = 175,
-
     #[strum(props(fallback = "You reacted %1$s to \"%2$s\""))]
     MsgYouReacted = 176,
 
@@ -439,6 +431,22 @@ https://delta.chat/donate"))]
 
     #[strum(props(fallback = "Scan to join channel %1$s"))]
     SecureJoinBrodcastQRDescription = 201,
+
+    #[strum(props(fallback = "You joined the channel."))]
+    MsgYouJoinedBroadcast = 202,
+
+    #[strum(props(
+        fallback = "The attachment contains anonymous usage statistics, which helps us improve Delta Chat. Thank you!"
+    ))]
+    StatsMsgBody = 210,
+
+    #[strum(props(fallback = "Proxy Enabled"))]
+    ProxyEnabled = 220,
+
+    #[strum(props(
+        fallback = "You are using a proxy. If you're having trouble connecting, try a different proxy."
+    ))]
+    ProxyEnabledDescription = 221,
 }
 
 impl StockMessage {
@@ -727,6 +735,11 @@ pub(crate) async fn msg_you_left_broadcast(context: &Context) -> String {
     translated(context, StockMessage::MsgYouLeftBroadcast).await
 }
 
+/// Stock string: `You joined the channel.`
+pub(crate) async fn msg_you_joined_broadcast(context: &Context) -> String {
+    translated(context, StockMessage::MsgYouJoinedBroadcast).await
+}
+
 /// Stock string: `You reacted %1$s to "%2$s"` or `%1$s reacted %2$s to "%3$s"`.
 pub(crate) async fn msg_reacted(
     context: &Context,
@@ -761,16 +774,6 @@ pub(crate) async fn e2e_available(context: &Context) -> String {
 /// Stock string: `No encryption.`.
 pub(crate) async fn encr_none(context: &Context) -> String {
     translated(context, StockMessage::EncrNone).await
-}
-
-/// Stock string: `This message was encrypted for another setup.`.
-pub(crate) async fn cant_decrypt_msg_body(context: &Context) -> String {
-    translated(context, StockMessage::CantDecryptMsgBody).await
-}
-
-/// Stock string:`Got outgoing message(s) encrypted for another setup...`.
-pub(crate) async fn cant_decrypt_outgoing_msgs(context: &Context) -> String {
-    translated(context, StockMessage::CantDecryptOutgoingMsgs).await
 }
 
 /// Stock string: `Fingerprints`.
@@ -1083,13 +1086,6 @@ pub(crate) async fn messages_e2e_encrypted(context: &Context) -> String {
     translated(context, StockMessage::ChatProtectionEnabled).await
 }
 
-/// Stock string: `%1$s sent a message from another device.`
-pub(crate) async fn chat_protection_disabled(context: &Context, contact_id: ContactId) -> String {
-    translated(context, StockMessage::ChatProtectionDisabled)
-        .await
-        .replace1(&contact_id.get_stock_name(context).await)
-}
-
 /// Stock string: `Reply`.
 pub(crate) async fn reply_noun(context: &Context) -> String {
     translated(context, StockMessage::ReplyNoun).await
@@ -1287,6 +1283,11 @@ pub(crate) async fn unencrypted_email(context: &Context, provider: &str) -> Stri
         .replace1(provider)
 }
 
+/// Stock string: `The attachment contains anonymous usage statistics, which helps us improve Delta Chat. Thank you!`
+pub(crate) async fn stats_msg_body(context: &Context) -> String {
+    translated(context, StockMessage::StatsMsgBody).await
+}
+
 pub(crate) async fn aeap_explanation_and_link(
     context: &Context,
     old_addr: &str,
@@ -1324,6 +1325,16 @@ pub(crate) async fn backup_transfer_msg_body(context: &Context) -> String {
     translated(context, StockMessage::BackupTransferMsgBody).await
 }
 
+/// Stock string: `Proxy Enabled`.
+pub(crate) async fn proxy_enabled(context: &Context) -> String {
+    translated(context, StockMessage::ProxyEnabled).await
+}
+
+/// Stock string: `You are using a proxy. If you're having trouble connecting, try a different proxy.`.
+pub(crate) async fn proxy_description(context: &Context) -> String {
+    translated(context, StockMessage::ProxyEnabledDescription).await
+}
+
 impl Context {
     /// Set the stock string for the [StockMessage].
     ///
@@ -1332,26 +1343,6 @@ impl Context {
             .set_stock_translation(id, stockstring)
             .await?;
         Ok(())
-    }
-
-    /// Returns a stock message saying that protection status has changed.
-    pub(crate) async fn stock_protection_msg(
-        &self,
-        protect: ProtectionStatus,
-        contact_id: Option<ContactId>,
-    ) -> String {
-        match protect {
-            ProtectionStatus::Unprotected => {
-                if let Some(contact_id) = contact_id {
-                    chat_protection_disabled(self, contact_id).await
-                } else {
-                    // In a group chat, it's not possible to downgrade verification.
-                    // In a 1:1 chat, the `contact_id` always has to be provided.
-                    "[Error] No contact_id given".to_string()
-                }
-            }
-            ProtectionStatus::Protected => messages_e2e_encrypted(self).await,
-        }
     }
 
     pub(crate) async fn update_device_chats(&self) -> Result<()> {

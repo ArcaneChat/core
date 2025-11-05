@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use deltachat::chat::{Chat, ChatId};
 use deltachat::chatlist::get_last_message_for_chat;
 use deltachat::constants::*;
-use deltachat::contact::{Contact, ContactId};
+use deltachat::contact::Contact;
 use deltachat::{
     chat::{get_chat_contacts, ChatVisibility},
     chatlist::Chatlist,
@@ -30,7 +30,6 @@ pub enum ChatListItemFetchResult {
         summary_status: u32,
         /// showing preview if last chat message is image
         summary_preview_image: Option<String>,
-        is_protected: bool,
 
         /// True if the chat is encrypted.
         /// This means that all messages in the chat are encrypted,
@@ -127,11 +126,8 @@ pub(crate) async fn get_chat_list_item_by_id(
         None => (None, None),
     };
 
-    let chat_contacts = get_chat_contacts(ctx, chat_id).await?;
-
-    let self_in_group = chat_contacts.contains(&ContactId::SELF);
-
     let (dm_chat_contact, was_seen_recently) = if chat.get_type() == Chattype::Single {
+        let chat_contacts = get_chat_contacts(ctx, chat_id).await?;
         let contact = chat_contacts.first();
         let was_seen_recently = match contact {
             Some(contact) => Contact::get_by_id(ctx, *contact)
@@ -161,13 +157,12 @@ pub(crate) async fn get_chat_list_item_by_id(
         summary_text2,
         summary_status: summary.state.to_u32().expect("impossible"), // idea and a function to transform the constant to strings? or return string enum
         summary_preview_image,
-        is_protected: chat.is_protected(),
         is_encrypted: chat.is_encrypted(ctx).await?,
         is_group: chat.get_type() == Chattype::Group,
         fresh_message_counter,
         is_self_talk: chat.is_self_talk(),
         is_device_talk: chat.is_device_talk(),
-        is_self_in_group: self_in_group,
+        is_self_in_group: chat.is_self_in_chat(ctx).await?,
         is_sending_location: chat.is_sending_locations(),
         is_archived: visibility == ChatVisibility::Archived,
         is_pinned: visibility == ChatVisibility::Pinned,
