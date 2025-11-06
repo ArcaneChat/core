@@ -1106,7 +1106,10 @@ impl Context {
                     " ORDER BY m.timestamp DESC,m.id DESC;"
                 ),
                 (MessageState::InFresh, time()),
-                |row| row.get::<_, MsgId>(0),
+                |row| {
+                    let msg_id: MsgId = row.get(0)?;
+                    Ok(msg_id)
+                },
             )
             .await?;
         Ok(list)
@@ -1210,7 +1213,10 @@ impl Context {
                    AND IFNULL(txt_normalized, txt) LIKE ?
                  ORDER BY m.timestamp,m.id;",
                     (chat_id, str_like_in_text),
-                    |row| row.get::<_, MsgId>("id"),
+                    |row| {
+                        let msg_id: MsgId = row.get("id")?;
+                        Ok(msg_id)
+                    },
                 )
                 .await?
         } else {
@@ -1239,7 +1245,10 @@ impl Context {
                    AND IFNULL(txt_normalized, txt) LIKE ?
                  ORDER BY m.id DESC LIMIT 1000",
                     (str_like_in_text,),
-                    |row| row.get::<_, MsgId>("id"),
+                    |row| {
+                        let msg_id: MsgId = row.get("id")?;
+                        Ok(msg_id)
+                    },
                 )
                 .await?
         };
