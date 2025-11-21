@@ -31,7 +31,7 @@ use crate::key::{
     DcKey, Fingerprint, SignedPublicKey, load_self_public_key, self_fingerprint,
     self_fingerprint_opt,
 };
-use crate::log::{LogExt, info, warn};
+use crate::log::{LogExt, warn};
 use crate::message::MessageState;
 use crate::mimeparser::AvatarAction;
 use crate::param::{Param, Params};
@@ -369,16 +369,15 @@ async fn import_vcard_contact(context: &Context, contact: &VcardContact) -> Resu
         return Ok(id);
     }
     let path = match &contact.profile_image {
-        Some(image) => match BlobObject::store_from_base64(context, image) {
-            Err(e) => {
+        Some(image) => match BlobObject::store_from_base64(context, image)? {
+            None => {
                 warn!(
                     context,
-                    "import_vcard_contact: Could not decode and save avatar for {}: {e:#}.",
-                    contact.addr
+                    "import_vcard_contact: Could not decode avatar for {}.", contact.addr
                 );
                 None
             }
-            Ok(path) => Some(path),
+            Some(path) => Some(path),
         },
         None => None,
     };
@@ -1574,9 +1573,22 @@ impl Contact {
     }
 
     /// Returns a color for the contact.
-    /// See [`self::get_color`].
+    /// For self-contact this returns gray if own keypair doesn't exist yet.
+    /// See also [`self::get_color`].
     pub fn get_color(&self) -> u32 {
         get_color(self.id == ContactId::SELF, &self.addr, &self.fingerprint())
+    }
+
+    /// Returns a color for the contact.
+    /// Ensures that the color isn't gray. For self-contact this generates own keypair if it doesn't
+    /// exist yet.
+    /// See also [`self::get_color`].
+    pub async fn get_or_gen_color(&self, context: &Context) -> Result<u32> {
+        let mut fpr = self.fingerprint();
+        if fpr.is_none() && self.id == ContactId::SELF {
+            fpr = Some(load_self_public_key(context).await?.dc_fingerprint());
+        }
+        Ok(get_color(self.id == ContactId::SELF, &self.addr, &fpr))
     }
 
     /// Gets the contact's status.

@@ -32,7 +32,7 @@ use crate::contact::{Contact, ContactId, Modifier, Origin};
 use crate::context::Context;
 use crate::events::EventType;
 use crate::headerdef::{HeaderDef, HeaderDefMap};
-use crate::log::{LogExt, error, info, warn};
+use crate::log::{LogExt, warn};
 use crate::message::{self, Message, MessageState, MessengerMessage, MsgId};
 use crate::mimeparser;
 use crate::net::proxy::ProxyConfig;
@@ -104,6 +104,12 @@ pub(crate) struct Imap {
     /// immediately after logging in or returning an error in response to LOGIN command
     /// due to internal server error.
     ratelimit: Ratelimit,
+
+    /// IMAP UID resync request sender.
+    pub(crate) resync_request_sender: async_channel::Sender<()>,
+
+    /// IMAP UID resync request receiver.
+    pub(crate) resync_request_receiver: async_channel::Receiver<()>,
 }
 
 #[derive(Debug)]
@@ -254,6 +260,7 @@ impl Imap {
         oauth2: bool,
         idle_interrupt_receiver: Receiver<()>,
     ) -> Self {
+        let (resync_request_sender, resync_request_receiver) = async_channel::bounded(1);
         Imap {
             idle_interrupt_receiver,
             addr: addr.to_string(),
@@ -268,6 +275,8 @@ impl Imap {
             conn_backoff_ms: 0,
             // 1 connection per minute + a burst of 2.
             ratelimit: Ratelimit::new(Duration::new(120, 0), 2.0),
+            resync_request_sender,
+            resync_request_receiver,
         }
     }
 
@@ -392,6 +401,7 @@ impl Imap {
             match login_res {
                 Ok(mut session) => {
                     let capabilities = determine_capabilities(&mut session).await?;
+                    let resync_request_sender = self.resync_request_sender.clone();
 
                     let session = if capabilities.can_compress {
                         info!(context, "Enabling IMAP compression.");
@@ -402,9 +412,9 @@ impl Imap {
                             })
                             .await
                             .context("Failed to enable IMAP compression")?;
-                        Session::new(compressed_session, capabilities)
+                        Session::new(compressed_session, capabilities, resync_request_sender)
                     } else {
-                        Session::new(session, capabilities)
+                        Session::new(session, capabilities, resync_request_sender)
                     };
 
                     // Store server ID in the context to display in account info.
@@ -2489,21 +2499,6 @@ pub(crate) async fn get_imap_self_sent_search_command(context: &Context) -> Resu
     }
 
     Ok(search_command)
-}
-
-/// Deprecated, use get_uid_next() and get_uidvalidity()
-pub async fn get_config_last_seen_uid(context: &Context, folder: &str) -> Result<(u32, u32)> {
-    let key = format!("imap.mailbox.{folder}");
-    if let Some(entry) = context.sql.get_raw_config(&key).await? {
-        // the entry has the format `imap.mailbox.<folder>=<uidvalidity>:<lastseenuid>`
-        let mut parts = entry.split(':');
-        Ok((
-            parts.next().unwrap_or_default().parse().unwrap_or(0),
-            parts.next().unwrap_or_default().parse().unwrap_or(0),
-        ))
-    } else {
-        Ok((0, 0))
-    }
 }
 
 /// Whether to ignore fetching messages from a folder.

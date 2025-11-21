@@ -32,7 +32,7 @@ use crate::ephemeral::{Timer as EphemeralTimer, start_chat_ephemeral_timers};
 use crate::events::EventType;
 use crate::key::self_fingerprint;
 use crate::location;
-use crate::log::{LogExt, error, info, warn};
+use crate::log::{LogExt, warn};
 use crate::logged_debug_assert;
 use crate::message::{self, Message, MessageState, MsgId, Viewtype};
 use crate::mimefactory::MimeFactory;
@@ -1643,36 +1643,37 @@ impl Chat {
 
     /// Returns true if the chat is encrypted.
     pub async fn is_encrypted(&self, context: &Context) -> Result<bool> {
-        let is_encrypted = match self.typ {
-            Chattype::Single => {
-                match context
-                    .sql
-                    .query_row_optional(
-                        "SELECT cc.contact_id, c.fingerprint<>''
+        let is_encrypted = self.is_self_talk()
+            || match self.typ {
+                Chattype::Single => {
+                    match context
+                        .sql
+                        .query_row_optional(
+                            "SELECT cc.contact_id, c.fingerprint<>''
                              FROM chats_contacts cc LEFT JOIN contacts c
                                  ON c.id=cc.contact_id
                              WHERE cc.chat_id=?
                             ",
-                        (self.id,),
-                        |row| {
-                            let id: ContactId = row.get(0)?;
-                            let is_key: bool = row.get(1)?;
-                            Ok((id, is_key))
-                        },
-                    )
-                    .await?
-                {
-                    Some((id, is_key)) => is_key || id == ContactId::DEVICE,
-                    None => true,
+                            (self.id,),
+                            |row| {
+                                let id: ContactId = row.get(0)?;
+                                let is_key: bool = row.get(1)?;
+                                Ok((id, is_key))
+                            },
+                        )
+                        .await?
+                    {
+                        Some((id, is_key)) => is_key || id == ContactId::DEVICE,
+                        None => true,
+                    }
                 }
-            }
-            Chattype::Group => {
-                // Do not encrypt ad-hoc groups.
-                !self.grpid.is_empty()
-            }
-            Chattype::Mailinglist => false,
-            Chattype::OutBroadcast | Chattype::InBroadcast => true,
-        };
+                Chattype::Group => {
+                    // Do not encrypt ad-hoc groups.
+                    !self.grpid.is_empty()
+                }
+                Chattype::Mailinglist => false,
+                Chattype::OutBroadcast | Chattype::InBroadcast => true,
+            };
         Ok(is_encrypted)
     }
 
@@ -3462,7 +3463,13 @@ pub(crate) async fn create_group_ex(
     if !context.get_config_bool(Config::Bot).await?
         && !context.get_config_bool(Config::SkipStartMessages).await?
     {
-        let text = stock_str::new_group_send_first_message(context).await;
+        let text = if !grpid.is_empty() {
+            // Add "Others will only see this group after you sent a first message." message.
+            stock_str::new_group_send_first_message(context).await
+        } else {
+            // Add "Messages in this chat use classic email and are not encrypted." message.
+            stock_str::chat_unencrypted_explanation(context).await
+        };
         add_info_msg(context, chat_id, &text, create_smeared_timestamp(context)).await?;
     }
     if let (true, true) = (sync.into(), !grpid.is_empty()) {
@@ -3741,7 +3748,11 @@ pub(crate) async fn add_contact_to_chat_ex(
         context.emit_event(EventType::ErrorSelfNotInGroup(
             "Cannot add contact to group; self not in group.".into(),
         ));
-        bail!("can not add contact because the account is not part of the group/broadcast");
+        warn!(
+            context,
+            "Can not add contact because the account is not part of the group/broadcast."
+        );
+        return Ok(false);
     }
 
     let sync_qr_code_tokens;

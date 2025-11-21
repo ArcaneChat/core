@@ -80,7 +80,7 @@ use crate::contact::ContactId;
 use crate::context::Context;
 use crate::download::MIN_DELETE_SERVER_AFTER;
 use crate::events::EventType;
-use crate::log::{LogExt, error, info, warn};
+use crate::log::{LogExt, warn};
 use crate::message::{Message, MessageState, MsgId, Viewtype};
 use crate::mimeparser::SystemMessage;
 use crate::stock_str;
@@ -241,10 +241,9 @@ pub(crate) async fn stock_ephemeral_timer_changed(
     match timer {
         Timer::Disabled => stock_str::msg_ephemeral_timer_disabled(context, from_id).await,
         Timer::Enabled { duration } => match duration {
-            0..=59 => {
+            0..=60 => {
                 stock_str::msg_ephemeral_timer_enabled(context, &timer.to_string(), from_id).await
             }
-            60 => stock_str::msg_ephemeral_timer_minute(context, from_id).await,
             61..=3599 => {
                 stock_str::msg_ephemeral_timer_minutes(
                     context,

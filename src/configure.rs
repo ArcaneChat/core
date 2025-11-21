@@ -27,7 +27,7 @@ use crate::config::{self, Config};
 use crate::constants::NON_ALPHANUMERIC_WITHOUT_DOT;
 use crate::context::Context;
 use crate::imap::Imap;
-use crate::log::{LogExt, info, warn};
+use crate::log::{LogExt, warn};
 use crate::login_param::EnteredCertificateChecks;
 pub use crate::login_param::EnteredLoginParam;
 use crate::message::Message;
@@ -564,14 +564,6 @@ async fn configure(ctx: &Context, param: &EnteredLoginParam) -> Result<Option<&'
     drop(imap);
 
     progress!(ctx, 910);
-
-    if let Some(configured_addr) = ctx.get_config(Config::ConfiguredAddr).await? {
-        if configured_addr != param.addr {
-            // Switched account, all server UIDs we know are invalid
-            info!(ctx, "Scheduling resync because the address has changed.");
-            ctx.schedule_resync().await?;
-        }
-    }
 
     let provider = configured_param.provider;
     configured_param

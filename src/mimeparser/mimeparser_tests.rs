@@ -1401,22 +1401,28 @@ async fn test_x_microsoft_original_message_id_precedence() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_extra_imf_chat_header() -> Result<()> {
+async fn test_extra_imf_headers() -> Result<()> {
     let mut tcm = TestContextManager::new();
     let t = &tcm.alice().await;
     let chat_id = t.get_self_chat().await.id;
 
-    chat::send_text_msg(t, chat_id, "hi!".to_string()).await?;
-    let sent_msg = t.pop_sent_msg().await;
-    // Check removal of some nonexistent "Chat-*" header to protect the code from future breakages.
-    let payload = sent_msg
-        .payload
-        .replace("Message-ID:", "Chat-Forty-Two: 42\r\nMessage-ID:");
-    let msg = MimeMessage::from_bytes(t, payload.as_bytes(), None)
-        .await
-        .unwrap();
-    assert!(msg.headers.contains_key("chat-version"));
-    assert!(!msg.headers.contains_key("chat-forty-two"));
+    for std_hp_composing in [false, true] {
+        t.set_config_bool(Config::StdHeaderProtectionComposing, std_hp_composing)
+            .await?;
+        chat::send_text_msg(t, chat_id, "hi!".to_string()).await?;
+        let sent_msg = t.pop_sent_msg().await;
+        // Check removal of some nonexistent "Chat-*" header to protect the code from future
+        // breakages. But headers not prefixed with "Chat-" remain unless a message has standard
+        // Header Protection.
+        let payload = sent_msg.payload.replace(
+            "Message-ID:",
+            "Chat-Forty-Two: 42\r\nForty-Two: 42\r\nMessage-ID:",
+        );
+        let msg = MimeMessage::from_bytes(t, payload.as_bytes(), None).await?;
+        assert!(msg.headers.contains_key("chat-version"));
+        assert!(!msg.headers.contains_key("chat-forty-two"));
+        assert_ne!(msg.headers.contains_key("forty-two"), std_hp_composing);
+    }
     Ok(())
 }
 
@@ -1748,6 +1754,39 @@ async fn test_time_in_future() -> Result<()> {
     assert!(mime_message.timestamp_sent >= beginning_time + 60);
     assert!(mime_message.timestamp_rcvd <= time());
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_hp_legacy_display() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+
+    let mut msg = Message::new_text(
+        "Subject: Dinner plans\n\
+        \n\
+        Let's eat"
+            .to_string(),
+    );
+    msg.set_subject("Dinner plans".to_string());
+    let chat_id = alice.create_chat(bob).await.id;
+    alice.set_config_bool(Config::TestHooks, true).await?;
+    *alice.pre_encrypt_mime_hook.lock() = Some(|_, mut mime| {
+        for (h, v) in &mut mime.headers {
+            if h == "Content-Type" {
+                if let mail_builder::headers::HeaderType::ContentType(ct) = v {
+                    *ct = ct.clone().attribute("hp-legacy-display", "1");
+                }
+            }
+        }
+        mime
+    });
+    let sent_msg = alice.send_msg(chat_id, &mut msg).await;
+
+    let msg_bob = bob.recv_msg(&sent_msg).await;
+    assert_eq!(msg_bob.subject, "Dinner plans");
+    assert_eq!(msg_bob.text, "Let's eat");
     Ok(())
 }
 

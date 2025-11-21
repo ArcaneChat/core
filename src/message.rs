@@ -25,7 +25,7 @@ use crate::events::EventType;
 use crate::imap::markseen_on_imap_table;
 use crate::location::delete_poi_location;
 use crate::location::get_poi_location;
-use crate::log::{error, info, warn};
+use crate::log::warn;
 use crate::mimeparser::{SystemMessage, parse_message_id};
 use crate::param::{Param, Params};
 use crate::pgp::split_armored_data;
@@ -1452,7 +1452,15 @@ pub(crate) fn guess_msgtype_from_path_suffix(path: &Path) -> Option<(Viewtype, &
     let extension: &str = &path.extension()?.to_str()?.to_lowercase();
     let info = match extension {
         // before using viewtype other than Viewtype::File,
-        // make sure, all target UIs support that type in the context of the used viewer/player.
+        // make sure, all target UIs support that type.
+        //
+        // it is a non-goal to support as many formats as possible in-app.
+        // additional parser come at security and maintainance costs and
+        // should only be added when strictly neccessary,
+        // eg. when a format comes from the camera app on a significant number of devices.
+        // it is okay, when eg. dragging some video from a browser results in a "File"
+        // for everyone, sender as well as all receivers.
+        //
         // if in doubt, it is better to default to Viewtype::File that passes handing to an external app.
         // (cmp. <https://developer.android.com/guide/topics/media/media-formats>)
         "3gp" => (Viewtype::Video, "video/3gpp"),

@@ -801,6 +801,7 @@ async fn test_self_talk() -> Result<()> {
     let chat = &t.get_self_chat().await;
     assert!(!chat.id.is_special());
     assert!(chat.is_self_talk());
+    assert!(chat.is_encrypted(&t).await?);
     assert!(chat.visibility == ChatVisibility::Normal);
     assert!(!chat.is_device_talk());
     assert!(chat.can_send(&t).await?);
@@ -2631,12 +2632,6 @@ async fn test_can_send_group() -> Result<()> {
 /// the recipients can't see the identity of their fellow recipients.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_broadcast_members_cant_see_each_other() -> Result<()> {
-    fn contains(parsed: &MimeMessage, s: &str) -> bool {
-        assert_eq!(parsed.decrypting_failed, false);
-        let decoded_str = std::str::from_utf8(&parsed.decoded_data).unwrap();
-        decoded_str.contains(s)
-    }
-
     let mut tcm = TestContextManager::new();
     let alice = &tcm.alice().await;
     let bob = &tcm.bob().await;
@@ -2668,8 +2663,8 @@ async fn test_broadcast_members_cant_see_each_other() -> Result<()> {
         );
         let parsed = charlie.parse_msg(&auth_required).await;
         assert!(parsed.get_header(HeaderDef::AutocryptGossip).is_some());
-        assert!(contains(&parsed, "charlie@example.net"));
-        assert_eq!(contains(&parsed, "bob@example.net"), false);
+        assert!(parsed.decoded_data_contains("charlie@example.net"));
+        assert_eq!(parsed.decoded_data_contains("bob@example.net"), false);
 
         let parsed_by_bob = bob.parse_msg(&auth_required).await;
         assert!(parsed_by_bob.decrypting_failed);
@@ -2697,8 +2692,8 @@ async fn test_broadcast_members_cant_see_each_other() -> Result<()> {
         );
         let parsed = charlie.parse_msg(&member_added).await;
         assert!(parsed.get_header(HeaderDef::AutocryptGossip).is_some());
-        assert!(contains(&parsed, "charlie@example.net"));
-        assert_eq!(contains(&parsed, "bob@example.net"), false);
+        assert!(parsed.decoded_data_contains("charlie@example.net"));
+        assert_eq!(parsed.decoded_data_contains("bob@example.net"), false);
 
         let parsed_by_bob = bob.parse_msg(&member_added).await;
         assert!(parsed_by_bob.decrypting_failed);
@@ -2712,8 +2707,8 @@ async fn test_broadcast_members_cant_see_each_other() -> Result<()> {
         let hi_msg = alice.send_text(alice_broadcast_id, "hi").await;
         let parsed = charlie.parse_msg(&hi_msg).await;
         assert_eq!(parsed.header_exists(HeaderDef::AutocryptGossip), false);
-        assert_eq!(contains(&parsed, "charlie@example.net"), false);
-        assert_eq!(contains(&parsed, "bob@example.net"), false);
+        assert_eq!(parsed.decoded_data_contains("charlie@example.net"), false);
+        assert_eq!(parsed.decoded_data_contains("bob@example.net"), false);
 
         let parsed_by_bob = bob.parse_msg(&hi_msg).await;
         assert_eq!(parsed_by_bob.decrypting_failed, false);
@@ -2729,8 +2724,8 @@ async fn test_broadcast_members_cant_see_each_other() -> Result<()> {
             "charlie@example.net alice@example.org"
         );
         let parsed = charlie.parse_msg(&member_removed).await;
-        assert!(contains(&parsed, "charlie@example.net"));
-        assert_eq!(contains(&parsed, "bob@example.net"), false);
+        assert!(parsed.decoded_data_contains("charlie@example.net"));
+        assert_eq!(parsed.decoded_data_contains("bob@example.net"), false);
 
         let parsed_by_bob = bob.parse_msg(&member_removed).await;
         assert!(parsed_by_bob.decrypting_failed);
@@ -5082,6 +5077,28 @@ async fn test_send_edit_request() -> Result<()> {
     let forwarded = alice2.get_last_msg().await;
     assert!(!forwarded.is_edited());
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_edit_saved_messages() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice1 = &tcm.alice().await;
+    let alice2 = &tcm.alice().await;
+
+    alice1.set_config_bool(Config::BccSelf, true).await?;
+    alice2.set_config_bool(Config::BccSelf, true).await?;
+
+    let alice1_chat_id = ChatId::create_for_contact(alice1, ContactId::SELF).await?;
+    let alice1_sent_msg = alice1.send_text(alice1_chat_id, "Original message").await;
+    let alice1_msg_id = alice1_sent_msg.sender_msg_id;
+    let received_msg = alice2.recv_msg(&alice1_sent_msg).await;
+    assert_eq!(received_msg.text, "Original message");
+
+    send_edit_request(alice1, alice1_msg_id, "Edited message".to_string()).await?;
+    alice2.recv_msg_trash(&alice1.pop_sent_msg().await).await;
+    let received_msg = Message::load_from_db(alice2, received_msg.id).await?;
+    assert_eq!(received_msg.text, "Edited message");
     Ok(())
 }
 

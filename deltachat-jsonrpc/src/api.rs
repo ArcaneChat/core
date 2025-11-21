@@ -273,13 +273,18 @@ impl CommandApi {
     /// The `AccountsBackgroundFetchDone` event is emitted at the end even in case of timeout.
     /// Process all events until you get this one and you can safely return to the background
     /// without forgetting to create notifications caused by timing race conditions.
-    async fn accounts_background_fetch(&self, timeout_in_seconds: f64) -> Result<()> {
+    async fn background_fetch(&self, timeout_in_seconds: f64) -> Result<()> {
         let future = {
             let lock = self.accounts.read().await;
             lock.background_fetch(std::time::Duration::from_secs_f64(timeout_in_seconds))
         };
         // At this point account manager is not locked anymore.
         future.await;
+        Ok(())
+    }
+
+    async fn stop_background_fetch(&self) -> Result<()> {
+        self.accounts.read().await.stop_background_fetch();
         Ok(())
     }
 

@@ -5,7 +5,7 @@ use anyhow::Context as _;
 use super::session::Session as ImapSession;
 use super::{get_uid_next, get_uidvalidity, set_modseq, set_uid_next, set_uidvalidity};
 use crate::context::Context;
-use crate::log::{info, warn};
+use crate::log::warn;
 
 type Result<T> = std::result::Result<T, Error>;
 
@@ -206,7 +206,7 @@ impl ImapSession {
                             "The server illegally decreased the uid_next of folder {folder:?} from {old_uid_next} to {new_uid_next} without changing validity ({new_uid_validity}), resyncing UIDs...",
                         );
                         set_uid_next(context, folder, new_uid_next).await?;
-                        context.schedule_resync().await?;
+                        self.resync_request_sender.try_send(()).ok();
                     }
 
                     // If UIDNEXT changed, there are new emails.
@@ -243,7 +243,7 @@ impl ImapSession {
             .await?;
 
         if old_uid_validity != 0 || old_uid_next != 0 {
-            context.schedule_resync().await?;
+            self.resync_request_sender.try_send(()).ok();
         }
         info!(
             context,

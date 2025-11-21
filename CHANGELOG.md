@@ -1,5 +1,87 @@
 # Changelog
 
+## [2.27.0] - 2025-11-16
+
+### API-Changes
+
+- Add APIs to stop background fetch.
+- [**breaking**]: rename JSON-RPC method accounts_background_fetch() into background_fetch()
+- rpc-client: Add APIs for background fetch.
+- rpc-client: Add Account.wait_for_msg().
+- Deprecate deletion timer string for '1 Minute'.
+
+### Features / Changes
+
+- Implement RFC 9788 (Header Protection for Cryptographically Protected Email) ([#7130](https://github.com/chatmail/core/pull/7130)).
+- Tweak initial info-message for unencrypted chats ([#7427](https://github.com/chatmail/core/pull/7427)).
+- Add Contact::get_or_gen_color. Use it in CFFI and JSON-RPC to avoid gray self-color ([#7374](https://github.com/chatmail/core/pull/7374)).
+- [**breaking**] Withdraw broadcast invites. Add Qr::WithdrawJoinBroadcast and Qr::ReviveJoinBroadcast QR code types. ([#7439](https://github.com/chatmail/core/pull/7439)).
+
+### Fixes
+
+- Set `get_max_smtp_rcpt_to` for chatmail to the actual limit of 1000 instead of unlimited. ([#7432](https://github.com/chatmail/core/pull/7432)).
+- Always set bcc_self on backup import/export.
+- Escape connectivity HTML.
+- Send webm as file, it is not supported by all UI.
+
+### Build system
+
+- nix: Exclude CONTRIBUTING.md from the source files.
+
+### Refactor
+
+- Use wait_for_incoming_msg() in more tests.
+
+### Tests
+
+- Fix flaky test_send_receive_locations.
+- Port folder-related CFFI tests to JSON-RPC.
+- HP-Outer headers are added to messages with standard Header Protection ([#7130](https://github.com/chatmail/core/pull/7130)).
+- rpc-client: Test_qr_securejoin_broadcast: Wait for incoming message before getting chatlist ([#7442](https://github.com/chatmail/core/pull/7442)).
+- Add pytest fixture for account manager.
+- Test background_fetch() and stop_background_fetch().
+
+## [2.26.0] - 2025-11-11
+
+### API-Changes
+
+- [**breaking**] JSON-RPC: `chat_type` now contains a variant of a string enum/union. Affected places: `FullChat.chat_type`, `BasicChat.chat_type`, `ChatListItemFetchResult::ChatListItem.chat_type`, `Event:: SecurejoinInviterProgress.chat_type` and `MessageSearchResult.chat_type` ([#7285](https://github.com/chatmail/core/pull/7285))
+
+### Features / Changes
+
+- Error toast for "Not creating securejoin QR for old broadcast".
+
+### Fixes
+
+- `is_encrypted()` should be true for Saved Messages chat so messages there are editable.
+- Do not return an error from `receive_imf` if we fail to add a member because we are not in chat.
+- Do not add QR inviter to groups immediately.
+- Do not ignore I/O errors in `BlobObject::store_from_base64`.
+
+### Miscellaneous Tasks
+
+- Rustfmt.
+
+### Refactor
+
+- imap: Move resync request from Context to Imap.
+- Replace imap:: calls in migration 73 with SQL queries.
+- Remove unused imports.
+
+### Documentation
+
+- Readme: update language binding section to avoid usage of cffi in new projects ([#7380](https://github.com/chatmail/core/pull/7380)).
+- Fix Context::set_stock_translation reference.
+
+### Tests
+
+- Test editing saved messages.
+- Remove ThreadPoolExecutor from test_wait_next_messages.
+- Move test_two_group_securejoins from receive_imf to securejoin module.
+- At the end of securejoin Bob has two members in a group chat.
+- Bob has 0 members in the chat until securejoin finishes.
+- Do not add QR inviter to groups right after scanning the code.
+
 ## [2.25.0] - 2025-11-05
 
 ### Features / Changes
@@ -7101,3 +7183,5 @@ https://github.com/chatmail/core/pulls?q=is%3Apr+is%3Aclosed
 [2.23.0]: https://github.com/chatmail/core/compare/v2.22.0..v2.23.0
 [2.24.0]: https://github.com/chatmail/core/compare/v2.23.0..v2.24.0
 [2.25.0]: https://github.com/chatmail/core/compare/v2.24.0..v2.25.0
+[2.26.0]: https://github.com/chatmail/core/compare/v2.25.0..v2.26.0
+[2.27.0]: https://github.com/chatmail/core/compare/v2.26.0..v2.27.0

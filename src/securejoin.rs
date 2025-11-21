@@ -19,7 +19,7 @@ use crate::events::EventType;
 use crate::headerdef::HeaderDef;
 use crate::key::{DcKey, Fingerprint, load_self_public_key};
 use crate::log::LogExt as _;
-use crate::log::{error, info, warn};
+use crate::log::warn;
 use crate::message::{Message, Viewtype};
 use crate::mimeparser::{MimeMessage, SystemMessage};
 use crate::param::Param;
@@ -112,7 +112,11 @@ pub async fn get_securejoin_qr(context: &Context, chat: Option<ChatId>) -> Resul
                 // If the user created the broadcast before updating Delta Chat,
                 // then the secret will be missing, and the user needs to recreate the broadcast:
                 if load_broadcast_secret(context, chat.id).await?.is_none() {
-                    warn!(context, "Not creating securejoin QR for old broadcast");
+                    error!(
+                        context,
+                        "Not creating securejoin QR for old broadcast {}, see chat for more info.",
+                        chat.id,
+                    );
                     let text = BROADCAST_INCOMPATIBILITY_MSG;
                     add_info_msg(context, chat.id, text, time()).await?;
                     bail!(text.to_string());

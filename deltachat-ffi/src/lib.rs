@@ -4260,7 +4260,17 @@ pub unsafe extern "C" fn dc_contact_get_color(contact: *mut dc_contact_t) -> u32
         return 0;
     }
     let ffi_contact = &*contact;
-    ffi_contact.contact.get_color()
+    let ctx = &*ffi_contact.context;
+    block_on(async move {
+        ffi_contact
+            .contact
+            // We don't want any UIs displaying gray self-color.
+            .get_or_gen_color(ctx)
+            .await
+            .context("Contact::get_color()")
+            .log_err(ctx)
+            .unwrap_or(0)
+    })
 }
 
 #[no_mangle]
@@ -5035,6 +5045,17 @@ pub unsafe extern "C" fn dc_accounts_background_fetch(
     // At this point account manager is not locked anymore.
     block_on(background_fetch_future);
     1
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_accounts_stop_background_fetch(accounts: *mut dc_accounts_t) {
+    if accounts.is_null() {
+        eprintln!("ignoring careless call to dc_accounts_stop_background_fetch()");
+        return;
+    }
+
+    let accounts = &*accounts;
+    block_on(accounts.read()).stop_background_fetch();
 }
 
 #[no_mangle]

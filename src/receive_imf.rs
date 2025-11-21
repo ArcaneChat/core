@@ -28,7 +28,7 @@ use crate::imap::{GENERATED_PREFIX, markseen_on_imap_table};
 use crate::key::{DcKey, Fingerprint};
 use crate::key::{self_fingerprint, self_fingerprint_opt};
 use crate::log::LogExt;
-use crate::log::{info, warn};
+use crate::log::warn;
 use crate::logged_debug_assert;
 use crate::message::{
     self, Message, MessageState, MessengerMessage, MsgId, Viewtype, rfc724_mid_exists,
@@ -2841,6 +2841,16 @@ async fn apply_group_changes(
         if !is_from_in_chat {
             better_msg = Some(String::new());
         } else if let Some(key) = mime_parser.gossiped_keys.get(added_addr) {
+            if !chat_contacts.contains(&from_id) {
+                chat::add_to_chat_contacts_table(
+                    context,
+                    mime_parser.timestamp_sent,
+                    chat.id,
+                    &[from_id],
+                )
+                .await?;
+            }
+
             // TODO: if gossiped keys contain the same address multiple times,
             // we may lookup the wrong contact.
             // This can be fixed by looking at ChatGroupMemberAddedFpr,

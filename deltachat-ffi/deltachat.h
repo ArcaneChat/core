@@ -2578,8 +2578,10 @@ void            dc_stop_ongoing_process      (dc_context_t* context);
 #define         DC_QR_ERROR                  400 // text1=error string
 #define         DC_QR_WITHDRAW_VERIFYCONTACT 500
 #define         DC_QR_WITHDRAW_VERIFYGROUP   502 // text1=groupname
+#define         DC_QR_WITHDRAW_JOINBROADCAST 504 // text1=broadcast name
 #define         DC_QR_REVIVE_VERIFYCONTACT   510
 #define         DC_QR_REVIVE_VERIFYGROUP     512 // text1=groupname
+#define         DC_QR_REVIVE_JOINBROADCAST   514 // text1=broadcast name
 #define         DC_QR_LOGIN                  520 // text1=email_address
 
 /**
@@ -3296,10 +3298,28 @@ void           dc_accounts_maybe_network_lost    (dc_accounts_t* accounts);
  * without forgetting to create notifications caused by timing race conditions.
  *
  * @memberof dc_accounts_t
+ * @param accounts The account manager as created by dc_accounts_new().
  * @param timeout The timeout in seconds
  * @return Return 1 if DC_EVENT_ACCOUNTS_BACKGROUND_FETCH_DONE was emitted and 0 otherwise.
  */
 int            dc_accounts_background_fetch    (dc_accounts_t* accounts, uint64_t timeout);
+
+
+/**
+ * Stop ongoing background fetch.
+ *
+ * Calling this function allows to stop dc_accounts_background_fetch() early.
+ * dc_accounts_background_fetch() will then return immediately
+ * and emit DC_EVENT_ACCOUNTS_BACKGROUND_FETCH_DONE unless
+ * if it has failed and returned 0.
+ *
+ * If there is no ongoing dc_accounts_background_fetch() call,
+ * calling this function does nothing.
+ *
+ * @memberof dc_accounts_t
+ * @param accounts The account manager as created by dc_accounts_new().
+ */
+void           dc_accounts_stop_background_fetch (dc_accounts_t *accounts);
 
 
 /**
@@ -7521,14 +7541,13 @@ void dc_event_unref(dc_event_t* event);
 
 /// "You set message deletion timer to 1 minute."
 ///
-/// Used in status messages.
+/// @deprecated 2025-11-14, this string is no longer needed
 #define DC_STR_EPHEMERAL_TIMER_1_MINUTE_BY_YOU 142
 
 /// "Message deletion timer is set to 1 minute by %1$s."
 ///
 /// `%1$s` will be replaced by name and address of the contact.
-///
-/// Used in status messages.
+/// @deprecated 2025-11-14, this string is no longer needed
 #define DC_STR_EPHEMERAL_TIMER_1_MINUTE_BY_OTHER 143
 
 /// "You set message deletion timer to 1 hour."
@@ -7751,6 +7770,11 @@ void dc_event_unref(dc_event_t* event);
 ///
 /// Description in connectivity view when proxy is enabled.
 #define DC_STR_PROXY_ENABLED_DESCRIPTION  221
+
+/// "Messages in this chat use classic email and are not encrypted."
+///
+/// Used as the first info messages in newly created classic email threads.
+#define DC_STR_CHAT_UNENCRYPTED_EXPLANATON 230
 
 /**
  * @}

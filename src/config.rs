@@ -16,7 +16,7 @@ use crate::blob::BlobObject;
 use crate::configure::EnteredLoginParam;
 use crate::context::Context;
 use crate::events::EventType;
-use crate::log::{LogExt, info};
+use crate::log::LogExt;
 use crate::mimefactory::RECOMMENDED_FILE_SIZE;
 use crate::provider::{Provider, get_provider_by_id};
 use crate::sync::{self, Sync::*, SyncData};
@@ -438,8 +438,19 @@ pub enum Config {
     /// storing the same token multiple times on the server.
     EncryptedDeviceToken,
 
+    /// Enables running test hooks, e.g. see `InnerContext::pre_encrypt_mime_hook`.
+    /// This way is better than conditional compilation, i.e. `#[cfg(test)]`, because tests not
+    /// using this still run unmodified code.
+    TestHooks,
+
     /// Return an error from `receive_imf_inner()` for a fully downloaded message. For tests.
     FailOnReceivingFullMsg,
+
+    /// Enable composing emails with Header Protection as defined in
+    /// <https://www.rfc-editor.org/rfc/rfc9788.html> "Header Protection for Cryptographically
+    /// Protected Email".
+    #[strum(props(default = "1"))]
+    StdHeaderProtectionComposing,
 }
 
 impl Config {
@@ -665,7 +676,7 @@ impl Context {
             Config::Selfavatar if value.is_empty() => None,
             Config::Selfavatar => {
                 config_value = BlobObject::store_from_base64(self, value)?;
-                Some(config_value.as_str())
+                config_value.as_deref()
             }
             _ => Some(value),
         };

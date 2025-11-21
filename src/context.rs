@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -21,7 +21,7 @@ use crate::debug_logging::DebugLogging;
 use crate::events::{Event, EventEmitter, EventType, Events};
 use crate::imap::{FolderMeaning, Imap, ServerMetadata};
 use crate::key::self_fingerprint;
-use crate::log::{info, warn};
+use crate::log::warn;
 use crate::logged_debug_assert;
 use crate::login_param::EnteredLoginParam;
 use crate::message::{self, MessageState, MsgId};
@@ -138,7 +138,7 @@ impl ContextBuilder {
     ///
     /// This is useful in order to share the same translation strings in all [`Context`]s.
     /// The mapping may be empty when set, it will be populated by
-    /// [`Context::set_stock-translation`] or [`Accounts::set_stock_translation`] calls.
+    /// [`Context::set_stock_translation`] or [`Accounts::set_stock_translation`] calls.
     ///
     /// Note that the [account manager](crate::accounts::Accounts) is designed to handle the
     /// common case for using multiple [`Context`] instances.
@@ -243,9 +243,6 @@ pub struct InnerContext {
     /// Set to `None` if quota was never tried to load.
     pub(crate) quota: RwLock<Option<QuotaInfo>>,
 
-    /// IMAP UID resync request.
-    pub(crate) resync_request: AtomicBool,
-
     /// Notify about new messages.
     ///
     /// This causes [`Context::wait_next_msgs`] to wake up.
@@ -306,6 +303,17 @@ pub struct InnerContext {
     /// `Connectivity` values for mailboxes, unordered. Used to compute the aggregate connectivity,
     /// see [`Context::get_connectivity()`].
     pub(crate) connectivities: parking_lot::Mutex<Vec<ConnectivityStore>>,
+
+    #[expect(clippy::type_complexity)]
+    /// Transforms the root of the cryptographic payload before encryption.
+    pub(crate) pre_encrypt_mime_hook: parking_lot::Mutex<
+        Option<
+            for<'a> fn(
+                &Context,
+                mail_builder::mime::MimePart<'a>,
+            ) -> mail_builder::mime::MimePart<'a>,
+        >,
+    >,
 }
 
 /// The state of ongoing process.
@@ -457,7 +465,6 @@ impl Context {
             scheduler: SchedulerState::new(),
             ratelimit: RwLock::new(Ratelimit::new(Duration::new(60, 0), 6.0)), // Allow at least 1 message every 10 seconds + a burst of 6.
             quota: RwLock::new(None),
-            resync_request: AtomicBool::new(false),
             new_msgs_notify,
             server_id: RwLock::new(None),
             metadata: RwLock::new(None),
@@ -471,6 +478,7 @@ impl Context {
             iroh: Arc::new(RwLock::new(None)),
             self_fingerprint: OnceLock::new(),
             connectivities: parking_lot::Mutex::new(Vec::new()),
+            pre_encrypt_mime_hook: None.into(),
         };
 
         let ctx = Context {
@@ -549,7 +557,7 @@ impl Context {
             .and_then(|provider| provider.opt.max_smtp_rcpt_to)
             .map_or_else(
                 || match is_chatmail {
-                    true => usize::MAX,
+                    true => constants::DEFAULT_CHATMAIL_MAX_SMTP_RCPT_TO,
                     false => constants::DEFAULT_MAX_SMTP_RCPT_TO,
                 },
                 usize::from,
@@ -618,12 +626,6 @@ impl Context {
             time_elapsed(&time_start),
         );
 
-        Ok(())
-    }
-
-    pub(crate) async fn schedule_resync(&self) -> Result<()> {
-        self.resync_request.store(true, Ordering::Relaxed);
-        self.scheduler.interrupt_inbox().await;
         Ok(())
     }
 
@@ -1067,9 +1069,23 @@ impl Context {
                 .to_string(),
         );
         res.insert(
+            "test_hooks",
+            self.sql
+                .get_raw_config("test_hooks")
+                .await?
+                .unwrap_or_default(),
+        );
+        res.insert(
             "fail_on_receiving_full_msg",
             self.sql
                 .get_raw_config("fail_on_receiving_full_msg")
+                .await?
+                .unwrap_or_default(),
+        );
+        res.insert(
+            "std_header_protection_composing",
+            self.sql
+                .get_raw_config("std_header_protection_composing")
                 .await?
                 .unwrap_or_default(),
         );

@@ -26,7 +26,7 @@ use crate::dehtml::dehtml;
 use crate::events::EventType;
 use crate::headerdef::{HeaderDef, HeaderDefMap};
 use crate::key::{self, DcKey, Fingerprint, SignedPublicKey, load_self_secret_keyring};
-use crate::log::{error, info, warn};
+use crate::log::warn;
 use crate::message::{self, Message, MsgId, Viewtype, get_vcard_summary, set_msg_failed};
 use crate::param::{Param, Params};
 use crate::simplify::{SimplifiedText, simplify};
@@ -271,7 +271,7 @@ impl MimeMessage {
             &mut from,
             &mut list_post,
             &mut chat_disposition_notification_to,
-            &mail.headers,
+            &mail,
         );
         headers.retain(|k, _| {
             !is_hidden(k) || {
@@ -299,7 +299,7 @@ impl MimeMessage {
                         &mut from,
                         &mut list_post,
                         &mut chat_disposition_notification_to,
-                        &part.headers,
+                        part,
                     );
                     (part, part.ctype.mimetype.parse::<Mime>()?)
                 } else {
@@ -536,7 +536,7 @@ impl MimeMessage {
                 &mut inner_from,
                 &mut list_post,
                 &mut chat_disposition_notification_to,
-                &mail.headers,
+                mail,
             );
 
             if !signatures.is_empty() {
@@ -714,14 +714,16 @@ impl MimeMessage {
     }
 
     /// Parses avatar action headers.
-    fn parse_avatar_headers(&mut self, context: &Context) {
+    fn parse_avatar_headers(&mut self, context: &Context) -> Result<()> {
         if let Some(header_value) = self.get_header(HeaderDef::ChatGroupAvatar) {
-            self.group_avatar = self.avatar_action_from_header(context, header_value.to_string());
+            self.group_avatar =
+                self.avatar_action_from_header(context, header_value.to_string())?;
         }
 
         if let Some(header_value) = self.get_header(HeaderDef::ChatUserAvatar) {
-            self.user_avatar = self.avatar_action_from_header(context, header_value.to_string());
+            self.user_avatar = self.avatar_action_from_header(context, header_value.to_string())?;
         }
+        Ok(())
     }
 
     fn parse_videochat_headers(&mut self) {
@@ -826,7 +828,7 @@ impl MimeMessage {
 
     async fn parse_headers(&mut self, context: &Context) -> Result<()> {
         self.parse_system_message_headers(context);
-        self.parse_avatar_headers(context);
+        self.parse_avatar_headers(context)?;
         self.parse_videochat_headers();
         if self.delivery_report.is_none() {
             self.squash_attachment_parts();
@@ -928,21 +930,18 @@ impl MimeMessage {
         &mut self,
         context: &Context,
         header_value: String,
-    ) -> Option<AvatarAction> {
-        if header_value == "0" {
+    ) -> Result<Option<AvatarAction>> {
+        let res = if header_value == "0" {
             Some(AvatarAction::Delete)
         } else if let Some(base64) = header_value
             .split_ascii_whitespace()
             .collect::<String>()
             .strip_prefix("base64:")
         {
-            match BlobObject::store_from_base64(context, base64) {
-                Ok(path) => Some(AvatarAction::Change(path)),
-                Err(err) => {
-                    warn!(
-                        context,
-                        "Could not decode and save avatar to blob file: {:#}", err,
-                    );
+            match BlobObject::store_from_base64(context, base64)? {
+                Some(path) => Some(AvatarAction::Change(path)),
+                None => {
+                    warn!(context, "Could not decode avatar base64");
                     None
                 }
             }
@@ -956,7 +955,7 @@ impl MimeMessage {
                         if let Some(blob) = part.param.get(Param::File) {
                             let res = Some(AvatarAction::Change(blob.to_string()));
                             self.parts.remove(i);
-                            return res;
+                            return Ok(res);
                         }
                         break;
                     }
@@ -964,7 +963,8 @@ impl MimeMessage {
                 i += 1;
             }
             None
-        }
+        };
+        Ok(res)
     }
 
     /// Returns true if the message was encrypted as defined in
@@ -1003,6 +1003,14 @@ impl MimeMessage {
     pub(crate) fn header_exists(&self, headerdef: HeaderDef) -> bool {
         let hname = headerdef.get_headername();
         self.headers.contains_key(hname) || self.headers_removed.contains(hname)
+    }
+
+    #[cfg(test)]
+    /// Returns whether the decrypted data contains the given `&str`.
+    pub(crate) fn decoded_data_contains(&self, s: &str) -> bool {
+        assert!(!self.decrypting_failed);
+        let decoded_str = str::from_utf8(&self.decoded_data).unwrap();
+        decoded_str.contains(s)
     }
 
     /// Returns `Chat-Group-ID` header value if it is a valid group ID.
@@ -1321,6 +1329,10 @@ impl MimeMessage {
                             let is_html = mime_type == mime::TEXT_HTML;
                             if is_html {
                                 self.is_mime_modified = true;
+                                // NB: This unconditionally removes Legacy Display Elements (see
+                                // <https://www.rfc-editor.org/rfc/rfc9788.html#section-4.5.3.3>). We
+                                // don't check for the "hp-legacy-display" Content-Type parameter
+                                // for simplicity.
                                 if let Some(text) = dehtml(&decoded_data) {
                                     text
                                 } else {
@@ -1348,16 +1360,30 @@ impl MimeMessage {
 
                         let (simplified_txt, simplified_quote) = if mime_type.type_() == mime::TEXT
                             && mime_type.subtype() == mime::PLAIN
-                            && is_format_flowed
                         {
-                            let delsp = if let Some(delsp) = mail.ctype.params.get("delsp") {
-                                delsp.as_str().eq_ignore_ascii_case("yes")
-                            } else {
-                                false
+                            // Don't check that we're inside an encrypted or signed part for
+                            // simplicity.
+                            let simplified_txt = match mail
+                                .ctype
+                                .params
+                                .get("hp-legacy-display")
+                                .is_some_and(|v| v == "1")
+                            {
+                                false => simplified_txt,
+                                true => rm_legacy_display_elements(&simplified_txt),
                             };
-                            let unflowed_text = unformat_flowed(&simplified_txt, delsp);
-                            let unflowed_quote = top_quote.map(|q| unformat_flowed(&q, delsp));
-                            (unflowed_text, unflowed_quote)
+                            if is_format_flowed {
+                                let delsp = if let Some(delsp) = mail.ctype.params.get("delsp") {
+                                    delsp.as_str().eq_ignore_ascii_case("yes")
+                                } else {
+                                    false
+                                };
+                                let unflowed_text = unformat_flowed(&simplified_txt, delsp);
+                                let unflowed_quote = top_quote.map(|q| unformat_flowed(&q, delsp));
+                                (unflowed_text, unflowed_quote)
+                            } else {
+                                (simplified_txt, top_quote)
+                            }
                         } else {
                             (simplified_txt, top_quote)
                         };
@@ -1630,6 +1656,11 @@ impl MimeMessage {
         }
     }
 
+    /// Merges headers from the email `part` into `headers` respecting header protection.
+    /// Should only be called with nonempty `headers` if `part` is a root of the Cryptographic
+    /// Payload as defined in <https://www.rfc-editor.org/rfc/rfc9788.html> "Header Protection for
+    /// Cryptographically Protected Email", otherwise this may unnecessarily discard headers from
+    /// outer parts.
     #[allow(clippy::too_many_arguments)]
     fn merge_headers(
         context: &Context,
@@ -1640,10 +1671,14 @@ impl MimeMessage {
         from: &mut Option<SingleInfo>,
         list_post: &mut Option<String>,
         chat_disposition_notification_to: &mut Option<SingleInfo>,
-        fields: &[mailparse::MailHeader<'_>],
+        part: &mailparse::ParsedMail,
     ) {
+        let fields = &part.headers;
+        // See <https://www.rfc-editor.org/rfc/rfc9788.html>.
+        let has_header_protection = part.ctype.params.contains_key("hp");
+
         headers.retain(|k, _| {
-            !is_protected(k) || {
+            !(has_header_protection || is_protected(k)) || {
                 headers_removed.insert(k.to_string());
                 false
             }
@@ -1970,6 +2005,20 @@ impl MimeMessage {
     }
 }
 
+fn rm_legacy_display_elements(text: &str) -> String {
+    let mut res = None;
+    for l in text.lines() {
+        res = res.map(|r: String| match r.is_empty() {
+            true => l.to_string(),
+            false => r + "\r\n" + l,
+        });
+        if l.is_empty() {
+            res = Some(String::new());
+        }
+    }
+    res.unwrap_or_default()
+}
+
 fn remove_header(
     headers: &mut HashMap<String, String>,
     key: &str,
@@ -2094,7 +2143,8 @@ pub(crate) fn parse_message_id(ids: &str) -> Result<String> {
 }
 
 /// Returns whether the outer header value must be ignored if the message contains a signed (and
-/// optionally encrypted) part.
+/// optionally encrypted) part. This is independent from the modern Header Protection defined in
+/// <https://www.rfc-editor.org/rfc/rfc9788.html>.
 ///
 /// NB: There are known cases when Subject and List-ID only appear in the outer headers of
 /// signed-only messages. Such messages are shown as unencrypted anyway.
