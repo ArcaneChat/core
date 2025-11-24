@@ -467,7 +467,7 @@ def test_bot(acfactory) -> None:
 
 
 def test_wait_next_messages(acfactory) -> None:
-    alice = acfactory.new_configured_account()
+    alice = acfactory.get_online_account()
 
     # Create a bot account so it does not receive device messages in the beginning.
     addr, password = acfactory.get_credentials()
@@ -475,6 +475,7 @@ def test_wait_next_messages(acfactory) -> None:
     bot.set_config("bot", "1")
     bot.add_or_update_transport({"addr": addr, "password": password})
     assert bot.is_configured()
+    bot.bring_online()
 
     # There are no old messages and the call returns immediately.
     assert not bot.wait_next_messages()
@@ -867,14 +868,14 @@ def test_leave_broadcast(acfactory, all_devices_online):
         contact_snapshot = contact.get_snapshot()
         chat_msgs = chat.get_messages()
 
-        if please_wait_info_msg:
-            first_msg = chat_msgs.pop(0).get_snapshot()
-            assert first_msg.text == "Establishing guaranteed end-to-end encryption, please wait…"
-            assert first_msg.is_info
-
         encrypted_msg = chat_msgs.pop(0).get_snapshot()
         assert encrypted_msg.text == "Messages are end-to-end encrypted."
         assert encrypted_msg.is_info
+
+        if please_wait_info_msg:
+            first_msg = chat_msgs.pop(0).get_snapshot()
+            assert "invited you to join this channel" in first_msg.text
+            assert first_msg.is_info
 
         member_added_msg = chat_msgs.pop(0).get_snapshot()
         if inviter_side:

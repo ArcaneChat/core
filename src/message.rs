@@ -639,33 +639,33 @@ impl Message {
     pub(crate) async fn try_calc_and_set_dimensions(&mut self, context: &Context) -> Result<()> {
         if self.viewtype.has_file() {
             let file_param = self.param.get_file_path(context)?;
-            if let Some(path_and_filename) = file_param {
-                if matches!(
+            if let Some(path_and_filename) = file_param
+                && matches!(
                     self.viewtype,
                     Viewtype::Image | Viewtype::Gif | Viewtype::Sticker
-                ) && !self.param.exists(Param::Width)
-                {
-                    let buf = read_file(context, &path_and_filename).await?;
+                )
+                && !self.param.exists(Param::Width)
+            {
+                let buf = read_file(context, &path_and_filename).await?;
 
-                    match get_filemeta(&buf) {
-                        Ok((width, height)) => {
-                            self.param.set_int(Param::Width, width as i32);
-                            self.param.set_int(Param::Height, height as i32);
-                        }
-                        Err(err) => {
-                            self.param.set_int(Param::Width, 0);
-                            self.param.set_int(Param::Height, 0);
-                            warn!(
-                                context,
-                                "Failed to get width and height for {}: {err:#}.",
-                                path_and_filename.display()
-                            );
-                        }
+                match get_filemeta(&buf) {
+                    Ok((width, height)) => {
+                        self.param.set_int(Param::Width, width as i32);
+                        self.param.set_int(Param::Height, height as i32);
                     }
+                    Err(err) => {
+                        self.param.set_int(Param::Width, 0);
+                        self.param.set_int(Param::Height, 0);
+                        warn!(
+                            context,
+                            "Failed to get width and height for {}: {err:#}.",
+                            path_and_filename.display()
+                        );
+                    }
+                }
 
-                    if !self.id.is_unset() {
-                        self.update_param(context).await?;
-                    }
+                if !self.id.is_unset() {
+                    self.update_param(context).await?;
                 }
             }
         }
@@ -1004,14 +1004,12 @@ impl Message {
             return None;
         }
 
-        if let Some(filename) = self.get_file(context) {
-            if let Ok(ref buf) = read_file(context, &filename).await {
-                if let Ok((typ, headers, _)) = split_armored_data(buf) {
-                    if typ == pgp::armor::BlockType::Message {
-                        return headers.get(crate::pgp::HEADER_SETUPCODE).cloned();
-                    }
-                }
-            }
+        if let Some(filename) = self.get_file(context)
+            && let Ok(ref buf) = read_file(context, &filename).await
+            && let Ok((typ, headers, _)) = split_armored_data(buf)
+            && typ == pgp::armor::BlockType::Message
+        {
+            return headers.get(crate::pgp::HEADER_SETUPCODE).cloned();
         }
 
         None
@@ -1236,26 +1234,25 @@ impl Message {
     ///
     /// `References` header is not taken into account.
     pub async fn parent(&self, context: &Context) -> Result<Option<Message>> {
-        if let Some(in_reply_to) = &self.in_reply_to {
-            if let Some(msg_id) = rfc724_mid_exists(context, in_reply_to).await? {
-                let msg = Message::load_from_db_optional(context, msg_id).await?;
-                return Ok(msg);
-            }
+        if let Some(in_reply_to) = &self.in_reply_to
+            && let Some(msg_id) = rfc724_mid_exists(context, in_reply_to).await?
+        {
+            let msg = Message::load_from_db_optional(context, msg_id).await?;
+            return Ok(msg);
         }
         Ok(None)
     }
 
     /// Returns original message ID for message from "Saved Messages".
     pub async fn get_original_msg_id(&self, context: &Context) -> Result<Option<MsgId>> {
-        if !self.original_msg_id.is_special() {
-            if let Some(msg) = Message::load_from_db_optional(context, self.original_msg_id).await?
-            {
-                return if msg.chat_id.is_trash() {
-                    Ok(None)
-                } else {
-                    Ok(Some(msg.id))
-                };
-            }
+        if !self.original_msg_id.is_special()
+            && let Some(msg) = Message::load_from_db_optional(context, self.original_msg_id).await?
+        {
+            return if msg.chat_id.is_trash() {
+                Ok(None)
+            } else {
+                Ok(Some(msg.id))
+            };
         }
         Ok(None)
     }
@@ -1625,10 +1622,10 @@ pub(crate) async fn delete_msg_locally(context: &Context, msg: &Message) -> Resu
         .expect("RwLock is poisoned")
         .as_ref()
         .map(|dl| dl.msg_id);
-    if let Some(id) = logging_xdc_id {
-        if id == msg.id {
-            set_debug_logging_xdc(context, None).await?;
-        }
+    if let Some(id) = logging_xdc_id
+        && id == msg.id
+    {
+        set_debug_logging_xdc(context, None).await?;
     }
 
     Ok(())
@@ -1881,6 +1878,33 @@ pub async fn markseen_msgs(context: &Context, msg_ids: Vec<MsgId>) -> Result<()>
     }
 
     Ok(())
+}
+
+/// Checks if the messages with given IDs exist.
+///
+/// Returns IDs of existing messages.
+pub async fn get_existing_msg_ids(context: &Context, ids: &[MsgId]) -> Result<Vec<MsgId>> {
+    let query_only = true;
+    let res = context
+        .sql
+        .transaction_ex(query_only, |transaction| {
+            let mut res: Vec<MsgId> = Vec::new();
+            for id in ids {
+                if transaction.query_one(
+                    "SELECT COUNT(*) > 0 FROM msgs WHERE id=? AND chat_id!=3",
+                    (id,),
+                    |row| {
+                        let exists: bool = row.get(0)?;
+                        Ok(exists)
+                    },
+                )? {
+                    res.push(*id);
+                }
+            }
+            Ok(res)
+        })
+        .await?;
+    Ok(res)
 }
 
 pub(crate) async fn update_msg_state(

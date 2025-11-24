@@ -89,7 +89,7 @@ impl Smtp {
         }
 
         self.connectivity.set_connecting(context);
-        let lp = ConfiguredLoginParam::load(context)
+        let (_transport_id, lp) = ConfiguredLoginParam::load(context)
             .await?
             .context("Not configured")?;
         let proxy_config = ProxyConfig::load(context).await?;
@@ -307,23 +307,22 @@ pub(crate) async fn smtp_send(
         Ok(()) => SendResult::Success,
     };
 
-    if let SendResult::Failure(err) = &status {
-        if let Some(msg_id) = msg_id {
-            // We couldn't send the message, so mark it as failed
-            match Message::load_from_db(context, msg_id).await {
-                Ok(mut msg) => {
-                    if let Err(err) =
-                        message::set_msg_failed(context, &mut msg, &err.to_string()).await
-                    {
-                        error!(context, "Failed to mark {msg_id} as failed: {err:#}.");
-                    }
+    if let SendResult::Failure(err) = &status
+        && let Some(msg_id) = msg_id
+    {
+        // We couldn't send the message, so mark it as failed
+        match Message::load_from_db(context, msg_id).await {
+            Ok(mut msg) => {
+                if let Err(err) = message::set_msg_failed(context, &mut msg, &err.to_string()).await
+                {
+                    error!(context, "Failed to mark {msg_id} as failed: {err:#}.");
                 }
-                Err(err) => {
-                    error!(
-                        context,
-                        "Failed to load {msg_id} to mark it as failed: {err:#}."
-                    );
-                }
+            }
+            Err(err) => {
+                error!(
+                    context,
+                    "Failed to load {msg_id} to mark it as failed: {err:#}."
+                );
             }
         }
     }
@@ -444,8 +443,8 @@ pub(crate) async fn send_msg_to_smtp(
                         chat_id,
                         &text,
                         crate::mimeparser::SystemMessage::InvalidUnencryptedMail,
+                        Some(timestamp_sort),
                         timestamp_sort,
-                        None,
                         None,
                         None,
                         None,

@@ -39,17 +39,16 @@ async fn test_get_width_height() {
     let mut has_image = false;
     let chatitems = chat::get_chat_msgs(&t, device_chat_id).await.unwrap();
     for chatitem in chatitems {
-        if let ChatItem::Message { msg_id } = chatitem {
-            if let Ok(msg) = Message::load_from_db(&t, msg_id).await {
-                if msg.get_viewtype() == Viewtype::Image {
-                    has_image = true;
-                    // just check that width/height are inside some reasonable ranges
-                    assert!(msg.get_width() > 100);
-                    assert!(msg.get_height() > 100);
-                    assert!(msg.get_width() < 4000);
-                    assert!(msg.get_height() < 4000);
-                }
-            }
+        if let ChatItem::Message { msg_id } = chatitem
+            && let Ok(msg) = Message::load_from_db(&t, msg_id).await
+            && msg.get_viewtype() == Viewtype::Image
+        {
+            has_image = true;
+            // just check that width/height are inside some reasonable ranges
+            assert!(msg.get_width() > 100);
+            assert!(msg.get_height() > 100);
+            assert!(msg.get_width() < 4000);
+            assert!(msg.get_height() < 4000);
         }
     }
     assert!(has_image);
@@ -763,5 +762,29 @@ async fn test_load_unknown_viewtype() -> Result<()> {
         .await?;
     let bob_msg = Message::load_from_db(bob, msg_id).await?;
     assert_eq!(bob_msg.get_viewtype(), Viewtype::Unknown);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_get_existing_msg_ids() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+
+    let msg1_id = tcm.send_recv(alice, bob, "Hello 1!").await.id;
+    let msg2_id = tcm.send_recv(alice, bob, "Hello 2!").await.id;
+    let msg3_id = tcm.send_recv(alice, bob, "Hello 3!").await.id;
+    let msg4_id = tcm.send_recv(alice, bob, "Hello 4!").await.id;
+
+    assert_eq!(
+        get_existing_msg_ids(bob, &[msg1_id, msg2_id, msg3_id, msg4_id]).await?,
+        vec![msg1_id, msg2_id, msg3_id, msg4_id]
+    );
+    delete_msgs(bob, &[msg1_id, msg3_id]).await?;
+    assert_eq!(
+        get_existing_msg_ids(bob, &[msg1_id, msg2_id, msg3_id, msg4_id]).await?,
+        vec![msg2_id, msg4_id]
+    );
+
     Ok(())
 }

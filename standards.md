@@ -1,6 +1,6 @@
-# Standards used in Delta Chat
+# Standards used in chatmail core
 
-Some of the standards Delta Chat is based on:
+Some of the standards chatmail is based on:
 
 Tasks                            | Standards
 -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -19,14 +19,14 @@ Authorization                    | OAuth2 ([RFC 6749][])
 End-to-end encryption            | [Autocrypt Level 1][], OpenPGP ([RFC 4880][]), Security Multiparts for MIME ([RFC 1847][]) and [“Mixed Up” Encryption repairing](https://tools.ietf.org/id/draft-dkg-openpgp-pgpmime-message-mangling-00.html)
 Detect/prevent active attacks    | [securejoin][] protocols
 Compare public keys              | [openpgp4fpr][] URI Scheme
-Header encryption                | [Header Protection for Cryptographically Protected E-mail](https://datatracker.ietf.org/doc/draft-ietf-lamps-header-protection/)
+Metadata minimization            | Header Protection for Cryptographically Protected Email ([RFC 9788][])
 Configuration assistance         | [Autoconfigure](https://web.archive.org/web/20210402044801/https://developer.mozilla.org/en-US/docs/Mozilla/Thunderbird/Autoconfiguration) and [Autodiscover][]
 Messenger functions              | [Chat-over-Email](https://github.com/chatmail/core/blob/main/spec.md#chat-mail-specification)
 Detect mailing list              | List-Id ([RFC 2919][]) and Precedence ([RFC 3834][])
 User and chat colors             | [XEP-0392][]: Consistent Color Generation
 Send and receive system messages | Multipart/Report Media Type ([RFC 6522][])
 Send and receive contact files   | vCard ([RFC 6350][])
-Return receipts                  | Message Disposition Notification (MDN, [RFC 8098][], [RFC 3503][]) using the Chat-Disposition-Notification-To header
+Return receipts                  | Message Disposition Notification (MDN, [RFC 8098][]) using the Chat-Disposition-Notification-To header
 Locations                        | KML ([Open Geospatial Consortium](http://www.opengeospatial.org/standards/kml/), [Google Dev](https://developers.google.com/kml/))
 
 [Autocrypt Level 1]: https://autocrypt.org/level1.html
@@ -47,7 +47,6 @@ Locations                        | KML ([Open Geospatial Consortium](http://www.
 [RFC 2919]: https://tools.ietf.org/html/rfc2919
 [RFC 2971]: https://tools.ietf.org/html/rfc2971
 [RFC 3501]: https://tools.ietf.org/html/rfc3501
-[RFC 3503]: https://tools.ietf.org/html/rfc3503
 [RFC 3676]: https://tools.ietf.org/html/rfc3676
 [RFC 3834]: https://tools.ietf.org/html/rfc3834
 [RFC 4880]: https://tools.ietf.org/html/rfc4880
@@ -60,3 +59,4 @@ Locations                        | KML ([Open Geospatial Consortium](http://www.
 [RFC 7162]: https://tools.ietf.org/html/rfc7162
 [RFC 8098]: https://tools.ietf.org/html/rfc8098
 [RFC 9078]: https://tools.ietf.org/html/rfc9078
+[RFC 9788]: https://tools.ietf.org/html/rfc9788

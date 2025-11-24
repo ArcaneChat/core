@@ -1964,28 +1964,53 @@ Message content",
     assert_ne!(msg.chat_id, t.get_self_chat().await.id);
 }
 
-/// Tests that message with hidden recipients is assigned to Saved Messages chat.
+/// Tests that an outgoing self-sent unencrypted message doesn't go to the self-chat, but to a
+/// proper unencrypted chat instead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_hidden_recipients_self_chat() {
-    let t = TestContext::new_alice().await;
+async fn test_unencrypted_doesnt_goto_self_chat() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let t = &tcm.alice().await;
+    let mut chat_id = None;
 
-    receive_imf(
-        &t,
-        b"Subject: s
+    for (i, to) in [
+        "<alice@example.org>",
+        "<alice@example.org>",
+        "alice@example.org, alice@example.org",
+        "hidden-recipients:;",
+    ]
+    .iter()
+    .enumerate()
+    {
+        receive_imf(
+            t,
+            format!(
+                "Subject: s
 Chat-Version: 1.0
-Message-ID: <foobar@localhost>
-To: hidden-recipients:;
+Message-ID: <foobar{i}@localhost>
+To: {to}
 From: <alice@example.org>
 
-Message content",
-        false,
-    )
-    .await
-    .unwrap();
+Your server is hacked. Have a nice day!"
+            )
+            .as_bytes(),
+            false,
+        )
+        .await?;
 
-    let msg = t.get_last_msg().await;
-    assert_eq!(msg.chat_id, t.get_self_chat().await.id);
-    assert_eq!(msg.to_id, ContactId::SELF);
+        let msg = t.get_last_msg().await;
+        assert_ne!(msg.chat_id, t.get_self_chat().await.id);
+        assert_eq!(msg.from_id, ContactId::SELF);
+        assert_eq!(msg.to_id, ContactId::SELF);
+        if let Some(chat_id) = chat_id {
+            assert_eq!(msg.chat_id, chat_id);
+        } else {
+            chat_id = Some(msg.chat_id);
+            let chat = Chat::load_from_db(t, msg.chat_id).await?;
+            assert_eq!(chat.typ, Chattype::Group);
+            assert!(!chat.is_encrypted(t).await?);
+        }
+    }
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4986,7 +5011,7 @@ async fn test_make_n_send_vcard() -> Result<()> {
     Ok(())
 }
 
-/// Tests that group is not created if the message
+/// Tests that an ad-hoc group is created if the message
 /// has no recipients even if it has unencrypted Chat-Group-ID.
 ///
 /// Chat-Group-ID in unencrypted messages should be ignored.
@@ -5005,8 +5030,12 @@ Hello!"
         .as_bytes();
     let received = receive_imf(t, raw, false).await?.unwrap();
     let msg = Message::load_from_db(t, *received.msg_ids.last().unwrap()).await?;
+    assert_eq!(msg.from_id, ContactId::SELF);
+    assert_eq!(msg.to_id, ContactId::SELF);
     let chat = Chat::load_from_db(t, msg.chat_id).await?;
-    assert_eq!(chat.typ, Chattype::Single);
+    assert_eq!(chat.typ, Chattype::Group);
+    assert!(!chat.is_encrypted(t).await?);
+    assert!(chat.grpid.is_empty());
 
     // Check that the weird group name is sanitzied correctly:
     let mail = mailparse::parse_mail(raw).unwrap();
@@ -5017,7 +5046,7 @@ Hello!"
             .get_value_raw(),
         "Group\n name\u{202B}".as_bytes()
     );
-    assert_eq!(chat.name, "Saved messages");
+    assert_eq!(chat.name, "Group name");
 
     Ok(())
 }
@@ -5151,6 +5180,58 @@ async fn test_dont_reverify_by_self_on_outgoing_msg() -> Result<()> {
         a1_fiona.get_verifier_id(a1).await?.unwrap().unwrap(),
         a1_bob_id
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_dont_verify_by_verified_by_unknown() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let a0 = &tcm.alice().await;
+    let a1 = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+    let fiona = &tcm.fiona().await;
+
+    let bob_chat_id = chat::create_group(bob, "Group").await?;
+    bob.set_chat_protected(bob_chat_id).await;
+    let qr = get_securejoin_qr(bob, Some(bob_chat_id)).await?;
+    tcm.exec_securejoin_qr(a0, bob, &qr).await;
+
+    let qr = get_securejoin_qr(bob, None).await?;
+    tcm.exec_securejoin_qr(fiona, bob, &qr).await;
+
+    // Bob verifies Fiona for Alice#0.
+    let bob_fiona_id = bob.add_or_lookup_contact_id(fiona).await;
+    add_contact_to_chat(bob, bob_chat_id, bob_fiona_id).await?;
+    let sent_msg = bob.pop_sent_msg().await;
+    a0.recv_msg(&sent_msg).await;
+    fiona.recv_msg(&sent_msg).await;
+    let a0_bob = a0.add_or_lookup_contact(bob).await;
+    let a0_fiona = a0.add_or_lookup_contact(fiona).await;
+    assert_eq!(a0_fiona.get_verifier_id(a0).await?, Some(Some(a0_bob.id)));
+
+    let chat_id = a0.create_group_with_members("", &[fiona]).await;
+    a0.set_chat_protected(chat_id).await;
+    a1.recv_msg(&a0.send_text(chat_id, "Hi").await).await;
+    let a1_fiona = a1.add_or_lookup_contact(fiona).await;
+    assert_eq!(a1_fiona.get_verifier_id(a1).await?, Some(None));
+
+    let some_time_to_regossip = Duration::from_secs(20 * 24 * 3600);
+    SystemTime::shift(some_time_to_regossip);
+    let fiona_chat_id = fiona.get_last_msg().await.chat_id;
+    fiona.set_chat_protected(fiona_chat_id).await;
+    a1.recv_msg(&fiona.send_text(fiona_chat_id, "Hi").await)
+        .await;
+    let a1_bob = a1.add_or_lookup_contact(bob).await;
+    // There was a bug that Bob is verified by Fiona on Alice's other device.
+    assert_eq!(a1_bob.get_verifier_id(a1).await?, Some(None));
+
+    SystemTime::shift(some_time_to_regossip);
+    tcm.execute_securejoin(a1, fiona).await;
+    a1.recv_msg(&fiona.send_text(fiona_chat_id, "Hi").await)
+        .await;
+    // But now Bob's verifier id must be updated because Fiona is verified by a known verifier
+    // (moreover, directly), so Alice has reverse verification chains on her devices.
+    assert_eq!(a1_bob.get_verifier_id(a1).await?, Some(Some(a1_fiona.id)));
     Ok(())
 }
 
