@@ -29,6 +29,7 @@ jobs:
   lint_rust:
     name: Lint Rust
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
         with:
@@ -52,6 +53,7 @@ jobs:
   cargo_deny:
     name: cargo deny
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
         with:
@@ -66,6 +68,7 @@ jobs:
   provider_database:
     name: Check provider database
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
         with:
@@ -79,6 +82,7 @@ jobs:
   docs:
     name: Rust doc comments
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     env:
       RUSTDOCFLAGS: -Dwarnings
     steps:
@@ -107,6 +111,7 @@ jobs:
           - os: ubuntu-latest
             rust: minimum
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     steps:
       - run:
           echo "RUSTUP_TOOLCHAIN=$MSRV" >> $GITHUB_ENV
@@ -155,6 +160,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
         with:
@@ -180,6 +186,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
         with:
@@ -202,6 +209,7 @@ jobs:
   python_lint:
     name: Python lint
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
         with:
@@ -218,6 +226,38 @@ jobs:
       - name: Lint deltachat-rpc-client
         working-directory: deltachat-rpc-client
         run: tox -e lint
+
+  # mypy does not work with PyPy since mypy 1.19
+  # as it introduced native `librt` dependency
+  # that uses CPython internals.
+  # We only run mypy with CPython because of this.
+  cffi_python_mypy:
+    name: CFFI Python mypy
+    needs: ["c_library", "python_lint"]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          show-progress: false
+          persist-credentials: false
+
+      - name: Download libdeltachat.a
+        uses: actions/download-artifact@v6
+        with:
+          name: ubuntu-latest-libdeltachat.a
+          path: target/debug
+
+      - name: Install tox
+        run: pip install tox
+
+      - name: Run mypy
+        env:
+          DCC_RS_TARGET: debug
+          DCC_RS_DEV: ${{ github.workspace }}
+        working-directory: python
+        run: tox -e mypy
+
 
   cffi_python_tests:
     name: CFFI Python tests
@@ -238,13 +278,14 @@ jobs:
           - os: macos-latest
             python: pypy3.10
 
-          # Minimum Supported Python Version = 3.8
+          # Minimum Supported Python Version = 3.10
           # This is the minimum version for which manylinux Python wheels are
           # built. Test it with minimum supported Rust version.
           - os: ubuntu-latest
-            python: 3.8
+            python: "3.10"
 
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
         with:
@@ -271,7 +312,7 @@ jobs:
           DCC_RS_TARGET: debug
           DCC_RS_DEV: ${{ github.workspace }}
         working-directory: python
-        run: tox -e mypy,doc,py
+        run: tox -e doc,py
 
   rpc_python_tests:
     name: JSON-RPC Python tests
@@ -293,11 +334,12 @@ jobs:
           - os: macos-latest
             python: pypy3.10
 
-          # Minimum Supported Python Version = 3.8
+          # Minimum Supported Python Version = 3.10
           - os: ubuntu-latest
-            python: 3.8
+            python: "3.10"
 
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
         with:

@@ -9,31 +9,12 @@ import os
 import subprocess
 import sys
 from queue import Empty, Queue
-from threading import Event, Thread
+from threading import Thread
 from typing import Any, Iterator, Optional
 
 
 class JsonRpcError(Exception):
     """JSON-RPC error."""
-
-
-class RpcFuture:
-    """RPC future waiting for RPC call result."""
-
-    def __init__(self, rpc: "Rpc", request_id: int, event: Event):
-        self.rpc = rpc
-        self.request_id = request_id
-        self.event = event
-
-    def __call__(self):
-        """Wait for the future to return the result."""
-        self.event.wait()
-        response = self.rpc.request_results.pop(self.request_id)
-        if "error" in response:
-            raise JsonRpcError(response["error"])
-        if "result" in response:
-            return response["result"]
-        return None
 
 
 class RpcMethod:
@@ -57,17 +38,23 @@ class RpcMethod:
             "params": args,
             "id": request_id,
         }
-        event = Event()
-        self.rpc.request_events[request_id] = event
+        self.rpc.request_results[request_id] = queue = Queue()
         self.rpc.request_queue.put(request)
 
-        return RpcFuture(self.rpc, request_id, event)
+        def rpc_future():
+            """Wait for the request to receive a result."""
+            response = queue.get()
+            if "error" in response:
+                raise JsonRpcError(response["error"])
+            return response.get("result", None)
+
+        return rpc_future
 
 
 class Rpc:
     """RPC client."""
 
-    def __init__(self, accounts_dir: Optional[str] = None, **kwargs):
+    def __init__(self, accounts_dir: Optional[str] = None, rpc_server_path="deltachat-rpc-server", **kwargs):
         """Initialize RPC client.
 
         The given arguments will be passed to subprocess.Popen().
@@ -79,13 +66,12 @@ class Rpc:
             }
 
         self._kwargs = kwargs
+        self.rpc_server_path = rpc_server_path
         self.process: subprocess.Popen
         self.id_iterator: Iterator[int]
         self.event_queues: dict[int, Queue]
-        # Map from request ID to `threading.Event`.
-        self.request_events: dict[int, Event]
-        # Map from request ID to the result.
-        self.request_results: dict[int, Any]
+        # Map from request ID to a Queue which provides a single result
+        self.request_results: dict[int, Queue]
         self.request_queue: Queue[Any]
         self.closing: bool
         self.reader_thread: Thread
@@ -94,27 +80,18 @@ class Rpc:
 
     def start(self) -> None:
         """Start RPC server subprocess."""
+        popen_kwargs = {"stdin": subprocess.PIPE, "stdout": subprocess.PIPE}
         if sys.version_info >= (3, 11):
-            self.process = subprocess.Popen(
-                "deltachat-rpc-server",
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                # Prevent subprocess from capturing SIGINT.
-                process_group=0,
-                **self._kwargs,
-            )
+            # Prevent subprocess from capturing SIGINT.
+            popen_kwargs["process_group"] = 0
         else:
-            self.process = subprocess.Popen(
-                "deltachat-rpc-server",
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                # `process_group` is not supported before Python 3.11.
-                preexec_fn=os.setpgrp,  # noqa: PLW1509
-                **self._kwargs,
-            )
+            # `process_group` is not supported before Python 3.11.
+            popen_kwargs["preexec_fn"] = os.setpgrp  # noqa: PLW1509
+
+        popen_kwargs.update(self._kwargs)
+        self.process = subprocess.Popen(self.rpc_server_path, **popen_kwargs)
         self.id_iterator = itertools.count(start=1)
         self.event_queues = {}
-        self.request_events = {}
         self.request_results = {}
         self.request_queue = Queue()
         self.closing = False
@@ -149,9 +126,7 @@ class Rpc:
                 response = json.loads(line)
                 if "id" in response:
                     response_id = response["id"]
-                    event = self.request_events.pop(response_id)
-                    self.request_results[response_id] = response
-                    event.set()
+                    self.request_results.pop(response_id).put(response)
                 else:
                     logging.warning("Got a response without ID: %s", response)
         except Exception:

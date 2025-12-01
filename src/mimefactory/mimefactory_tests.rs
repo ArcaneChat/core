@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use super::*;
 use crate::chat::{
-    self, ChatId, add_contact_to_chat, create_group, remove_contact_from_chat, send_text_msg,
+    self, ChatId, add_contact_to_chat, create_group, create_group_unencrypted,
+    remove_contact_from_chat, send_text_msg,
 };
 use crate::chatlist::Chatlist;
 use crate::constants;
@@ -351,7 +352,7 @@ async fn test_subject_in_group() -> Result<()> {
     let mut tcm = TestContextManager::new();
     let t = tcm.alice().await;
     let bob = tcm.bob().await;
-    let group_id = chat::create_group(&t, "groupname").await.unwrap();
+    let group_id = create_group(&t, "groupname").await.unwrap();
     let bob_contact_id = t.add_or_lookup_contact_id(&bob).await;
     chat::add_contact_to_chat(&t, group_id, bob_contact_id).await?;
 
@@ -594,26 +595,6 @@ async fn test_selfavatar_unencrypted() -> anyhow::Result<()> {
 
     assert_eq!(inner.match_indices("text/plain").count(), 1);
     assert_eq!(inner.match_indices("Message-ID:").count(), 1);
-    assert_eq!(inner.match_indices("Chat-User-Avatar:").count(), 1);
-    assert_eq!(inner.match_indices("Subject:").count(), 0);
-
-    assert_eq!(body.match_indices("this is the text!").count(), 1);
-
-    // if another message is sent, that one must not contain the avatar
-    let sent_msg = t.send_msg(chat.id, &mut msg).await;
-    let mut payload = sent_msg.payload().splitn(3, "\r\n\r\n");
-    let outer = payload.next().unwrap();
-    let inner = payload.next().unwrap();
-    let body = payload.next().unwrap();
-
-    assert_eq!(outer.match_indices("multipart/mixed").count(), 1);
-    assert_eq!(outer.match_indices("Message-ID:").count(), 1);
-    assert_eq!(outer.match_indices("Subject:").count(), 1);
-    assert_eq!(outer.match_indices("Autocrypt:").count(), 1);
-    assert_eq!(outer.match_indices("Chat-User-Avatar:").count(), 0);
-
-    assert_eq!(inner.match_indices("text/plain").count(), 1);
-    assert_eq!(inner.match_indices("Message-ID:").count(), 1);
     assert_eq!(inner.match_indices("Chat-User-Avatar:").count(), 0);
     assert_eq!(inner.match_indices("Subject:").count(), 0);
 
@@ -670,7 +651,7 @@ async fn test_selfavatar_unencrypted_signed() {
     assert_eq!(part.match_indices("text/plain").count(), 1);
     assert_eq!(part.match_indices("From:").count(), 0);
     assert_eq!(part.match_indices("Message-ID:").count(), 1);
-    assert_eq!(part.match_indices("Chat-User-Avatar:").count(), 1);
+    assert_eq!(part.match_indices("Chat-User-Avatar:").count(), 0);
     assert_eq!(part.match_indices("Subject:").count(), 0);
 
     let body = payload.next().unwrap();
@@ -684,58 +665,6 @@ async fn test_selfavatar_unencrypted_signed() {
         .unwrap();
     let alice_contact = Contact::get_by_id(&bob.ctx, alice_id).await.unwrap();
     assert_eq!(alice_contact.is_key_contact(), false);
-    assert!(
-        alice_contact
-            .get_profile_image(&bob.ctx)
-            .await
-            .unwrap()
-            .is_some()
-    );
-
-    // if another message is sent, that one must not contain the avatar
-    let mut msg = Message::new_text("this is the text!".to_string());
-    let sent_msg = t.send_msg(chat.id, &mut msg).await;
-    let mut payload = sent_msg.payload().splitn(4, "\r\n\r\n");
-
-    let part = payload.next().unwrap();
-    assert_eq!(part.match_indices("multipart/signed").count(), 1);
-    assert_eq!(part.match_indices("From:").count(), 1);
-    assert_eq!(part.match_indices("Message-ID:").count(), 1);
-    assert_eq!(part.match_indices("Subject:").count(), 1);
-    assert_eq!(part.match_indices("Autocrypt:").count(), 1);
-    assert_eq!(part.match_indices("Chat-User-Avatar:").count(), 0);
-
-    let part = payload.next().unwrap();
-    assert_eq!(
-        part.match_indices("multipart/mixed; protected-headers=\"v1\"")
-            .count(),
-        1
-    );
-    assert_eq!(part.match_indices("From:").count(), 1);
-    assert_eq!(part.match_indices("Message-ID:").count(), 0);
-    assert_eq!(part.match_indices("Subject:").count(), 1);
-    assert_eq!(part.match_indices("Autocrypt:").count(), 1);
-    assert_eq!(part.match_indices("Chat-User-Avatar:").count(), 0);
-
-    let part = payload.next().unwrap();
-    assert_eq!(part.match_indices("text/plain").count(), 1);
-    assert_eq!(body.match_indices("From:").count(), 0);
-    assert_eq!(part.match_indices("Message-ID:").count(), 1);
-    assert_eq!(part.match_indices("Chat-User-Avatar:").count(), 0);
-    assert_eq!(part.match_indices("Subject:").count(), 0);
-
-    let body = payload.next().unwrap();
-    assert_eq!(body.match_indices("this is the text!").count(), 1);
-
-    bob.recv_msg(&sent_msg).await;
-    let alice_contact = Contact::get_by_id(&bob.ctx, alice_id).await.unwrap();
-    assert!(
-        alice_contact
-            .get_profile_image(&bob.ctx)
-            .await
-            .unwrap()
-            .is_some()
-    );
 }
 
 /// Test that removed member address does not go into the `To:` field.
@@ -743,17 +672,20 @@ async fn test_selfavatar_unencrypted_signed() {
 async fn test_remove_member_bcc() -> Result<()> {
     let mut tcm = TestContextManager::new();
 
-    // Alice creates a group with Bob and Claire and then removes Bob.
+    // Alice creates a group with Bob and Charlie and then removes Charlie.
+
     let alice = &tcm.alice().await;
     let bob = &tcm.bob().await;
     let charlie = &tcm.charlie().await;
 
-    let bob_id = alice.add_or_lookup_contact_id(bob).await;
-    let charlie_id = alice.add_or_lookup_contact_id(charlie).await;
-    let charlie_contact = Contact::get_by_id(alice, charlie_id).await?;
-    let charlie_addr = charlie_contact.get_addr();
+    let alice_addr = alice.get_config(Config::Addr).await?.unwrap();
+    let bob_addr = bob.get_config(Config::Addr).await?.unwrap();
+    let charlie_addr = charlie.get_config(Config::Addr).await?.unwrap();
 
-    let alice_chat_id = create_group(alice, "foo").await?;
+    let bob_id = alice.add_or_lookup_address_contact_id(bob).await;
+    let charlie_id = alice.add_or_lookup_address_contact_id(charlie).await;
+
+    let alice_chat_id = create_group_unencrypted(alice, "foo").await?;
     add_contact_to_chat(alice, alice_chat_id, bob_id).await?;
     add_contact_to_chat(alice, alice_chat_id, charlie_id).await?;
     send_text_msg(alice, alice_chat_id, "Creating a group".to_string()).await?;
@@ -770,8 +702,9 @@ async fn test_remove_member_bcc() -> Result<()> {
     for to_addr in to.iter() {
         match to_addr {
             mailparse::MailAddr::Single(info) => {
-                // Addresses should be of existing members (Alice and Bob) and not Charlie.
+                // Addresses should be of existing members and not Charlie.
                 assert_ne!(info.addr, charlie_addr);
+                assert!(info.addr == alice_addr || info.addr == bob_addr);
             }
             mailparse::MailAddr::Group(_) => {
                 panic!("Group addresses are not expected here");

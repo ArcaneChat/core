@@ -9,7 +9,7 @@ use data_encoding::BASE32_NOPAD;
 use deltachat_contact_tools::sanitize_bidi_characters;
 use iroh_gossip::proto::TopicId;
 use mail_builder::headers::HeaderType;
-use mail_builder::headers::address::{Address, EmailAddress};
+use mail_builder::headers::address::Address;
 use mail_builder::mime::MimePart;
 use tokio::fs;
 
@@ -464,7 +464,11 @@ impl MimeFactory {
                 .unwrap_or_default(),
             false => "".to_string(),
         };
-        let attach_selfavatar = Self::should_attach_selfavatar(context, &msg).await;
+        // We don't display avatars for address-contacts, so sending avatars w/o encryption is not
+        // useful and causes e.g. Outlook to reject a message with a big header, see
+        // https://support.delta.chat/t/invalid-mime-content-single-text-value-size-32822-exceeded-allowed-maximum-32768-for-the-chat-user-avatar-header/4067.
+        let attach_selfavatar =
+            Self::should_attach_selfavatar(context, &msg).await && encryption_pubkeys.is_some();
 
         ensure_and_debug_assert!(
             member_timestamps.is_empty()
@@ -993,24 +997,7 @@ impl MimeFactory {
             } else if header_name == "to" {
                 protected_headers.push(header.clone());
                 if is_encrypted {
-                    let mut to_without_names = to
-                        .clone()
-                        .into_iter()
-                        .filter_map(|header| match header {
-                            Address::Address(mb) => Some(Address::Address(EmailAddress {
-                                name: None,
-                                email: mb.email,
-                            })),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>();
-                    if to_without_names.is_empty() {
-                        to_without_names.push(hidden_recipients());
-                    }
-                    unprotected_headers.push((
-                        original_header_name,
-                        Address::new_list(to_without_names).into(),
-                    ));
+                    unprotected_headers.push(("To", hidden_recipients().into()));
                 } else {
                     unprotected_headers.push(header.clone());
                 }
@@ -1538,10 +1525,9 @@ impl MimeFactory {
                             .await?
                             .unwrap_or_default()
                     {
-                        placeholdertext = Some(stock_str::msg_group_left_remote(context).await);
+                        placeholdertext = Some("I left the group.".to_string());
                     } else {
-                        placeholdertext =
-                            Some(stock_str::msg_del_member_remote(context, email_to_remove).await);
+                        placeholdertext = Some(format!("I removed member {email_to_remove}."));
                     };
 
                     if !email_to_remove.is_empty() {
@@ -1564,8 +1550,7 @@ impl MimeFactory {
                     let email_to_add = msg.param.get(Param::Arg).unwrap_or_default();
                     let fingerprint_to_add = msg.param.get(Param::Arg4).unwrap_or_default();
 
-                    placeholdertext =
-                        Some(stock_str::msg_add_member_remote(context, email_to_add).await);
+                    placeholdertext = Some(format!("I added member {email_to_add}."));
 
                     if !email_to_add.is_empty() {
                         headers.push((
@@ -1601,7 +1586,7 @@ impl MimeFactory {
                         "Chat-Content",
                         mail_builder::headers::text::Text::new("group-avatar-changed").into(),
                     ));
-                    if grpimage.is_none() {
+                    if grpimage.is_none() && is_encrypted {
                         headers.push((
                             "Chat-Group-Avatar",
                             mail_builder::headers::raw::Raw::new("0").into(),
@@ -1728,7 +1713,9 @@ impl MimeFactory {
             _ => {}
         }
 
-        if let Some(grpimage) = grpimage {
+        if let Some(grpimage) = grpimage
+            && is_encrypted
+        {
             info!(context, "setting group image '{}'", grpimage);
             let avatar = build_avatar_file(context, grpimage)
                 .await

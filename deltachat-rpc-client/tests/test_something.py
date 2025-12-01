@@ -661,8 +661,6 @@ def test_download_limit_chat_assignment(acfactory, tmp_path, n_accounts):
         contact = alice.create_contact(account)
         alice_group.add_contact(contact)
 
-    if n_accounts == 2:
-        bob_chat_alice = bob.create_chat(alice)
     bob.set_config("download_limit", str(download_limit))
 
     alice_group.send_text("hi")
@@ -678,15 +676,7 @@ def test_download_limit_chat_assignment(acfactory, tmp_path, n_accounts):
         alice_group.send_file(str(path))
         snapshot = bob.wait_for_incoming_msg().get_snapshot()
         assert snapshot.download_state == DownloadState.AVAILABLE
-        if n_accounts > 2:
-            assert snapshot.chat == bob_group
-        else:
-            # Group contains only Alice and Bob,
-            # so partially downloaded messages are
-            # hard to distinguish from private replies to group messages.
-            #
-            # Message may be a private reply, so we assign it to 1:1 chat with Alice.
-            assert snapshot.chat == bob_chat_alice
+        assert snapshot.chat == bob_group
 
 
 def test_markseen_contact_request(acfactory):
@@ -1003,3 +993,22 @@ def test_background_fetch(acfactory, dc):
         snapshot = messages[-1].get_snapshot()
         if snapshot.text == "Hello again!":
             break
+
+
+def test_message_exists(acfactory):
+    ac1, ac2 = acfactory.get_online_accounts(2)
+    chat = ac1.create_chat(ac2)
+    message1 = chat.send_text("Hello!")
+    message2 = chat.send_text("Hello again!")
+    assert message1.exists()
+    assert message2.exists()
+
+    ac1.delete_messages([message1])
+    assert not message1.exists()
+    assert message2.exists()
+
+    # There is no error when checking if
+    # the message exists for deleted account.
+    ac1.remove()
+    assert not message1.exists()
+    assert not message2.exists()
