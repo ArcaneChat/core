@@ -10,11 +10,14 @@ jobs:
   pack-module:
     name: "Publish @deltachat/jsonrpc-client"
     runs-on: ubuntu-latest
+    environment:
+      name: npm-jsonrpc-client
+      url: https://www.npmjs.com/package/@deltachat/jsonrpc-client
     permissions:
       id-token: write
       contents: read
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           show-progress: false
           persist-credentials: false
@@ -23,6 +26,11 @@ jobs:
         with:
           node-version: 20
           registry-url: "https://registry.npmjs.org"
+
+      # Ensure npm 11.5.1 or later is installed.
+      # It is needed for <https://docs.npmjs.com/trusted-publishers>
+      - name: Update npm
+        run: npm install -g npm@latest
 
       - name: Install dependencies without running scripts
         working-directory: deltachat-jsonrpc/typescript
@@ -37,5 +45,3 @@ jobs:
       - name: Publish
         working-directory: deltachat-jsonrpc/typescript
         run: npm publish --provenance deltachat-jsonrpc-client-* --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

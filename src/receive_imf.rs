@@ -827,6 +827,41 @@ pub(crate) async fn receive_imf_inner(
     if let Some(ref sync_items) = mime_parser.sync_items {
         if from_id == ContactId::SELF {
             if mime_parser.was_encrypted() {
+                // Receiving encrypted message from self updates primary transport.
+                let from_addr = &mime_parser.from.addr;
+
+                let transport_changed = context
+                    .sql
+                    .transaction(|transaction| {
+                        let transport_exists = transaction.query_row(
+                            "SELECT COUNT(*) FROM transports WHERE addr=?",
+                            (from_addr,),
+                            |row| {
+                                let count: i64 = row.get(0)?;
+                                Ok(count > 0)
+                            },
+                        )?;
+
+                        let transport_changed = if transport_exists {
+                            transaction.execute(
+                                "UPDATE config SET value=? WHERE keyname='configured_addr'",
+                                (from_addr,),
+                            )? > 0
+                        } else {
+                            warn!(
+                                context,
+                                "Received sync message from unknown address {from_addr:?}."
+                            );
+                            false
+                        };
+                        Ok(transport_changed)
+                    })
+                    .await?;
+                if transport_changed {
+                    info!(context, "Primary transport changed to {from_addr:?}.");
+                    context.sql.uncache_raw_config("configured_addr").await;
+                }
+
                 context
                     .execute_sync_items(sync_items, mime_parser.timestamp_sent)
                     .await;
@@ -2471,10 +2506,11 @@ async fn lookup_or_create_adhoc_group(
                 id INTEGER PRIMARY KEY
             ) STRICT",
             (),
-        )?;
+        )
+        .context("CREATE TEMP TABLE temp.contacts")?;
         let mut stmt = t.prepare("INSERT INTO temp.contacts(id) VALUES (?)")?;
         for &id in &contact_ids {
-            stmt.execute((id,))?;
+            stmt.execute((id,)).context("INSERT INTO temp.contacts")?;
         }
         let val = t
             .query_row(
@@ -2496,8 +2532,10 @@ async fn lookup_or_create_adhoc_group(
                     Ok((id, blocked))
                 },
             )
-            .optional()?;
-        t.execute("DROP TABLE temp.contacts", ())?;
+            .optional()
+            .context("Select chat with matching name and members")?;
+        t.execute("DROP TABLE temp.contacts", ())
+            .context("DROP TABLE temp.contacts")?;
         Ok(val)
     };
     let query_only = true;
