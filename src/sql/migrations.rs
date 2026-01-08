@@ -19,7 +19,7 @@ use crate::log::warn;
 use crate::message::MsgId;
 use crate::provider::get_provider_info;
 use crate::sql::Sql;
-use crate::tools::{Time, inc_and_check, normalize_text, time_elapsed};
+use crate::tools::{Time, inc_and_check, time_elapsed};
 use crate::transport::ConfiguredLoginParam;
 
 const DBVERSION: i32 = 68;
@@ -1011,6 +1011,8 @@ CREATE INDEX msgs_status_updates_index2 ON msgs_status_updates (uid);
 
     inc_and_check(&mut migration_version, 119)?;
     if dbversion < migration_version {
+        // This table is deprecated sinc 2025-12-25.
+        // Sync messages are again sent over SMTP.
         sql.execute_migration(
             "CREATE TABLE imap_send (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1456,52 +1458,45 @@ CREATE INDEX imap_sync_index ON imap_sync(transport_id, folder);
 
     inc_and_check(&mut migration_version, 143)?;
     if dbversion < migration_version {
-        let trans_fn = |t: &mut rusqlite::Transaction| {
-            t.execute_batch(
-                "
+        sql.execute_migration(
+            "
 ALTER TABLE chats ADD COLUMN name_normalized TEXT;
 ALTER TABLE contacts ADD COLUMN name_normalized TEXT;
                 ",
-            )?;
+            migration_version,
+        )
+        .await?;
+    }
 
-            let mut stmt = t.prepare("UPDATE chats SET name_normalized=? WHERE id=?")?;
-            for res in t
-                .prepare("SELECT id, name FROM chats LIMIT 10000")?
-                .query_map((), |row| {
-                    let id: u32 = row.get(0)?;
-                    let name: String = row.get(1)?;
-                    Ok((id, name))
-                })?
-            {
-                let (id, name) = res?;
-                if let Some(name_normalized) = normalize_text(&name) {
-                    stmt.execute((name_normalized, id))?;
-                }
-            }
+    inc_and_check(&mut migration_version, 144)?;
+    if dbversion < migration_version {
+        sql.execute_migration_transaction(
+            |transaction| {
+                let is_chatmail = transaction
+                    .query_row(
+                        "SELECT value FROM config WHERE keyname='is_chatmail'",
+                        (),
+                        |row| {
+                            let value: String = row.get(0)?;
+                            Ok(value)
+                        },
+                    )
+                    .optional()?
+                    .as_deref()
+                    == Some("1");
 
-            let mut stmt = t.prepare("UPDATE contacts SET name_normalized=? WHERE id=?")?;
-            for res in t
-                .prepare(
-                    "
-SELECT id, IIF(name='', authname, name) FROM contacts
-ORDER BY last_seen DESC LIMIT 10000
-                ",
-                )?
-                .query_map((), |row| {
-                    let id: u32 = row.get(0)?;
-                    let name: String = row.get(1)?;
-                    Ok((id, name))
-                })?
-            {
-                let (id, name) = res?;
-                if let Some(name_normalized) = normalize_text(&name) {
-                    stmt.execute((name_normalized, id))?;
+                if is_chatmail {
+                    transaction.execute_batch(
+                        "DELETE FROM config WHERE keyname='only_fetch_mvbox';
+                         DELETE FROM config WHERE keyname='show_emails';
+                         UPDATE config SET value='0' WHERE keyname='mvbox_move'",
+                    )?;
                 }
-            }
-            Ok(())
-        };
-        sql.execute_migration_transaction(trans_fn, migration_version)
-            .await?;
+                Ok(())
+            },
+            migration_version,
+        )
+        .await?;
     }
 
     let new_version = sql

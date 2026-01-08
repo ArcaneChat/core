@@ -1,6 +1,6 @@
 [package]
 name = "deltachat-jsonrpc"
-version = "2.34.0"
+version = "2.36.0"
 description = "DeltaChat JSON-RPC API"
 edition = "2021"
 license = "MPL-2.0"
@@ -19,7 +19,6 @@ yerpc = { workspace = true, features = ["anyhow_expose", "openrpc"] }
 typescript-type-def = { version = "0.5.13", features = ["json_value"] }
 tokio = { workspace = true }
 sanitize-filename = { workspace = true }
-walkdir = "2.5.0"
 base64 = { workspace = true }
 
 [dev-dependencies]

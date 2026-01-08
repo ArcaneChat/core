@@ -45,6 +45,10 @@ use crate::transport::{
 use crate::{EventType, stock_str};
 use crate::{chat, provider};
 
+/// Maximum number of relays
+/// see <https://github.com/chatmail/core/issues/7608>
+pub(crate) const MAX_TRANSPORT_RELAYS: usize = 5;
+
 macro_rules! progress {
     ($context:tt, $progress:expr, $comment:expr) => {
         assert!(
@@ -206,7 +210,8 @@ impl Context {
     /// (i.e. [EnteredLoginParam::addr]).
     pub async fn delete_transport(&self, addr: &str) -> Result<()> {
         let now = time();
-        self.sql
+        let removed_transport_id = self
+            .sql
             .transaction(|transaction| {
                 let primary_addr = transaction.query_row(
                     "SELECT value FROM config WHERE keyname='configured_addr'",
@@ -247,10 +252,11 @@ impl Context {
                     (addr, remove_timestamp),
                 )?;
 
-                Ok(())
+                Ok(transport_id)
             })
             .await?;
         send_sync_transports(self).await?;
+        self.quota.write().await.remove(&removed_transport_id);
 
         Ok(())
     }
@@ -268,18 +274,53 @@ impl Context {
                 )
                 .await?
         {
-            if self.get_config(Config::MvboxMove).await?.as_deref() != Some("0") {
-                bail!("Cannot use multi-transport with mvbox_move enabled.");
-            }
+            // Should be checked before `MvboxMove` because the latter makes no sense in presense of
+            // `OnlyFetchMvbox` and even grayed out in the UIs in this case.
             if self.get_config(Config::OnlyFetchMvbox).await?.as_deref() != Some("0") {
-                bail!("Cannot use multi-transport with only_fetch_mvbox enabled.");
+                bail!(
+                    "To use additional relays, disable the legacy option \"Settings / Advanced / Only Fetch from DeltaChat Folder\"."
+                );
+            }
+            if self.get_config(Config::MvboxMove).await?.as_deref() != Some("0") {
+                bail!(
+                    "To use additional relays, disable the legacy option \"Settings / Advanced / Move automatically to DeltaChat Folder\"."
+                );
             }
             if self.get_config(Config::ShowEmails).await?.as_deref() != Some("2") {
-                bail!("Cannot use multi-transport with disabled fetching of classic emails.");
+                bail!(
+                    "To use additional relays, set the legacy option \"Settings / Advanced / Show Classic Emails\" to \"All\"."
+                );
+            }
+
+            if self
+                .sql
+                .count("SELECT COUNT(*) FROM transports", ())
+                .await?
+                >= MAX_TRANSPORT_RELAYS
+            {
+                bail!(
+                    "You have reached the maximum number of relays ({}).",
+                    MAX_TRANSPORT_RELAYS
+                )
             }
         }
 
-        let provider = configure(self, param).await?;
+        let provider = match configure(self, param).await {
+            Err(error) => {
+                // Log entered and actual params
+                let configured_param = get_configured_param(self, param).await;
+                warn!(
+                    self,
+                    "configure failed: Entered params: {}. Used params: {}. Error: {error}.",
+                    param.to_string(),
+                    configured_param
+                        .map(|param| param.to_string())
+                        .unwrap_or("error".to_owned())
+                );
+                return Err(error);
+            }
+            Ok(provider) => provider,
+        };
         self.set_config_internal(Config::NotifyAboutWrongPw, Some("1"))
             .await?;
         on_configure_completed(self, provider).await?;

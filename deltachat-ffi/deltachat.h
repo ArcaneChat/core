@@ -429,16 +429,13 @@ char*           dc_get_blobdir               (const dc_context_t* context);
  *                    1=send a copy of outgoing messages to self (default).
  *                    Sending messages to self is needed for a proper multi-account setup,
  *                    however, on the other hand, may lead to unwanted notifications in non-delta clients.
- * - `sentbox_watch`= 1=watch `Sent`-folder for changes,
- *                    0=do not watch the `Sent`-folder (default).
  * - `mvbox_move`   = 1=detect chat messages,
  *                    move them to the `DeltaChat` folder,
  *                    and watch the `DeltaChat` folder for updates (default),
  *                    0=do not move chat-messages
  * - `only_fetch_mvbox` = 1=Do not fetch messages from folders other than the
  *                    `DeltaChat` folder. Messages will still be fetched from the
- *                    spam folder and `sendbox_watch` will also still be respected
- *                    if enabled.
+ *                    spam folder.
  *                    0=watch all folders normally (default)
  * - `show_emails`  = DC_SHOW_EMAILS_OFF (0)=
  *                    show direct replies to chats only,
@@ -1611,10 +1608,10 @@ void            dc_set_chat_visibility       (dc_context_t* context, uint32_t ch
  *
  * Messages are deleted from the device and the chat database entry is deleted.
  * After that, the event #DC_EVENT_MSGS_CHANGED is posted.
+ * Messages are deleted from the server in background.
  *
  * Things that are _not_ done implicitly:
  *
- * - Messages are **not deleted from the server**.
  * - The chat or the contact is **not blocked**, so new messages from the user/the group may appear
  *   and the user may create the chat again.
  * - **Groups are not left** - this would
@@ -6705,6 +6702,16 @@ void dc_event_unref(dc_event_t* event);
  */
 #define DC_EVENT_CALL_ENDED                               2580
 
+/**
+ * Transport relay added/deleted or default has changed.
+ * UI should update the list.
+ *
+ * The event is emitted when the transports are modified on another device
+ * using the JSON-RPC calls `add_or_update_transport`, `add_transport_from_qr`, `delete_transport`
+ * or `set_config(configured_addr)`.
+ */
+#define DC_EVENT_TRANSPORTS_MODIFIED           2600
+
 
 /**
  * @}
@@ -7307,12 +7314,6 @@ void dc_event_unref(dc_event_t* event);
 /// Used as a headline in the connectivity view.
 #define DC_STR_OUTGOING_MESSAGES          104
 
-/// "Storage on %1$s"
-///
-/// Used as a headline in the connectivity view.
-///
-/// `%1$s` will be replaced by the domain of the configured e-mail address.
-#define DC_STR_STORAGE_ON_DOMAIN          105
 
 /// @deprecated Deprecated 2022-04-16, this string is no longer needed.
 #define DC_STR_ONE_MOMENT                 106

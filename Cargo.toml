@@ -1,6 +1,6 @@
 [package]
 name = "deltachat"
-version = "2.34.0"
+version = "2.36.0"
 edition = "2024"
 license = "MPL-2.0"
 rust-version = "1.88"
@@ -111,11 +111,12 @@ toml = "0.9"
 tracing = "0.1.41"
 url = "2"
 uuid = { version = "1", features = ["serde", "v4"] }
+walkdir = "2.5.0"
 webpki-roots = "0.26.8"
 
 [dev-dependencies]
 anyhow = { workspace = true, features = ["backtrace"] } # Enable `backtrace` feature in tests.
-criterion = { version = "0.7.0", features = ["async_tokio"] }
+criterion = { version = "0.8.1", features = ["async_tokio"] }
 futures-lite = { workspace = true }
 log = { workspace = true }
 nu-ansi-term = { workspace = true }
@@ -198,7 +199,7 @@ rusqlite = "0.37"
 sanitize-filename = "0.6"
 serde = "1.0"
 serde_json = "1"
-tempfile = "3.23.0"
+tempfile = "3.24.0"
 thiserror = "2"
 tokio = "1"
 tokio-util = "0.7.17"

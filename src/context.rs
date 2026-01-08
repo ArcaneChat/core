@@ -23,7 +23,6 @@ use crate::imap::{FolderMeaning, Imap, ServerMetadata};
 use crate::key::self_fingerprint;
 use crate::log::warn;
 use crate::logged_debug_assert;
-use crate::login_param::EnteredLoginParam;
 use crate::message::{self, MessageState, MsgId};
 use crate::net::tls::TlsSessionStore;
 use crate::peer_channels::Iroh;
@@ -244,9 +243,9 @@ pub struct InnerContext {
     pub(crate) scheduler: SchedulerState,
     pub(crate) ratelimit: RwLock<Ratelimit>,
 
-    /// Recently loaded quota information, if any.
-    /// Set to `None` if quota was never tried to load.
-    pub(crate) quota: RwLock<Option<QuotaInfo>>,
+    /// Recently loaded quota information for each trasnport, if any.
+    /// If quota was never tried to load, then the transport doesn't have an entry in the BTreeMap.
+    pub(crate) quota: RwLock<BTreeMap<u32, QuotaInfo>>,
 
     /// Notify about new messages.
     ///
@@ -352,7 +351,7 @@ pub fn get_info() -> BTreeMap<&'static str, String> {
     #[cfg(not(debug_assertions))]
     res.insert("debug_assertions", "Off".to_string());
 
-    res.insert("deltachat_core_version", format!("v{}", &*DC_VERSION_STR));
+    res.insert("deltachat_core_version", format!("v{DC_VERSION_STR}"));
     res.insert("sqlite_version", rusqlite::version().to_string());
     res.insert("arch", (std::mem::size_of::<usize>() * 8).to_string());
     res.insert("num_cpus", num_cpus::get().to_string());
@@ -480,7 +479,7 @@ impl Context {
             events,
             scheduler: SchedulerState::new(),
             ratelimit: RwLock::new(Ratelimit::new(Duration::new(3, 0), 3.0)), // Allow at least 1 message every second + a burst of 3.
-            quota: RwLock::new(None),
+            quota: RwLock::new(BTreeMap::new()),
             new_msgs_notify,
             server_id: RwLock::new(None),
             metadata: RwLock::new(None),
@@ -620,8 +619,13 @@ impl Context {
             }
 
             // Update quota (to send warning if full) - but only check it once in a while.
+            // note: For now this only checks quota of primary transport,
+            // because background check only checks primary transport at the moment
             if self
-                .quota_needs_update(DC_BACKGROUND_FETCH_QUOTA_CHECK_RATELIMIT)
+                .quota_needs_update(
+                    session.transport_id(),
+                    DC_BACKGROUND_FETCH_QUOTA_CHECK_RATELIMIT,
+                )
                 .await
                 && let Err(err) = self.update_recent_quota(&mut session).await
             {
@@ -821,11 +825,6 @@ impl Context {
 
     /// Returns information about the context as key-value pairs.
     pub async fn get_info(&self) -> Result<BTreeMap<&'static str, String>> {
-        let l = EnteredLoginParam::load(self).await?;
-        let l2 = ConfiguredLoginParam::load(self).await?.map_or_else(
-            || "Not configured".to_string(),
-            |(_transport_id, param)| param.to_string(),
-        );
         let secondary_addrs = self.get_secondary_self_addrs().await?.join(", ");
         let all_transports: Vec<String> = ConfiguredLoginParam::load_all(self)
             .await?
@@ -915,8 +914,6 @@ impl Context {
                 .unwrap_or_else(|| "<unset>".to_string()),
         );
         res.insert("proxy_enabled", proxy_enabled.to_string());
-        res.insert("entered_account_settings", l.to_string());
-        res.insert("used_account_settings", l2);
         res.insert("used_transport_settings", all_transports);
 
         if let Some(server_id) = &*self.server_id.read().await {
@@ -1345,11 +1342,6 @@ impl Context {
         wal_fname.push("-wal");
         dbfile.with_file_name(wal_fname)
     }
-}
-
-/// Returns core version as a string.
-pub fn get_version_str() -> &'static str {
-    &DC_VERSION_STR
 }
 
 #[cfg(test)]

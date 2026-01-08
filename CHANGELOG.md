@@ -1,5 +1,99 @@
 # Changelog
 
+## [2.36.0] - 2026-01-03
+
+### CI
+
+- Pin GitHub Action references.
+
+### API-Changes
+
+- Add transports event to FFI.
+
+### Features / Changes
+
+- Add core version to `receive_imf` failure message.
+- Connectivity view: quota for all transports ([#7630](https://github.com/chatmail/core/pull/7630)).
+- Send sync messages over SMTP and do not move them to mvbox.
+
+### Fixes
+
+- When accepting group, add members with `Origin::IncomingTo` and sort them down in the contact list (7592).
+- Update fallback welcome message.
+- `inner_configure`: Check Config::OnlyFetchMvbox before MvboxMove for multi-transport ([#7637](https://github.com/chatmail/core/pull/7637)).
+- Reset options not available for chatmail on chatmail profiles.
+- Don't send webxdc notification for `notify: "*"` when chat is muted ([#7658](https://github.com/chatmail/core/pull/7658)).
+
+### Documentation
+
+- `delete_chat()`: don't lie that messages aren't deleted from server.
+- Remove references to removed `sentbox_watch` config.
+- Update documentation for `TransportsModified` event.
+
+### Tests
+
+- Contact list after accepting group with unknown contacts ([#7592](https://github.com/chatmail/core/pull/7592)).
+- Port test_import_export_online_all to JSON-RPC ([#7411](https://github.com/chatmail/core/pull/7411)).
+
+### Refactor
+
+- Turn `DC_VERSION_STR` into `&str`.
+- ffi: Remove one pointer indirection for `dc_accounts_t`.
+
+### Miscellaneous Tasks
+
+- deps: Bump actions/download-artifact from 6 to 7.
+- deps: Bump actions/upload-artifact from 5 to 6.
+- deps: Bump astral-sh/setup-uv from 7.1.4 to 7.1.6.
+- deps: Bump cachix/install-nix-action from 31.8.4 to 31.9.0.
+- cargo: Bump serde_json from 1.0.145 to 1.0.147.
+- cargo: Bump uuid from 1.18.1 to 1.19.0.
+- cargo: Bump toml from 0.9.8 to 0.9.10+spec-1.1.0.
+- cargo: Bump tempfile from 3.23.0 to 3.24.0.
+- cargo: Bump libc from 0.2.177 to 0.2.178.
+- cargo: Bump tracing from 0.1.41 to 0.1.44.
+- cargo: Bump hyper-util from 0.1.18 to 0.1.19.
+- cargo: Bump log from 0.4.28 to 0.4.29.
+- cargo: Bump rustls-pki-types from 1.13.0 to 1.13.2.
+- cargo: Bump criterion from 0.7.0 to 0.8.1.
+
+## [2.35.0] - 2025-12-16
+
+### API-Changes
+
+- Add blob dir size to storage info ([#7605](https://github.com/chatmail/core/pull/7605)).
+
+### Features / Changes
+
+- Use `turn.delta.chat` as fallback TURN server ([#7382](https://github.com/chatmail/core/pull/7382)).
+- Add ip addresses of known public chatmail relays from https://chatmail.at/relays to DNS cache ([#7607](https://github.com/chatmail/core/pull/7607)).
+- Improve error messages on adding relays.
+- Add transport addresses to IMAP URLs in message info.
+- `lookup_host_with_cache()`: Don't return empty address list ([#7596](https://github.com/chatmail/core/pull/7596)).
+
+### Fixes
+
+- `get_chat_msgs_ex()`: Don't match on "S=" (Cmd) in param payload.
+- Remove `SecurejoinWait` info message when received Alice's key ([#7585](https://github.com/chatmail/core/pull/7585)).
+- Do not set normalized name for existing chats and contacts in a migration.
+- Remove now redundant "used_account_settings" and "entered_account_settings" from `Context.get_info()` ([#7587](https://github.com/chatmail/core/pull/7587)).
+- Don't use fallback servers if got TURN servers from IMAP METADATA.
+- Use fallback ICE servers if server can't IMAP METADATA ([#7382](https://github.com/chatmail/core/pull/7382)).
+- Add explicit limit for adding relays (5 at the moment) ([#7611](https://github.com/chatmail/core/pull/7611)).
+- Take `transport_id` into account when using `imap` table.
+
+### CI
+
+- Update Rust to 1.92.0.
+
+### Miscellaneous Tasks
+
+- Apply Rust 1.92.0 clippy suggestions.
+
+### Other
+
+- Log entered login params and actual used params on configuration failure ([#7610](https://github.com/chatmail/core/pull/7610)).
+
 ## [2.34.0] - 2025-12-11
 
 ### API-Changes
@@ -7411,3 +7505,5 @@ https://github.com/chatmail/core/pulls?q=is%3Apr+is%3Aclosed
 [2.32.0]: https://github.com/chatmail/core/compare/v2.31.0..v2.32.0
 [2.33.0]: https://github.com/chatmail/core/compare/v2.32.0..v2.33.0
 [2.34.0]: https://github.com/chatmail/core/compare/v2.33.0..v2.34.0
+[2.35.0]: https://github.com/chatmail/core/compare/v2.34.0..v2.35.0
+[2.36.0]: https://github.com/chatmail/core/compare/v2.35.0..v2.36.0

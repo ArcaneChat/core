@@ -504,7 +504,7 @@ impl Context {
                         .into_owned()
                 })
             }
-            Config::SysVersion => Some((*constants::DC_VERSION_STR).clone()),
+            Config::SysVersion => Some(constants::DC_VERSION_STR.to_string()),
             Config::SysMsgsizeMaxRecommended => Some(format!("{RECOMMENDED_FILE_SIZE}")),
             Config::SysConfigKeys => Some(get_config_keys_string()),
             _ => self.sql.get_raw_config(key.as_ref()).await?,
@@ -603,12 +603,6 @@ impl Context {
         Ok(self.get_config_bool(Config::SyncMsgs).await?
             && self.get_config_bool(Config::BccSelf).await?
             && !self.get_config_bool(Config::Bot).await?)
-    }
-
-    /// Returns whether sync messages should be uploaded to the mvbox.
-    pub(crate) async fn should_move_sync_msgs(&self) -> Result<bool> {
-        Ok(self.get_config_bool(Config::MvboxMove).await?
-            || !self.get_config_bool(Config::IsChatmail).await?)
     }
 
     /// Returns whether MDNs should be requested.
@@ -880,7 +874,7 @@ impl Context {
         {
             return Ok(());
         }
-        self.scheduler.interrupt_inbox().await;
+        self.scheduler.interrupt_smtp().await;
         Ok(())
     }
 
@@ -944,7 +938,7 @@ impl Context {
     /// This should only be used by test code and during configure.
     #[cfg(test)] // AEAP is disabled, but there are still tests for it
     pub(crate) async fn set_primary_self_addr(&self, primary_new: &str) -> Result<()> {
-        self.quota.write().await.take();
+        self.quota.write().await.clear();
 
         self.sql
             .set_raw_config(Config::ConfiguredAddr.as_ref(), Some(primary_new))

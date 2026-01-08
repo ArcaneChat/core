@@ -432,14 +432,18 @@ impl ChatId {
 
         match chat.typ {
             Chattype::Single | Chattype::Group | Chattype::OutBroadcast | Chattype::InBroadcast => {
-                // User has "created a chat" with all these contacts.
-                //
                 // Previously accepting a chat literally created a chat because unaccepted chats
                 // went to "contact requests" list rather than normal chatlist.
+                // But for groups we use lower origin because users don't always check all members
+                // before accepting a chat and may not want to have the group members mixed with
+                // existing contacts. `IncomingTo` fits here by its definition.
+                let origin = match chat.typ {
+                    Chattype::Group => Origin::IncomingTo,
+                    _ => Origin::CreateChat,
+                };
                 for contact_id in get_chat_contacts(context, self).await? {
                     if contact_id != ContactId::SELF {
-                        ContactId::scaleup_origin(context, &[contact_id], Origin::CreateChat)
-                            .await?;
+                        ContactId::scaleup_origin(context, &[contact_id], origin).await?;
                     }
                 }
             }
@@ -596,6 +600,10 @@ impl ChatId {
     }
 
     /// Deletes a chat.
+    ///
+    /// Messages are deleted from the device and the chat database entry is deleted.
+    /// After that, a `MsgsChanged` event is emitted.
+    /// Messages are deleted from the server in background.
     pub async fn delete(self, context: &Context) -> Result<()> {
         self.delete_ex(context, Sync).await
     }
@@ -654,7 +662,7 @@ impl ChatId {
         context
             .set_config_internal(Config::LastHousekeeping, None)
             .await?;
-        context.scheduler.interrupt_inbox().await;
+        context.scheduler.interrupt_smtp().await;
 
         Ok(())
     }
@@ -2107,7 +2115,7 @@ pub(crate) async fn sync(context: &Context, id: SyncId, action: SyncAction) -> R
     context
         .add_sync_item(SyncData::AlterChat { id, action })
         .await?;
-    context.scheduler.interrupt_inbox().await;
+    context.scheduler.interrupt_smtp().await;
     Ok(())
 }
 
@@ -2728,7 +2736,7 @@ async fn prepare_send_msg(
     Ok(row_ids)
 }
 
-/// Constructs jobs for sending a message and inserts them into the appropriate table.
+/// Constructs jobs for sending a message and inserts them into the `smtp` table.
 ///
 /// Updates the message `GuaranteeE2ee` parameter and persists it
 /// in the database depending on whether the message
@@ -2852,30 +2860,27 @@ pub(crate) async fn create_send_msg_jobs(context: &Context, msg: &mut Message) -
     let chunk_size = context.get_max_smtp_rcpt_to().await?;
     let trans_fn = |t: &mut rusqlite::Transaction| {
         let mut row_ids = Vec::<i64>::new();
+
         if let Some(sync_ids) = rendered_msg.sync_ids_to_delete {
             t.execute(
                 &format!("DELETE FROM multi_device_sync WHERE id IN ({sync_ids})"),
                 (),
             )?;
-            t.execute(
-                "INSERT INTO imap_send (mime, msg_id) VALUES (?, ?)",
-                (&rendered_msg.message, msg.id),
+        }
+
+        for recipients_chunk in recipients.chunks(chunk_size) {
+            let recipients_chunk = recipients_chunk.join(" ");
+            let row_id = t.execute(
+                "INSERT INTO smtp (rfc724_mid, recipients, mime, msg_id) \
+                VALUES            (?1,         ?2,         ?3,   ?4)",
+                (
+                    &rendered_msg.rfc724_mid,
+                    recipients_chunk,
+                    &rendered_msg.message,
+                    msg.id,
+                ),
             )?;
-        } else {
-            for recipients_chunk in recipients.chunks(chunk_size) {
-                let recipients_chunk = recipients_chunk.join(" ");
-                let row_id = t.execute(
-                    "INSERT INTO smtp (rfc724_mid, recipients, mime, msg_id) \
-                    VALUES            (?1,         ?2,         ?3,   ?4)",
-                    (
-                        &rendered_msg.rfc724_mid,
-                        recipients_chunk,
-                        &rendered_msg.message,
-                        msg.id,
-                    ),
-                )?;
-                row_ids.push(row_id.try_into()?);
-            }
+            row_ids.push(row_id.try_into()?);
         }
         Ok(row_ids)
     };
@@ -3090,7 +3095,7 @@ pub async fn get_chat_msgs_ex(
               WHERE m.chat_id=?
                 AND m.hidden=0
                 AND (
-                    m.param GLOB \"*S=*\"
+                    m.param GLOB '*\nS=*' OR param GLOB 'S=*'
                     OR m.from_id == ?
                     OR m.to_id == ?
                 );",
@@ -3837,7 +3842,7 @@ pub(crate) async fn add_contact_to_chat_ex(
                 .log_err(context)
                 .is_ok()
         {
-            context.scheduler.interrupt_inbox().await;
+            context.scheduler.interrupt_smtp().await;
         }
     }
     context.emit_event(EventType::ChatModified(chat_id));
@@ -4311,7 +4316,7 @@ pub async fn save_msgs(context: &Context, msg_ids: &[MsgId]) -> Result<()> {
             })
             .await?;
     }
-    context.scheduler.interrupt_inbox().await;
+    context.scheduler.interrupt_smtp().await;
     Ok(())
 }
 

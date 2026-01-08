@@ -481,7 +481,7 @@ async fn inbox_fetch_idle(ctx: &Context, imap: &mut Imap, mut session: Session) 
     }
 
     // Update quota no more than once a minute.
-    if ctx.quota_needs_update(60).await
+    if ctx.quota_needs_update(session.transport_id(), 60).await
         && let Err(err) = ctx.update_recent_quota(&mut session).await
     {
         warn!(ctx, "Failed to update quota: {:#}.", err);
@@ -538,9 +538,9 @@ async fn inbox_fetch_idle(ctx: &Context, imap: &mut Imap, mut session: Session) 
         .await
         .context("Failed to download messages")?;
     session
-        .fetch_metadata(ctx)
+        .update_metadata(ctx)
         .await
-        .context("Failed to fetch metadata")?;
+        .context("update_metadata")?;
     session
         .register_token(ctx)
         .await
@@ -572,28 +572,6 @@ async fn fetch_idle(
     };
 
     if folder_config == Config::ConfiguredInboxFolder {
-        let mvbox;
-        let syncbox = match ctx.should_move_sync_msgs().await? {
-            false => &watch_folder,
-            true => {
-                mvbox = ctx.get_config(Config::ConfiguredMvboxFolder).await?;
-                mvbox.as_deref().unwrap_or(&watch_folder)
-            }
-        };
-        if ctx
-            .get_config(Config::ConfiguredAddr)
-            .await?
-            .unwrap_or_default()
-            == connection.addr
-        {
-            session
-                .send_sync_msgs(ctx, syncbox)
-                .await
-                .context("fetch_idle: send_sync_msgs")
-                .log_err(ctx)
-                .ok();
-        }
-
         session
             .store_seen_flags_on_imap(ctx)
             .await

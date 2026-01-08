@@ -172,12 +172,17 @@ impl MsgId {
         context
             .sql
             .query_map_vec(
-                "SELECT folder, uid FROM imap WHERE rfc724_mid=?",
+                "SELECT transports.addr, imap.folder, imap.uid
+                 FROM imap
+                 LEFT JOIN transports
+                 ON transports.id = imap.transport_id
+                 WHERE imap.rfc724_mid=?",
                 (rfc724_mid,),
                 |row| {
-                    let folder: String = row.get("folder")?;
-                    let uid: u32 = row.get("uid")?;
-                    Ok(format!("</{folder}/;UID={uid}>"))
+                    let addr: String = row.get(0)?;
+                    let folder: String = row.get(1)?;
+                    let uid: u32 = row.get(2)?;
+                    Ok(format!("<{addr}/{folder}/;UID={uid}>"))
                 },
             )
             .await
@@ -1724,6 +1729,7 @@ pub async fn delete_msgs_ex(
                 msgs: deleted_rfc724_mid,
             })
             .await?;
+        context.scheduler.interrupt_smtp().await;
     }
 
     for &msg_id in msg_ids {
