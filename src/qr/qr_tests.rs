@@ -841,6 +841,44 @@ async fn test_decode_account_with_custom_username() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_decode_account_with_params_missing_password() -> Result<()> {
+    // Test that missing password returns an error
+    let ctx = TestContext::new().await;
+    let result = check_qr(
+        &ctx.ctx,
+        "dcaccount:example.org?v=1&ih=imap.example.org",
+    )
+    .await;
+
+    assert!(result.is_err());
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("password missing"));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_decode_account_with_params_missing_version() -> Result<()> {
+    // Test that missing version returns an error
+    let ctx = TestContext::new().await;
+    let result = check_qr(
+        &ctx.ctx,
+        "dcaccount:example.org?p=secret&ih=imap.example.org",
+    )
+    .await;
+
+    assert!(result.is_err());
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("version missing"));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_decode_tg_socks_proxy() -> Result<()> {
     let t = TestContext::new().await;
 
