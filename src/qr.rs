@@ -656,6 +656,8 @@ async fn decode_ideltachat(context: &Context, prefix: &str, qr: &str) -> Result<
 /// scheme: `DCACCOUNT:example.org`
 /// or `DCACCOUNT:https://example.org/new`
 /// or `DCACCOUNT:https://example.org/new_email?t=1w_7wDjgjelxeX884x96v3`
+/// or `DCACCOUNT:example.org?p=password&v=1&ih=imap.example.org&ip=993&...`
+/// or `DCACCOUNT:192.168.1.1?p=password&v=1&ih=192.168.1.1&ip=993&...`
 fn decode_account(qr: &str) -> Result<Qr> {
     let payload = qr
         .get(DCACCOUNT_SCHEME.len()..)
@@ -673,9 +675,17 @@ fn decode_account(qr: &str) -> Result<Qr> {
             bail!("Bad scheme for account URL: {:?}.", url.scheme());
         }
     } else {
-        Ok(Qr::Account {
-            domain: payload.to_string(),
-        })
+        // Check if the payload contains query parameters
+        // Format: domain?p=password&v=1&...
+        if let Some((domain_or_ip, query)) = payload.split_once('?') {
+            // Parse query parameters using dclogin scheme parsing logic
+            dclogin_scheme::decode_account_with_params(domain_or_ip, query)
+        } else {
+            // Simple domain or IP without parameters
+            Ok(Qr::Account {
+                domain: payload.to_string(),
+            })
+        }
     }
 }
 

@@ -712,6 +712,135 @@ async fn test_decode_account() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_decode_account_with_ip() -> Result<()> {
+    let ctx = TestContext::new().await;
+
+    // Test IP address without parameters
+    let qr = check_qr(&ctx.ctx, "dcaccount:192.168.1.1").await?;
+    assert_eq!(
+        qr,
+        Qr::Account {
+            domain: "192.168.1.1".to_string()
+        }
+    );
+
+    // Test another IP format
+    let qr = check_qr(&ctx.ctx, "DCACCOUNT:10.0.0.1").await?;
+    assert_eq!(
+        qr,
+        Qr::Account {
+            domain: "10.0.0.1".to_string()
+        }
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_decode_account_with_params() -> Result<()> {
+    // Test dcaccount with query parameters (domain)
+    let ctx = TestContext::new().await;
+    let qr = check_qr(
+        &ctx.ctx,
+        "dcaccount:example.org?p=secret&v=1&ih=imap.example.org&ip=993&is=ssl",
+    )
+    .await?;
+
+    if let Qr::Login { address, options } = qr {
+        // Email address should have been generated with the domain
+        assert!(address.ends_with("@example.org"));
+        
+        if let dclogin_scheme::LoginOptions::V1 {
+            mail_pw,
+            imap_host,
+            imap_port,
+            imap_security,
+            ..
+        } = options
+        {
+            assert_eq!(mail_pw, "secret");
+            assert_eq!(imap_host, Some("imap.example.org".to_string()));
+            assert_eq!(imap_port, Some(993));
+            assert_eq!(imap_security, Some(Socket::Ssl));
+        } else {
+            bail!("Expected LoginOptions::V1");
+        }
+    } else {
+        bail!("Expected Qr::Login, got {:?}", qr);
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_decode_account_with_params_ip() -> Result<()> {
+    // Test dcaccount with query parameters (IP address)
+    let ctx = TestContext::new().await;
+    let qr = check_qr(
+        &ctx.ctx,
+        "DCACCOUNT:192.168.1.1?p=mypassword&v=1&ih=192.168.1.1&ip=143&is=starttls&sh=192.168.1.1&sp=587&ss=starttls",
+    )
+    .await?;
+
+    if let Qr::Login { address, options } = qr {
+        // Email address should have been generated with the IP
+        assert!(address.ends_with("@192.168.1.1"));
+        
+        if let dclogin_scheme::LoginOptions::V1 {
+            mail_pw,
+            imap_host,
+            imap_port,
+            imap_security,
+            smtp_host,
+            smtp_port,
+            smtp_security,
+            ..
+        } = options
+        {
+            assert_eq!(mail_pw, "mypassword");
+            assert_eq!(imap_host, Some("192.168.1.1".to_string()));
+            assert_eq!(imap_port, Some(143));
+            assert_eq!(imap_security, Some(Socket::Starttls));
+            assert_eq!(smtp_host, Some("192.168.1.1".to_string()));
+            assert_eq!(smtp_port, Some(587));
+            assert_eq!(smtp_security, Some(Socket::Starttls));
+        } else {
+            bail!("Expected LoginOptions::V1");
+        }
+    } else {
+        bail!("Expected Qr::Login, got {:?}", qr);
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_decode_account_with_custom_username() -> Result<()> {
+    // Test dcaccount with custom username parameter
+    let ctx = TestContext::new().await;
+    let qr = check_qr(
+        &ctx.ctx,
+        "dcaccount:example.org?p=secret&v=1&u=alice",
+    )
+    .await?;
+
+    if let Qr::Login { address, options } = qr {
+        // Email address should use the custom username
+        assert_eq!(address, "alice@example.org");
+        
+        if let dclogin_scheme::LoginOptions::V1 { mail_pw, .. } = options {
+            assert_eq!(mail_pw, "secret");
+        } else {
+            bail!("Expected LoginOptions::V1");
+        }
+    } else {
+        bail!("Expected Qr::Login, got {:?}", qr);
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_decode_tg_socks_proxy() -> Result<()> {
     let t = TestContext::new().await;
 

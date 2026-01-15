@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use anyhow::{Context as _, Result, bail};
 
 use deltachat_contact_tools::may_be_valid_addr;
+use rand::TryRngCore as _;
+use rand::distr::{Alphanumeric, SampleString};
 
 use super::{DCLOGIN_SCHEME, Qr};
 use crate::login_param::{EnteredCertificateChecks, EnteredLoginParam, EnteredServerLoginParam};
@@ -198,6 +200,62 @@ pub(crate) fn login_param_from_login_qr(
             "DeltaChat does not understand this QR Code yet, please update the app and try again."
         ),
     }
+}
+
+/// Decodes a DCACCOUNT QR code with query parameters.
+/// scheme: `DCACCOUNT:example.org?p=password&v=1[&options]`
+/// or `DCACCOUNT:192.168.1.1?p=password&v=1[&options]`
+/// 
+/// This generates a random email address using the provided domain/IP
+/// and parses the query parameters similarly to dclogin scheme.
+pub(super) fn decode_account_with_params(domain_or_ip: &str, query: &str) -> Result<Qr> {
+    // Create a fake URL to parse query parameters using the url crate
+    let fake_url = format!("dcaccount://{}?{}", domain_or_ip, query);
+    let url = url::Url::parse(&fake_url)
+        .context("Failed to parse DCACCOUNT with parameters")?;
+
+    // Parse query parameters
+    let parameter_map: HashMap<String, String> = url.query_pairs()
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+
+    // Parse options similar to dclogin
+    let options: LoginOptions = match parameter_map.get("v").map(|i| i.parse::<u32>()) {
+        Some(Ok(1)) => LoginOptions::V1 {
+            mail_pw: parameter_map
+                .get("p")
+                .map(|s| s.to_owned())
+                .context("password missing")?,
+            imap_host: parameter_map.get("ih").map(|s| s.to_owned()),
+            imap_port: parse_port(parameter_map.get("ip"))
+                .context("could not parse imap port")?,
+            imap_username: parameter_map.get("iu").map(|s| s.to_owned()),
+            imap_password: parameter_map.get("ipw").map(|s| s.to_owned()),
+            imap_security: parse_socket_security(parameter_map.get("is"))?,
+            smtp_host: parameter_map.get("sh").map(|s| s.to_owned()),
+            smtp_port: parse_port(parameter_map.get("sp"))
+                .context("could not parse smtp port")?,
+            smtp_username: parameter_map.get("su").map(|s| s.to_owned()),
+            smtp_password: parameter_map.get("spw").map(|s| s.to_owned()),
+            smtp_security: parse_socket_security(parameter_map.get("ss"))?,
+            certificate_checks: parse_certificate_checks(parameter_map.get("ic"))?,
+        },
+        Some(Ok(v)) => LoginOptions::UnsuportedVersion(v),
+        Some(Err(_)) => bail!("version could not be parsed as number"),
+        None => bail!("invalid DCACCOUNT payload: version missing"),
+    };
+
+    // Generate a random email address using the domain/IP
+    // Use the provided username if available, otherwise generate a random one
+    let address = if let Some(username) = parameter_map.get("u") {
+        format!("{}@{}", username, domain_or_ip)
+    } else {
+        let rng = &mut rand::rngs::OsRng.unwrap_err();
+        let username = Alphanumeric.sample_string(rng, 9);
+        format!("{}@{}", username, domain_or_ip)
+    };
+
+    Ok(Qr::Login { address, options })
 }
 
 #[cfg(test)]
