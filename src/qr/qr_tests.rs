@@ -879,10 +879,37 @@ async fn test_decode_account_with_params_missing_version() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_decode_account_url_encoding() -> Result<()> {
+    // Test that URL-encoded parameters are properly decoded
+    let ctx = TestContext::new().await;
+    let qr = check_qr(
+        &ctx.ctx,
+        "dcaccount:example.org?p=my%20pass%40word&v=1&u=test%2Buser",
+    )
+    .await?;
+
+    if let Qr::Login { address, options } = qr {
+        // Email address should have decoded the URL-encoded username
+        assert_eq!(address, "test+user@example.org");
+        
+        if let dclogin_scheme::LoginOptions::V1 { mail_pw, .. } = options {
+            // Password should be decoded with space and @ symbol
+            assert_eq!(mail_pw, "my pass@word");
+        } else {
+            bail!("Expected LoginOptions::V1");
+        }
+    } else {
+        bail!("Expected Qr::Login, got {:?}", qr);
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_decode_tg_socks_proxy() -> Result<()> {
     let t = TestContext::new().await;
 
-    let qr = check_qr(&t, "https://t.me/socks?server=84.53.239.95&port=4145").await?;
+    let qr = check_qr(&t.ctx, "https://t.me/socks?server=84.53.239.95&port=4145").await?;
     assert_eq!(
         qr,
         Qr::Proxy {
