@@ -1,7 +1,6 @@
 import os
 import queue
 import sys
-import base64
 from datetime import datetime, timezone
 
 import pytest
@@ -221,38 +220,6 @@ def test_webxdc_huge_update(acfactory, data, lp):
     assert update["payload"] == payload
 
 
-def test_webxdc_download_on_demand(acfactory, data, lp):
-    ac1, ac2 = acfactory.get_online_accounts(2)
-    acfactory.introduce_each_other([ac1, ac2])
-    chat = acfactory.get_accepted_chat(ac1, ac2)
-
-    msg1 = Message.new_empty(ac1, "webxdc")
-    msg1.set_text("message1")
-    msg1.set_file(data.get_path("webxdc/minimal.xdc"))
-    msg1 = chat.send_msg(msg1)
-    assert msg1.is_webxdc()
-    assert msg1.filename
-
-    msg2 = ac2._evtracker.wait_next_incoming_message()
-    assert msg2.is_webxdc()
-
-    lp.sec("ac2 sets download limit")
-    ac2.set_config("download_limit", "100")
-    assert msg1.send_status_update({"payload": base64.b64encode(os.urandom(300000))}, "some test data")
-    ac2_update = ac2._evtracker.wait_next_incoming_message()
-    assert ac2_update.download_state == dc.const.DC_DOWNLOAD_AVAILABLE
-    assert not msg2.get_status_updates()
-
-    ac2_update.download_full()
-    ac2._evtracker.get_matching("DC_EVENT_WEBXDC_STATUS_UPDATE")
-    assert msg2.get_status_updates()
-
-    # Get a event notifying that the message disappeared from the chat.
-    msgs_changed_event = ac2._evtracker.get_matching("DC_EVENT_MSGS_CHANGED")
-    assert msgs_changed_event.data1 == msg2.chat.id
-    assert msgs_changed_event.data2 == 0
-
-
 def test_enable_mvbox_move(acfactory, lp):
     (ac1,) = acfactory.get_online_accounts(1)
 
@@ -266,25 +233,6 @@ def test_enable_mvbox_move(acfactory, lp):
     lp.sec("ac1: send message and wait for ac2 to receive it")
     acfactory.get_accepted_chat(ac1, ac2).send_text("message1")
     assert ac2._evtracker.wait_next_incoming_message().text == "message1"
-
-
-def test_dont_move_sync_msgs(acfactory):
-    ac1 = acfactory.new_online_configuring_account(bcc_self=True, sync_msgs=True, fix_is_chatmail=True)
-    acfactory.bring_accounts_online()
-
-    ac1.direct_imap.select_folder("Inbox")
-    # Sync messages may also be sent during the configuration.
-    inbox_msg_cnt = len(ac1.direct_imap.get_all_messages())
-
-    ac1.set_config("displayname", "Alice")
-    ac1._evtracker.get_matching("DC_EVENT_MSG_DELIVERED")
-    ac1.set_config("displayname", "Bob")
-    ac1._evtracker.get_matching("DC_EVENT_MSG_DELIVERED")
-    ac1.direct_imap.select_folder("Inbox")
-    assert len(ac1.direct_imap.get_all_messages()) == inbox_msg_cnt + 2
-
-    ac1.direct_imap.select_folder("DeltaChat")
-    assert len(ac1.direct_imap.get_all_messages()) == 0
 
 
 def test_forward_messages(acfactory, lp):

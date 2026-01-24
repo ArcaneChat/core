@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use super::*;
+use crate::Event;
 use crate::chatlist::get_archived_cnt;
 use crate::constants::{DC_GCL_ARCHIVED_ONLY, DC_GCL_NO_SPECIALS};
 use crate::ephemeral::Timer;
@@ -1236,6 +1237,96 @@ async fn test_unarchive_if_muted() -> Result<()> {
     set_muted(&t, chat_id, MuteDuration::NotMuted).await?;
     send_text_msg(&t, chat_id, "out2".to_string()).await?;
     assert_eq!(get_archived_cnt(&t).await?, 0);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_marknoticed_all_chats() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+
+    tcm.section("alice: create chats & promote them by sending a message");
+
+    let alice_chat_normal = alice
+        .create_group_with_members("Chat (normal)", &[alice, bob])
+        .await;
+    send_text_msg(alice, alice_chat_normal, "Hi".to_string()).await?;
+
+    let alice_chat_muted = alice
+        .create_group_with_members("Chat (muted)", &[alice, bob])
+        .await;
+    send_text_msg(alice, alice_chat_muted, "Hi".to_string()).await?;
+    set_muted(&alice.ctx, alice_chat_muted, MuteDuration::Forever).await?;
+
+    let alice_chat_archived_and_muted = alice
+        .create_group_with_members("Chat (archived and muted)", &[alice, bob])
+        .await;
+    send_text_msg(alice, alice_chat_archived_and_muted, "Hi".to_string()).await?;
+    set_muted(
+        &alice.ctx,
+        alice_chat_archived_and_muted,
+        MuteDuration::Forever,
+    )
+    .await?;
+    alice_chat_archived_and_muted
+        .set_visibility(&alice.ctx, ChatVisibility::Archived)
+        .await?;
+
+    tcm.section("bob: receive messages, accept all chats and send a reply to each messsage");
+
+    while let Some(sent_msg) = alice.pop_sent_msg_opt(Duration::default()).await {
+        let bob_message = bob.recv_msg(&sent_msg).await;
+        let bob_chat_id = bob_message.chat_id;
+        bob_chat_id.accept(bob).await?;
+        send_text_msg(bob, bob_chat_id, "reply".to_string()).await?;
+    }
+
+    tcm.section("alice: receive replies from bob");
+    while let Some(sent_msg) = bob.pop_sent_msg_opt(Duration::default()).await {
+        alice.recv_msg(&sent_msg).await;
+    }
+    // ensure chats have unread messages
+    assert_eq!(alice_chat_normal.get_fresh_msg_cnt(alice).await?, 1);
+    assert_eq!(alice_chat_muted.get_fresh_msg_cnt(alice).await?, 1);
+    assert_eq!(
+        alice_chat_archived_and_muted
+            .get_fresh_msg_cnt(alice)
+            .await?,
+        1
+    );
+
+    tcm.section("alice: mark as read");
+    alice.evtracker.clear_events();
+    marknoticed_all_chats(alice).await?;
+    tcm.section("alice: check that chats are no longer unread and that chatlist update events were received");
+    assert_eq!(alice_chat_normal.get_fresh_msg_cnt(alice).await?, 0);
+    assert_eq!(alice_chat_muted.get_fresh_msg_cnt(alice).await?, 0);
+    assert_eq!(
+        alice_chat_archived_and_muted
+            .get_fresh_msg_cnt(alice)
+            .await?,
+        0
+    );
+
+    let emitted_events = alice.evtracker.take_events();
+    for event in &[
+        EventType::ChatlistItemChanged {
+            chat_id: Some(alice_chat_normal),
+        },
+        EventType::ChatlistItemChanged {
+            chat_id: Some(alice_chat_muted),
+        },
+        EventType::ChatlistItemChanged {
+            chat_id: Some(alice_chat_archived_and_muted),
+        },
+        EventType::ChatlistItemChanged {
+            chat_id: Some(DC_CHAT_ID_ARCHIVED_LINK),
+        },
+    ] {
+        assert!(emitted_events.iter().any(|Event { typ, .. }| typ == event));
+    }
 
     Ok(())
 }
@@ -2862,6 +2953,123 @@ async fn test_broadcast_multidev() -> Result<()> {
     Ok(())
 }
 
+/// Test that, if the broadcast channel owner has multiple devices
+/// and they have diverging views on the recipients,
+/// it is synced when sending a member-addition message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_broadcast_recipients_sync1() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice1 = &tcm.alice().await;
+    let alice2 = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+    let charlie = &tcm.charlie().await;
+    for a in &[alice1, alice2] {
+        a.set_config_bool(Config::SyncMsgs, true).await?;
+    }
+
+    // Alice1 creates a broadcast and adds Bob, but for some reason
+    // (e.g. because alice2 runs an older version of DC),
+    // Alice2 doesn't get to know about it
+    let a1_broadcast_id = create_broadcast(alice1, "Channel".to_string()).await?;
+    alice1.send_sync_msg().await.unwrap();
+    alice1.pop_sent_msg().await;
+
+    let qr = get_securejoin_qr(alice1, Some(a1_broadcast_id))
+        .await
+        .unwrap();
+    tcm.exec_securejoin_qr(bob, alice1, &qr).await;
+
+    // The first sync message got lost, so, alice2 doesn't know about the channel now
+    sync(alice1, alice2).await;
+    let a2_chatlist = Chatlist::try_load(alice2, 0, Some("Channel"), None).await?;
+    assert!(a2_chatlist.is_empty());
+
+    // Alice1 adds Charlie to the broadcast channel,
+    // and now, Alice2 receives the messages
+    join_securejoin(charlie, &qr).await.unwrap();
+
+    let request = charlie.pop_sent_msg().await;
+    alice1.recv_msg_trash(&request).await;
+    alice2.recv_msg_trash(&request).await;
+
+    let auth_required = alice1.pop_sent_msg().await;
+    charlie.recv_msg_trash(&auth_required).await;
+    alice2.recv_msg_trash(&auth_required).await;
+
+    let request_with_auth = charlie.pop_sent_msg().await;
+    alice1.recv_msg_trash(&request_with_auth).await;
+    alice2.recv_msg_trash(&request_with_auth).await;
+
+    let member_added = alice1.pop_sent_msg().await;
+    let a2_member_added = alice2.recv_msg(&member_added).await;
+    let _c_member_added = charlie.recv_msg(&member_added).await;
+
+    // Alice1 will now sync the full member list to Alice2:
+    sync(alice1, alice2).await;
+    let a2_chatlist = Chatlist::try_load(alice2, 0, Some("Channel"), None).await?;
+    assert_eq!(a2_chatlist.get_msg_id(0)?.unwrap(), a2_member_added.id);
+
+    let a2_bob_contact = alice2.add_or_lookup_contact_id(bob).await;
+    let a2_charlie_contact = alice2.add_or_lookup_contact_id(charlie).await;
+
+    let a2_chat_members = get_chat_contacts(alice2, a2_member_added.chat_id).await?;
+    assert!(a2_chat_members.contains(&a2_bob_contact));
+    assert!(a2_chat_members.contains(&a2_charlie_contact));
+    assert_eq!(a2_chat_members.len(), 2);
+
+    Ok(())
+}
+
+/// Test that, if the broadcast channel owner has multiple devices
+/// and they have diverging views on the recipients,
+/// sync messages only add members but don't remove them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_broadcast_recipients_sync2() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice1 = &tcm.alice().await;
+    let alice2 = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+    let charlie = &tcm.charlie().await;
+    for a in &[alice1, alice2] {
+        a.set_config_bool(Config::SyncMsgs, true).await?;
+    }
+
+    let a1_broadcast_id = create_broadcast(alice1, "Channel".to_string()).await?;
+    sync(alice1, alice2).await;
+
+    tcm.section("Alice1 adds Bob, but Alice2 misses it for some reason");
+    let qr = get_securejoin_qr(alice1, Some(a1_broadcast_id))
+        .await
+        .unwrap();
+    tcm.exec_securejoin_qr(bob, alice1, &qr).await;
+
+    tcm.section("Alice2 adds Charlie, but Alice1 misses it for some reason");
+    let a2_broadcast_id = Chatlist::try_load(alice2, 0, Some("Channel"), None)
+        .await?
+        .get_chat_id(0)
+        .unwrap();
+    let qr = get_securejoin_qr(alice2, Some(a2_broadcast_id))
+        .await
+        .unwrap();
+    tcm.exec_securejoin_qr(charlie, alice2, &qr).await;
+
+    tcm.section("The sync messages should correct the problem");
+    sync(alice1, alice2).await;
+    sync(alice2, alice1).await;
+
+    for (alice, broadcast_id) in [(alice1, a1_broadcast_id), (alice2, a2_broadcast_id)] {
+        let bob_contact = alice.add_or_lookup_contact_id(bob).await;
+        let charlie_contact = alice.add_or_lookup_contact_id(charlie).await;
+
+        let chat_members = get_chat_contacts(alice, broadcast_id).await?;
+        assert!(chat_members.contains(&bob_contact));
+        assert!(chat_members.contains(&charlie_contact));
+        assert_eq!(chat_members.len(), 2);
+    }
+
+    Ok(())
+}
+
 /// - Create a broadcast channel
 /// - Send a message into it in order to promote it
 /// - Add a contact
@@ -3116,7 +3324,7 @@ async fn test_broadcast_channel_protected_listid() -> Result<()> {
         .await?
         .grpid;
 
-    let parsed = mimeparser::MimeMessage::from_bytes(bob, sent.payload.as_bytes(), None).await?;
+    let parsed = mimeparser::MimeMessage::from_bytes(bob, sent.payload.as_bytes()).await?;
     assert_eq!(
         parsed.get_mailinglist_header().unwrap(),
         format!("My Channel <{}>", alice_list_id)
@@ -3227,6 +3435,11 @@ async fn test_remove_member_from_broadcast() -> Result<()> {
     let alice_bob_contact_id = alice.add_or_lookup_contact_id(bob).await;
     remove_contact_from_chat(alice, alice_chat_id, alice_bob_contact_id).await?;
 
+    // Alice must not remember old members,
+    // because we would like to remember the minimum information possible
+    let past_contacts = get_past_chat_contacts(alice, alice_chat_id).await?;
+    assert_eq!(past_contacts.len(), 0);
+
     let remove_msg = alice.pop_sent_msg().await;
     let rcvd = bob.recv_msg(&remove_msg).await;
     assert_eq!(rcvd.text, "Member Me removed by alice@example.org.");
@@ -3311,7 +3524,7 @@ async fn test_leave_broadcast_multidevice() -> Result<()> {
     remove_contact_from_chat(bob0, bob_chat_id, ContactId::SELF).await?;
 
     let leave_msg = bob0.pop_sent_msg().await;
-    let parsed = MimeMessage::from_bytes(bob1, leave_msg.payload().as_bytes(), None).await?;
+    let parsed = MimeMessage::from_bytes(bob1, leave_msg.payload().as_bytes()).await?;
     assert_eq!(parsed.parts[0].msg, "I left the group.");
 
     let rcvd = bob1.recv_msg(&leave_msg).await;
@@ -5275,6 +5488,97 @@ async fn test_forward_msgs_2ctx() -> Result<()> {
     assert!(msg.is_forwarded());
     assert_eq!(msg.text, bob_text);
     assert_eq!(msg.from_id, bob_alice_msg.from_id);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_forward_msgs_2ctx_with_file() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+
+    // First, establish a chat between Alice and Bob to have the chat IDs
+    let alice_chat = alice.create_chat(bob).await;
+    let alice_initial = alice.send_text(alice_chat.id, "hi").await;
+    let bob_alice_msg = bob.recv_msg(&alice_initial).await;
+    let bob_chat_id = bob_alice_msg.chat_id;
+    bob_chat_id.accept(bob).await?;
+
+    // Alice sends a message with an attached file to her self-chat
+    let alice_self_chat = alice.get_self_chat().await;
+    let file_bytes = b"test file content";
+    let file = alice.get_blobdir().join("test.txt");
+    tokio::fs::write(&file, file_bytes).await?;
+
+    let mut msg = Message::new(Viewtype::File);
+    msg.set_file_and_deduplicate(alice, &file, Some("test.txt"), Some("text/plain"))?;
+    msg.set_text("Here's a file".to_string());
+
+    alice.send_msg(alice_self_chat.id, &mut msg).await;
+    let alice_self_msg = alice.get_last_msg().await;
+
+    // Verify the file exists in Alice's blobdir
+    assert_eq!(alice_self_msg.viewtype, Viewtype::File);
+    let alice_original_file_path = alice_self_msg.get_file(alice).unwrap();
+    let alice_original_content = tokio::fs::read(&alice_original_file_path).await?;
+    assert_eq!(alice_original_content, file_bytes);
+
+    // Alice forwards the message to Bob using forward_msgs_2ctx
+    forward_msgs_2ctx(alice, &[alice_self_msg.id], bob, bob_chat_id).await?;
+
+    // Bob should have the forwarded message with the file in his database
+    let bob_msg = bob.get_last_msg().await;
+    assert_eq!(bob_msg.viewtype, Viewtype::File);
+    assert!(bob_msg.is_forwarded());
+    assert_eq!(bob_msg.text, "Here's a file");
+    assert_eq!(bob_msg.from_id, ContactId::SELF);
+
+    // Verify Bob has the file in his blobdir with correct content
+    let bob_file_path = bob_msg.get_file(bob).unwrap();
+    let bob_file_content = tokio::fs::read(&bob_file_path).await?;
+    assert_eq!(bob_file_content, file_bytes);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_forward_msgs_2ctx_missing_blob() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+
+    let alice_chat = alice.create_chat(bob).await;
+    let alice_initial = alice.send_text(alice_chat.id, "hi").await;
+    let bob_alice_msg = bob.recv_msg(&alice_initial).await;
+    let bob_chat_id = bob_alice_msg.chat_id;
+    bob_chat_id.accept(bob).await?;
+    // Alice sends a file to her self-chat
+    let alice_self_chat = alice.get_self_chat().await;
+    let file_bytes = b"test content";
+    let file = alice.get_blobdir().join("test.txt");
+    tokio::fs::write(&file, file_bytes).await?;
+
+    let mut msg = Message::new(Viewtype::File);
+    msg.set_file_and_deduplicate(alice, &file, Some("test.txt"), Some("text/plain"))?;
+    msg.set_text("File message".to_string());
+
+    alice.send_msg(alice_self_chat.id, &mut msg).await;
+    let alice_self_msg = alice.get_last_msg().await;
+
+    // Delete the blob file from Alice's blobdir to simulate a missing file
+    let alice_file_path = alice_self_msg.get_file(alice).unwrap();
+    tokio::fs::remove_file(&alice_file_path).await?;
+
+    // Alice tries to forward the message - this should fail with an error
+    let result = forward_msgs_2ctx(alice, &[alice_self_msg.id], bob, bob_chat_id).await;
+    assert!(result.is_err());
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("Failed to copy blob file")
+    );
+
     Ok(())
 }
 

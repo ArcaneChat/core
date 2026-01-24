@@ -11,11 +11,11 @@ use deltachat::blob::BlobObject;
 use deltachat::calls::ice_servers;
 use deltachat::chat::{
     self, add_contact_to_chat, forward_msgs, forward_msgs_2ctx, get_chat_media, get_chat_msgs,
-    get_chat_msgs_ex, marknoticed_chat, remove_contact_from_chat, Chat, ChatId, ChatItem,
-    MessageListOptions,
+    get_chat_msgs_ex, marknoticed_all_chats, marknoticed_chat, remove_contact_from_chat, Chat,
+    ChatId, ChatItem, MessageListOptions,
 };
 use deltachat::chatlist::Chatlist;
-use deltachat::config::Config;
+use deltachat::config::{get_all_ui_config_keys, Config};
 use deltachat::constants::DC_MSG_ID_DAYMARKER;
 use deltachat::contact::{may_be_valid_addr, Contact, ContactId, Origin};
 use deltachat::context::get_info;
@@ -23,8 +23,8 @@ use deltachat::ephemeral::Timer;
 use deltachat::imex;
 use deltachat::location;
 use deltachat::message::{
-    self, delete_msgs_ex, get_existing_msg_ids, get_msg_read_receipts, markseen_msgs, Message,
-    MessageState, MsgId, Viewtype,
+    self, delete_msgs_ex, get_existing_msg_ids, get_msg_read_receipt_count, get_msg_read_receipts,
+    markseen_msgs, Message, MessageState, MsgId, Viewtype,
 };
 use deltachat::peer_channels::{
     leave_webxdc_realtime, send_webxdc_realtime_advertisement, send_webxdc_realtime_data,
@@ -416,11 +416,11 @@ impl CommandApi {
         Ok(())
     }
 
-    /// Set configuration values from a QR code. (technically from the URI that is stored in the qrcode)
-    /// Before this function is called, `checkQr()` should confirm the type of the
-    /// QR code is `account` or `webrtcInstance`.
+    /// Set configuration values from a QR code (technically from the URI stored in it).
+    /// Before this function is called, `check_qr()` should be used to get the QR code type.
     ///
-    /// Internally, the function will call dc_set_config() with the appropriate keys,
+    /// "DCACCOUNT:" and "DCLOGIN:" QR codes configure the account, but I/O mustn't be started for
+    /// such QR codes, consider using [`Self::add_transport_from_qr`] which also restarts I/O.
     async fn set_config_from_qr(&self, account_id: u32, qr_content: String) -> Result<()> {
         let ctx = self.get_context(account_id).await?;
         qr::set_config_from_qr(&ctx, &qr_content).await
@@ -450,6 +450,12 @@ impl CommandApi {
             result.insert(key.clone(), get_config(&ctx, &key).await?);
         }
         Ok(result)
+    }
+
+    /// Returns all `ui.*` config keys that were set by the UI.
+    async fn get_all_ui_config_keys(&self, account_id: u32) -> Result<Vec<String>> {
+        let ctx = self.get_context(account_id).await?;
+        get_all_ui_config_keys(&ctx).await
     }
 
     async fn set_stock_strings(&self, strings: HashMap<u32, String>) -> Result<()> {
@@ -1158,10 +1164,24 @@ impl CommandApi {
         Ok(None)
     }
 
+    /// Mark all messages in all chats as _noticed_.
+    /// Skips messages from blocked contacts, but does not skip messages in muted chats.
+    ///
+    /// _Noticed_ messages are no longer _fresh_ and do not count as being unseen
+    /// but are still waiting for being marked as "seen" using markseen_msgs()
+    /// (read receipts aren't sent for noticed messages).
+    ///
+    /// Calling this function usually results in the event #DC_EVENT_MSGS_NOTICED.
+    /// See also markseen_msgs().
+    pub async fn marknoticed_all_chats(&self, account_id: u32) -> Result<()> {
+        let ctx = self.get_context(account_id).await?;
+        marknoticed_all_chats(&ctx).await
+    }
+
     ///  Mark all messages in a chat as _noticed_.
     ///  _Noticed_ messages are no longer _fresh_ and do not count as being unseen
     ///  but are still waiting for being marked as "seen" using markseen_msgs()
-    ///  (IMAP/MDNs is not done for noticed messages).
+    ///  (read receipts aren't sent for noticed messages).
     ///
     ///  Calling this function usually results in the event #DC_EVENT_MSGS_NOTICED.
     ///  See also markseen_msgs().
@@ -1426,6 +1446,18 @@ impl CommandApi {
     ) -> Result<MessageInfo> {
         let ctx = self.get_context(account_id).await?;
         MessageInfo::from_msg_id(&ctx, MsgId::new(message_id)).await
+    }
+
+    /// Returns count of read receipts on message.
+    ///
+    /// This view count is meant as a feedback measure for the channel owner only.
+    async fn get_message_read_receipt_count(
+        &self,
+        account_id: u32,
+        message_id: u32,
+    ) -> Result<usize> {
+        let ctx = self.get_context(account_id).await?;
+        get_msg_read_receipt_count(&ctx, MsgId::new(message_id)).await
     }
 
     /// Returns contacts that sent read receipts and the time of reading.

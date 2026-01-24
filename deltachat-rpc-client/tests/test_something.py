@@ -5,12 +5,11 @@ import logging
 import os
 import socket
 import subprocess
-import time
 from unittest.mock import MagicMock
 
 import pytest
 
-from deltachat_rpc_client import Contact, EventType, Message, events
+from deltachat_rpc_client import EventType, events
 from deltachat_rpc_client.const import DownloadState, MessageState
 from deltachat_rpc_client.pytestplugin import E2EE_INFO_MSGS
 from deltachat_rpc_client.rpc import JsonRpcError
@@ -333,7 +332,7 @@ def test_receive_imf_failure(acfactory) -> None:
     alice_contact_bob = alice.create_contact(bob, "Bob")
     alice_chat_bob = alice_contact_bob.create_chat()
 
-    bob.set_config("fail_on_receiving_full_msg", "1")
+    bob.set_config("simulate_receive_imf_error", "1")
     alice_chat_bob.send_text("Hello!")
     event = bob.wait_for_event(EventType.MSGS_CHANGED)
     assert event.chat_id == bob.get_device_chat().id
@@ -343,18 +342,17 @@ def test_receive_imf_failure(acfactory) -> None:
     version = bob.get_info()["deltachat_core_version"]
     assert (
         snapshot.text == "❌ Failed to receive a message:"
-        " Condition failed: `!context.get_config_bool(Config::FailOnReceivingFullMsg).await?`."
+        " Condition failed: `!context.get_config_bool(Config::SimulateReceiveImfError).await?`."
         f" Core version {version}."
         " Please report this bug to delta@merlinux.eu or https://support.delta.chat/."
     )
 
     # The failed message doesn't break the IMAP loop.
-    bob.set_config("fail_on_receiving_full_msg", "0")
+    bob.set_config("simulate_receive_imf_error", "0")
     alice_chat_bob.send_text("Hello again!")
     message = bob.wait_for_incoming_msg()
     snapshot = message.get_snapshot()
     assert snapshot.text == "Hello again!"
-    assert snapshot.download_state == DownloadState.DONE
     assert snapshot.error is None
 
 
@@ -372,15 +370,39 @@ def test_selfavatar_sync(acfactory, data, log) -> None:
     alice.set_config("selfavatar", image)
     avatar_config = alice.get_config("selfavatar")
     avatar_hash = os.path.basename(avatar_config)
-    print("Info: avatar hash is ", avatar_hash)
+    logging.info(f"Avatar hash is {avatar_hash}")
 
     log.section("First device receives avatar change")
     alice2.wait_for_event(EventType.SELFAVATAR_CHANGED)
     avatar_config2 = alice2.get_config("selfavatar")
     avatar_hash2 = os.path.basename(avatar_config2)
-    print("Info: avatar hash on second device is ", avatar_hash2)
+    logging.info(f"Avatar hash on second device is {avatar_hash2}")
     assert avatar_hash == avatar_hash2
     assert avatar_config != avatar_config2
+
+
+def test_dont_move_sync_msgs(acfactory, direct_imap):
+    addr, password = acfactory.get_credentials()
+    ac1 = acfactory.get_unconfigured_account()
+    ac1.set_config("bcc_self", "1")
+    ac1.set_config("fix_is_chatmail", "1")
+    ac1.add_or_update_transport({"addr": addr, "password": password})
+    ac1.bring_online()
+    ac1_direct_imap = direct_imap(ac1)
+
+    ac1_direct_imap.select_folder("Inbox")
+    # Sync messages may also be sent during configuration.
+    inbox_msg_cnt = len(ac1_direct_imap.get_all_messages())
+
+    ac1.set_config("displayname", "Alice")
+    ac1.wait_for_event(EventType.MSG_DELIVERED)
+    ac1.set_config("displayname", "Bob")
+    ac1.wait_for_event(EventType.MSG_DELIVERED)
+    ac1_direct_imap.select_folder("Inbox")
+    assert len(ac1_direct_imap.get_all_messages()) == inbox_msg_cnt + 2
+
+    ac1_direct_imap.select_folder("DeltaChat")
+    assert len(ac1_direct_imap.get_all_messages()) == 0
 
 
 def test_reaction_seen_on_another_dev(acfactory) -> None:
@@ -687,60 +709,6 @@ def test_mdn_doesnt_break_autocrypt(acfactory) -> None:
     assert snapshot.show_padlock
 
 
-def test_reaction_to_partially_fetched_msg(acfactory, tmp_path):
-    """See https://github.com/deltachat/deltachat-core-rust/issues/3688 "Partially downloaded
-    messages are received out of order".
-
-    If the Inbox contains X small messages followed by Y large messages followed by Z small
-    messages, Delta Chat first downloaded a batch of X+Z messages, and then a batch of Y messages.
-
-    This bug was discovered by @Simon-Laux while testing reactions PR #3644 and can be reproduced
-    with online test as follows:
-    - Bob enables download limit and goes offline.
-    - Alice sends a large message to Bob and reacts to this message with a thumbs-up.
-    - Bob goes online
-    - Bob first processes a reaction message and throws it away because there is no corresponding
-      message, then processes a partially downloaded message.
-    - As a result, Bob does not see a reaction
-    """
-    download_limit = 300000
-    ac1, ac2 = acfactory.get_online_accounts(2)
-    ac1_addr = ac1.get_config("addr")
-    chat = ac1.create_chat(ac2)
-    ac2.set_config("download_limit", str(download_limit))
-    ac2.stop_io()
-
-    logging.info("sending small+large messages from ac1 to ac2")
-    msgs = []
-    msgs.append(chat.send_text("hi"))
-    path = tmp_path / "large"
-    path.write_bytes(os.urandom(download_limit + 1))
-    msgs.append(chat.send_file(str(path)))
-    for m in msgs:
-        m.wait_until_delivered()
-
-    logging.info("sending a reaction to the large message from ac1 to ac2")
-    # TODO: Find the reason of an occasional message reordering on the server (so that the reaction
-    # has a lower UID than the previous message). W/a is to sleep for some time to let the reaction
-    # have a later INTERNALDATE.
-    time.sleep(1.1)
-    react_str = "\N{THUMBS UP SIGN}"
-    msgs.append(msgs[-1].send_reaction(react_str))
-    msgs[-1].wait_until_delivered()
-
-    ac2.start_io()
-
-    logging.info("wait for ac2 to receive a reaction")
-    msg2 = Message(ac2, ac2.wait_for_reactions_changed().msg_id)
-    assert msg2.get_sender_contact().get_snapshot().address == ac1_addr
-    assert msg2.get_snapshot().download_state == DownloadState.AVAILABLE
-    reactions = msg2.get_reactions()
-    contacts = [Contact(ac2, int(i)) for i in reactions.reactions_by_contact]
-    assert len(contacts) == 1
-    assert contacts[0].get_snapshot().address == ac1_addr
-    assert list(reactions.reactions_by_contact.values())[0] == [react_str]
-
-
 @pytest.mark.parametrize("n_accounts", [3, 2])
 def test_download_limit_chat_assignment(acfactory, tmp_path, n_accounts):
     download_limit = 300000
@@ -767,12 +735,157 @@ def test_download_limit_chat_assignment(acfactory, tmp_path, n_accounts):
     path = tmp_path / "large"
     path.write_bytes(os.urandom(download_limit + 1))
 
+    n_done = 0
     for i in range(10):
         logging.info("Sending message %s", i)
         alice_group.send_file(str(path))
         snapshot = bob.wait_for_incoming_msg().get_snapshot()
-        assert snapshot.download_state == DownloadState.AVAILABLE
+        if snapshot.download_state == DownloadState.DONE:
+            n_done += 1
+            # Work around lost and reordered pre-messages.
+            assert n_done <= 1
+        else:
+            assert snapshot.download_state == DownloadState.AVAILABLE
         assert snapshot.chat == bob_group
+
+
+def test_download_small_msg_first(acfactory, tmp_path):
+    download_limit = 70000
+
+    alice, bob0 = acfactory.get_online_accounts(2)
+    bob1 = bob0.clone()
+    bob1.set_config("download_limit", str(download_limit))
+
+    chat = alice.create_chat(bob0)
+    path = tmp_path / "large_enough"
+    path.write_bytes(os.urandom(download_limit + 1))
+    # Less than 140K, so sent w/o a pre-message.
+    chat.send_file(str(path))
+    chat.send_text("hi")
+    bob0.create_chat(alice)
+    assert bob0.wait_for_incoming_msg().get_snapshot().text == ""
+    assert bob0.wait_for_incoming_msg().get_snapshot().text == "hi"
+
+    bob1.start_io()
+    bob1.create_chat(alice)
+    assert bob1.wait_for_incoming_msg().get_snapshot().text == "hi"
+    assert bob1.wait_for_incoming_msg().get_snapshot().text == ""
+
+
+@pytest.mark.parametrize("delete_chat", [False, True])
+def test_delete_available_msg(acfactory, tmp_path, direct_imap, delete_chat):
+    """
+    Tests `DownloadState.AVAILABLE` message deletion on the receiver side.
+    Also tests pre- and post-message deletion on the sender side.
+    """
+    # Min. UI setting as of v2.35
+    download_limit = 163840
+    alice, bob = acfactory.get_online_accounts(2)
+    bob.set_config("download_limit", str(download_limit))
+    # Avoid immediate deletion from the server
+    alice.set_config("bcc_self", "1")
+    bob.set_config("bcc_self", "1")
+
+    chat_alice = alice.create_chat(bob)
+    path = tmp_path / "large"
+    path.write_bytes(os.urandom(download_limit + 1))
+    msg_alice = chat_alice.send_file(str(path))
+    msg_bob = bob.wait_for_incoming_msg()
+    msg_bob_snapshot = msg_bob.get_snapshot()
+    assert msg_bob_snapshot.download_state == DownloadState.AVAILABLE
+    chat_bob = bob.get_chat_by_id(msg_bob_snapshot.chat_id)
+
+    # Avoid DeleteMessages sync message
+    bob.set_config("bcc_self", "0")
+    if delete_chat:
+        chat_bob.delete()
+    else:
+        bob.delete_messages([msg_bob])
+    alice.wait_for_event(EventType.SMTP_MESSAGE_SENT)
+    alice.wait_for_event(EventType.SMTP_MESSAGE_SENT)
+    alice.set_config("bcc_self", "0")
+    if delete_chat:
+        chat_alice.delete()
+    else:
+        alice.delete_messages([msg_alice])
+    for acc in [bob, alice]:
+        if not delete_chat:
+            acc.wait_for_event(EventType.MSG_DELETED)
+        acc_direct_imap = direct_imap(acc)
+        # Messages may be deleted separately
+        while True:
+            acc.wait_for_event(EventType.IMAP_MESSAGE_DELETED)
+            while True:
+                event = acc.wait_for_event()
+                if event.kind == EventType.INFO and "Close/expunge succeeded." in event.msg:
+                    break
+            if len(acc_direct_imap.get_all_messages()) == 0:
+                break
+
+
+def test_delete_fully_downloaded_msg(acfactory, tmp_path, direct_imap):
+    alice, bob = acfactory.get_online_accounts(2)
+    # Avoid immediate deletion from the server
+    bob.set_config("bcc_self", "1")
+
+    chat_alice = alice.create_chat(bob)
+    path = tmp_path / "large"
+    # Big enough to be sent with a pre-message
+    path.write_bytes(os.urandom(300000))
+    chat_alice.send_file(str(path))
+
+    msg = bob.wait_for_incoming_msg()
+    msg_snapshot = msg.get_snapshot()
+    assert msg_snapshot.download_state == DownloadState.AVAILABLE
+    msgs_changed_event = bob.wait_for_msgs_changed_event()
+    assert msgs_changed_event.msg_id == msg.id
+    msg_snapshot = msg.get_snapshot()
+    assert msg_snapshot.download_state == DownloadState.DONE
+
+    bob_direct_imap = direct_imap(bob)
+    assert len(bob_direct_imap.get_all_messages()) == 2
+    # Avoid DeleteMessages sync message
+    bob.set_config("bcc_self", "0")
+    bob.delete_messages([msg])
+    bob.wait_for_event(EventType.MSG_DELETED)
+    # Messages may be deleted separately
+    while True:
+        bob.wait_for_event(EventType.IMAP_MESSAGE_DELETED)
+        while True:
+            event = bob.wait_for_event()
+            if event.kind == EventType.INFO and "Close/expunge succeeded." in event.msg:
+                break
+        if len(bob_direct_imap.get_all_messages()) == 0:
+            break
+
+
+def test_imap_autodelete_fully_downloaded_msg(acfactory, tmp_path, direct_imap):
+    alice, bob = acfactory.get_online_accounts(2)
+
+    chat_alice = alice.create_chat(bob)
+    path = tmp_path / "large"
+    # Big enough to be sent with a pre-message
+    path.write_bytes(os.urandom(300000))
+    chat_alice.send_file(str(path))
+
+    msg = bob.wait_for_incoming_msg()
+    msg_snapshot = msg.get_snapshot()
+    assert msg_snapshot.download_state == DownloadState.AVAILABLE
+    msgs_changed_event = bob.wait_for_msgs_changed_event()
+    assert msgs_changed_event.msg_id == msg.id
+    msg_snapshot = msg.get_snapshot()
+    assert msg_snapshot.download_state == DownloadState.DONE
+
+    bob_direct_imap = direct_imap(bob)
+    # Messages may be deleted separately
+    while True:
+        if len(bob_direct_imap.get_all_messages()) == 0:
+            break
+        bob.wait_for_event(EventType.IMAP_MESSAGE_DELETED)
+        while True:
+            event = bob.wait_for_event()
+            if event.kind == EventType.INFO and "Close/expunge succeeded." in event.msg:
+                break
 
 
 def test_markseen_contact_request(acfactory):
@@ -798,6 +911,47 @@ def test_markseen_contact_request(acfactory):
     assert message2.get_snapshot().state == MessageState.IN_SEEN
 
 
+@pytest.mark.parametrize("team_profile", [True, False])
+def test_no_markseen_in_team_profile(team_profile, acfactory):
+    """
+    Test that seen status is synchronized iff `team_profile` isn't set.
+    """
+    alice, bob = acfactory.get_online_accounts(2)
+    if team_profile:
+        bob.set_config("team_profile", "1")
+
+    # Bob sets up a second device.
+    bob2 = bob.clone()
+    bob2.start_io()
+
+    alice_chat_bob = alice.create_chat(bob)
+    bob_chat_alice = bob.create_chat(alice)
+    bob2.create_chat(alice)
+    alice_chat_bob.send_text("Hello Bob!")
+
+    message = bob.wait_for_incoming_msg()
+    message2 = bob2.wait_for_incoming_msg()
+    assert message2.get_snapshot().state == MessageState.IN_FRESH
+
+    message.mark_seen()
+
+    # Send a message and wait until it arrives
+    # in order to wait until Bob2 gets the markseen message.
+    # This also tests that outgoing messages
+    # don't mark preceeding messages as seen in team profiles.
+    bob_chat_alice.send_text("Outgoing message")
+    while True:
+        outgoing = bob2.wait_for_msg(EventType.MSGS_CHANGED)
+        if outgoing.id != 0:
+            break
+    assert outgoing.get_snapshot().text == "Outgoing message"
+
+    if team_profile:
+        assert message2.get_snapshot().state == MessageState.IN_FRESH
+    else:
+        assert message2.get_snapshot().state == MessageState.IN_SEEN
+
+
 def test_read_receipt(acfactory):
     """
     Test sending a read receipt and ensure it is attributed to the correct contact.
@@ -816,6 +970,9 @@ def test_read_receipt(acfactory):
     read_receipts = read_msg.get_read_receipts()
     assert len(read_receipts) == 1
     assert read_receipts[0].contact_id == alice_contact_bob.id
+
+    read_receipt_cnt = read_msg.get_read_receipt_count()
+    assert read_receipt_cnt == 1
 
 
 def test_get_http_response(acfactory):
@@ -1020,6 +1177,30 @@ def test_leave_broadcast(acfactory, all_devices_online):
     check_account(bob2, bob2.create_contact(alice), inviter_side=False)
 
 
+def test_leave_and_delete_group(acfactory, log):
+    alice, bob = acfactory.get_online_accounts(2)
+
+    log.section("Alice creates a group")
+    alice_chat = alice.create_group("Group")
+    alice_chat.add_contact(bob)
+    assert len(alice_chat.get_contacts()) == 2  # Alice and Bob
+    alice_chat.send_text("hello")
+
+    log.section("Bob sees the group, and leaves and deletes it")
+    msg = bob.wait_for_incoming_msg().get_snapshot()
+    assert msg.text == "hello"
+    msg.chat.accept()
+
+    msg.chat.leave()
+    # Bob deletes the chat. This must not prevent the leave message from being sent.
+    msg.chat.delete()
+
+    log.section("Alice receives the delete message")
+    # After Bob left, only Alice will be left in the group:
+    while len(alice_chat.get_contacts()) != 1:
+        alice.wait_for_event(EventType.CHAT_MODIFIED)
+
+
 def test_immediate_autodelete(acfactory, direct_imap, log):
     ac1, ac2 = acfactory.get_online_accounts(2)
 
@@ -1152,3 +1333,23 @@ def test_synchronize_member_list_on_group_rejoin(acfactory, log):
 
     assert chat.num_contacts() == 2
     assert msg.get_snapshot().chat.num_contacts() == 2
+
+
+def test_large_message(acfactory) -> None:
+    """
+    Test sending large message without download limit set,
+    so it is sent with pre-message but downloaded without user interaction.
+    """
+    alice, bob = acfactory.get_online_accounts(2)
+
+    alice_chat_bob = alice.create_chat(bob)
+    alice_chat_bob.send_message(
+        "Hello World, this message is bigger than 5 bytes",
+        file="../test-data/image/screenshot.jpg",
+    )
+
+    msg = bob.wait_for_incoming_msg()
+    msgs_changed_event = bob.wait_for_msgs_changed_event()
+    assert msg.id == msgs_changed_event.msg_id
+    snapshot = msg.get_snapshot()
+    assert snapshot.text == "Hello World, this message is bigger than 5 bytes"

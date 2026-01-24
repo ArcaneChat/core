@@ -21,6 +21,7 @@ use crate::constants::{ASM_SUBJECT, BROADCAST_INCOMPATIBILITY_MSG};
 use crate::constants::{Chattype, DC_FROM_HANDSHAKE};
 use crate::contact::{Contact, ContactId, Origin};
 use crate::context::Context;
+use crate::download::PostMsgMetadata;
 use crate::e2ee::EncryptHelper;
 use crate::ensure_and_debug_assert;
 use crate::ephemeral::Timer as EphemeralTimer;
@@ -59,6 +60,17 @@ pub enum Loaded {
     },
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum PreMessageMode {
+    /// adds the Chat-Is-Post-Message header in unprotected part
+    Post,
+    /// adds the Chat-Post-Message-ID header to protected part
+    /// also adds metadata and explicitly excludes attachment
+    Pre { post_msg_rfc724_mid: String },
+    /// Atomic ("normal") message.
+    None,
+}
+
 /// Helper to construct mime messages.
 #[derive(Debug, Clone)]
 pub struct MimeFactory {
@@ -94,6 +106,7 @@ pub struct MimeFactory {
     /// addresses and OpenPGP keys
     /// to use for encryption.
     ///
+    /// If `Some`, encrypt to self also.
     /// `None` if the message is not encrypted.
     encryption_pubkeys: Option<Vec<(String, SignedPublicKey)>>,
 
@@ -146,6 +159,9 @@ pub struct MimeFactory {
 
     /// This field is used to sustain the topic id of webxdcs needed for peer channels.
     webxdc_topic: Option<TopicId>,
+
+    /// Pre-message / post-message / atomic message.
+    pre_message_mode: PreMessageMode,
 }
 
 /// Result of rendering a message, ready to be submitted to a send job.
@@ -219,7 +235,6 @@ impl MimeFactory {
             encryption_pubkeys = if msg.param.get_bool(Param::ForcePlaintext).unwrap_or(false) {
                 None
             } else {
-                // Encrypt, but only to self.
                 Some(Vec::new())
             };
         } else if chat.is_mailing_list() {
@@ -232,6 +247,37 @@ impl MimeFactory {
 
             // Do not encrypt messages to mailing lists.
             encryption_pubkeys = None;
+        } else if let Some(fp) = must_have_only_one_recipient(&msg, &chat) {
+            let fp = fp?;
+            // In a broadcast channel, only send member-added/removed messages
+            // to the affected member
+            let (authname, addr) = context
+                .sql
+                .query_row(
+                    "SELECT authname, addr FROM contacts WHERE fingerprint=?",
+                    (fp,),
+                    |row| {
+                        let authname: String = row.get(0)?;
+                        let addr: String = row.get(1)?;
+                        Ok((authname, addr))
+                    },
+                )
+                .await?;
+
+            let public_key_bytes: Vec<_> = context
+                .sql
+                .query_get_value(
+                    "SELECT public_key FROM public_keys WHERE fingerprint=?",
+                    (fp,),
+                )
+                .await?
+                .context("Can't send member addition/removal: missing key")?;
+
+            recipients.push(addr.clone());
+            to.push((authname, addr.clone()));
+
+            let public_key = SignedPublicKey::from_slice(&public_key_bytes)?;
+            encryption_pubkeys = Some(vec![(addr, public_key)]);
         } else {
             let email_to_remove = if msg.param.get_cmd() == SystemMessage::MemberRemovedFromGroup {
                 msg.param.get(Param::Arg)
@@ -290,13 +336,6 @@ impl MimeFactory {
 
                         for row in rows {
                             let (authname, addr, fingerprint, id, add_timestamp, remove_timestamp, public_key_bytes_opt) = row?;
-
-                            // In a broadcast channel, only send member-added/removed messages
-                            // to the affected member:
-                            if let Some(fp) = must_have_only_one_recipient(&msg, &chat)
-                                && fp? != fingerprint {
-                                    continue;
-                                }
 
                             let public_key_opt = if let Some(public_key_bytes) = &public_key_bytes_opt {
                                 Some(SignedPublicKey::from_slice(public_key_bytes)?)
@@ -411,8 +450,16 @@ impl MimeFactory {
                     },
                 )
                 .await?;
-            let recipient_ids: Vec<_> = recipient_ids.into_iter().collect();
-            ContactId::scaleup_origin(context, &recipient_ids, Origin::OutgoingTo).await?;
+            let recipient_ids: Vec<_> = recipient_ids
+                .into_iter()
+                .filter(|id| *id != ContactId::SELF)
+                .collect();
+            if recipient_ids.len() == 1
+                && msg.param.get_cmd() != SystemMessage::MemberRemovedFromGroup
+                && chat.typ != Chattype::OutBroadcast
+            {
+                ContactId::scaleup_origin(context, &recipient_ids, Origin::OutgoingTo).await?;
+            }
 
             if !msg.is_system_message()
                 && msg.param.get_int(Param::Reaction).unwrap_or_default() == 0
@@ -500,6 +547,7 @@ impl MimeFactory {
             sync_ids_to_delete: None,
             attach_selfavatar,
             webxdc_topic,
+            pre_message_mode: PreMessageMode::None,
         };
         Ok(factory)
     }
@@ -515,7 +563,9 @@ impl MimeFactory {
         let timestamp = create_smeared_timestamp(context);
 
         let addr = contact.get_addr().to_string();
-        let encryption_pubkeys = if contact.is_key_contact() {
+        let encryption_pubkeys = if from_id == ContactId::SELF {
+            Some(Vec::new())
+        } else if contact.is_key_contact() {
             if let Some(key) = contact.public_key(context).await? {
                 Some(vec![(addr.clone(), key)])
             } else {
@@ -548,6 +598,7 @@ impl MimeFactory {
             sync_ids_to_delete: None,
             attach_selfavatar: false,
             webxdc_topic: None,
+            pre_message_mode: PreMessageMode::None,
         };
 
         Ok(res)
@@ -779,7 +830,10 @@ impl MimeFactory {
         headers.push(("Date", mail_builder::headers::raw::Raw::new(date).into()));
 
         let rfc724_mid = match &self.loaded {
-            Loaded::Message { msg, .. } => msg.rfc724_mid.clone(),
+            Loaded::Message { msg, .. } => match &self.pre_message_mode {
+                PreMessageMode::Pre { .. } => create_outgoing_rfc724_mid(),
+                _ => msg.rfc724_mid.clone(),
+            },
             Loaded::Mdn { .. } => create_outgoing_rfc724_mid(),
         };
         headers.push((
@@ -893,7 +947,7 @@ impl MimeFactory {
             ));
         }
 
-        let is_encrypted = self.encryption_pubkeys.is_some();
+        let is_encrypted = self.will_be_encrypted();
 
         // Add ephemeral timer for non-MDN messages.
         // For MDNs it does not matter because they are not visible
@@ -978,6 +1032,23 @@ impl MimeFactory {
             "MIME-Version",
             mail_builder::headers::raw::Raw::new("1.0").into(),
         ));
+
+        if self.pre_message_mode == PreMessageMode::Post {
+            unprotected_headers.push((
+                "Chat-Is-Post-Message",
+                mail_builder::headers::raw::Raw::new("1").into(),
+            ));
+        } else if let PreMessageMode::Pre {
+            post_msg_rfc724_mid,
+        } = &self.pre_message_mode
+        {
+            protected_headers.push((
+                "Chat-Post-Message-ID",
+                mail_builder::headers::message_id::MessageId::new(post_msg_rfc724_mid.clone())
+                    .into(),
+            ));
+        }
+
         for header @ (original_header_name, _header_value) in &headers {
             let header_name = original_header_name.to_lowercase();
             if header_name == "message-id" {
@@ -1119,6 +1190,10 @@ impl MimeFactory {
                         for (addr, key) in &encryption_pubkeys {
                             let fingerprint = key.dc_fingerprint().hex();
                             let cmd = msg.param.get_cmd();
+                            if self.pre_message_mode == PreMessageMode::Post {
+                                continue;
+                            }
+
                             let should_do_gossip = cmd == SystemMessage::MemberAddedToGroup
                                 || cmd == SystemMessage::SecurejoinMessage
                                 || multiple_recipients && {
@@ -1831,19 +1906,23 @@ impl MimeFactory {
 
         let footer = if is_reaction { "" } else { &self.selfstatus };
 
-        let message_text = format!(
-            "{}{}{}{}{}{}",
-            fwdhint.unwrap_or_default(),
-            quoted_text.unwrap_or_default(),
-            escape_message_footer_marks(final_text),
-            if !final_text.is_empty() && !footer.is_empty() {
-                "\r\n\r\n"
-            } else {
-                ""
-            },
-            if !footer.is_empty() { "-- \r\n" } else { "" },
-            footer
-        );
+        let message_text = if self.pre_message_mode == PreMessageMode::Post {
+            "".to_string()
+        } else {
+            format!(
+                "{}{}{}{}{}{}",
+                fwdhint.unwrap_or_default(),
+                quoted_text.unwrap_or_default(),
+                escape_message_footer_marks(final_text),
+                if !final_text.is_empty() && !footer.is_empty() {
+                    "\r\n\r\n"
+                } else {
+                    ""
+                },
+                if !footer.is_empty() { "-- \r\n" } else { "" },
+                footer
+            )
+        };
 
         let mut main_part = MimePart::new("text/plain", message_text);
         if is_reaction {
@@ -1875,8 +1954,19 @@ impl MimeFactory {
 
         // add attachment part
         if msg.viewtype.has_file() {
-            let file_part = build_body_file(context, &msg).await?;
-            parts.push(file_part);
+            if let PreMessageMode::Pre { .. } = self.pre_message_mode {
+                let Some(metadata) = PostMsgMetadata::from_msg(context, &msg).await? else {
+                    bail!("Failed to generate metadata for pre-message")
+                };
+
+                headers.push((
+                    HeaderDef::ChatPostMessageMetadata.into(),
+                    mail_builder::headers::raw::Raw::new(metadata.to_header_value()?).into(),
+                ));
+            } else {
+                let file_part = build_body_file(context, &msg).await?;
+                parts.push(file_part);
+            }
         }
 
         if let Some(msg_kml_part) = self.get_message_kml_part() {
@@ -1921,6 +2011,8 @@ impl MimeFactory {
             }
         }
 
+        self.attach_selfavatar =
+            self.attach_selfavatar && self.pre_message_mode != PreMessageMode::Post;
         if self.attach_selfavatar {
             match context.get_config(Config::Selfavatar).await? {
                 Some(path) => match build_avatar_file(context, &path).await {
@@ -1989,6 +2081,20 @@ impl MimeFactory {
         ));
 
         Ok(message)
+    }
+
+    pub fn will_be_encrypted(&self) -> bool {
+        self.encryption_pubkeys.is_some()
+    }
+
+    pub fn set_as_post_message(&mut self) {
+        self.pre_message_mode = PreMessageMode::Post;
+    }
+
+    pub fn set_as_pre_message_for(&mut self, post_message: &RenderedEmail) {
+        self.pre_message_mode = PreMessageMode::Pre {
+            post_msg_rfc724_mid: post_message.rfc724_mid.clone(),
+        };
     }
 }
 

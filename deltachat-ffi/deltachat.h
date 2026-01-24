@@ -22,6 +22,7 @@ typedef struct _dc_lot       dc_lot_t;
 typedef struct _dc_provider  dc_provider_t;
 typedef struct _dc_event     dc_event_t;
 typedef struct _dc_event_emitter dc_event_emitter_t;
+typedef struct _dc_event_channel dc_event_channel_t;
 typedef struct _dc_jsonrpc_instance dc_jsonrpc_instance_t;
 typedef struct _dc_backup_provider dc_backup_provider_t;
 
@@ -485,12 +486,15 @@ char*           dc_get_blobdir               (const dc_context_t* context);
  *                    0=use IMAP IDLE if the server supports it.
  *                    This is a developer option used for testing polling used as an IDLE fallback.
  * - `download_limit` = Messages up to this number of bytes are downloaded automatically.
- *                    For larger messages, only the header is downloaded and a placeholder is shown.
- *                    These messages can be downloaded fully using dc_download_full_msg() later.
- *                    The limit is compared against raw message sizes, including headers.
- *                    The actually used limit may be corrected
- *                    to not mess up with non-delivery-reports or read-receipts.
- *                    0=no limit (default).
+ *                    For messages with large attachments, two messages are sent:
+ *                    a Pre-Message containing metadata and text and a Post-Message additionally
+ *                    containing the attachment. NB: Some "extra" metadata like avatars and gossiped
+ *                    encryption keys is stripped from post-messages to save traffic.
+ *                    Pre-Messages are shown as placeholder messages. They can be downloaded fully
+ *                    using dc_download_full_msg() later. Post-Messages are automatically
+ *                    downloaded if they are smaller than the download_limit. Other messages are
+ *                    always auto-downloaded.
+ *                    0 = no limit (default).
  *                    Changes affect future messages only.
  * - `protect_autocrypt` = Enable Header Protection for Autocrypt header.
  *                    This is an experimental option not compatible to other MUAs
@@ -516,6 +520,10 @@ char*           dc_get_blobdir               (const dc_context_t* context);
  * - `webxdc_realtime_enabled` = Whether the realtime APIs should be enabled.
  *                               0 = WebXDC realtime API is disabled and behaves as noop.
  *                               1 = WebXDC realtime API is enabled (default).
+ * - `who_can_call_me` = Who can cause call notifications.
+ *                       0 = Everybody (except explicitly blocked contacts),
+ *                       1 = Contacts (default, does not include contact requests),
+ *                       2 = Nobody (calls never result in a notification).
  *
  * If you want to retrieve a value, use dc_get_config().
  *
@@ -572,11 +580,10 @@ int             dc_set_stock_translation(dc_context_t* context, uint32_t stock_i
 
 /**
  * Set configuration values from a QR code.
- * Before this function is called, dc_check_qr() should confirm the type of the
- * QR code is DC_QR_ACCOUNT or DC_QR_LOGIN.
+ * Before this function is called, dc_check_qr() should be used to get the QR code type.
  *
- * Internally, the function will call dc_set_config() with the appropriate keys,
- * e.g. `addr` and `mail_pw` for DC_QR_ACCOUNT and DC_QR_LOGIN.
+ * DC_QR_ACCOUNT and DC_QR_LOGIN QR codes configure the context, but I/O mustn't be started for such
+ * QR codes.
  *
  * @memberof dc_context_t
  * @param context The context object.
@@ -887,7 +894,7 @@ int             dc_preconfigure_keypair        (dc_context_t* context, const cha
  *       the pseudo-chat DC_CHAT_ID_ARCHIVED_LINK is added if there are _any_ archived
  *       chats
  *     - the flag DC_GCL_FOR_FORWARDING sorts "Saved messages" to the top of the chatlist
- *       and hides the "Device chat" and contact requests.
+ *       and hides the "Device chat", contact requests and incoming broadcasts.
  *       typically used on forwarding, may be combined with DC_GCL_NO_SPECIALS
  *       to also hide the archive link.
  *     - if the flag DC_GCL_NO_SPECIALS is set, archive link is not added
@@ -1556,7 +1563,7 @@ dc_array_t*     dc_wait_next_msgs            (dc_context_t* context);
  * Mark all messages in a chat as _noticed_.
  * _Noticed_ messages are no longer _fresh_ and do not count as being unseen
  * but are still waiting for being marked as "seen" using dc_markseen_msgs()
- * (IMAP/MDNs is not done for noticed messages).
+ * (read receipts aren't sent for noticed messages).
  *
  * Calling this function usually results in the event #DC_EVENT_MSGS_NOTICED.
  * See also dc_markseen_msgs().
@@ -2213,10 +2220,6 @@ uint32_t        dc_lookup_contact_id_by_addr (dc_context_t* context, const char*
 uint32_t        dc_create_contact            (dc_context_t* context, const char* name, const char* addr);
 
 
-
-// Deprecated 2025-05-20, setting this flag is a no-op.
-#define         DC_GCL_DEPRECATED_VERIFIED_ONLY         0x01
-
 #define         DC_GCL_ADD_SELF              0x02
 #define         DC_GCL_ADDRESS               0x04
 
@@ -2287,17 +2290,6 @@ dc_array_t*     dc_import_vcard              (dc_context_t* context, const char*
  *     after usage.
  */
 dc_array_t*     dc_get_contacts              (dc_context_t* context, uint32_t flags, const char* query);
-
-
-/**
- * Get the number of blocked contacts.
- *
- * @deprecated Deprecated 2021-02-22, use dc_array_get_cnt() on dc_get_blocked_contacts() instead.
- * @memberof dc_context_t
- * @param context The context object.
- * @return The number of blocked contacts.
- */
-int             dc_get_blocked_cnt           (dc_context_t* context);
 
 
 /**
@@ -2572,7 +2564,6 @@ void            dc_stop_ongoing_process      (dc_context_t* context);
 #define         DC_QR_FPR_MISMATCH           220 // id=contact
 #define         DC_QR_FPR_WITHOUT_ADDR       230 // test1=formatted fingerprint
 #define         DC_QR_ACCOUNT                250 // text1=domain
-#define         DC_QR_BACKUP                 251 // deprecated
 #define         DC_QR_BACKUP2                252
 #define         DC_QR_BACKUP_TOO_NEW         255
 #define         DC_QR_PROXY                  271 // text1=address (e.g. "127.0.0.1:9050")
@@ -3089,7 +3080,7 @@ int dc_receive_backup (dc_context_t* context, const char* qr);
 
 /**
  * Create a new account manager.
- * The account manager takes an directory
+ * The account manager takes a directory
  * where all context-databases are placed in.
  * To add a context to the account manager,
  * use dc_accounts_add_account() or dc_accounts_migrate_account().
@@ -3111,6 +3102,35 @@ int dc_receive_backup (dc_context_t* context, const char* qr);
  */
 dc_accounts_t* dc_accounts_new                  (const char* dir, int writable);
 
+/**
+ * Create a new account manager with an existing events channel,
+ * which allows you to see events emitted during startup.
+ * 
+ * The account manager takes a directory
+ * where all context-databases are placed in.
+ * To add a context to the account manager,
+ * use dc_accounts_add_account() or dc_accounts_migrate_account().
+ * All account information are persisted.
+ * To remove a context from the account manager,
+ * use dc_accounts_remove_account().
+ *
+ * @memberof dc_accounts_t
+ * @param dir The directory to create the context-databases in.
+ *     If the directory does not exist,
+ *     dc_accounts_new_with_event_channel() will try to create it.
+ * @param writable Whether the returned account manager is writable, i.e. calling these functions on
+ *     it is possible: dc_accounts_add_account(), dc_accounts_add_closed_account(),
+ *     dc_accounts_migrate_account(), dc_accounts_remove_account(), dc_accounts_select_account().
+ * @param dc_event_channel_t Events Channel to be used for this accounts manager, 
+ *      create one with dc_event_channel_new().
+ *      This channel is consumed by this method and can not be used again afterwards,
+ *      so be sure to call `dc_event_channel_get_event_emitter` before.
+ * @return An account manager object.
+ *     The object must be passed to the other account manager functions
+ *     and must be freed using dc_accounts_unref() after usage.
+ *     On errors, NULL is returned.
+ */
+dc_accounts_t* dc_accounts_new_with_event_channel(const char* dir, int writable, dc_event_channel_t* events_channel);
 
 /**
  * Free an account manager object.
@@ -3351,8 +3371,12 @@ void           dc_accounts_set_push_device_token (dc_accounts_t* accounts, const
  *     Must be freed using dc_event_emitter_unref() after usage.
  *
  * Note: Use only one event emitter per account manager.
- * Having more than one event emitter running at the same time on the same account manager
- * will result in events randomly delivered to the one or to the other.
+ * The result of having multiple event emitters is unspecified.
+ * Currently events are broadcasted to all existing event emitters,
+ * but previous versions delivered events to only one event emitter
+ * and this behavior may change again in the future.
+ * Events emitted before creation of event emitter
+ * are not available to event emitter.
  */
 dc_event_emitter_t* dc_accounts_get_event_emitter (dc_accounts_t* accounts);
 
@@ -3729,30 +3753,7 @@ uint32_t        dc_chat_get_id               (const dc_chat_t* chat);
 
 
 /**
- * Get chat type as one of the @ref DC_CHAT_TYPE constants:
- *
- * - @ref DC_CHAT_TYPE_SINGLE - a normal chat is a chat with a single contact,
- *   chats_contacts contains one record for the user. DC_CONTACT_ID_SELF
- *   (see dc_contact_t::id) is added _only_ for a self talk.
- *   These chats are created by dc_create_chat_by_contact_id().
- *
- * - @ref DC_CHAT_TYPE_GROUP - a group chat, chats_contacts contain all group
- *   members, incl. DC_CONTACT_ID_SELF.
- *   Groups are created by dc_create_group_chat().
- *
- * - @ref DC_CHAT_TYPE_MAILINGLIST - a mailing list, this is similar to groups,
- *   however, the member list cannot be retrieved completely
- *   and cannot be changed using this api.
- *   Mailing lists are created as needed by incoming messages
- *   and usually require some special server;
- *   they cannot be created by a function call as the other chat types.
- *   Moreover, for now, mailing lists are read-only.
- *
- * - @ref DC_CHAT_TYPE_BROADCAST - a broadcast list,
- *   the recipients will get messages in a one-to-one chats and
- *   the sender will get answers in a one-to-one as well.
- *   chats_contacts contain all recipients but DC_CONTACT_ID_SELF.
- *   Broadcasts are created by dc_create_broadcast_list().
+ * Get chat type as one of the @ref DC_CHAT_TYPE constants.
  *
  * @memberof dc_chat_t
  * @param chat The chat object.
@@ -4308,6 +4309,7 @@ char*             dc_msg_get_webxdc_info      (const dc_msg_t* msg);
 /**
  * Get the size of the file. Returns the size of the file associated with a
  * message, if applicable.
+ * If message is a pre-message, then this returns the size of the file to be downloaded.
  *
  * Typically, this is used to show the size of document files, e.g. a PDF.
  *
@@ -4657,7 +4659,6 @@ uint32_t        dc_msg_get_info_contact_id    (const dc_msg_t* msg);
 #define         DC_INFO_LOCATION_ONLY              9
 #define         DC_INFO_EPHEMERAL_TIMER_CHANGED   10
 #define         DC_INFO_PROTECTION_ENABLED        11
-#define         DC_INFO_PROTECTION_DISABLED       12 // deprecated 2025-07
 #define         DC_INFO_INVALID_UNENCRYPTED_MAIL  13
 #define         DC_INFO_WEBXDC_INFO_MESSAGE       32
 #define         DC_INFO_CHAT_E2EE                 50
@@ -5328,8 +5329,8 @@ int             dc_contact_is_key_contact    (dc_contact_t* contact);
  *
  * - If dc_contact_get_verifier_id() != 0,
  *   display text "Introduced by ..."
- *   with the name and address of the contact
- *   formatted by dc_contact_get_name_n_addr().
+ *   with the name of the contact
+ *   formatted by dc_contact_get_name().
  *   Prefix the text by a green checkmark.
  *
  * - If dc_contact_get_verifier_id() == 0 and dc_contact_is_verified() != 0,
@@ -5760,17 +5761,32 @@ int64_t         dc_lot_get_timestamp     (const dc_lot_t* lot);
 #define         DC_CHAT_TYPE_UNDEFINED       0
 
 /**
- * A one-to-one chat with a single contact. See dc_chat_get_type() for details.
+ * A one-to-one chat with a single contact.
+ *
+ * dc_get_chat_contacts() contains one record for the user.
+ * DC_CONTACT_ID_SELF is added _only_ for a self talk.
+ * These chats are created by dc_create_chat_by_contact_id().
  */
 #define         DC_CHAT_TYPE_SINGLE          100
 
 /**
- * A group chat. See dc_chat_get_type() for details.
+ * A group chat.
+ *
+ * dc_get_chat_contacts() contain all group members,
+ * including DC_CONTACT_ID_SELF.
+ * Groups are created by dc_create_group_chat().
  */
 #define         DC_CHAT_TYPE_GROUP           120
 
 /**
- * A mailing list. See dc_chat_get_type() for details.
+ * A mailing list.
+ *
+ * This is similar to groups,
+ * however, the member list cannot be retrieved completely
+ * and cannot be changed using an API from this library.
+ * Mailing lists are created as needed by incoming messages
+ * and usually require some special server;
+ * they cannot be created by a function call as the other chat types.
  */
 #define         DC_CHAT_TYPE_MAILINGLIST     140
 
@@ -5998,6 +6014,62 @@ char* dc_jsonrpc_next_response(dc_jsonrpc_instance_t* jsonrpc_instance);
  *     If there is no response, NULL is returned.
  */
 char* dc_jsonrpc_blocking_call(dc_jsonrpc_instance_t* jsonrpc_instance, const char *input);
+
+/**
+ * @class dc_event_channel_t
+ *
+ * Opaque object that is used to create an event emitter which can be used log events during startup of an accounts manger.
+ * Only used for dc_accounts_new_with_event_channel().
+ * To use it:
+ *   1. create an events channel with `dc_event_channel_new()`.
+ *   2. get an event emitter for it with `dc_event_channel_get_event_emitter()`.
+ *   3. use it to create your account manager with `dc_accounts_new_with_event_channel()`, which consumes the channel.
+ *   4. free the empty channel wrapper object with `dc_event_channel_unref()`.
+ */
+
+ /**
+  * Create a new event channel.
+  *
+  * @memberof dc_event_channel_t
+  * @return An event channel wrapper object (dc_event_channel_t).
+  */
+ dc_event_channel_t* dc_event_channel_new();
+ 
+ /**
+  * Release/free the events channel structure.
+  * This function releases the memory of the `dc_event_channel_t` structure.
+  *
+  * you can call it after calling dc_accounts_new_with_event_channel,
+  * which took the events channel out of it already, so this just frees the underlying option.
+  * 
+  * @memberof dc_event_channel_t
+  */
+void dc_event_channel_unref(dc_event_channel_t* event_channel);
+
+/**
+ * Create the event emitter that is used to receive events.
+ * 
+ * The library will emit various @ref DC_EVENT events, such as "new message", "message read" etc.
+ * To get these events, you have to create an event emitter using this function
+ * and call dc_get_next_event() on the emitter.
+ *
+ * This is similar to dc_get_event_emitter(), which, however,
+ * must not be called for accounts handled by the account manager.
+ * 
+ * @memberof dc_event_channel_t
+ * @param The event channel.
+ * @return Returns the event emitter, NULL on errors.
+ *     Must be freed using dc_event_emitter_unref() after usage.
+ * 
+ * Note: Use only one event emitter per account manager / event channel.
+ * The result of having multiple event emitters is unspecified.
+ * Currently events are broadcasted to all existing event emitters,
+ * but previous versions delivered events to only one event emitter
+ * and this behavior may change again in the future.
+ * Events emitted before creation of event emitter
+ * are not available to event emitter.
+ */
+dc_event_emitter_t* dc_event_channel_get_event_emitter(dc_event_channel_t* event_channel);
 
 /**
  * @class dc_event_emitter_t
@@ -6936,60 +7008,15 @@ void dc_event_unref(dc_event_t* event);
 /// Used in summaries.
 #define DC_STR_FILE                       12
 
-/// "Group name changed from %1$s to %2$s."
-///
-/// Used in status messages for group name changes.
-/// - %1$s will be replaced by the old group name
-/// - %2$s will be replaced by the new group name
-///
-/// @deprecated 2022-09-10
-#define DC_STR_MSGGRPNAME                 15
-
-/// "Group image changed."
-///
-/// Used in status messages for group images changes.
-///
-/// @deprecated 2022-09-10
-#define DC_STR_MSGGRPIMGCHANGED           16
-
-/// "Member %1$s added."
-///
-/// Used in status messages for added members.
-/// - %1$s will be replaced by the name of the added member
-///
-/// @deprecated 2022-09-10
-#define DC_STR_MSGADDMEMBER               17
-
-/// "Member %1$s removed."
-///
-/// Used in status messages for removed members.
-/// - %1$s will be replaced by the name of the removed member
-///
-/// @deprecated 2022-09-10
-#define DC_STR_MSGDELMEMBER               18
-
-/// "Group left."
-///
-/// Used in status messages.
-///
-/// @deprecated 2022-09-10
-#define DC_STR_MSGGROUPLEFT               19
-
 /// "GIF"
 ///
 /// Used in summaries.
 #define DC_STR_GIF                        23
 
-/// @deprecated 2025-07, this string is no longer needed.
-#define DC_STR_ENCRYPTEDMSG               24
-
 /// "End-to-end encryption available."
 ///
 /// Used to build the string returned by dc_get_contact_encrinfo().
 #define DC_STR_E2E_AVAILABLE              25
-
-/// @deprecated Deprecated 2021-02-07, this string is no longer needed.
-#define DC_STR_ENCR_TRANSP                27
 
 /// "No encryption."
 ///
@@ -7001,89 +7028,22 @@ void dc_event_unref(dc_event_t* event);
 /// Used to build the string returned by dc_get_contact_encrinfo().
 #define DC_STR_FINGERPRINTS               30
 
-/// "Message opened"
-///
-/// Used in subjects of outgoing read receipts.
-///
-/// @deprecated Deprecated 2024-07-26
-#define DC_STR_READRCPT                   31
-
-/// "The message '%1$s' you sent was displayed on the screen of the recipient."
-///
-/// Used as message text of outgoing read receipts.
-/// - %1$s will be replaced by the subject of the displayed message
-///
-/// @deprecated Deprecated 2024-06-23
-#define DC_STR_READRCPT_MAILBODY          32
-
-/// @deprecated Deprecated, this string is no longer needed.
-#define DC_STR_MSGGRPIMGDELETED           33
-
-/// "End-to-end encryption preferred."
-///
-/// Used to build the string returned by dc_get_contact_encrinfo().
-/// @deprecated 2025-06-05
-#define DC_STR_E2E_PREFERRED              34
-
 /// "%1$s verified"
 ///
 /// Used in status messages.
 /// - %1$s will be replaced by the name of the verified contact
 #define DC_STR_CONTACT_VERIFIED           35
 
-/// "Cannot establish guaranteed end-to-end encryption with %1$s."
-///
-/// Used in status messages.
-/// - %1$s will be replaced by the name of the contact that cannot be verified
-/// @deprecated 2025-06-05
-#define DC_STR_CONTACT_NOT_VERIFIED       36
-
-/// "Changed setup for %1$s."
-///
-/// Used in status messages.
-/// - %1$s will be replaced by the name of the contact with the changed setup
-/// @deprecated 2025-06-05
-#define DC_STR_CONTACT_SETUP_CHANGED      37
-
 /// "Archived chats"
 ///
 /// Used as the name for the corresponding chatlist entry.
 #define DC_STR_ARCHIVEDCHATS              40
-
-/// "Autocrypt Setup Message"
-///
-/// @deprecated 2025-04
-#define DC_STR_AC_SETUP_MSG_SUBJECT       42
-
-/// "This is the Autocrypt Setup Message, open it in a compatible client to use your setup"
-///
-/// @deprecated 2025-04
-#define DC_STR_AC_SETUP_MSG_BODY          43
 
 /// "Cannot login as %1$s."
 ///
 /// Used in error strings.
 /// - %1$s will be replaced by the failing login name
 #define DC_STR_CANNOT_LOGIN               60
-
-/// "%1$s by %2$s"
-///
-/// Used to concretize actions,
-/// - %1$s will be replaced by an action
-///   as #DC_STR_MSGADDMEMBER or #DC_STR_MSGGRPIMGCHANGED (full-stop removed, if any)
-/// - %2$s will be replaced by the name of the user taking that action
-///
-/// @deprecated 2022-09-10
-#define DC_STR_MSGACTIONBYUSER            62
-
-/// "%1$s by me"
-///
-/// Used to concretize actions.
-/// - %1$s will be replaced by an action
-///   as #DC_STR_MSGADDMEMBER or #DC_STR_MSGGRPIMGCHANGED (full-stop removed, if any)
-///
-/// @deprecated 2022-09-10
-#define DC_STR_MSGACTIONBYME              63
 
 /// "Location streaming enabled."
 ///
@@ -7125,13 +7085,6 @@ void dc_event_unref(dc_event_t* event);
 /// Used as message text for the message added to the device chat after successful login.
 #define DC_STR_WELCOME_MESSAGE            71
 
-/// "Unknown sender for this chat. See 'info' for more details."
-///
-/// Use as message text if assigning the message to a chat is not totally correct.
-///
-/// @deprecated 2025-08-18
-#define DC_STR_UNKNOWN_SENDER_FOR_CHAT    72
-
 /// "Message from %1$s"
 ///
 /// Used in subjects of outgoing messages in one-to-one chats.
@@ -7144,53 +7097,6 @@ void dc_event_unref(dc_event_t* event);
 /// Unused. Was used in group chat status messages.
 /// - %1$s will be replaced by the name of the contact the message cannot be sent to
 #define DC_STR_FAILED_SENDING_TO          74
-
-/// "Message deletion timer is disabled."
-///
-/// Used in status messages.
-///
-/// @deprecated 2022-09-10
-#define DC_STR_EPHEMERAL_DISABLED         75
-
-/// "Message deletion timer is set to %1$s s."
-///
-/// Used in status messages when the other constants
-/// (#DC_STR_EPHEMERAL_MINUTE, #DC_STR_EPHEMERAL_HOUR and so on) do not match the timer.
-/// - %1$s will be replaced by the number of seconds the timer is set to
-///
-/// @deprecated 2022-09-10
-#define DC_STR_EPHEMERAL_SECONDS          76
-
-/// "Message deletion timer is set to 1 minute."
-///
-/// Used in status messages.
-///
-/// @deprecated 2022-09-10
-#define DC_STR_EPHEMERAL_MINUTE           77
-
-/// "Message deletion timer is set to 1 hour."
-///
-/// Used in status messages.
-///
-/// @deprecated 2022-09-10
-#define DC_STR_EPHEMERAL_HOUR             78
-
-/// "Message deletion timer is set to 1 day."
-///
-/// Used in status messages.
-///
-/// @deprecated 2022-09-10
-#define DC_STR_EPHEMERAL_DAY              79
-
-/// "Message deletion timer is set to 1 week."
-///
-/// Used in status messages.
-///
-/// @deprecated 2022-09-10
-#define DC_STR_EPHEMERAL_WEEK             80
-
-/// @deprecated Deprecated 2021-01-30, DC_STR_EPHEMERAL_WEEKS is used instead.
-#define DC_STR_EPHEMERAL_FOUR_WEEKS       81
 
 /// "Error: %1$s"
 ///
@@ -7225,42 +7131,6 @@ void dc_event_unref(dc_event_t* event);
 /// Used as device message text.
 #define DC_STR_SELF_DELETED_MSG_BODY      91
 
-/// "Message deletion timer is set to %1$s minutes."
-///
-/// Used in status messages.
-///
-/// `%1$s` will be replaced by the number of minutes (always >1) the timer is set to.
-///
-/// @deprecated Replaced by DC_STR_MSG_YOU_EPHEMERAL_TIMER_MINUTES and DC_STR_MSG_EPHEMERAL_TIMER_MINUTES_BY.
-#define DC_STR_EPHEMERAL_MINUTES          93
-
-/// "Message deletion timer is set to %1$s hours."
-///
-/// Used in status messages.
-///
-/// `%1$s` will be replaced by the number of hours (always >1) the timer is set to.
-///
-/// @deprecated Replaced by DC_STR_MSG_YOU_EPHEMERAL_TIMER_HOURS and DC_STR_MSG_EPHEMERAL_TIMER_HOURS_BY.
-#define DC_STR_EPHEMERAL_HOURS            94
-
-/// "Message deletion timer is set to %1$s days."
-///
-/// Used in status messages.
-///
-/// `%1$s` will be replaced by the number of days (always >1) the timer is set to.
-///
-/// @deprecated Replaced by DC_STR_MSG_YOU_EPHEMERAL_TIMER_DAYS and DC_STR_MSG_EPHEMERAL_TIMER_DAYS_BY.
-#define DC_STR_EPHEMERAL_DAYS             95
-
-/// "Message deletion timer is set to %1$s weeks."
-///
-/// Used in status messages.
-///
-/// `%1$s` will be replaced by the number of weeks (always >1) the timer is set to.
-///
-/// @deprecated Replaced by DC_STR_MSG_YOU_EPHEMERAL_TIMER_WEEKS and DC_STR_MSG_EPHEMERAL_TIMER_WEEKS_BY.
-#define DC_STR_EPHEMERAL_WEEKS            96
-
 /// "Forwarded"
 ///
 /// Used in message summary text for notifications and chatlist.
@@ -7272,22 +7142,6 @@ void dc_event_unref(dc_event_t* event);
 ///
 /// `%1$s` will be replaced by the percentage used
 #define DC_STR_QUOTA_EXCEEDING_MSG_BODY   98
-
-/// "%1$s message"
-///
-/// Used as the message body when a message
-/// was not yet downloaded completely
-/// (dc_msg_get_download_state() is e.g. @ref DC_DOWNLOAD_AVAILABLE).
-///
-/// `%1$s` will be replaced by human-readable size (e.g. "1.2 MiB").
-#define DC_STR_PARTIAL_DOWNLOAD_MSG_BODY  99
-
-/// "Download maximum available until %1$s"
-///
-/// Appended after some separator to @ref DC_STR_PARTIAL_DOWNLOAD_MSG_BODY.
-///
-/// `%1$s` will be replaced by human-readable date and time.
-#define DC_STR_DOWNLOAD_AVAILABILITY      100
 
 /// "Multi Device Synchronization"
 ///
@@ -7313,10 +7167,6 @@ void dc_event_unref(dc_event_t* event);
 ///
 /// Used as a headline in the connectivity view.
 #define DC_STR_OUTGOING_MESSAGES          104
-
-
-/// @deprecated Deprecated 2022-04-16, this string is no longer needed.
-#define DC_STR_ONE_MOMENT                 106
 
 /// "Connected"
 ///
@@ -7376,8 +7226,7 @@ void dc_event_unref(dc_event_t* event);
 /// May be followed by the info-messages
 /// #DC_STR_SECURE_JOIN_REPLIES, #DC_STR_CONTACT_VERIFIED and #DC_STR_MSGADDMEMBER.
 ///
-/// `%1$s` will be replaced by name and address of the inviter,
-/// `%2$s` will be replaced by the name of the inviter.
+/// `%1$s` and `%2$s` will be replaced by name of the inviter.
 #define DC_STR_SECURE_JOIN_STARTED        117
 
 /// "%1$s replied, waiting for being added to the group…"
@@ -7394,7 +7243,7 @@ void dc_event_unref(dc_event_t* event);
 ///
 /// Subtitle for verification qrcode svg image generated by the core.
 ///
-/// `%1$s` will be replaced by name and address of the inviter.
+/// `%1$s` will be replaced by name of the inviter.
 #define DC_STR_SETUP_CONTACT_QR_DESC      119
 
 /// "Scan to join %1$s"
@@ -7409,12 +7258,6 @@ void dc_event_unref(dc_event_t* event);
 /// Used as status in the connectivity view.
 #define DC_STR_NOT_CONNECTED              121
 
-/// "%1$s changed their address from %2$s to %3$s"
-///
-/// Used as an info message to chats with contacts that changed their address.
-/// @deprecated 2025-06-05
-#define DC_STR_AEAP_ADDR_CHANGED          122
-
 /// "You changed group name from \"%1$s\" to \"%2$s\"."
 ///
 /// `%1$s` will be replaced by the old group name.
@@ -7425,7 +7268,7 @@ void dc_event_unref(dc_event_t* event);
 ///
 /// `%1$s` will be replaced by the old group name.
 /// `%2$s` will be replaced by the new group name.
-/// `%3$s` will be replaced by name and address of the contact who did the action.
+/// `%3$s` will be replaced by name of the contact who did the action.
 #define DC_STR_GROUP_NAME_CHANGED_BY_OTHER 125
 
 /// "You changed the group image."
@@ -7433,7 +7276,7 @@ void dc_event_unref(dc_event_t* event);
 
 /// "Group image changed by %1$s."
 ///
-/// `%1$s` will be replaced by name and address of the contact who did the action.
+/// `%1$s` will be replaced by name of the contact who did the action.
 #define DC_STR_GROUP_IMAGE_CHANGED_BY_OTHER 127
 
 /// "You added member %1$s."
@@ -7445,23 +7288,23 @@ void dc_event_unref(dc_event_t* event);
 
 /// "Member %1$s added by %2$s."
 ///
-/// `%1$s` will be replaced by name and address of the contact added to the group.
-/// `%2$s` will be replaced by name and address of the contact who did the action.
+/// `%1$s` will be replaced by name of the contact added to the group.
+/// `%2$s` will be replaced by name of the contact who did the action.
 ///
 /// Used in status messages.
 #define DC_STR_ADD_MEMBER_BY_OTHER 129
 
 /// "You removed member %1$s."
 ///
-/// `%1$s` will be replaced by name and address of the contact removed from the group.
+/// `%1$s` will be replaced by name of the contact removed from the group.
 ///
 /// Used in status messages.
 #define DC_STR_REMOVE_MEMBER_BY_YOU 130
 
 /// "Member %1$s removed by %2$s."
 ///
-/// `%1$s` will be replaced by name and address of the contact removed from the group.
-/// `%2$s` will be replaced by name and address of the contact who did the action.
+/// `%1$s` will be replaced by name of the contact removed from the group.
+/// `%2$s` will be replaced by name of the contact who did the action.
 ///
 /// Used in status messages.
 #define DC_STR_REMOVE_MEMBER_BY_OTHER 131
@@ -7473,7 +7316,7 @@ void dc_event_unref(dc_event_t* event);
 
 /// "Group left by %1$s."
 ///
-/// `%1$s` will be replaced by name and address of the contact.
+/// `%1$s` will be replaced by name of the contact.
 ///
 /// Used in status messages.
 #define DC_STR_GROUP_LEFT_BY_OTHER 133
@@ -7485,7 +7328,7 @@ void dc_event_unref(dc_event_t* event);
 
 /// "Group image deleted by %1$s."
 ///
-/// `%1$s` will be replaced by name and address of the contact.
+/// `%1$s` will be replaced by name of the contact.
 ///
 /// Used in status messages.
 #define DC_STR_GROUP_IMAGE_DELETED_BY_OTHER 135
@@ -7497,7 +7340,7 @@ void dc_event_unref(dc_event_t* event);
 
 /// "Location streaming enabled by %1$s."
 ///
-/// `%1$s` will be replaced by name and address of the contact.
+/// `%1$s` will be replaced by name of the contact.
 ///
 /// Used in status messages.
 #define DC_STR_LOCATION_ENABLED_BY_OTHER 137
@@ -7509,7 +7352,7 @@ void dc_event_unref(dc_event_t* event);
 
 /// "Message deletion timer is disabled by %1$s."
 ///
-/// `%1$s` will be replaced by name and address of the contact.
+/// `%1$s` will be replaced by name of the contact.
 ///
 /// Used in status messages.
 #define DC_STR_EPHEMERAL_TIMER_DISABLED_BY_OTHER 139
@@ -7524,21 +7367,10 @@ void dc_event_unref(dc_event_t* event);
 /// "Message deletion timer is set to %1$s s by %2$s."
 ///
 /// `%1$s` will be replaced by the number of seconds (always >1) the timer is set to.
-/// `%2$s` will be replaced by name and address of the contact.
+/// `%2$s` will be replaced by name of the contact.
 ///
 /// Used in status messages.
 #define DC_STR_EPHEMERAL_TIMER_SECONDS_BY_OTHER 141
-
-/// "You set message deletion timer to 1 minute."
-///
-/// @deprecated 2025-11-14, this string is no longer needed
-#define DC_STR_EPHEMERAL_TIMER_1_MINUTE_BY_YOU 142
-
-/// "Message deletion timer is set to 1 minute by %1$s."
-///
-/// `%1$s` will be replaced by name and address of the contact.
-/// @deprecated 2025-11-14, this string is no longer needed
-#define DC_STR_EPHEMERAL_TIMER_1_MINUTE_BY_OTHER 143
 
 /// "You set message deletion timer to 1 hour."
 ///
@@ -7547,7 +7379,7 @@ void dc_event_unref(dc_event_t* event);
 
 /// "Message deletion timer is set to 1 hour by %1$s."
 ///
-/// `%1$s` will be replaced by name and address of the contact.
+/// `%1$s` will be replaced by name of the contact.
 ///
 /// Used in status messages.
 #define DC_STR_EPHEMERAL_TIMER_1_HOUR_BY_OTHER 145
@@ -7559,7 +7391,7 @@ void dc_event_unref(dc_event_t* event);
 
 /// "Message deletion timer is set to 1 day by %1$s."
 ///
-/// `%1$s` will be replaced by name and address of the contact.
+/// `%1$s` will be replaced by name of the contact.
 ///
 /// Used in status messages.
 #define DC_STR_EPHEMERAL_TIMER_1_DAY_BY_OTHER 147
@@ -7571,7 +7403,7 @@ void dc_event_unref(dc_event_t* event);
 
 /// "Message deletion timer is set to 1 week by %1$s."
 ///
-/// `%1$s` will be replaced by name and address of the contact.
+/// `%1$s` will be replaced by name of the contact.
 ///
 /// Used in status messages.
 #define DC_STR_EPHEMERAL_TIMER_1_WEEK_BY_OTHER 149
@@ -7588,7 +7420,7 @@ void dc_event_unref(dc_event_t* event);
 /// Used in status messages.
 ///
 /// `%1$s` will be replaced by the number of minutes (always >1) the timer is set to.
-/// `%2$s` will be replaced by name and address of the contact.
+/// `%2$s` will be replaced by name of the contact.
 #define DC_STR_EPHEMERAL_TIMER_MINUTES_BY_OTHER 151
 
 /// "You set message deletion timer to %1$s hours."
@@ -7603,7 +7435,7 @@ void dc_event_unref(dc_event_t* event);
 /// Used in status messages.
 ///
 /// `%1$s` will be replaced by the number of hours (always >1) the timer is set to.
-/// `%2$s` will be replaced by name and address of the contact.
+/// `%2$s` will be replaced by name of the contact.
 #define DC_STR_EPHEMERAL_TIMER_HOURS_BY_OTHER 153
 
 /// "You set message deletion timer to %1$s days."
@@ -7618,7 +7450,7 @@ void dc_event_unref(dc_event_t* event);
 /// Used in status messages.
 ///
 /// `%1$s` will be replaced by the number of days (always >1) the timer is set to.
-/// `%2$s` will be replaced by name and address of the contact.
+/// `%2$s` will be replaced by name of the contact.
 #define DC_STR_EPHEMERAL_TIMER_DAYS_BY_OTHER 155
 
 /// "You set message deletion timer to %1$s weeks."
@@ -7633,7 +7465,7 @@ void dc_event_unref(dc_event_t* event);
 /// Used in status messages.
 ///
 /// `%1$s` will be replaced by the number of weeks (always >1) the timer is set to.
-/// `%2$s` will be replaced by name and address of the contact.
+/// `%2$s` will be replaced by name of the contact.
 #define DC_STR_EPHEMERAL_TIMER_WEEKS_BY_OTHER 157
 
 /// "You set message deletion timer to 1 year."
@@ -7643,14 +7475,14 @@ void dc_event_unref(dc_event_t* event);
 
 /// "Message deletion timer is set to 1 year by %1$s."
 ///
-/// `%1$s` will be replaced by name and address of the contact.
+/// `%1$s` will be replaced by name of the contact.
 ///
 /// Used in status messages.
 #define DC_STR_EPHEMERAL_TIMER_1_YEAR_BY_OTHER 159
 
 /// "Scan to set up second device for %1$s"
 ///
-/// `%1$s` will be replaced by name and address of the account.
+/// `%1$s` will be replaced by name of the account.
 #define DC_STR_BACKUP_TRANSFER_QR 162
 
 /// "Account transferred to your second device."
@@ -7708,17 +7540,6 @@ void dc_event_unref(dc_event_t* event);
 ///
 /// Used as info message.
 #define DC_STR_SECUREJOIN_WAIT 190
-
-/// "Could not yet establish guaranteed end-to-end encryption, but you may already send a message."
-///
-/// @deprecated 2025-03
-#define DC_STR_SECUREJOIN_WAIT_TIMEOUT 191
-
-/// "The contact must be online to proceed. This process will continue automatically in background."
-///
-/// Used as info message.
-/// @deprecated 2025-06-05
-#define DC_STR_SECUREJOIN_TAKES_LONGER 192
 
 /// "❤️ Seems you're enjoying Delta Chat!"… (donation request device message)
 #define DC_STR_DONATION_REQUEST 193

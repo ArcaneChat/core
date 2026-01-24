@@ -4,6 +4,7 @@
 //! This means, the "Call ID" is a "Message ID" - similar to Webxdc IDs.
 use crate::chat::ChatIdBlocked;
 use crate::chat::{Chat, ChatId, send_msg};
+use crate::config::Config;
 use crate::constants::{Blocked, Chattype};
 use crate::contact::ContactId;
 use crate::context::{Context, WeakContext};
@@ -16,6 +17,8 @@ use crate::net::dns::lookup_host_with_cache;
 use crate::param::Param;
 use crate::tools::{normalize_text, time};
 use anyhow::{Context as _, Result, ensure};
+use deltachat_derive::{FromSql, ToSql};
+use num_traits::FromPrimitive;
 use sdp::SessionDescription;
 use serde::Serialize;
 use std::io::Cursor;
@@ -348,26 +351,34 @@ impl Context {
                             false
                         }
                     };
-                    if let Some(chat_id_blocked) =
-                        ChatIdBlocked::lookup_by_contact(self, from_id).await?
-                    {
-                        match chat_id_blocked.blocked {
-                            Blocked::Not => {
-                                self.emit_event(EventType::IncomingCall {
-                                    msg_id: call.msg.id,
-                                    chat_id: call.msg.chat_id,
-                                    place_call_info: call.place_call_info.to_string(),
-                                    has_video,
-                                });
-                            }
-                            Blocked::Yes | Blocked::Request => {
-                                // Do not notify about incoming calls
-                                // from contact requests and blocked contacts.
-                                //
-                                // User can still access the call and accept it
-                                // via the chat in case of contact requests.
-                            }
-                        }
+                    let can_call_me = match who_can_call_me(self).await? {
+                        WhoCanCallMe::Contacts => ChatIdBlocked::lookup_by_contact(self, from_id)
+                            .await?
+                            .is_some_and(|chat_id_blocked| {
+                                match chat_id_blocked.blocked {
+                                    Blocked::Not => true,
+                                    Blocked::Yes | Blocked::Request => {
+                                        // Do not notify about incoming calls
+                                        // from contact requests and blocked contacts.
+                                        //
+                                        // User can still access the call and accept it
+                                        // via the chat in case of contact requests.
+                                        false
+                                    }
+                                }
+                            }),
+                        WhoCanCallMe::Everybody => ChatIdBlocked::lookup_by_contact(self, from_id)
+                            .await?
+                            .is_none_or(|chat_id_blocked| chat_id_blocked.blocked != Blocked::Yes),
+                        WhoCanCallMe::Nobody => false,
+                    };
+                    if can_call_me {
+                        self.emit_event(EventType::IncomingCall {
+                            msg_id: call.msg.id,
+                            chat_id: call.msg.chat_id,
+                            place_call_info: call.place_call_info.to_string(),
+                            has_video,
+                        });
                     }
                     let wait = call.remaining_ring_seconds();
                     let context = self.get_weak_context();
@@ -606,33 +617,7 @@ struct IceServer {
     pub credential: Option<String>,
 }
 
-/// Creates JSON with ICE servers.
-async fn create_ice_servers(
-    context: &Context,
-    hostname: &str,
-    port: u16,
-    username: &str,
-    password: &str,
-) -> Result<String> {
-    // Do not use cache because there is no TLS.
-    let load_cache = false;
-    let urls: Vec<String> = lookup_host_with_cache(context, hostname, port, "", load_cache)
-        .await?
-        .into_iter()
-        .map(|addr| format!("turn:{addr}"))
-        .collect();
-
-    let ice_server = IceServer {
-        urls,
-        username: Some(username.to_string()),
-        credential: Some(password.to_string()),
-    };
-
-    let json = serde_json::to_string(&[ice_server])?;
-    Ok(json)
-}
-
-/// Creates JSON with ICE servers from a line received over IMAP METADATA.
+/// Creates ICE servers from a line received over IMAP METADATA.
 ///
 /// IMAP METADATA returns a line such as
 /// `example.com:3478:1758650868:8Dqkyyu11MVESBqjbIylmB06rv8=`
@@ -642,20 +627,107 @@ async fn create_ice_servers(
 /// while `8Dqkyyu11MVESBqjbIylmB06rv8=`
 /// is the password.
 pub(crate) async fn create_ice_servers_from_metadata(
-    context: &Context,
     metadata: &str,
-) -> Result<(i64, String)> {
+) -> Result<(i64, Vec<UnresolvedIceServer>)> {
     let (hostname, rest) = metadata.split_once(':').context("Missing hostname")?;
     let (port, rest) = rest.split_once(':').context("Missing port")?;
     let port = u16::from_str(port).context("Failed to parse the port")?;
     let (ts, password) = rest.split_once(':').context("Missing timestamp")?;
     let expiration_timestamp = i64::from_str(ts).context("Failed to parse the timestamp")?;
-    let ice_servers = create_ice_servers(context, hostname, port, ts, password).await?;
+    let ice_servers = vec![UnresolvedIceServer::Turn {
+        hostname: hostname.to_string(),
+        port,
+        username: ts.to_string(),
+        credential: password.to_string(),
+    }];
     Ok((expiration_timestamp, ice_servers))
 }
 
+/// STUN or TURN server with unresolved DNS name.
+#[derive(Debug, Clone)]
+pub(crate) enum UnresolvedIceServer {
+    /// STUN server.
+    Stun { hostname: String, port: u16 },
+
+    /// TURN server with the username and password.
+    Turn {
+        hostname: String,
+        port: u16,
+        username: String,
+        credential: String,
+    },
+}
+
+/// Resolves domain names of ICE servers.
+///
+/// On failure to resolve, logs the error
+/// and skips the server, but does not fail.
+pub(crate) async fn resolve_ice_servers(
+    context: &Context,
+    unresolved_ice_servers: Vec<UnresolvedIceServer>,
+) -> Result<String> {
+    let mut result: Vec<IceServer> = Vec::new();
+
+    // Do not use cache because there is no TLS.
+    let load_cache = false;
+
+    for unresolved_ice_server in unresolved_ice_servers {
+        match unresolved_ice_server {
+            UnresolvedIceServer::Stun { hostname, port } => {
+                match lookup_host_with_cache(context, &hostname, port, "", load_cache).await {
+                    Ok(addrs) => {
+                        let urls: Vec<String> = addrs
+                            .into_iter()
+                            .map(|addr| format!("stun:{addr}"))
+                            .collect();
+                        let stun_server = IceServer {
+                            urls,
+                            username: None,
+                            credential: None,
+                        };
+                        result.push(stun_server);
+                    }
+                    Err(err) => {
+                        warn!(
+                            context,
+                            "Failed to resolve STUN {hostname}:{port}: {err:#}."
+                        );
+                    }
+                }
+            }
+            UnresolvedIceServer::Turn {
+                hostname,
+                port,
+                username,
+                credential,
+            } => match lookup_host_with_cache(context, &hostname, port, "", load_cache).await {
+                Ok(addrs) => {
+                    let urls: Vec<String> = addrs
+                        .into_iter()
+                        .map(|addr| format!("turn:{addr}"))
+                        .collect();
+                    let turn_server = IceServer {
+                        urls,
+                        username: Some(username),
+                        credential: Some(credential),
+                    };
+                    result.push(turn_server);
+                }
+                Err(err) => {
+                    warn!(
+                        context,
+                        "Failed to resolve TURN {hostname}:{port}: {err:#}."
+                    );
+                }
+            },
+        }
+    }
+    let json = serde_json::to_string(&result)?;
+    Ok(json)
+}
+
 /// Creates JSON with ICE servers when no TURN servers are known.
-pub(crate) async fn create_fallback_ice_servers(context: &Context) -> Result<String> {
+pub(crate) fn create_fallback_ice_servers() -> Vec<UnresolvedIceServer> {
     // Do not use public STUN server from https://stunprotocol.org/.
     // It changes the hostname every year
     // (e.g. stunserver2025.stunprotocol.org
@@ -663,36 +735,18 @@ pub(crate) async fn create_fallback_ice_servers(context: &Context) -> Result<Str
     // because of bandwidth costs:
     // <https://github.com/jselbie/stunserver/issues/50>
 
-    let hostname = "nine.testrun.org";
-    // Do not use cache because there is no TLS.
-    let load_cache = false;
-    let urls: Vec<String> = lookup_host_with_cache(context, hostname, STUN_PORT, "", load_cache)
-        .await?
-        .into_iter()
-        .map(|addr| format!("stun:{addr}"))
-        .collect();
-    let stun_server = IceServer {
-        urls,
-        username: None,
-        credential: None,
-    };
-
-    let hostname = "turn.delta.chat";
-    // Do not use cache because there is no TLS.
-    let load_cache = false;
-    let urls: Vec<String> = lookup_host_with_cache(context, hostname, STUN_PORT, "", load_cache)
-        .await?
-        .into_iter()
-        .map(|addr| format!("turn:{addr}"))
-        .collect();
-    let turn_server = IceServer {
-        urls,
-        username: Some("public".to_string()),
-        credential: Some("o4tR7yG4rG2slhXqRUf9zgmHz".to_string()),
-    };
-
-    let json = serde_json::to_string(&[stun_server, turn_server])?;
-    Ok(json)
+    vec![
+        UnresolvedIceServer::Stun {
+            hostname: "nine.testrun.org".to_string(),
+            port: STUN_PORT,
+        },
+        UnresolvedIceServer::Turn {
+            hostname: "turn.delta.chat".to_string(),
+            port: STUN_PORT,
+            username: "public".to_string(),
+            credential: "o4tR7yG4rG2slhXqRUf9zgmHz".to_string(),
+        },
+    ]
 }
 
 /// Returns JSON with ICE servers.
@@ -706,10 +760,38 @@ pub(crate) async fn create_fallback_ice_servers(context: &Context) -> Result<Str
 /// <https://github.com/deltachat/deltachat-desktop/issues/5447>.
 pub async fn ice_servers(context: &Context) -> Result<String> {
     if let Some(ref metadata) = *context.metadata.read().await {
-        Ok(metadata.ice_servers.clone())
+        let ice_servers = resolve_ice_servers(context, metadata.ice_servers.clone()).await?;
+        Ok(ice_servers)
     } else {
         Ok("[]".to_string())
     }
+}
+
+/// "Who can call me" config options.
+#[derive(
+    Debug, Default, Display, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive, FromSql, ToSql,
+)]
+#[repr(u8)]
+pub enum WhoCanCallMe {
+    /// Everybody can call me if they are not blocked.
+    ///
+    /// This includes contact requests.
+    Everybody = 0,
+
+    /// Every contact who is not blocked and not a contact request, can call.
+    #[default]
+    Contacts = 1,
+
+    /// Nobody can call me.
+    Nobody = 2,
+}
+
+/// Returns currently configuration of the "who can call me" option.
+async fn who_can_call_me(context: &Context) -> Result<WhoCanCallMe> {
+    let who_can_call_me =
+        WhoCanCallMe::from_i32(context.get_config_int(Config::WhoCanCallMe).await?)
+            .unwrap_or_default();
+    Ok(who_can_call_me)
 }
 
 #[cfg(test)]

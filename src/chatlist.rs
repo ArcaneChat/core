@@ -76,7 +76,7 @@ impl Chatlist {
     ///   the pseudo-chat DC_CHAT_ID_ARCHIVED_LINK is added if there are *any* archived
     ///   chats
     /// - the flag DC_GCL_FOR_FORWARDING sorts "Saved messages" to the top of the chatlist
-    ///   and hides the device-chat and contact requests
+    ///   and hides the device-chat, contact requests and incoming broadcasts.
     ///   typically used on forwarding, may be combined with DC_GCL_NO_SPECIALS
     /// - if the flag DC_GCL_NO_SPECIALS is set, archive link is not added
     ///   to the list (may be used eg. for selecting chats on forwarding, the flag is
@@ -224,8 +224,9 @@ impl Chatlist {
                 let process_rows = |rows: rusqlite::AndThenRows<_>| {
                     rows.filter_map(|row: std::result::Result<(_, _, Params, _), _>| match row {
                         Ok((chat_id, typ, param, msg_id)) => {
-                            if typ == Chattype::Mailinglist
-                                && param.get(Param::ListPost).is_none_or_empty()
+                            if typ == Chattype::InBroadcast
+                                || (typ == Chattype::Mailinglist
+                                    && param.get(Param::ListPost).is_none_or_empty())
                             {
                                 None
                             } else {
@@ -396,8 +397,6 @@ impl Chatlist {
             if lastmsg.from_id == ContactId::SELF {
                 None
             } else if chat.typ == Chattype::Group
-                || chat.typ == Chattype::OutBroadcast
-                || chat.typ == Chattype::InBroadcast
                 || chat.typ == Chattype::Mailinglist
                 || chat.is_self_talk()
             {
@@ -471,10 +470,11 @@ mod tests {
     use super::*;
     use crate::chat::save_msgs;
     use crate::chat::{
-        add_contact_to_chat, create_group, get_chat_contacts, remove_contact_from_chat,
-        send_text_msg, set_chat_name,
+        add_contact_to_chat, create_broadcast, create_group, get_chat_contacts,
+        remove_contact_from_chat, send_text_msg, set_chat_name,
     };
     use crate::receive_imf::receive_imf;
+    use crate::securejoin::get_securejoin_qr;
     use crate::stock_str::StockMessage;
     use crate::test_utils::TestContext;
     use crate::test_utils::TestContextManager;
@@ -596,6 +596,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(chats.len(), 1);
+    }
+
+    /// Test that DC_CHAT_TYPE_IN_BROADCAST are hidden
+    /// and DC_CHAT_TYPE_OUT_BROADCAST are shown in chatlist for forwarding.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_broadcast_visiblity_on_forward() -> Result<()> {
+        let mut tcm = TestContextManager::new();
+        let alice = &tcm.alice().await;
+        let bob = &tcm.bob().await;
+
+        let alice_broadcast_a_id = create_broadcast(alice, "Channel Alice".to_string()).await?;
+        let qr = get_securejoin_qr(alice, Some(alice_broadcast_a_id))
+            .await
+            .unwrap();
+        let bob_broadcast_a_id = tcm.exec_securejoin_qr(bob, alice, &qr).await;
+        let bob_broadcast_b_id = create_broadcast(bob, "Channel Bob".to_string()).await?;
+
+        let chats = Chatlist::try_load(bob, DC_GCL_FOR_FORWARDING, None, None)
+            .await
+            .unwrap();
+
+        assert!(
+            !chats
+                .iter()
+                .any(|(chat_id, _)| chat_id == &bob_broadcast_a_id),
+            "alice broadcast is not shown in bobs forwarding chatlist"
+        );
+        assert!(
+            chats
+                .iter()
+                .any(|(chat_id, _)| chat_id == &bob_broadcast_b_id),
+            "bobs own broadcast is shown in his forwarding chatlist"
+        );
+
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -801,6 +836,32 @@ mod tests {
         let chatlist = Chatlist::try_load(&bob, 0, None, None).await?;
         let summary = chatlist.get_summary(&bob, 0, None).await?;
         assert_eq!(summary.prefix.unwrap().to_string(), "alice@example.org");
+        assert_eq!(summary.text, "hi");
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_no_summary_prefix_for_channel() -> Result<()> {
+        let mut tcm = TestContextManager::new();
+        let alice = tcm.alice().await;
+        let bob = tcm.bob().await;
+
+        let alice_chat_id = create_broadcast(&alice, "alice's channel".to_string()).await?;
+        let qr = get_securejoin_qr(&alice, Some(alice_chat_id)).await?;
+        tcm.exec_securejoin_qr(&bob, &alice, &qr).await;
+
+        send_text_msg(&alice, alice_chat_id, "hi".into()).await?;
+        let sent1 = alice.pop_sent_msg().await;
+        let chatlist = Chatlist::try_load(&alice, 0, None, None).await?;
+        let summary = chatlist.get_summary(&alice, 0, None).await?;
+        assert!(summary.prefix.is_none());
+        assert_eq!(summary.text, "hi");
+
+        bob.recv_msg(&sent1).await;
+        let chatlist = Chatlist::try_load(&bob, 0, None, None).await?;
+        let summary = chatlist.get_summary(&bob, 0, None).await?;
+        assert!(summary.prefix.is_none());
         assert_eq!(summary.text, "hi");
 
         Ok(())

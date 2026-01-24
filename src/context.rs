@@ -36,6 +36,8 @@ use crate::tools::{self, duration_to_str, time, time_elapsed};
 use crate::transport::ConfiguredLoginParam;
 use crate::{chatlist_events, stats};
 
+pub use crate::scheduler::connectivity::Connectivity;
+
 /// Builder for the [`Context`].
 ///
 /// Many arguments to the [`Context`] are kind of optional and only needed to handle
@@ -960,6 +962,10 @@ impl Context {
             self.get_config_int(Config::ShowEmails).await?.to_string(),
         );
         res.insert(
+            "who_can_call_me",
+            self.get_config_int(Config::WhoCanCallMe).await?.to_string(),
+        );
+        res.insert(
             "download_limit",
             self.get_config_int(Config::DownloadLimit)
                 .await?
@@ -1094,18 +1100,15 @@ impl Context {
                 .unwrap_or_default(),
         );
         res.insert(
-            "fail_on_receiving_full_msg",
-            self.sql
-                .get_raw_config("fail_on_receiving_full_msg")
-                .await?
-                .unwrap_or_default(),
-        );
-        res.insert(
             "std_header_protection_composing",
             self.sql
                 .get_raw_config("std_header_protection_composing")
                 .await?
                 .unwrap_or_default(),
+        );
+        res.insert(
+            "team_profile",
+            self.get_config_bool(Config::TeamProfile).await?.to_string(),
         );
 
         let elapsed = time_elapsed(&self.creation_time);
@@ -1124,21 +1127,19 @@ impl Context {
         let list = self
             .sql
             .query_map_vec(
-                concat!(
-                    "SELECT m.id",
-                    " FROM msgs m",
-                    " LEFT JOIN contacts ct",
-                    "        ON m.from_id=ct.id",
-                    " LEFT JOIN chats c",
-                    "        ON m.chat_id=c.id",
-                    " WHERE m.state=?",
-                    "   AND m.hidden=0",
-                    "   AND m.chat_id>9",
-                    "   AND ct.blocked=0",
-                    "   AND c.blocked=0",
-                    "   AND NOT(c.muted_until=-1 OR c.muted_until>?)",
-                    " ORDER BY m.timestamp DESC,m.id DESC;"
-                ),
+                "SELECT m.id
+FROM msgs m
+LEFT JOIN contacts ct
+    ON m.from_id=ct.id
+LEFT JOIN chats c
+    ON m.chat_id=c.id
+WHERE m.state=?
+AND m.hidden=0
+AND m.chat_id>9
+AND ct.blocked=0
+AND c.blocked=0
+AND NOT(c.muted_until=-1 OR c.muted_until>?)
+ORDER BY m.timestamp DESC,m.id DESC",
                 (MessageState::InFresh, time()),
                 |row| {
                     let msg_id: MsgId = row.get(0)?;

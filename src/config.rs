@@ -354,7 +354,17 @@ pub enum Config {
     DonationRequestNextCheck,
 
     /// Defines the max. size (in bytes) of messages downloaded automatically.
+    ///
+    /// For messages with large attachments, two messages are sent:
+    /// a Pre-Message containing metadata and text and a Post-Message additionally
+    /// containing the attachment. NB: Some "extra" metadata like avatars and gossiped
+    /// encryption keys is stripped from post-messages to save traffic.
+    /// Pre-Messages are shown as placeholder messages. They can be downloaded fully using
+    /// `MsgId::download_full()` later. Post-Messages are automatically downloaded if they are
+    /// smaller than the download_limit. Other messages are always auto-downloaded.
+    ///
     /// 0 = no limit.
+    /// Changes only affect future messages.
     #[strum(props(default = "655360"))]
     DownloadLimit,
 
@@ -438,14 +448,24 @@ pub enum Config {
     /// using this still run unmodified code.
     TestHooks,
 
-    /// Return an error from `receive_imf_inner()` for a fully downloaded message. For tests.
-    FailOnReceivingFullMsg,
+    /// Return an error from `receive_imf_inner()`. For tests.
+    SimulateReceiveImfError,
 
     /// Enable composing emails with Header Protection as defined in
     /// <https://www.rfc-editor.org/rfc/rfc9788.html> "Header Protection for Cryptographically
     /// Protected Email".
     #[strum(props(default = "1"))]
     StdHeaderProtectionComposing,
+
+    /// Who can call me.
+    ///
+    /// The options are from the `WhoCanCallMe` enum.
+    #[strum(props(default = "1"))]
+    WhoCanCallMe,
+
+    /// Experimental option denoting that the current profile is shared between multiple team members.
+    /// For now, the only effect of this option is that seen flags are not synchronized.
+    TeamProfile,
 }
 
 impl Config {
@@ -947,7 +967,7 @@ impl Context {
         Ok(())
     }
 
-    /// Returns all primary and secondary self addresses.
+    /// Returns the primary self address followed by all secondary ones.
     pub(crate) async fn get_all_self_addrs(&self) -> Result<Vec<String>> {
         let primary_addrs = self.get_config(Config::ConfiguredAddr).await?.into_iter();
         let secondary_addrs = self.get_secondary_self_addrs().await?.into_iter();
@@ -981,6 +1001,19 @@ fn get_config_keys_string() -> String {
     });
 
     format!(" {keys} ")
+}
+
+/// Returns all `ui.*` config keys that were set by the UI.
+pub async fn get_all_ui_config_keys(context: &Context) -> Result<Vec<String>> {
+    let ui_keys = context
+        .sql
+        .query_map_vec(
+            "SELECT keyname FROM config WHERE keyname GLOB 'ui.*' ORDER BY config.id",
+            (),
+            |row| Ok(row.get::<_, String>(0)?),
+        )
+        .await?;
+    Ok(ui_keys)
 }
 
 #[cfg(test)]

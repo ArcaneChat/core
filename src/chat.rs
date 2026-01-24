@@ -12,12 +12,14 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use chrono::TimeZone;
 use deltachat_contact_tools::{ContactAddress, sanitize_bidi_characters, sanitize_single_line};
+use humansize::{BINARY, format_size};
 use mail_builder::mime::MimePart;
 use serde::{Deserialize, Serialize};
 use strum_macros::EnumIter;
 
 use crate::blob::BlobObject;
 use crate::chatlist::Chatlist;
+use crate::chatlist_events;
 use crate::color::str_to_color;
 use crate::config::Config;
 use crate::constants::{
@@ -27,7 +29,9 @@ use crate::constants::{
 use crate::contact::{self, Contact, ContactId, Origin};
 use crate::context::Context;
 use crate::debug_logging::maybe_set_logging_xdc;
-use crate::download::DownloadState;
+use crate::download::{
+    DownloadState, PRE_MSG_ATTACHMENT_SIZE_THRESHOLD, PRE_MSG_SIZE_WARNING_THRESHOLD,
+};
 use crate::ephemeral::{Timer as EphemeralTimer, start_chat_ephemeral_timers};
 use crate::events::EventType;
 use crate::key::self_fingerprint;
@@ -35,11 +39,11 @@ use crate::location;
 use crate::log::{LogExt, warn};
 use crate::logged_debug_assert;
 use crate::message::{self, Message, MessageState, MsgId, Viewtype};
-use crate::mimefactory::MimeFactory;
+use crate::mimefactory::{MimeFactory, RenderedEmail};
 use crate::mimeparser::SystemMessage;
 use crate::param::{Param, Params};
 use crate::receive_imf::ReceivedMsg;
-use crate::smtp::send_msg_to_smtp;
+use crate::smtp::{self, send_msg_to_smtp};
 use crate::stock_str;
 use crate::sync::{self, Sync::*, SyncData};
 use crate::tools::{
@@ -48,7 +52,6 @@ use crate::tools::{
     gm2local_offset, normalize_text, smeared_time, time, truncate_msg_text,
 };
 use crate::webxdc::StatusUpdateSerial;
-use crate::{chatlist_events, imap};
 
 pub(crate) const PARAM_BROADCAST_SECRET: Param = Param::Arg3;
 
@@ -625,18 +628,26 @@ impl ChatId {
             .sql
             .transaction(|transaction| {
                 transaction.execute(
-                    "UPDATE imap SET target=? WHERE rfc724_mid IN (SELECT rfc724_mid FROM msgs WHERE chat_id=?)",
-                    (delete_msgs_target, self,),
+                    "UPDATE imap SET target=? WHERE rfc724_mid IN (SELECT rfc724_mid FROM msgs WHERE chat_id=? AND rfc724_mid!='')",
+                    (&delete_msgs_target, self,),
                 )?;
                 transaction.execute(
-                    "DELETE FROM smtp WHERE msg_id IN (SELECT id FROM msgs WHERE chat_id=?)",
-                    (self,),
+                    "UPDATE imap SET target=? WHERE rfc724_mid IN (SELECT pre_rfc724_mid FROM msgs WHERE chat_id=? AND pre_rfc724_mid!='')",
+                    (&delete_msgs_target, self,),
                 )?;
                 transaction.execute(
                     "DELETE FROM msgs_mdns WHERE msg_id IN (SELECT id FROM msgs WHERE chat_id=?)",
                     (self,),
                 )?;
-                transaction.execute("DELETE FROM msgs WHERE chat_id=?", (self,))?;
+                // If you change which information is preserved here, also change `MsgId::trash()`
+                // and other places it references.
+                transaction.execute(
+                    "
+INSERT OR REPLACE INTO msgs (id, rfc724_mid, pre_rfc724_mid, timestamp, chat_id, deleted)
+SELECT id, rfc724_mid, pre_rfc724_mid, timestamp, ?, 1 FROM msgs WHERE chat_id=?
+                    ",
+                    (DC_CHAT_ID_TRASH, self),
+                )?;
                 transaction.execute("DELETE FROM chats_contacts WHERE chat_id=?", (self,))?;
                 transaction.execute("DELETE FROM chats WHERE id=?", (self,))?;
                 Ok(())
@@ -2120,10 +2131,11 @@ pub(crate) async fn sync(context: &Context, id: SyncId, action: SyncAction) -> R
 }
 
 /// Whether the chat is pinned or archived.
-#[derive(Debug, Copy, Eq, PartialEq, Clone, Serialize, Deserialize, EnumIter)]
+#[derive(Debug, Copy, Eq, PartialEq, Clone, Serialize, Deserialize, EnumIter, Default)]
 #[repr(i8)]
 pub enum ChatVisibility {
     /// Chat is neither archived nor pinned.
+    #[default]
     Normal = 0,
 
     /// Chat is archived.
@@ -2736,6 +2748,60 @@ async fn prepare_send_msg(
     Ok(row_ids)
 }
 
+/// Renders the Message or splits it into Pre- and Post-Message.
+///
+/// Pre-Message is a small message with metadata which announces a larger Post-Message.
+/// Post-Messages are not downloaded in the background.
+///
+/// If pre-message is not nessesary, this returns `None` as the 0th value.
+async fn render_mime_message_and_pre_message(
+    context: &Context,
+    msg: &mut Message,
+    mimefactory: MimeFactory,
+) -> Result<(Option<RenderedEmail>, RenderedEmail)> {
+    let needs_pre_message = msg.viewtype.has_file()
+        && mimefactory.will_be_encrypted() // unencrypted is likely email, we don't want to spam by sending multiple messages
+        && msg
+            .get_filebytes(context)
+            .await?
+            .context("filebytes not available, even though message has attachment")?
+            > PRE_MSG_ATTACHMENT_SIZE_THRESHOLD;
+
+    if needs_pre_message {
+        info!(
+            context,
+            "Message {} is large and will be split into pre- and post-messages.", msg.id,
+        );
+
+        let mut mimefactory_post_msg = mimefactory.clone();
+        mimefactory_post_msg.set_as_post_message();
+        let rendered_msg = mimefactory_post_msg
+            .render(context)
+            .await
+            .context("Failed to render post-message")?;
+
+        let mut mimefactory_pre_msg = mimefactory;
+        mimefactory_pre_msg.set_as_pre_message_for(&rendered_msg);
+        let rendered_pre_msg = mimefactory_pre_msg
+            .render(context)
+            .await
+            .context("pre-message failed to render")?;
+
+        if rendered_pre_msg.message.len() > PRE_MSG_SIZE_WARNING_THRESHOLD {
+            warn!(
+                context,
+                "Pre-message for message {} is larger than expected: {}.",
+                msg.id,
+                rendered_pre_msg.message.len()
+            );
+        }
+
+        Ok((Some(rendered_pre_msg), rendered_msg))
+    } else {
+        Ok((None, mimefactory.render(context).await?))
+    }
+}
+
 /// Constructs jobs for sending a message and inserts them into the `smtp` table.
 ///
 /// Updates the message `GuaranteeE2ee` parameter and persists it
@@ -2769,24 +2835,11 @@ pub(crate) async fn create_send_msg_jobs(context: &Context, msg: &mut Message) -
     let from = context.get_primary_self_addr().await?;
     let lowercase_from = from.to_lowercase();
 
-    // Send BCC to self if it is enabled.
-    //
-    // Previous versions of Delta Chat did not send BCC self
-    // if DeleteServerAfter was set to immediately delete messages
-    // from the server. This is not the case anymore
-    // because BCC-self messages are also used to detect
-    // that message was sent if SMTP server is slow to respond
-    // and connection is frequently lost
-    // before receiving status line. NB: This is not a problem for chatmail servers, so `BccSelf`
-    // disabled by default is fine.
-    //
-    // `from` must be the last addr, see `receive_imf_inner()` why.
     recipients.retain(|x| x.to_lowercase() != lowercase_from);
-    if (context.get_config_bool(Config::BccSelf).await?
-        || msg.param.get_cmd() == SystemMessage::AutocryptSetupMessage)
-        && (context.get_config_delete_server_after().await? != Some(0) || !recipients.is_empty())
+    if context.get_config_bool(Config::BccSelf).await?
+        || msg.param.get_cmd() == SystemMessage::AutocryptSetupMessage
     {
-        recipients.push(from);
+        smtp::add_self_recipients(context, &mut recipients, needs_encryption).await?;
     }
 
     // Default Webxdc integrations are hidden messages and must not be sent out
@@ -2807,13 +2860,32 @@ pub(crate) async fn create_send_msg_jobs(context: &Context, msg: &mut Message) -
         return Ok(Vec::new());
     }
 
-    let rendered_msg = match mimefactory.render(context).await {
-        Ok(res) => Ok(res),
-        Err(err) => {
-            message::set_msg_failed(context, msg, &err.to_string()).await?;
-            Err(err)
-        }
-    }?;
+    let (rendered_pre_msg, rendered_msg) =
+        match render_mime_message_and_pre_message(context, msg, mimefactory).await {
+            Ok(res) => Ok(res),
+            Err(err) => {
+                message::set_msg_failed(context, msg, &err.to_string()).await?;
+                Err(err)
+            }
+        }?;
+
+    if let (post_msg, Some(pre_msg)) = (&rendered_msg, &rendered_pre_msg) {
+        info!(
+            context,
+            "Message {} sizes: pre-message: {}; post-message: {}.",
+            msg.id,
+            format_size(pre_msg.message.len(), BINARY),
+            format_size(post_msg.message.len(), BINARY),
+        );
+        msg.pre_rfc724_mid = pre_msg.rfc724_mid.clone();
+    } else {
+        info!(
+            context,
+            "Message {} will be sent in one shot (no pre- and post-message). Size: {}.",
+            msg.id,
+            format_size(rendered_msg.message.len(), BINARY),
+        );
+    }
 
     if needs_encryption && !rendered_msg.is_encrypted {
         /* unrecoverable */
@@ -2852,8 +2924,13 @@ pub(crate) async fn create_send_msg_jobs(context: &Context, msg: &mut Message) -
     context
         .sql
         .execute(
-            "UPDATE msgs SET subject=?, param=? WHERE id=?",
-            (&msg.subject, msg.param.to_string(), msg.id),
+            "UPDATE msgs SET pre_rfc724_mid=?, subject=?, param=? WHERE id=?",
+            (
+                &msg.pre_rfc724_mid,
+                &msg.subject,
+                msg.param.to_string(),
+                msg.id,
+            ),
         )
         .await?;
 
@@ -2867,19 +2944,27 @@ pub(crate) async fn create_send_msg_jobs(context: &Context, msg: &mut Message) -
                 (),
             )?;
         }
-
+        let mut stmt = t.prepare(
+            "INSERT INTO smtp (rfc724_mid, recipients, mime, msg_id)
+            VALUES            (?1,         ?2,         ?3,   ?4)",
+        )?;
         for recipients_chunk in recipients.chunks(chunk_size) {
             let recipients_chunk = recipients_chunk.join(" ");
-            let row_id = t.execute(
-                "INSERT INTO smtp (rfc724_mid, recipients, mime, msg_id) \
-                VALUES            (?1,         ?2,         ?3,   ?4)",
-                (
-                    &rendered_msg.rfc724_mid,
-                    recipients_chunk,
-                    &rendered_msg.message,
+            if let Some(pre_msg) = &rendered_pre_msg {
+                let row_id = stmt.execute((
+                    &pre_msg.rfc724_mid,
+                    &recipients_chunk,
+                    &pre_msg.message,
                     msg.id,
-                ),
-            )?;
+                ))?;
+                row_ids.push(row_id.try_into()?);
+            }
+            let row_id = stmt.execute((
+                &rendered_msg.rfc724_mid,
+                &recipients_chunk,
+                &rendered_msg.message,
+                msg.id,
+            ))?;
             row_ids.push(row_id.try_into()?);
         }
         Ok(row_ids)
@@ -3121,6 +3206,36 @@ pub async fn get_chat_msgs_ex(
     Ok(items)
 }
 
+/// Marks all unread messages in all chats as noticed.
+/// Ignores messages from blocked contacts, but does not ignore messages in muted chats.
+pub async fn marknoticed_all_chats(context: &Context) -> Result<()> {
+    // The sql statement here is similar to the one in get_fresh_msgs
+    let list = context
+        .sql
+        .query_map_vec(
+            "SELECT DISTINCT(c.id)
+                 FROM msgs m
+                 INNER JOIN chats c
+                        ON m.chat_id=c.id
+                 WHERE m.state=?
+                   AND m.hidden=0
+                   AND m.chat_id>9
+                   AND c.blocked=0;",
+            (MessageState::InFresh,),
+            |row| {
+                let msg_id: ChatId = row.get(0)?;
+                Ok(msg_id)
+            },
+        )
+        .await?;
+
+    for chat_id in list {
+        marknoticed_chat(context, chat_id).await?;
+    }
+
+    Ok(())
+}
+
 /// Marks all messages in the chat as noticed.
 /// If the given chat-id is the archive-link, marks all messages in all archived chats as noticed.
 pub async fn marknoticed_chat(context: &Context, chat_id: ChatId) -> Result<()> {
@@ -3182,7 +3297,7 @@ pub async fn marknoticed_chat(context: &Context, chat_id: ChatId) -> Result<()> 
         let hidden_messages = context
             .sql
             .query_map_vec(
-                "SELECT id, rfc724_mid FROM msgs
+                "SELECT id FROM msgs
                     WHERE state=?
                       AND hidden=1
                       AND chat_id=?
@@ -3190,16 +3305,11 @@ pub async fn marknoticed_chat(context: &Context, chat_id: ChatId) -> Result<()> 
                 (MessageState::InFresh, chat_id), // No need to check for InNoticed messages, because reactions are never InNoticed
                 |row| {
                     let msg_id: MsgId = row.get(0)?;
-                    let rfc724_mid: String = row.get(1)?;
-                    Ok((msg_id, rfc724_mid))
+                    Ok(msg_id)
                 },
             )
             .await?;
-        for (msg_id, rfc724_mid) in &hidden_messages {
-            message::update_msg_state(context, *msg_id, MessageState::InSeen).await?;
-            imap::markseen_on_imap_table(context, rfc724_mid).await?;
-        }
-
+        message::markseen_msgs(context, hidden_messages).await?;
         if noticed_msgs_count == 0 {
             return Ok(());
         }
@@ -3221,6 +3331,10 @@ pub(crate) async fn mark_old_messages_as_noticed(
     context: &Context,
     mut msgs: Vec<ReceivedMsg>,
 ) -> Result<()> {
+    if context.get_config_bool(Config::TeamProfile).await? {
+        return Ok(());
+    }
+
     msgs.retain(|m| m.state.is_outgoing());
     if msgs.is_empty() {
         return Ok(());
@@ -4003,7 +4117,7 @@ pub async fn remove_contact_from_chat(
         } else {
             let mut sync = Nosync;
 
-            if chat.is_promoted() {
+            if chat.is_promoted() && chat.typ != Chattype::OutBroadcast {
                 remove_from_chat_contacts_table(context, chat_id, contact_id).await?;
             } else {
                 remove_from_chat_contacts_table_without_trace(context, chat_id, contact_id).await?;
@@ -4261,8 +4375,19 @@ pub async fn forward_msgs_2ctx(
             msg.viewtype = Viewtype::Text;
         }
 
+        if msg.download_state != DownloadState::Done {
+            msg.text += &msg.additional_text;
+        }
+
         let param = &mut param;
-        msg.param.steal(param, Param::File);
+
+        // When forwarding between different accounts, blob files must be physically copied
+        // because each account has its own blob directory.
+        if let Some(src_path) = param.get_file_path(ctx_src)? {
+            let new_blob = BlobObject::create_and_deduplicate(ctx_dst, &src_path, &src_path)
+                .context("Failed to copy blob file to destination account")?;
+            msg.param.set(Param::File, new_blob.as_name());
+        }
         msg.param.steal(param, Param::Filename);
         msg.param.steal(param, Param::Width);
         msg.param.steal(param, Param::Height);
@@ -4337,12 +4462,18 @@ pub(crate) async fn save_copy_in_self_talk(
     msg.param.remove(Param::WebxdcDocumentTimestamp);
     msg.param.remove(Param::WebxdcSummary);
     msg.param.remove(Param::WebxdcSummaryTimestamp);
+    msg.param.remove(Param::PostMessageFileBytes);
+    msg.param.remove(Param::PostMessageViewtype);
+
+    if msg.download_state != DownloadState::Done {
+        msg.text += &msg.additional_text;
+    }
 
     if !msg.original_msg_id.is_unset() {
         bail!("message already saved.");
     }
 
-    let copy_fields = "from_id, to_id, timestamp_rcvd, type, txt,
+    let copy_fields = "from_id, to_id, timestamp_rcvd, type,
                        mime_modified, mime_headers, mime_compressed, mime_in_reply_to, subject, msgrmsg";
     let row_id = context
         .sql
@@ -4350,7 +4481,7 @@ pub(crate) async fn save_copy_in_self_talk(
             &format!(
                 "INSERT INTO msgs ({copy_fields},
                                    timestamp_sent,
-                                   chat_id, rfc724_mid, state, timestamp, param, starred)
+                                   txt, chat_id, rfc724_mid, state, timestamp, param, starred)
                  SELECT            {copy_fields},
                                    -- Outgoing messages on originating device
                                    -- have timestamp_sent == 0.
@@ -4358,10 +4489,11 @@ pub(crate) async fn save_copy_in_self_talk(
                                    -- so UIs display the same timestamp
                                    -- for saved and original message.
                                    IIF(timestamp_sent == 0, timestamp, timestamp_sent),
-                                   ?, ?, ?, ?, ?, ?
+                                   ?, ?, ?, ?, ?, ?, ?
                  FROM msgs WHERE id=?;"
             ),
             (
+                msg.text,
                 dest_chat_id,
                 dest_rfc724_mid,
                 if msg.from_id == ContactId::SELF {
@@ -4821,12 +4953,20 @@ async fn set_contacts_by_fingerprints(
     context
         .sql
         .transaction(move |transaction| {
-            transaction.execute("DELETE FROM chats_contacts WHERE chat_id=?", (id,))?;
+            // For broadcast channels, we only add members,
+            // because we don't use the membership consistency algorithm,
+            // and are using sync messages as a basic way to ensure consistency between devices.
+            // For groups, we also remove members,
+            // because the sync message is used in order to sync unpromoted groups.
+            if chat.typ != Chattype::OutBroadcast {
+                transaction.execute("DELETE FROM chats_contacts WHERE chat_id=?", (id,))?;
+            }
 
             // We do not care about `add_timestamp` column
             // because timestamps are not used for broadcast channels.
-            let mut statement = transaction
-                .prepare("INSERT INTO chats_contacts (chat_id, contact_id) VALUES (?, ?)")?;
+            let mut statement = transaction.prepare(
+                "INSERT OR IGNORE INTO chats_contacts (chat_id, contact_id) VALUES (?, ?)",
+            )?;
             for contact_id in &contacts {
                 statement.execute((id, contact_id))?;
             }
