@@ -63,10 +63,7 @@ pub enum StockMessage {
     #[strum(props(fallback = "GIF"))]
     Gif = 23,
 
-    #[strum(props(fallback = "End-to-end encryption available"))]
-    E2eAvailable = 25,
-
-    #[strum(props(fallback = "No encryption"))]
+    #[strum(props(fallback = "No encryption."))]
     EncrNone = 28,
 
     #[strum(props(fallback = "Fingerprints"))]
@@ -415,6 +412,11 @@ https://delta.chat/donate"))]
 
     #[strum(props(fallback = "Messages in this chat use classic email and are not encrypted."))]
     ChatUnencryptedExplanation = 230,
+
+    #[strum(props(
+        fallback = "You are using the legacy option \"Settings → Advanced → Move automatically to DeltaChat Folder\".\n\nThis option will be removed in a few weeks and you should disable it already today.\n\nIf having chat messages mixed into your inbox is a problem, see https://delta.chat/legacy-move"
+    ))]
+    MvboxMoveDeprecation = 231,
 }
 
 impl StockMessage {
@@ -705,11 +707,6 @@ pub(crate) async fn msg_reacted(
 /// Stock string: `GIF`.
 pub(crate) async fn gif(context: &Context) -> String {
     translated(context, StockMessage::Gif).await
-}
-
-/// Stock string: `End-to-end encryption available.`.
-pub(crate) async fn e2e_available(context: &Context) -> String {
-    translated(context, StockMessage::E2eAvailable).await
 }
 
 /// Stock string: `No encryption.`.
@@ -1229,6 +1226,11 @@ pub(crate) async fn proxy_description(context: &Context) -> String {
 /// Stock string: `Messages in this chat use classic email and are not encrypted.`.
 pub(crate) async fn chat_unencrypted_explanation(context: &Context) -> String {
     translated(context, StockMessage::ChatUnencryptedExplanation).await
+}
+
+/// Stock string: `You are using the legacy option "Move automatically to DeltaChat Folder`…
+pub(crate) async fn mvbox_move_deprecation(context: &Context) -> String {
+    translated(context, StockMessage::MvboxMoveDeprecation).await
 }
 
 impl Viewtype {

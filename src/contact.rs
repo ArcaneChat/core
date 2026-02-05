@@ -1342,13 +1342,13 @@ WHERE addr=?
         let fingerprint_other = fingerprint_other.to_string();
 
         let stock_message = if contact.public_key(context).await?.is_some() {
-            stock_str::e2e_available(context).await
+            stock_str::messages_e2e_encrypted(context).await
         } else {
             stock_str::encr_none(context).await
         };
 
         let finger_prints = stock_str::finger_prints(context).await;
-        let mut ret = format!("{stock_message}.\n{finger_prints}:");
+        let mut ret = format!("{stock_message}\n{finger_prints}:");
 
         let fingerprint_self = load_self_public_key(context)
             .await?
@@ -1454,7 +1454,7 @@ WHERE addr=?
     /// Returns true if the contact is a key-contact.
     /// Otherwise it is an addresss-contact.
     pub fn is_key_contact(&self) -> bool {
-        self.fingerprint.is_some()
+        self.fingerprint.is_some() || self.id == ContactId::SELF
     }
 
     /// Returns OpenPGP fingerprint of a contact.

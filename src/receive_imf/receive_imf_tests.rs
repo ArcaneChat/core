@@ -4,8 +4,9 @@ use tokio::fs;
 
 use super::*;
 use crate::chat::{
-    ChatItem, ChatVisibility, add_contact_to_chat, add_to_chat_contacts_table, create_group,
-    get_chat_contacts, get_chat_msgs, is_contact_in_chat, remove_contact_from_chat, send_text_msg,
+    CantSendReason, ChatItem, ChatVisibility, add_contact_to_chat, add_to_chat_contacts_table,
+    create_group, get_chat_contacts, get_chat_msgs, is_contact_in_chat, remove_contact_from_chat,
+    send_text_msg,
 };
 use crate::chatlist::Chatlist;
 use crate::constants::DC_GCL_FOR_FORWARDING;
@@ -3283,7 +3284,8 @@ async fn test_blocked_contact_creates_group() -> Result<()> {
 
     let sent = bob.send_text(group_id, "Heyho, I'm a spammer!").await;
     let rcvd = alice.recv_msg(&sent).await;
-    // Alice blocked Bob, so she shouldn't get the message
+    // Alice blocked Bob, so she shouldn't be notified.
+    assert_eq!(rcvd.state, MessageState::InSeen);
     assert_eq!(rcvd.chat_blocked, Blocked::Yes);
 
     // Fiona didn't block Bob, though, so she gets the message
@@ -5107,6 +5109,100 @@ async fn test_dont_verify_by_verified_by_unknown() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_recv_outgoing_msg_before_securejoin() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let bob = &tcm.bob().await;
+    let a0 = &tcm.elena().await;
+    let a1 = &tcm.elena().await;
+
+    tcm.execute_securejoin(bob, a0).await;
+    let chat_id_a0_bob = a0.create_chat_id(bob).await;
+    let sent_msg = a0.send_text(chat_id_a0_bob, "Hi").await;
+    bob.recv_msg(&sent_msg).await;
+    let msg_a1 = a1.recv_msg(&sent_msg).await;
+    assert!(msg_a1.get_showpadlock());
+    let chat_a1 = Chat::load_from_db(a1, msg_a1.chat_id).await?;
+    assert_eq!(chat_a1.typ, Chattype::Group);
+    assert!(!chat_a1.is_encrypted(a1).await?);
+    assert_eq!(
+        chat::get_chat_contacts(a1, chat_a1.id).await?,
+        [a1.add_or_lookup_address_contact_id(bob).await]
+    );
+    assert_eq!(
+        chat_a1.why_cant_send(a1).await?,
+        Some(CantSendReason::NotAMember)
+    );
+
+    let sent_msg = a0.send_text(chat_id_a0_bob, "Hi again").await;
+    bob.recv_msg(&sent_msg).await;
+    let msg_a1 = a1.recv_msg(&sent_msg).await;
+    assert!(msg_a1.get_showpadlock());
+    assert_eq!(msg_a1.chat_id, chat_a1.id);
+    let chat_a1 = Chat::load_from_db(a1, msg_a1.chat_id).await?;
+    assert_eq!(
+        chat_a1.why_cant_send(a1).await?,
+        Some(CantSendReason::NotAMember)
+    );
+
+    let msg_a1 = tcm.send_recv(bob, a1, "Hi back").await;
+    assert!(msg_a1.get_showpadlock());
+    let chat_a1 = Chat::load_from_db(a1, msg_a1.chat_id).await?;
+    assert_eq!(chat_a1.typ, Chattype::Single);
+    assert!(chat_a1.is_encrypted(a1).await?);
+    // Weird, but fine, anyway the bigger problem is the conversation split into two chats.
+    assert_eq!(
+        chat_a1.why_cant_send(a1).await?,
+        Some(CantSendReason::ContactRequest)
+    );
+
+    let a0 = &tcm.alice().await;
+    let a1 = &tcm.alice().await;
+    tcm.execute_securejoin(bob, a0).await;
+    let chat_id_a0_bob = a0.create_chat_id(bob).await;
+    let sent_msg = a0.send_text(chat_id_a0_bob, "Hi").await;
+    bob.recv_msg(&sent_msg).await;
+    let msg_a1 = a1.recv_msg(&sent_msg).await;
+    assert!(msg_a1.get_showpadlock());
+    let chat_a1 = Chat::load_from_db(a1, msg_a1.chat_id).await?;
+    assert_eq!(chat_a1.typ, Chattype::Single);
+    assert!(chat_a1.is_encrypted(a1).await?);
+    assert_eq!(
+        chat::get_chat_contacts(a1, chat_a1.id).await?,
+        [a1.add_or_lookup_contact_id(bob).await]
+    );
+    assert!(chat_a1.can_send(a1).await?);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_recv_outgoing_msg_before_having_key_and_after() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let a0 = &tcm.elena().await;
+    let a1 = &tcm.elena().await;
+    let bob = &tcm.bob().await;
+
+    tcm.execute_securejoin(bob, a0).await;
+    let chat_id_a0_bob = a0.create_chat_id(bob).await;
+    let sent_msg = a0.send_text(chat_id_a0_bob, "Hi").await;
+    let msg_a1 = a1.recv_msg(&sent_msg).await;
+    assert!(msg_a1.get_showpadlock());
+    let chat_a1 = Chat::load_from_db(a1, msg_a1.chat_id).await?;
+    assert_eq!(chat_a1.typ, Chattype::Group);
+    assert!(!chat_a1.is_encrypted(a1).await?);
+
+    // Device a1 somehow learns Bob's key and creates the corresponding chat. However, this doesn't
+    // help because we only look up key contacts by address in a particular chat and the new chat
+    // isn't referenced by the received message. This is fixed by sending and receiving Intended
+    // Recipient Fingerprint subpackets which elena doesn't send.
+    a1.create_chat_id(bob).await;
+    let sent_msg = a0.send_text(chat_id_a0_bob, "Hi again").await;
+    let msg_a1 = a1.recv_msg(&sent_msg).await;
+    assert!(msg_a1.get_showpadlock());
+    assert_eq!(msg_a1.chat_id, chat_a1.id);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_sanitize_filename_in_received() -> Result<()> {
     let alice = &TestContext::new_alice().await;
     let raw = b"Message-ID: Mr.XA6y3og8-az.WGbH9_dNcQx@testr
@@ -5365,16 +5461,14 @@ async fn test_encrypted_adhoc_group_message() -> Result<()> {
     assert_eq!(chat.is_encrypted(bob).await?, false);
 
     let contact_ids = get_chat_contacts(bob, chat.id).await?;
-    assert_eq!(contact_ids.len(), 3);
-    assert!(chat.is_self_in_chat(bob).await?);
+    assert_eq!(contact_ids.len(), 2);
+    assert!(!chat.is_self_in_chat(bob).await?);
 
     // Since the group is unencrypted, all contacts have
     // to be address-contacts.
     for contact_id in contact_ids {
         let contact = Contact::get_by_id(bob, contact_id).await?;
-        if contact_id != ContactId::SELF {
-            assert_eq!(contact.is_key_contact(), false);
-        }
+        assert_eq!(contact.is_key_contact(), false);
     }
 
     // `from_id` of the message corresponds to key-contact of Alice

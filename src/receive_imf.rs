@@ -27,7 +27,9 @@ use crate::events::EventType;
 use crate::headerdef::{HeaderDef, HeaderDefMap};
 use crate::imap::{GENERATED_PREFIX, markseen_on_imap_table};
 use crate::key::{DcKey, Fingerprint};
-use crate::key::{self_fingerprint, self_fingerprint_opt};
+use crate::key::{
+    load_self_public_key, load_self_public_key_opt, self_fingerprint, self_fingerprint_opt,
+};
 use crate::log::{LogExt as _, warn};
 use crate::message::{
     self, Message, MessageState, MessengerMessage, MsgId, Viewtype, rfc724_mid_exists,
@@ -196,7 +198,7 @@ async fn insert_tombstone(context: &Context, rfc724_mid: &str) -> Result<MsgId> 
 async fn get_to_and_past_contact_ids(
     context: &Context,
     mime_parser: &MimeMessage,
-    chat_assignment: &ChatAssignment,
+    chat_assignment: &mut ChatAssignment,
     parent_message: &Option<Message>,
     incoming_origin: Origin,
 ) -> Result<(Vec<Option<ContactId>>, Vec<Option<ContactId>>)> {
@@ -282,7 +284,7 @@ async fn get_to_and_past_contact_ids(
             .await?;
 
             if let Some(chat_id) = chat_id {
-                past_ids = lookup_key_contacts_by_address_list(
+                past_ids = lookup_key_contacts_fallback_to_chat(
                     context,
                     &mime_parser.past_members,
                     past_member_fingerprints,
@@ -315,7 +317,7 @@ async fn get_to_and_past_contact_ids(
                     Origin::Hidden,
                 )
                 .await?;
-                past_ids = lookup_key_contacts_by_address_list(
+                past_ids = lookup_key_contacts_fallback_to_chat(
                     context,
                     &mime_parser.past_members,
                     past_member_fingerprints,
@@ -385,54 +387,58 @@ async fn get_to_and_past_contact_ids(
                 // mapped it to a key contact.
                 // This is an encrypted 1:1 chat.
                 to_ids = pgp_to_ids
-            } else if let Some(chat_id) = chat_id {
-                to_ids = match mime_parser.was_encrypted() {
-                    true => {
-                        lookup_key_contacts_by_address_list(
-                            context,
-                            &mime_parser.recipients,
-                            to_member_fingerprints,
-                            Some(chat_id),
-                        )
-                        .await?
-                    }
-                    false => {
-                        add_or_lookup_contacts_by_address_list(
-                            context,
-                            &mime_parser.recipients,
-                            if !mime_parser.incoming {
-                                Origin::OutgoingTo
-                            } else if incoming_origin.is_known() {
-                                Origin::IncomingTo
-                            } else {
-                                Origin::IncomingUnknownTo
-                            },
-                        )
-                        .await?
-                    }
-                }
             } else {
-                let ids = match mime_parser.was_encrypted() {
-                    true => {
-                        lookup_key_contacts_by_address_list(
+                let ids = if mime_parser.was_encrypted() {
+                    let mut recipient_fps = mime_parser
+                        .signature
+                        .as_ref()
+                        .map(|(_, recipient_fps)| recipient_fps.iter().cloned().collect::<Vec<_>>())
+                        .unwrap_or_default();
+                    // If there are extra recipient fingerprints, it may be a non-chat "implicit
+                    // Bcc" message. Fall back to in-chat lookup if so.
+                    if !recipient_fps.is_empty() && recipient_fps.len() <= 2 {
+                        let self_fp = load_self_public_key(context).await?.dc_fingerprint();
+                        recipient_fps.retain(|fp| *fp != self_fp);
+                        if recipient_fps.is_empty() {
+                            vec![Some(ContactId::SELF)]
+                        } else {
+                            add_or_lookup_key_contacts(
+                                context,
+                                &mime_parser.recipients,
+                                &mime_parser.gossiped_keys,
+                                &recipient_fps,
+                                Origin::Hidden,
+                            )
+                            .await?
+                        }
+                    } else {
+                        lookup_key_contacts_fallback_to_chat(
                             context,
                             &mime_parser.recipients,
                             to_member_fingerprints,
-                            None,
+                            chat_id,
                         )
                         .await?
                     }
-                    false => vec![],
+                } else {
+                    vec![]
                 };
                 if mime_parser.was_encrypted() && !ids.contains(&None)
                 // Prefer creating PGP chats if there are any key-contacts. At least this prevents
-                // from replying unencrypted.
+                // from replying unencrypted. Otherwise downgrade to a non-replyable ad-hoc group.
                 || ids
                     .iter()
                     .any(|&c| c.is_some() && c != Some(ContactId::SELF))
                 {
                     to_ids = ids;
                 } else {
+                    if mime_parser.was_encrypted() {
+                        warn!(
+                            context,
+                            "No key-contact looked up. Downgrading to AdHocGroup."
+                        );
+                        *chat_assignment = ChatAssignment::AdHocGroup;
+                    }
                     to_ids = add_or_lookup_contacts_by_address_list(
                         context,
                         &mime_parser.recipients,
@@ -488,6 +494,18 @@ pub(crate) async fn receive_imf_inner(
         );
     }
 
+    let trash = || async {
+        let msg_ids = vec![insert_tombstone(context, rfc724_mid).await?];
+        Ok(Some(ReceivedMsg {
+            chat_id: DC_CHAT_ID_TRASH,
+            state: MessageState::Undefined,
+            hidden: false,
+            sort_timestamp: 0,
+            msg_ids,
+            needs_delete_job: false,
+        }))
+    };
+
     let mut mime_parser = match MimeMessage::from_bytes(context, imf_raw).await {
         Err(err) => {
             warn!(context, "receive_imf: can't parse MIME: {err:#}.");
@@ -495,17 +513,7 @@ pub(crate) async fn receive_imf_inner(
                 // We don't have an rfc724_mid, there's no point in adding a trash entry
                 return Ok(None);
             }
-
-            let msg_ids = vec![insert_tombstone(context, rfc724_mid).await?];
-
-            return Ok(Some(ReceivedMsg {
-                chat_id: DC_CHAT_ID_TRASH,
-                state: MessageState::Undefined,
-                hidden: false,
-                sort_timestamp: 0,
-                msg_ids,
-                needs_delete_job: false,
-            }));
+            return trash().await;
         }
         Ok(mime_parser) => mime_parser,
     };
@@ -513,6 +521,18 @@ pub(crate) async fn receive_imf_inner(
     let rfc724_mid_orig = &mime_parser
         .get_rfc724_mid()
         .unwrap_or(rfc724_mid.to_string());
+
+    if let Some((_, recipient_fps)) = &mime_parser.signature
+        && !recipient_fps.is_empty()
+        && let Some(self_pubkey) = load_self_public_key_opt(context).await?
+        && !recipient_fps.contains(&self_pubkey.dc_fingerprint())
+    {
+        warn!(
+            context,
+            "Message {rfc724_mid_orig:?} is not intended for us (TRASH)."
+        );
+        return trash().await;
+    }
     info!(
         context,
         "Receiving message {rfc724_mid_orig:?}, seen={seen}...",
@@ -596,7 +616,7 @@ pub(crate) async fn receive_imf_inner(
     // For example, GitHub sends messages from `notifications@github.com`,
     // but uses display name of the user whose action generated the notification
     // as the display name.
-    let fingerprint = mime_parser.signature.as_ref();
+    let fingerprint = mime_parser.signature.as_ref().map(|(fp, _)| fp);
     let (from_id, _from_id_blocked, incoming_origin) = match from_field_to_contact_id(
         context,
         &mime_parser.from,
@@ -634,14 +654,12 @@ pub(crate) async fn receive_imf_inner(
     .await?
     .filter(|p| Some(p.id) != replace_msg_id);
 
-    let chat_assignment =
+    let mut chat_assignment =
         decide_chat_assignment(context, &mime_parser, &parent_message, rfc724_mid, from_id).await?;
-    info!(context, "Chat assignment is {chat_assignment:?}.");
-
     let (to_ids, past_ids) = get_to_and_past_contact_ids(
         context,
         &mime_parser,
-        &chat_assignment,
+        &mut chat_assignment,
         &parent_message,
         incoming_origin,
     )
@@ -934,7 +952,7 @@ UPDATE config SET value=? WHERE keyname='configured_addr' AND value!=?1
 
     if !received_msg.msg_ids.is_empty() {
         let target = if received_msg.needs_delete_job || delete_server_after == Some(0) {
-            Some(context.get_delete_msgs_target().await?)
+            Some("".to_string())
         } else {
             None
         };
@@ -1313,17 +1331,34 @@ async fn decide_chat_assignment(
     if from_id != ContactId::SELF && !has_self_addr {
         num_recipients += 1;
     }
-    let can_be_11_chat = num_recipients <= 1
-        && (from_id != ContactId::SELF
-            || !(mime_parser.recipients.is_empty() || has_self_addr)
-            || mime_parser.was_encrypted());
+    let mut can_be_11_chat_log = String::new();
+    let mut l = |cond: bool, s: String| {
+        can_be_11_chat_log += &s;
+        cond
+    };
+    let can_be_11_chat = l(
+        num_recipients <= 1,
+        format!("num_recipients={num_recipients}."),
+    ) && (l(from_id != ContactId::SELF, format!(" from_id={from_id}."))
+        || !(l(
+            mime_parser.recipients.is_empty(),
+            format!(" Raw recipients len={}.", mime_parser.recipients.len()),
+        ) || l(has_self_addr, format!(" has_self_addr={has_self_addr}.")))
+        || l(
+            mime_parser.was_encrypted(),
+            format!(" was_encrypted={}.", mime_parser.was_encrypted()),
+        ));
 
+    let chat_assignment_log;
     let chat_assignment = if should_trash {
+        chat_assignment_log = "".to_string();
         ChatAssignment::Trash
     } else if mime_parser.get_mailinglist_header().is_some() {
+        chat_assignment_log = "Mailing list header found.".to_string();
         ChatAssignment::MailingListOrBroadcast
     } else if let Some(grpid) = mime_parser.get_chat_group_id() {
         if mime_parser.was_encrypted() {
+            chat_assignment_log = "Encrypted group message.".to_string();
             ChatAssignment::GroupChat {
                 grpid: grpid.to_string(),
             }
@@ -1332,11 +1367,13 @@ async fn decide_chat_assignment(
                 lookup_chat_by_reply(context, mime_parser, parent).await?
             {
                 // Try to assign to a chat based on In-Reply-To/References.
+                chat_assignment_log = "Unencrypted group reply.".to_string();
                 ChatAssignment::ExistingChat {
                     chat_id,
                     chat_id_blocked,
                 }
             } else {
+                chat_assignment_log = "Unencrypted group reply.".to_string();
                 ChatAssignment::AdHocGroup
             }
         } else {
@@ -1347,6 +1384,7 @@ async fn decide_chat_assignment(
             // even if it had only two members.
             //
             // Group ID is ignored, however.
+            chat_assignment_log = "Unencrypted group message, no parent.".to_string();
             ChatAssignment::AdHocGroup
         }
     } else if let Some(parent) = &parent_message {
@@ -1354,24 +1392,38 @@ async fn decide_chat_assignment(
             lookup_chat_by_reply(context, mime_parser, parent).await?
         {
             // Try to assign to a chat based on In-Reply-To/References.
+            chat_assignment_log = "Reply w/o grpid.".to_string();
             ChatAssignment::ExistingChat {
                 chat_id,
                 chat_id_blocked,
             }
         } else if mime_parser.get_header(HeaderDef::ChatGroupName).is_some() {
+            chat_assignment_log = "Reply with Chat-Group-Name.".to_string();
             ChatAssignment::AdHocGroup
         } else if can_be_11_chat {
+            chat_assignment_log = format!("Non-group reply. {can_be_11_chat_log}");
             ChatAssignment::OneOneChat
         } else {
+            chat_assignment_log = format!("Non-group reply. {can_be_11_chat_log}");
             ChatAssignment::AdHocGroup
         }
     } else if mime_parser.get_header(HeaderDef::ChatGroupName).is_some() {
+        chat_assignment_log = "Message with Chat-Group-Name, no parent.".to_string();
         ChatAssignment::AdHocGroup
     } else if can_be_11_chat {
+        chat_assignment_log = format!("Non-group message, no parent. {can_be_11_chat_log}");
         ChatAssignment::OneOneChat
     } else {
+        chat_assignment_log = format!("Non-group message, no parent. {can_be_11_chat_log}");
         ChatAssignment::AdHocGroup
     };
+
+    if !chat_assignment_log.is_empty() {
+        info!(
+            context,
+            "{chat_assignment_log} Chat assignment = {chat_assignment:?}."
+        );
+    }
     Ok(chat_assignment)
 }
 
@@ -2666,6 +2718,9 @@ async fn lookup_or_create_adhoc_group(
     let to_ids: Vec<ContactId> = to_ids.iter().filter_map(|x| *x).collect();
     let mut contact_ids = BTreeSet::<ContactId>::from_iter(to_ids.iter().copied());
     contact_ids.insert(from_id);
+    if mime_parser.was_encrypted() {
+        contact_ids.remove(&ContactId::SELF);
+    }
     let trans_fn = |t: &mut rusqlite::Transaction| {
         t.pragma_update(None, "query_only", "0")?;
         t.execute(
@@ -2973,6 +3028,8 @@ async fn apply_group_changes(
     to_ids: &[Option<ContactId>],
     past_ids: &[Option<ContactId>],
 ) -> Result<GroupChangesInfo> {
+    let from_is_key_contact = Contact::get_by_id(context, from_id).await?.is_key_contact();
+    ensure!(from_is_key_contact || chat.grpid.is_empty());
     let to_ids_flat: Vec<ContactId> = to_ids.iter().filter_map(|x| *x).collect();
     ensure!(chat.typ == Chattype::Group);
     ensure!(!chat.id.is_special());
@@ -3054,7 +3111,10 @@ async fn apply_group_changes(
         )
         .await?;
 
-        if chat.member_list_is_stale(context).await? {
+        // Avoid insertion of `from_id` into a group with inappropriate encryption state.
+        if from_is_key_contact != chat.grpid.is_empty()
+            && chat.member_list_is_stale(context).await?
+        {
             info!(context, "Member list is stale.");
             let mut new_members: HashSet<ContactId> =
                 HashSet::from_iter(to_ids_flat.iter().copied());
@@ -3062,7 +3122,9 @@ async fn apply_group_changes(
             if !from_id.is_special() {
                 new_members.insert(from_id);
             }
-
+            if mime_parser.was_encrypted() && chat.grpid.is_empty() {
+                new_members.remove(&ContactId::SELF);
+            }
             context
                 .sql
                 .transaction(|transaction| {
@@ -3112,7 +3174,7 @@ async fn apply_group_changes(
             if self_added {
                 new_members = HashSet::from_iter(to_ids_flat.iter().copied());
                 new_members.insert(ContactId::SELF);
-                if !from_id.is_special() {
+                if !from_id.is_special() && from_is_key_contact != chat.grpid.is_empty() {
                     new_members.insert(from_id);
                 }
             } else {
@@ -3134,6 +3196,10 @@ async fn apply_group_changes(
             // Apply explicit removal if any.
             if let Some(removed_id) = removed_id {
                 new_members.remove(&removed_id);
+            }
+
+            if mime_parser.was_encrypted() && chat.grpid.is_empty() {
+                new_members.remove(&ContactId::SELF);
             }
 
             if new_members != chat_contacts {
@@ -3777,11 +3843,15 @@ async fn create_adhoc_group(
     to_ids: &[ContactId],
     grpname: &str,
 ) -> Result<Option<(ChatId, Blocked)>> {
-    let mut member_ids: Vec<ContactId> = to_ids.to_vec();
-    if !member_ids.contains(&(from_id)) {
+    let mut member_ids: Vec<ContactId> = to_ids
+        .iter()
+        .copied()
+        .filter(|&id| id != ContactId::SELF)
+        .collect();
+    if from_id != ContactId::SELF && !member_ids.contains(&from_id) {
         member_ids.push(from_id);
     }
-    if !member_ids.contains(&(ContactId::SELF)) {
+    if !mime_parser.was_encrypted() {
         member_ids.push(ContactId::SELF);
     }
 
@@ -3870,7 +3940,7 @@ async fn has_verified_encryption(
     let signed_with_verified_key = mimeparser
         .signature
         .as_ref()
-        .is_some_and(|signature| *signature == fingerprint);
+        .is_some_and(|(signature, _)| *signature == fingerprint);
     if signed_with_verified_key {
         Ok(Verified)
     } else {
@@ -3998,12 +4068,13 @@ async fn add_or_lookup_key_contacts(
     let mut contact_ids = Vec::new();
     let mut fingerprint_iter = fingerprints.iter();
     for info in address_list {
+        let fp = fingerprint_iter.next();
         let addr = &info.addr;
         if !may_be_valid_addr(addr) {
             contact_ids.push(None);
             continue;
         }
-        let fingerprint: String = if let Some(fp) = fingerprint_iter.next() {
+        let fingerprint: String = if let Some(fp) = fp {
             // Iterator has not ran out of fingerprints yet.
             fp.hex()
         } else if let Some(key) = gossiped_keys.get(addr) {
@@ -4154,7 +4225,7 @@ async fn lookup_key_contact_by_fingerprint(
     }
 }
 
-/// Looks up key-contacts by email addresses.
+/// Adds or looks up key-contacts by fingerprints or by email addresses in the given chat.
 ///
 /// `fingerprints` may be empty.
 /// This is used as a fallback when email addresses are available,
@@ -4169,7 +4240,7 @@ async fn lookup_key_contact_by_fingerprint(
 /// is the same as the number of addresses in the header
 /// and it is possible to find corresponding
 /// `Chat-Group-Member-Timestamps` items.
-async fn lookup_key_contacts_by_address_list(
+async fn lookup_key_contacts_fallback_to_chat(
     context: &Context,
     address_list: &[SingleInfo],
     fingerprints: &[Fingerprint],
@@ -4178,13 +4249,14 @@ async fn lookup_key_contacts_by_address_list(
     let mut contact_ids = Vec::new();
     let mut fingerprint_iter = fingerprints.iter();
     for info in address_list {
+        let fp = fingerprint_iter.next();
         let addr = &info.addr;
         if !may_be_valid_addr(addr) {
             contact_ids.push(None);
             continue;
         }
 
-        if let Some(fp) = fingerprint_iter.next() {
+        if let Some(fp) = fp {
             // Iterator has not ran out of fingerprints yet.
             let display_name = info.display_name.as_deref();
             let fingerprint: String = fp.hex();

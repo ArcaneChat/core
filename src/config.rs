@@ -175,11 +175,6 @@ pub enum Config {
     #[strum(props(default = "0"))] // also change MediaQuality.default() on changes
     MediaQuality,
 
-    /// If set to "1", then existing messages are considered to be already fetched.
-    /// This flag is reset after successful configuration.
-    #[strum(props(default = "1"))]
-    FetchedExistingMsgs,
-
     /// Timer in seconds after which the message is deleted from the
     /// server.
     ///
@@ -198,10 +193,6 @@ pub enum Config {
     /// deleted.
     #[strum(props(default = "0"))]
     DeleteDeviceAfter,
-
-    /// Move messages to the Trash folder instead of marking them "\Deleted". Overrides
-    /// `ProviderOptions::delete_to_trash`.
-    DeleteToTrash,
 
     /// The primary email address.
     ConfiguredAddr,
@@ -279,9 +270,6 @@ pub enum Config {
 
     /// Configured folder for chat messages.
     ConfiguredMvboxFolder,
-
-    /// Configured "Trash" folder.
-    ConfiguredTrashFolder,
 
     /// Unix timestamp of the last successful configuration.
     ConfiguredTimestamp,
@@ -701,7 +689,6 @@ impl Context {
             | Config::MdnsEnabled
             | Config::MvboxMove
             | Config::OnlyFetchMvbox
-            | Config::DeleteToTrash
             | Config::Configured
             | Config::Bot
             | Config::NotifyAboutWrongPw

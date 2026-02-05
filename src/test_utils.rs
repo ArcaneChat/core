@@ -44,7 +44,7 @@ use crate::stock_str::StockStrings;
 use crate::tools::time;
 
 /// The number of info messages added to new e2ee chats.
-/// Currently this is "End-to-end encryption available", string `E2eAvailable`.
+/// Currently this is "Messages are end-to-end encrypted.", string `ChatProtectionEnabled`.
 pub const E2EE_INFO_MSGS: usize = 1;
 
 #[allow(non_upper_case_globals)]
@@ -117,6 +117,8 @@ impl TestContextManager {
             .await
     }
 
+    /// Returns new elena's "device".
+    /// Elena doesn't send Intended Recipient Fingerprint subpackets to simulate old Delta Chat.
     pub async fn elena(&mut self) -> TestContext {
         TestContext::builder()
             .configure_elena()
@@ -565,6 +567,7 @@ impl TestContext {
             .unwrap();
         ctx.set_config(Config::BccSelf, Some("1")).await.unwrap();
         ctx.set_config(Config::SyncMsgs, Some("0")).await.unwrap();
+        ctx.set_config(Config::MvboxMove, Some("0")).await.unwrap();
 
         Self {
             ctx,

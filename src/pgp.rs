@@ -1,6 +1,6 @@
 //! OpenPGP helper module using [rPGP facilities](https://github.com/rpgp/rpgp).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, Cursor};
 
 use anyhow::{Context as _, Result, bail};
@@ -10,7 +10,7 @@ use pgp::armor::BlockType;
 use pgp::composed::{
     ArmorOptions, DecryptionOptions, Deserializable, DetachedSignature, KeyType as PgpKeyType,
     Message, MessageBuilder, SecretKeyParamsBuilder, SignedPublicKey, SignedPublicSubKey,
-    SignedSecretKey, SubkeyParamsBuilder, TheRing,
+    SignedSecretKey, SubkeyParamsBuilder, SubpacketConfig, TheRing,
 };
 use pgp::crypto::aead::{AeadAlgorithm, ChunkSize};
 use pgp::crypto::ecc_curve::ECCCurve;
@@ -18,7 +18,8 @@ use pgp::crypto::hash::HashAlgorithm;
 use pgp::crypto::sym::SymmetricKeyAlgorithm;
 use pgp::packet::{SignatureConfig, SignatureType, Subpacket, SubpacketData};
 use pgp::types::{
-    CompressionAlgorithm, KeyDetails, Password, PublicKeyTrait, SecretKeyTrait as _, StringToKey,
+    CompressionAlgorithm, KeyDetails, KeyVersion, Password, PublicKeyTrait, SecretKeyTrait as _,
+    StringToKey,
 };
 use rand_old::{Rng as _, thread_rng};
 use tokio::runtime::Handle;
@@ -190,6 +191,36 @@ pub async fn pk_encrypt(
             let pkeys = public_keys_for_encryption
                 .iter()
                 .filter_map(select_pk_for_encryption);
+            let subpkts = {
+                let mut hashed = Vec::with_capacity(1 + public_keys_for_encryption.len() + 1);
+                hashed.push(Subpacket::critical(SubpacketData::SignatureCreationTime(
+                    chrono::Utc::now().trunc_subsecs(0),
+                ))?);
+                // Test "elena" uses old Delta Chat.
+                let skip = private_key_for_signing.dc_fingerprint().hex()
+                    == "B86586B6DEF437D674BFAFC02A6B2EBC633B9E82";
+                for key in &public_keys_for_encryption {
+                    if skip {
+                        break;
+                    }
+                    let data = SubpacketData::IntendedRecipientFingerprint(key.fingerprint());
+                    let subpkt = match private_key_for_signing.version() < KeyVersion::V6 {
+                        true => Subpacket::regular(data)?,
+                        false => Subpacket::critical(data)?,
+                    };
+                    hashed.push(subpkt);
+                }
+                hashed.push(Subpacket::regular(SubpacketData::IssuerFingerprint(
+                    private_key_for_signing.fingerprint(),
+                ))?);
+                let mut unhashed = vec![];
+                if private_key_for_signing.version() <= KeyVersion::V4 {
+                    unhashed.push(Subpacket::regular(SubpacketData::Issuer(
+                        private_key_for_signing.key_id(),
+                    ))?);
+                }
+                SubpacketConfig::UserDefined { hashed, unhashed }
+            };
 
             let msg = MessageBuilder::from_bytes("", plain);
             let encoded_msg = match seipd_version {
@@ -205,7 +236,12 @@ pub async fn pk_encrypt(
                     }
 
                     let hash_algorithm = private_key_for_signing.hash_alg();
-                    msg.sign(&*private_key_for_signing, Password::empty(), hash_algorithm);
+                    msg.sign_with_subpackets(
+                        &*private_key_for_signing,
+                        Password::empty(),
+                        hash_algorithm,
+                        subpkts,
+                    );
                     if compress {
                         msg.compression(CompressionAlgorithm::ZLIB);
                     }
@@ -229,7 +265,12 @@ pub async fn pk_encrypt(
                     }
 
                     let hash_algorithm = private_key_for_signing.hash_alg();
-                    msg.sign(&*private_key_for_signing, Password::empty(), hash_algorithm);
+                    msg.sign_with_subpackets(
+                        &*private_key_for_signing,
+                        Password::empty(),
+                        hash_algorithm,
+                        subpkts,
+                    );
                     if compress {
                         msg.compression(CompressionAlgorithm::ZLIB);
                     }
@@ -264,9 +305,14 @@ pub fn pk_calc_signature(
             chrono::Utc::now().trunc_subsecs(0),
         ))?,
     ];
-    config.unhashed_subpackets = vec![Subpacket::regular(SubpacketData::Issuer(
-        private_key_for_signing.key_id(),
-    ))?];
+    config.unhashed_subpackets = vec![];
+    if private_key_for_signing.version() <= KeyVersion::V4 {
+        config
+            .unhashed_subpackets
+            .push(Subpacket::regular(SubpacketData::Issuer(
+                private_key_for_signing.key_id(),
+            ))?);
+    }
 
     let signature = config.sign(
         &private_key_for_signing.primary_key,
@@ -370,19 +416,28 @@ fn check_symmetric_encryption(msg: &Message<'_>) -> std::result::Result<(), &'st
 
 /// Returns fingerprints
 /// of all keys from the `public_keys_for_validation` keyring that
-/// have valid signatures there.
+/// have valid signatures in `msg` and corresponding intended recipient fingerprints
+/// (<https://www.rfc-editor.org/rfc/rfc9580.html#name-intended-recipient-fingerpr>) if any.
 ///
-/// If the message is wrongly signed, HashSet will be empty.
+/// If the message is wrongly signed, returns an empty map.
 pub fn valid_signature_fingerprints(
     msg: &pgp::composed::Message,
     public_keys_for_validation: &[SignedPublicKey],
-) -> HashSet<Fingerprint> {
-    let mut ret_signature_fingerprints: HashSet<Fingerprint> = Default::default();
+) -> HashMap<Fingerprint, Vec<Fingerprint>> {
+    let mut ret_signature_fingerprints = HashMap::new();
     if msg.is_signed() {
         for pkey in public_keys_for_validation {
-            if msg.verify(&pkey.primary_key).is_ok() {
+            if let Ok(signature) = msg.verify(&pkey.primary_key) {
                 let fp = pkey.dc_fingerprint();
-                ret_signature_fingerprints.insert(fp);
+                let mut recipient_fps = Vec::new();
+                if let Some(cfg) = signature.config() {
+                    for subpkt in &cfg.hashed_subpackets {
+                        if let SubpacketData::IntendedRecipientFingerprint(fp) = &subpkt.data {
+                            recipient_fps.push(fp.clone().into());
+                        }
+                    }
+                }
+                ret_signature_fingerprints.insert(fp, recipient_fps);
             }
         }
     }
@@ -497,13 +552,14 @@ mod tests {
     use pgp::composed::Esk;
     use pgp::packet::PublicKeyEncryptedSessionKey;
 
+    #[expect(clippy::type_complexity)]
     fn pk_decrypt_and_validate<'a>(
         ctext: &'a [u8],
         private_keys_for_decryption: &'a [SignedSecretKey],
         public_keys_for_validation: &[SignedPublicKey],
     ) -> Result<(
         pgp::composed::Message<'static>,
-        HashSet<Fingerprint>,
+        HashMap<Fingerprint, Vec<Fingerprint>>,
         Vec<u8>,
     )> {
         let mut msg = decrypt(ctext.to_vec(), private_keys_for_decryption, &[])?;
@@ -611,7 +667,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_decrypt_singed() {
+    async fn test_decrypt_signed() {
         // Check decrypting as Alice
         let decrypt_keyring = vec![KEYS.alice_secret.clone()];
         let sig_check_keyring = vec![KEYS.alice_public.clone()];
@@ -623,6 +679,9 @@ mod tests {
         .unwrap();
         assert_eq!(content, CLEARTEXT);
         assert_eq!(valid_signatures.len(), 1);
+        for recipient_fps in valid_signatures.values() {
+            assert_eq!(recipient_fps.len(), 2);
+        }
 
         // Check decrypting as Bob
         let decrypt_keyring = vec![KEYS.bob_secret.clone()];
@@ -635,6 +694,9 @@ mod tests {
         .unwrap();
         assert_eq!(content, CLEARTEXT);
         assert_eq!(valid_signatures.len(), 1);
+        for recipient_fps in valid_signatures.values() {
+            assert_eq!(recipient_fps.len(), 2);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
