@@ -1,5 +1,45 @@
 # Changelog
 
+## [2.42.0] - 2026-02-10
+
+### Fixes
+
+- Set `mvbox_move` to '0' explicitly for existing chatmail profiles.
+  It's needed to prevent device message about deprecated `mvbox_move` option from appearing in chatmail profiles.
+
+### Features / Changes
+
+- Do not scan not watched folders.
+
+### Miscellaneous Tasks
+
+- Update rPGP from 0.18.0 to 0.19.0.
+- cargo: Bump quick-xml from 0.38.4 to 0.39.0.
+
+### Tests
+
+- Remove test_dont_show_emails.
+
+### Other
+
+- Fix typo in CHANGELOG for marknoticed_all_chats.
+
+## [2.41.0] - 2026-02-06
+
+### Features / Changes
+
+- Do not require `ShowEmails` to be set to `All` for adding second relay.
+- Use different strings for audio and video calls.
+
+### Fixes
+
+- Don't set download state to Failure if message is available on another Session's transport ([#7684](https://github.com/chatmail/core/pull/7684)).
+- Make use of call stock strings.
+
+### Miscellaneous Tasks
+
+- cargo: Bump `time` from 0.3.37 to 0.3.47.
+
 ## [2.40.0] - 2026-02-04
 
 ### Features / Changes
@@ -103,7 +143,7 @@
 - [**breaking**] Jsonrpc: remove `contacts` from `FullChat`. To migrate load contacts on demand via `get_contacts_by_ids` using `FullChat.contactIds` ([#7282](https://github.com/chatmail/core/pull/7282)).
 - jsonrpc: Add run_until parameter for bots ([#7688](https://github.com/chatmail/core/pull/7688)).
 - rust, jsonrpc: Add `get_message_read_receipt_count` method ([#7732](https://github.com/chatmail/core/pull/7732)).
-- rust and jsonrpc: Marknoticed_all_chats method to mark all chats as notices, including muted ones. ([#7709](https://github.com/chatmail/core/pull/7709)).
+- rust and jsonrpc: Marknoticed_all_chats method to mark all chats as noticed, including muted ones. ([#7709](https://github.com/chatmail/core/pull/7709)).
 - Public re-export of Connectivity ([#7737](https://github.com/chatmail/core/pull/7737)).
 
 ### Documentation
@@ -7696,3 +7736,5 @@ https://github.com/chatmail/core/pulls?q=is%3Apr+is%3Aclosed
 [2.38.0]: https://github.com/chatmail/core/compare/v2.37.0..v2.38.0
 [2.39.0]: https://github.com/chatmail/core/compare/v2.38.0..v2.39.0
 [2.40.0]: https://github.com/chatmail/core/compare/v2.39.0..v2.40.0
+[2.41.0]: https://github.com/chatmail/core/compare/v2.40.0..v2.41.0
+[2.42.0]: https://github.com/chatmail/core/compare/v2.41.0..v2.42.0
