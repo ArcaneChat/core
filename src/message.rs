@@ -1017,6 +1017,7 @@ impl Message {
     pub async fn get_info_contact_id(&self, context: &Context) -> Result<Option<ContactId>> {
         match self.param.get_cmd() {
             SystemMessage::GroupNameChanged
+            | SystemMessage::GroupDescriptionChanged
             | SystemMessage::GroupImageChanged
             | SystemMessage::EphemeralTimerChanged => {
                 if self.from_id != ContactId::INFO {
