@@ -887,7 +887,11 @@ UPDATE config SET value=? WHERE keyname='configured_addr' AND value!=?1
             .is_some()
         {
             can_info_msg = false;
-            Some(Message::load_from_db(context, insert_msg_id).await?)
+            Some(
+                Message::load_from_db(context, insert_msg_id)
+                    .await
+                    .context("Failed to load just created webxdc instance")?,
+            )
         } else if let Some(field) = mime_parser.get_header(HeaderDef::InReplyTo) {
             if let Some(instance) =
                 message::get_by_rfc724_mids(context, &parse_message_ids(field)).await?
@@ -1185,6 +1189,7 @@ pub async fn from_field_to_contact_id(
     }
 }
 
+#[expect(clippy::arithmetic_side_effects)]
 async fn decide_chat_assignment(
     context: &Context,
     mime_parser: &MimeMessage,
@@ -2136,7 +2141,9 @@ async fn add_parts(
         }
 
         if let Some(replace_msg_id) = replace_msg_id {
-            let placeholder = Message::load_from_db(context, replace_msg_id).await?;
+            let placeholder = Message::load_from_db(context, replace_msg_id)
+                .await
+                .context("Failed to load placeholder message")?;
             for key in [
                 Param::WebxdcSummary,
                 Param::WebxdcSummaryTimestamp,
@@ -2919,6 +2926,7 @@ async fn create_group(
     }
 }
 
+#[expect(clippy::arithmetic_side_effects)]
 async fn update_chats_contacts_timestamps(
     context: &Context,
     chat_id: ChatId,
@@ -3418,6 +3426,7 @@ async fn apply_chat_name_avatar_and_description_changes(
 }
 
 /// Returns a list of strings that should be shown as info messages, informing about group membership changes.
+#[expect(clippy::arithmetic_side_effects)]
 async fn group_changes_msgs(
     context: &Context,
     added_ids: &HashSet<ContactId>,
@@ -3707,6 +3716,7 @@ async fn apply_out_broadcast_changes(
 
     let mut send_event_chat_modified = false;
     let mut better_msg = None;
+    let mut added_removed_id: Option<ContactId> = None;
 
     if from_id == ContactId::SELF {
         apply_chat_name_avatar_and_description_changes(
@@ -3739,6 +3749,7 @@ async fn apply_out_broadcast_changes(
                         stock_str::msg_add_member_local(context, added_id, ContactId::UNDEFINED)
                             .await;
                     better_msg.get_or_insert(msg);
+                    added_removed_id = Some(added_id);
                     send_event_chat_modified = true;
                 }
             } else {
@@ -3763,6 +3774,7 @@ async fn apply_out_broadcast_changes(
             better_msg.get_or_insert(
                 stock_str::msg_del_member_local(context, removed_id, ContactId::SELF).await,
             );
+            added_removed_id = Some(removed_id);
         }
     }
 
@@ -3772,7 +3784,7 @@ async fn apply_out_broadcast_changes(
     }
     Ok(GroupChangesInfo {
         better_msg,
-        added_removed_id: None,
+        added_removed_id,
         silent: false,
         extra_msgs: vec![],
     })

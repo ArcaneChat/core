@@ -189,10 +189,11 @@ impl BackupProvider {
 
         let blobdir = BlobDirContents::new(&context).await?;
 
-        let mut file_size = 0;
-        file_size += dbfile.metadata()?.len();
+        let mut file_size = dbfile.metadata()?.len();
         for blob in blobdir.iter() {
-            file_size += blob.to_abs_path().metadata()?.len()
+            file_size = file_size
+                .checked_add(blob.to_abs_path().metadata()?.len())
+                .context("File size overflow")?;
         }
 
         send_stream.write_all(&file_size.to_be_bytes()).await?;
@@ -464,6 +465,32 @@ mod tests {
                 .get_matching(|ev| matches!(ev, EventType::ImexProgress(1000)))
                 .await;
         }
+    }
+
+    /// Tests that trying to accidentally overwrite a profile
+    /// that is in use will fail.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cant_overwrite_profile_in_use() -> Result<()> {
+        let mut tcm = TestContextManager::new();
+        let ctx0 = &tcm.alice().await;
+        let ctx1 = &tcm.bob().await;
+
+        // Prepare to transfer backup.
+        let provider = BackupProvider::prepare(ctx0).await?;
+
+        // Try to overwrite an existing profile.
+        let err = get_backup(ctx1, provider.qr()).await.unwrap_err();
+        assert!(format!("{err:#}").contains("Cannot import backups to accounts in use"));
+
+        // ctx0 is supposed to also finish, and emit an error:
+        provider.await.unwrap();
+        ctx0.evtracker
+            .get_matching(|e| matches!(e, EventType::Error(_)))
+            .await;
+
+        assert_eq!(ctx1.get_primary_self_addr().await?, "bob@example.net");
+
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
