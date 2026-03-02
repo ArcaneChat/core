@@ -9,10 +9,10 @@ use deltachat::contact::Contact;
 use deltachat::context::Context;
 use deltachat::download;
 use deltachat::message::Message;
+use deltachat::message::MessageState;
 use deltachat::message::MsgId;
 use deltachat::message::Viewtype;
 use deltachat::reaction::get_msg_reactions;
-use num_traits::cast::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use typescript_type_def::TypeDef;
 
@@ -48,7 +48,7 @@ pub struct MessageObject {
     has_location: bool,
     has_html: bool,
     view_type: MessageViewtype,
-    state: u32,
+    state: JsonrpcMessageState,
 
     /// An error text, if there is one.
     error: Option<String>,
@@ -213,10 +213,7 @@ impl MessageObject {
             has_location: message.has_location(),
             has_html: message.has_html(),
             view_type: message.get_viewtype().into(),
-            state: message
-                .get_state()
-                .to_u32()
-                .context("state conversion to number failed")?,
+            state: message.get_state().into(),
             error: message.error(),
 
             timestamp: message.get_timestamp(),
@@ -359,6 +356,68 @@ impl From<MessageViewtype> for Viewtype {
             MessageViewtype::Call => Viewtype::Call,
             MessageViewtype::Webxdc => Viewtype::Webxdc,
             MessageViewtype::Vcard => Viewtype::Vcard,
+        }
+    }
+}
+
+#[derive(Serialize, TypeDef, schemars::JsonSchema)]
+#[serde(rename = "MessageState")]
+pub enum JsonrpcMessageState {
+    /// Undefined message state.
+    Undefined,
+
+    /// Incoming *fresh* message. Fresh messages are neither noticed
+    /// nor seen and are typically shown in notifications.
+    InFresh,
+
+    /// Incoming *noticed* message. E.g. chat opened but message not
+    /// yet read - noticed messages are not counted as unread but did
+    /// not marked as read nor resulted in MDNs.
+    InNoticed,
+
+    /// Incoming message, really *seen* by the user. Marked as read on
+    /// IMAP and MDN may be sent.
+    InSeen,
+
+    /// For files which need time to be prepared before they can be
+    /// sent, the message enters this state before OutPending.
+    OutPreparing,
+
+    /// Message saved as draft.
+    OutDraft,
+
+    /// The user has pressed the "send" button but the message is not
+    /// yet sent and is pending in some way. Maybe we're offline (no
+    /// checkmark).
+    OutPending,
+
+    /// *Unrecoverable* error (*recoverable* errors result in pending
+    /// messages).
+    OutFailed,
+
+    /// Outgoing message successfully delivered to server (one
+    /// checkmark). Note, that already delivered messages may get into
+    /// the OutFailed state if we get such a hint from the server.
+    OutDelivered,
+
+    /// Outgoing message read by the recipient (two checkmarks; this
+    /// requires goodwill on the receiver's side).
+    OutMdnRcvd,
+}
+
+impl From<MessageState> for JsonrpcMessageState {
+    fn from(state: MessageState) -> Self {
+        match state {
+            MessageState::Undefined => JsonrpcMessageState::Undefined,
+            MessageState::InFresh => JsonrpcMessageState::InFresh,
+            MessageState::InNoticed => JsonrpcMessageState::InNoticed,
+            MessageState::InSeen => JsonrpcMessageState::InSeen,
+            MessageState::OutPreparing => JsonrpcMessageState::OutPreparing,
+            MessageState::OutDraft => JsonrpcMessageState::OutDraft,
+            MessageState::OutPending => JsonrpcMessageState::OutPending,
+            MessageState::OutFailed => JsonrpcMessageState::OutFailed,
+            MessageState::OutDelivered => JsonrpcMessageState::OutDelivered,
+            MessageState::OutMdnRcvd => JsonrpcMessageState::OutMdnRcvd,
         }
     }
 }

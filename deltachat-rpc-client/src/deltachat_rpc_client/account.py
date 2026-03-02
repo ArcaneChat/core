@@ -9,7 +9,7 @@ from warnings import warn
 
 from ._utils import AttrDict, futuremethod
 from .chat import Chat
-from .const import ChatlistFlag, ContactFlag, EventType, SpecialContactId
+from .const import EventType, SpecialContactId
 from .contact import Contact
 from .message import Message
 
@@ -246,14 +246,10 @@ class Account:
         :param with_self: if True the self-contact is also included if it matches the query.
         :param snapshot: If True return a list of contact snapshots instead of Contact instances.
         """
-        flags = 0
-        if with_self:
-            flags |= ContactFlag.ADD_SELF
-
         if snapshot:
-            contacts = self._rpc.get_contacts(self.id, flags, query)
+            contacts = self._rpc.get_contacts(self.id, with_self, None, query)
             return [AttrDict(contact=Contact(self, contact["id"]), **contact) for contact in contacts]
-        contacts = self._rpc.get_contact_ids(self.id, flags, query)
+        contacts = self._rpc.get_contact_ids(self.id, with_self, None, query)
         return [Contact(self, contact_id) for contact_id in contacts]
 
     @property
@@ -288,17 +284,15 @@ class Account:
                              as needed.
         :param snapshot: If True return a list of chat snapshots instead of Chat instances.
         """
-        flags = 0
-        if archived_only:
-            flags |= ChatlistFlag.ARCHIVED_ONLY
-        if for_forwarding:
-            flags |= ChatlistFlag.FOR_FORWARDING
-        if no_specials:
-            flags |= ChatlistFlag.NO_SPECIALS
-        if alldone_hint:
-            flags |= ChatlistFlag.ADD_ALLDONE_HINT
-
-        entries = self._rpc.get_chatlist_entries(self.id, flags, query, contact and contact.id)
+        entries = self._rpc.get_chatlist_entries(
+            self.id,
+            archived_only,
+            no_specials,
+            for_forwarding,
+            alldone_hint,
+            query,
+            contact and contact.id,
+        )
         if not snapshot:
             return [Chat(self, entry) for entry in entries]
 
