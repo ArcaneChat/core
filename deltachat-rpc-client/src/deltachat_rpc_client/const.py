@@ -183,19 +183,19 @@ class SystemMessageType(str, Enum):
     WEBXDC_INFO_MESSAGE = "WebxdcInfoMessage"
 
 
-class MessageState(IntEnum):
+class MessageState(str, Enum):
     """State of the message."""
 
-    UNDEFINED = 0
-    IN_FRESH = 10
-    IN_NOTICED = 13
-    IN_SEEN = 16
-    OUT_PREPARING = 18
-    OUT_DRAFT = 19
-    OUT_PENDING = 20
-    OUT_FAILED = 24
-    OUT_DELIVERED = 26
-    OUT_MDN_RCVD = 28
+    UNDEFINED = "Undefined"
+    IN_FRESH = "InFresh"
+    IN_NOTICED = "InNoticed"
+    IN_SEEN = "InSeen"
+    OUT_PREPARING = "OutPreparing"
+    OUT_DRAFT = "OutDraft"
+    OUT_PENDING = "OutPending"
+    OUT_FAILED = "OutFailed"
+    OUT_DELIVERED = "OutDelivered"
+    OUT_MDN_RCVD = "OutMdnRcvd"
 
 
 class MessageId(IntEnum):
