@@ -285,18 +285,6 @@ impl Imap {
         })
     }
 
-    /// Creates new disconnected IMAP client using configured parameters.
-    pub async fn new_configured(
-        context: &Context,
-        idle_interrupt_receiver: Receiver<()>,
-    ) -> Result<Self> {
-        let (transport_id, param) = ConfiguredLoginParam::load(context)
-            .await?
-            .context("Not configured")?;
-        let imap = Self::new(context, transport_id, param, idle_interrupt_receiver).await?;
-        Ok(imap)
-    }
-
     /// Connects to IMAP server and returns a new IMAP session.
     ///
     /// Calling this function is not enough to perform IMAP operations. Use [`Imap::prepare`]

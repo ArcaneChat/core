@@ -581,7 +581,7 @@ impl Context {
     ///
     /// Can be used even if I/O is currently stopped.
     /// If I/O is currently stopped, starts a new IMAP connection
-    /// and fetches from Inbox and DeltaChat folders.
+    /// and fetches from Inbox and DeltaChat folders for each configured transport.
     pub async fn background_fetch(&self) -> Result<()> {
         if !(self.is_configured().await?) {
             return Ok(());
@@ -604,35 +604,37 @@ impl Context {
             // while we are fetching on a dedicated connection.
             let _pause_guard = self.scheduler.pause(self).await?;
 
-            // Start a new dedicated connection.
-            let mut connection = Imap::new_configured(self, channel::bounded(1).1).await?;
-            let mut session = connection.prepare(self).await?;
+            // Fetch from all configured transports so that messages arriving on
+            // any relay (e.g. in a multi-relay / multi-transport setup) are not missed.
+            for (transport_id, param) in ConfiguredLoginParam::load_all(self).await? {
+                let mut connection =
+                    Imap::new(self, transport_id, param, channel::bounded(1).1).await?;
+                let mut session = connection.prepare(self).await?;
 
-            // Fetch IMAP folders.
-            // Inbox is fetched before Mvbox because fetching from Inbox
-            // may result in moving some messages to Mvbox.
-            for folder_meaning in [FolderMeaning::Inbox, FolderMeaning::Mvbox] {
-                if let Some((_folder_config, watch_folder)) =
-                    convert_folder_meaning(self, folder_meaning).await?
-                {
-                    connection
-                        .fetch_move_delete(self, &mut session, &watch_folder, folder_meaning)
-                        .await?;
+                // Fetch IMAP folders.
+                // Inbox is fetched before Mvbox because fetching from Inbox
+                // may result in moving some messages to Mvbox.
+                for folder_meaning in [FolderMeaning::Inbox, FolderMeaning::Mvbox] {
+                    if let Some((_folder_config, watch_folder)) =
+                        convert_folder_meaning(self, folder_meaning).await?
+                    {
+                        connection
+                            .fetch_move_delete(self, &mut session, &watch_folder, folder_meaning)
+                            .await?;
+                    }
                 }
-            }
 
-            // Update quota (to send warning if full) - but only check it once in a while.
-            // note: For now this only checks quota of primary transport,
-            // because background check only checks primary transport at the moment
-            if self
-                .quota_needs_update(
-                    session.transport_id(),
-                    DC_BACKGROUND_FETCH_QUOTA_CHECK_RATELIMIT,
-                )
-                .await
-                && let Err(err) = self.update_recent_quota(&mut session).await
-            {
-                warn!(self, "Failed to update quota: {err:#}.");
+                // Update quota (to send warning if full) - but only check it once in a while.
+                if self
+                    .quota_needs_update(
+                        session.transport_id(),
+                        DC_BACKGROUND_FETCH_QUOTA_CHECK_RATELIMIT,
+                    )
+                    .await
+                    && let Err(err) = self.update_recent_quota(&mut session).await
+                {
+                    warn!(self, "Failed to update quota: {err:#}.");
+                }
             }
         }
 
