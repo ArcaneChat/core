@@ -473,7 +473,13 @@ impl MimeFactory {
                     msg.param.get_cmd(),
                     SystemMessage::MemberRemovedFromGroup | SystemMessage::SecurejoinMessage
                 )
-                && !matches!(chat.typ, Chattype::OutBroadcast | Chattype::InBroadcast)
+                && !matches!(
+                    chat.typ,
+                    Chattype::OutBroadcast
+                        | Chattype::InBroadcast
+                        | Chattype::OutSuperGroup
+                        | Chattype::InSuperGroup
+                )
             {
                 info!(
                     context,
@@ -705,7 +711,9 @@ impl MimeFactory {
                     return Ok(msg.subject.clone());
                 }
 
-                if (chat.typ == Chattype::Group || chat.typ == Chattype::OutBroadcast)
+                if (chat.typ == Chattype::Group
+                    || chat.typ == Chattype::OutBroadcast
+                    || chat.typ == Chattype::OutSuperGroup)
                     && quoted_msg_subject.is_none_or_empty()
                 {
                     let re = if self.in_reply_to.is_empty() {
@@ -894,13 +902,26 @@ impl MimeFactory {
         }
 
         if let Loaded::Message { msg, chat } = &self.loaded
-            && (chat.typ == Chattype::OutBroadcast || chat.typ == Chattype::InBroadcast)
+            && matches!(
+                chat.typ,
+                Chattype::OutBroadcast
+                    | Chattype::InBroadcast
+                    | Chattype::OutSuperGroup
+                    | Chattype::InSuperGroup
+            )
         {
             headers.push((
                 "Chat-List-ID",
                 mail_builder::headers::text::Text::new(format!("{} <{}>", chat.name, chat.grpid))
                     .into(),
             ));
+
+            if matches!(chat.typ, Chattype::OutSuperGroup | Chattype::InSuperGroup) {
+                headers.push((
+                    "Chat-Super-Group",
+                    mail_builder::headers::text::Text::new("1".to_string()).into(),
+                ));
+            }
 
             if msg.param.get_cmd() == SystemMessage::MemberAddedToGroup
                 && let Some(secret) = msg.param.get(PARAM_BROADCAST_SECRET)
@@ -1362,6 +1383,7 @@ impl MimeFactory {
             // Mailinglists and broadcast channels can actually never be verified:
             Chattype::Mailinglist => false,
             Chattype::OutBroadcast | Chattype::InBroadcast => false,
+            Chattype::OutSuperGroup | Chattype::InSuperGroup => false,
         };
 
         if send_verified_headers {
@@ -1406,6 +1428,8 @@ impl MimeFactory {
         if chat.typ == Chattype::Group
             || chat.typ == Chattype::OutBroadcast
             || chat.typ == Chattype::InBroadcast
+            || chat.typ == Chattype::OutSuperGroup
+            || chat.typ == Chattype::InSuperGroup
         {
             headers.push((
                 "Chat-Group-Name",
@@ -2227,23 +2251,35 @@ fn hidden_recipients() -> Address<'static> {
 }
 
 fn should_encrypt_with_broadcast_secret(msg: &Message, chat: &Chat) -> bool {
-    chat.typ == Chattype::OutBroadcast && must_have_only_one_recipient(msg, chat).is_none()
+    // For broadcast channels (OutBroadcast), only regular messages are symmetrically encrypted.
+    // Member-added/removed messages go to a single recipient and are PGP encrypted.
+    // For super groups (OutSuperGroup/InSuperGroup), regular messages are also symmetrically encrypted.
+    // Member-added messages in super groups go to a single recipient (the new member)
+    // with PGP encryption so they can receive the group key before having it.
+    matches!(chat.typ, Chattype::OutBroadcast | Chattype::OutSuperGroup | Chattype::InSuperGroup)
+        && must_have_only_one_recipient(msg, chat).is_none()
 }
 
 fn should_hide_recipients(msg: &Message, chat: &Chat) -> bool {
-    should_encrypt_with_broadcast_secret(msg, chat)
+    // Only broadcast channels hide recipients.
+    // Super groups allow all members to know each other.
+    matches!(chat.typ, Chattype::OutBroadcast) && must_have_only_one_recipient(msg, chat).is_none()
 }
 
 fn should_encrypt_symmetrically(msg: &Message, chat: &Chat) -> bool {
     should_encrypt_with_broadcast_secret(msg, chat)
 }
 
-/// Some messages sent into outgoing broadcast channels (member-added/member-removed)
+/// Some messages sent into outgoing broadcast channels or super groups (member-added/member-removed)
 /// should only go to a single recipient,
 /// rather than all recipients.
 /// This function returns the fingerprint of the recipient the message should be sent to.
+///
+/// For broadcast channels: member-added/removed goes to the single added/removed member only.
+/// For super groups: member-added goes to the single new member (to deliver the group key
+/// via PGP encryption before they have it). Member-removed goes to the removed member.
 fn must_have_only_one_recipient<'a>(msg: &'a Message, chat: &Chat) -> Option<Result<&'a str>> {
-    if chat.typ == Chattype::OutBroadcast
+    if matches!(chat.typ, Chattype::OutBroadcast | Chattype::OutSuperGroup)
         && matches!(
             msg.param.get_cmd(),
             SystemMessage::MemberRemovedFromGroup | SystemMessage::MemberAddedToGroup

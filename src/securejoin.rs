@@ -99,7 +99,10 @@ pub async fn get_securejoin_qr(context: &Context, chat: Option<ChatId>) -> Resul
         Some(id) => {
             let chat = Chat::load_from_db(context, id).await?;
             ensure!(
-                chat.typ == Chattype::Group || chat.typ == Chattype::OutBroadcast,
+                matches!(
+                    chat.typ,
+                    Chattype::Group | Chattype::OutBroadcast | Chattype::OutSuperGroup
+                ),
                 "Can't generate SecureJoin QR code for chat {id} of type {}",
                 chat.typ
             );
@@ -108,13 +111,13 @@ pub async fn get_securejoin_qr(context: &Context, chat: Option<ChatId>) -> Resul
                 error!(context, "get_securejoin_qr: {}.", err);
                 bail!(err);
             }
-            if chat.typ == Chattype::OutBroadcast {
-                // If the user created the broadcast before updating Delta Chat,
-                // then the secret will be missing, and the user needs to recreate the broadcast:
+            if matches!(chat.typ, Chattype::OutBroadcast | Chattype::OutSuperGroup) {
+                // If the user created the broadcast/super group before updating Delta Chat,
+                // then the secret will be missing, and the user needs to recreate it:
                 if load_broadcast_secret(context, chat.id).await?.is_none() {
                     error!(
                         context,
-                        "Not creating securejoin QR for old broadcast {}, see chat for more info.",
+                        "Not creating securejoin QR for old broadcast/super group {}, see chat for more info.",
                         chat.id,
                     );
                     let text = BROADCAST_INCOMPATIBILITY_MSG;
@@ -171,9 +174,15 @@ pub async fn get_securejoin_qr(context: &Context, chat: Option<ChatId>) -> Resul
             .replace("%20", "+");
 
         if chat.typ == Chattype::OutBroadcast {
-            // For historic reansons, broadcasts currently use j instead of i for the invitenumber.
+            // For historic reasons, broadcasts currently use j instead of i for the invitenumber.
             format!(
                 "https://i.delta.chat/#{fingerprint}&v=3&x={grpid}&j={invitenumber}&s={auth}&a={self_addr_urlencoded}&n={self_name_urlencoded}&b={chat_name_urlencoded}",
+            )
+        } else if chat.typ == Chattype::OutSuperGroup {
+            // Super groups use j for the invitenumber (like broadcasts) and k for the group name
+            // to distinguish from regular groups (g) and broadcast channels (b).
+            format!(
+                "https://i.delta.chat/#{fingerprint}&v=3&x={grpid}&j={invitenumber}&s={auth}&a={self_addr_urlencoded}&n={self_name_urlencoded}&k={chat_name_urlencoded}",
             )
         } else {
             format!(
@@ -825,7 +834,14 @@ pub(crate) async fn observe_securejoin_on_other_device(
         {
             Chattype::Single
         } else if mime_message.get_header(HeaderDef::ListId).is_some() {
-            Chattype::OutBroadcast
+            if mime_message
+                .get_header(HeaderDef::ChatSuperGroup)
+                .is_some()
+            {
+                Chattype::OutSuperGroup
+            } else {
+                Chattype::OutBroadcast
+            }
         } else {
             Chattype::Group
         };

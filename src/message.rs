@@ -943,7 +943,8 @@ impl Message {
                 Chattype::Group | Chattype::Mailinglist => {
                     Some(Contact::get_by_id(context, self.from_id).await?)
                 }
-                Chattype::Single | Chattype::OutBroadcast | Chattype::InBroadcast => None,
+                Chattype::Single | Chattype::OutBroadcast | Chattype::InBroadcast
+                | Chattype::OutSuperGroup | Chattype::InSuperGroup => None,
             }
         } else {
             None
