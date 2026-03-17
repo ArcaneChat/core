@@ -549,9 +549,6 @@ async fn get_configured_param(
 async fn configure(ctx: &Context, param: &EnteredLoginParam) -> Result<Option<&'static Provider>> {
     progress!(ctx, 1);
 
-    let ctx2 = ctx.clone();
-    let update_device_chats_handle = task::spawn(async move { ctx2.update_device_chats().await });
-
     let configured_param = get_configured_param(ctx, param).await?;
     let proxy_config = ProxyConfig::load(ctx).await?;
     let strict_tls = configured_param.strict_tls(proxy_config.is_some());
@@ -590,11 +587,14 @@ async fn configure(ctx: &Context, param: &EnteredLoginParam) -> Result<Option<&'
     let (_s, r) = async_channel::bounded(1);
     let mut imap = Imap::new(ctx, transport_id, configured_param.clone(), r).await?;
     let configuring = true;
-    if let Err(err) = imap.connect(ctx, configuring).await {
-        bail!(
-            "{}",
-            nicer_configuration_error(ctx, format!("{err:#}")).await
-        );
+    let imap_session = match imap.connect(ctx, configuring).await {
+        Ok(imap_session) => imap_session,
+        Err(err) => {
+            bail!(
+                "{}",
+                nicer_configuration_error(ctx, format!("{err:#}")).await
+            );
+        }
     };
 
     progress!(ctx, 850);
@@ -609,7 +609,17 @@ async fn configure(ctx: &Context, param: &EnteredLoginParam) -> Result<Option<&'
         ctx.sql.set_raw_config("mvbox_move", Some("0")).await?;
         ctx.sql.set_raw_config("only_fetch_mvbox", None).await?;
     }
+    if !ctx.get_config_bool(Config::FixIsChatmail).await? {
+        if imap_session.is_chatmail() {
+            ctx.sql.set_raw_config("is_chatmail", Some("1")).await?;
+        } else if !is_configured {
+            // Reset the setting that may have been set
+            // during failed configuration.
+            ctx.sql.set_raw_config("is_chatmail", Some("0")).await?;
+        }
+    }
 
+    drop(imap_session);
     drop(imap);
 
     progress!(ctx, 910);
@@ -629,7 +639,9 @@ async fn configure(ctx: &Context, param: &EnteredLoginParam) -> Result<Option<&'
     ctx.scheduler.interrupt_inbox().await;
 
     progress!(ctx, 940);
-    update_device_chats_handle.await??;
+    ctx.update_device_chats()
+        .await
+        .context("Failed to update device chats")?;
 
     ctx.sql.set_raw_config_bool("configured", true).await?;
     ctx.emit_event(EventType::AccountsItemChanged);

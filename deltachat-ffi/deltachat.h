@@ -1569,13 +1569,36 @@ dc_array_t*     dc_wait_next_msgs            (dc_context_t* context);
  * (read receipts aren't sent for noticed messages).
  *
  * Calling this function usually results in the event #DC_EVENT_MSGS_NOTICED.
- * See also dc_markseen_msgs().
+ * See also dc_markseen_msgs() and dc_markfresh_chat().
  *
  * @memberof dc_context_t
  * @param context The context object as returned from dc_context_new().
  * @param chat_id The chat ID of which all messages should be marked as being noticed.
  */
 void            dc_marknoticed_chat          (dc_context_t* context, uint32_t chat_id);
+
+
+/**
+ * Mark the last incoming message in chat as _fresh_.
+ *
+ * UI can use this to offer a "mark unread" option,
+ * so that already noticed chats (see dc_marknoticed_chat()) get a badge counter again.
+ *
+ * dc_get_fresh_msg_cnt() and dc_get_fresh_msgs() usually is increased by one afterwards.
+ *
+ * #DC_EVENT_MSGS_CHANGED is fired as usual,
+ * however, #DC_EVENT_INCOMING_MSG is _not_ fired again.
+ * This is to not add complexity to incoming messages code,
+ * e.g. UI usually does not add notifications for manually unread chats.
+ * If the UI wants to update system badge counters,
+ * they should do so directly after calling dc_markfresh_chat().
+ *
+ * @memberof dc_context_t
+ * @param context The context object as returned from dc_context_new().
+ * @param chat_id The chat ID of which the last incoming message should be marked as fresh.
+ *     If the chat does not have incoming messages, nothing happens.
+ */
+void            dc_markfresh_chat            (dc_context_t* context, uint32_t chat_id);
 
 
 /**
@@ -4612,7 +4635,7 @@ int             dc_msg_is_info                (const dc_msg_t* msg);
  *   and also offer a way to fix the encryption, eg. by a button offering a QR scan
  * - DC_INFO_WEBXDC_INFO_MESSAGE (32) - Info-message created by webxdc app sending `update.info`
  * - DC_INFO_CHAT_E2EE (50) - Info-message for "Chat is end-to-end-encrypted"
- * - DC_INFO_GROUP_NAME_CHANGED (70) - Info-message "Description changed", UI should open the profile with the description
+ * - DC_INFO_GROUP_DESCRIPTION_CHANGED (70) - Info-message "Description changed", UI should open the profile with the description
  *
  * For the messages that refer to a CONTACT,
  * dc_msg_get_info_contact_id() returns the contact ID.
@@ -6758,6 +6781,7 @@ void dc_event_unref(dc_event_t* event);
  * UI usually only takes action in case call UI was opened before, otherwise the event should be ignored.
  *
  * @param data1 (int) msg_id ID of the message referring to the call
+ * @param data2 (int) 1 if the call was accepted from this device (process).
  */
  #define DC_EVENT_INCOMING_CALL_ACCEPTED                  2560
 
@@ -7499,7 +7523,7 @@ void dc_event_unref(dc_event_t* event);
 
 /// "Messages are end-to-end encrypted."
 ///
-/// Used in info messages.
+/// Used in info-messages, UI may add smth. as "Tap to learn more."
 #define DC_STR_CHAT_PROTECTION_ENABLED 170
 
 /// "Others will only see this group after you sent a first message."
@@ -7582,6 +7606,19 @@ void dc_event_unref(dc_event_t* event);
 /// `%1$s` and `%2$s` will both be replaced by the name of the inviter.
 #define DC_STR_SECURE_JOIN_CHANNEL_STARTED 203
 
+/// "Channel name changed from %1$s to %2$s."
+///
+/// Used in status messages.
+///
+/// `%1$s` will be replaced by the old channel name.
+/// `%2$s` will be replaced by the new channel name.
+#define DC_STR_CHANNEL_NAME_CHANGED 204
+
+/// "Channel image changed."
+///
+/// Used in status messages.
+#define DC_STR_CHANNEL_IMAGE_CHANGED 205
+
 /// "The attachment contains anonymous usage statistics, which help us improve Delta Chat. Thank you!"
 ///
 /// Used as the message body for statistics sent out.
@@ -7619,6 +7656,11 @@ void dc_event_unref(dc_event_t* event);
 
 /// "Chat description changed by %1$s."
 #define DC_STR_GROUP_DESCRIPTION_CHANGED_BY_OTHER 241
+
+/// "Messages are end-to-end encrypted."
+///
+/// Used when creating text for the "Encryption Info" dialogs.
+#define DC_STR_MESSAGES_ARE_E2EE 242
 
 /**
  * @}

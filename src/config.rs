@@ -19,7 +19,7 @@ use crate::log::LogExt;
 use crate::mimefactory::RECOMMENDED_FILE_SIZE;
 use crate::provider::Provider;
 use crate::sync::{self, Sync::*, SyncData};
-use crate::tools::get_abs_path;
+use crate::tools::{get_abs_path, time};
 use crate::transport::{ConfiguredLoginParam, add_pseudo_transport, send_sync_transports};
 use crate::{constants, stats};
 
@@ -828,6 +828,22 @@ impl Context {
                                 (addr,),
                             )?;
 
+                            // Update the timestamp for the primary transport
+                            // so it becomes the first in `get_all_self_addrs()` list
+                            // and the list of relays distributed in the public key.
+                            // This ensures that messages will be sent
+                            // to the primary relay by the contacts
+                            // and will be fetched in background_fetch()
+                            // which only fetches from the primary transport.
+                            transaction
+                                .execute(
+                                    "UPDATE transports SET add_timestamp=? WHERE addr=?",
+                                    (time(), addr),
+                                )
+                                .context(
+                                    "Failed to update add_timestamp for the new primary transport",
+                                )?;
+
                             // Clean up SMTP and IMAP APPEND queue.
                             //
                             // The messages in the queue have a different
@@ -944,12 +960,18 @@ impl Context {
         Ok(())
     }
 
-    /// Returns the primary self address followed by all secondary ones.
+    /// Returns all self addresses, newest first.
     pub(crate) async fn get_all_self_addrs(&self) -> Result<Vec<String>> {
-        let primary_addrs = self.get_config(Config::ConfiguredAddr).await?.into_iter();
-        let secondary_addrs = self.get_secondary_self_addrs().await?.into_iter();
-
-        Ok(primary_addrs.chain(secondary_addrs).collect())
+        self.sql
+            .query_map_vec(
+                "SELECT addr FROM transports ORDER BY add_timestamp DESC",
+                (),
+                |row| {
+                    let addr: String = row.get(0)?;
+                    Ok(addr)
+                },
+            )
+            .await
     }
 
     /// Returns all secondary self addresses.

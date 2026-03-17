@@ -391,6 +391,12 @@ https://delta.chat/donate"))]
                              Waiting for the device of %2$s to reply…"))]
     SecureJoinBroadcastStarted = 203,
 
+    #[strum(props(fallback = "Channel name changed from \"%1$s\" to \"%2$s\"."))]
+    MsgBroadcastNameChanged = 204,
+
+    #[strum(props(fallback = "Channel image changed."))]
+    MsgBroadcastImgChanged = 205,
+
     #[strum(props(
         fallback = "The attachment contains anonymous usage statistics, which helps us improve Delta Chat. Thank you!"
     ))]
@@ -429,6 +435,9 @@ https://delta.chat/donate"))]
 
     #[strum(props(fallback = "Chat description changed by %1$s."))]
     MsgChatDescriptionChangedBy = 241,
+
+    #[strum(props(fallback = "Messages are end-to-end encrypted."))]
+    MessagesAreE2ee = 242,
 }
 
 impl StockMessage {
@@ -620,10 +629,10 @@ pub(crate) async fn msg_chat_description_changed(
     }
 }
 
-/// Stock string: `You added member %1$s.` or `Member %1$s added by %2$s.`.
+/// Stock string: `Member %1$s added.`, `You added member %1$s.` or `Member %1$s added by %2$s.`.
 ///
-/// The `added_member_addr` parameter should be an email address and is looked up in the
-/// contacts to combine with the display name.
+/// The `added_member` and `by_contact` contacts
+/// are looked up in the database to get the display names.
 pub(crate) async fn msg_add_member_local(
     context: &Context,
     added_member: ContactId,
@@ -646,10 +655,10 @@ pub(crate) async fn msg_add_member_local(
     }
 }
 
-/// Stock string: `I added member %1$s.` or `Member %1$s removed by %2$s.`.
+/// Stock string: `Member %1$s removed.` or `You removed member %1$s.` or `Member %1$s removed by %2$s.`
 ///
-/// The `removed_member_addr` parameter should be an email address and is looked up in
-/// the contacts to combine with the display name.
+/// The `removed_member` and `by_contact` contacts
+/// are looked up in the database to get the display names.
 pub(crate) async fn msg_del_member_local(
     context: &Context,
     removed_member: ContactId,
@@ -706,6 +715,19 @@ pub(crate) async fn secure_join_broadcast_started(
     } else {
         format!("secure_join_started: unknown contact {inviter_contact_id}")
     }
+}
+
+/// Stock string: `Channel name changed from "1%s" to "2$s".`
+pub(crate) async fn msg_broadcast_name_changed(context: &Context, from: &str, to: &str) -> String {
+    translated(context, StockMessage::MsgBroadcastNameChanged)
+        .await
+        .replace1(from)
+        .replace2(to)
+}
+
+/// Stock string `Channel image changed.`
+pub(crate) async fn msg_broadcast_img_changed(context: &Context) -> String {
+    translated(context, StockMessage::MsgBroadcastImgChanged).await
 }
 
 /// Stock string: `You reacted %1$s to "%2$s"` or `%1$s reacted %2$s to "%3$s"`.
@@ -1049,9 +1071,14 @@ pub(crate) async fn error_no_network(context: &Context) -> String {
     translated(context, StockMessage::ErrorNoNetwork).await
 }
 
-/// Stock string: `Messages are end-to-end encrypted.`
-pub(crate) async fn messages_e2e_encrypted(context: &Context) -> String {
+/// Stock string: `Messages are end-to-end encrypted.`, used in info-messages, UI may add smth. as `Tap to learn more.`
+pub(crate) async fn messages_e2ee_info_msg(context: &Context) -> String {
     translated(context, StockMessage::ChatProtectionEnabled).await
+}
+
+/// Stock string: `Messages are end-to-end encrypted.`
+pub(crate) async fn messages_are_e2ee(context: &Context) -> String {
+    translated(context, StockMessage::MessagesAreE2ee).await
 }
 
 /// Stock string: `Reply`.

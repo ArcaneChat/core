@@ -31,7 +31,8 @@ use crate::key::{
 };
 use crate::log::{LogExt as _, warn};
 use crate::message::{
-    self, Message, MessageState, MessengerMessage, MsgId, Viewtype, rfc724_mid_exists,
+    self, Message, MessageState, MessengerMessage, MsgId, Viewtype, insert_tombstone,
+    rfc724_mid_exists,
 };
 use crate::mimeparser::{
     AvatarAction, GossipedKey, MimeMessage, PreMessageMode, SystemMessage, parse_message_ids,
@@ -176,22 +177,6 @@ pub(crate) async fn receive_imf_from_inbox(
     seen: bool,
 ) -> Result<Option<ReceivedMsg>> {
     receive_imf_inner(context, rfc724_mid, imf_raw, seen).await
-}
-
-/// Inserts a tombstone into `msgs` table
-/// to prevent downloading the same message in the future.
-///
-/// Returns tombstone database row ID.
-async fn insert_tombstone(context: &Context, rfc724_mid: &str) -> Result<MsgId> {
-    let row_id = context
-        .sql
-        .insert(
-            "INSERT INTO msgs(rfc724_mid, chat_id) VALUES (?,?)",
-            (rfc724_mid, DC_CHAT_ID_TRASH),
-        )
-        .await?;
-    let msg_id = MsgId::new(u32::try_from(row_id)?);
-    Ok(msg_id)
 }
 
 async fn get_to_and_past_contact_ids(
@@ -554,9 +539,17 @@ pub(crate) async fn receive_imf_inner(
             .await?
             .filter(|msg| msg.download_state() != DownloadState::Done)
         {
-            // the message was partially downloaded before and is fully downloaded now.
-            info!(context, "Message already partly in DB, replacing.");
-            Some(msg.chat_id)
+            // The message was partially downloaded before.
+            match mime_parser.pre_message {
+                PreMessageMode::Post | PreMessageMode::None => {
+                    info!(context, "Message already partly in DB, replacing.");
+                    Some(msg.chat_id)
+                }
+                PreMessageMode::Pre { .. } => {
+                    info!(context, "Cannot replace pre-message with a pre-message");
+                    None
+                }
+            }
         } else {
             // The message was already fully downloaded
             // or cannot be loaded because it is deleted.
@@ -868,6 +861,10 @@ UPDATE config SET value=? WHERE keyname='configured_addr' AND value!=?1
                 if transport_changed {
                     info!(context, "Primary transport changed to {from_addr:?}.");
                     context.sql.uncache_raw_config("configured_addr").await;
+
+                    // Regenerate User ID in V4 keys.
+                    context.self_public_key.lock().await.take();
+
                     context.emit_event(EventType::TransportsModified);
                 }
             } else {
@@ -1325,15 +1322,35 @@ async fn decide_chat_assignment(
     // no database row and ChatId yet.
     let mut num_recipients = 0;
     let mut has_self_addr = false;
-    for recipient in &mime_parser.recipients {
-        has_self_addr |= context.is_self_addr(&recipient.addr).await?;
-        if addr_cmp(&recipient.addr, &mime_parser.from.addr) {
-            continue;
+
+    if let Some((sender_fingerprint, intended_recipient_fingerprints)) = mime_parser
+        .signature
+        .as_ref()
+        .filter(|(_sender_fingerprint, fps)| !fps.is_empty())
+    {
+        // The message is signed and has intended recipient fingerprints.
+
+        // If the message has intended recipient fingerprint and is not trashed already,
+        // then it is intended for us.
+        has_self_addr = true;
+
+        num_recipients = intended_recipient_fingerprints
+            .iter()
+            .filter(|fp| *fp != sender_fingerprint)
+            .count();
+    } else {
+        // Message has no intended recipient fingerprints
+        // or is not signed, count the `To` field recipients.
+        for recipient in &mime_parser.recipients {
+            has_self_addr |= context.is_self_addr(&recipient.addr).await?;
+            if addr_cmp(&recipient.addr, &mime_parser.from.addr) {
+                continue;
+            }
+            num_recipients += 1;
         }
-        num_recipients += 1;
-    }
-    if from_id != ContactId::SELF && !has_self_addr {
-        num_recipients += 1;
+        if from_id != ContactId::SELF && !has_self_addr {
+            num_recipients += 1;
+        }
     }
     let mut can_be_11_chat_log = String::new();
     let mut l = |cond: bool, s: String| {
@@ -3339,8 +3356,13 @@ async fn apply_chat_name_avatar_and_description_changes(
             .is_some()
         {
             let old_name = &sanitize_single_line(old_name);
-            better_msg
-                .get_or_insert(stock_str::msg_grp_name(context, old_name, grpname, from_id).await);
+            better_msg.get_or_insert(
+                if matches!(chat.typ, Chattype::InBroadcast | Chattype::OutBroadcast) {
+                    stock_str::msg_broadcast_name_changed(context, old_name, grpname).await
+                } else {
+                    stock_str::msg_grp_name(context, old_name, grpname, from_id).await
+                },
+            );
         }
     }
 
@@ -3397,10 +3419,18 @@ async fn apply_chat_name_avatar_and_description_changes(
     {
         // this is just an explicit message containing the group-avatar,
         // apart from that, the group-avatar is send along with various other messages
-        better_msg.get_or_insert(match avatar_action {
-            AvatarAction::Delete => stock_str::msg_grp_img_deleted(context, from_id).await,
-            AvatarAction::Change(_) => stock_str::msg_grp_img_changed(context, from_id).await,
-        });
+        better_msg.get_or_insert(
+            if matches!(chat.typ, Chattype::InBroadcast | Chattype::OutBroadcast) {
+                stock_str::msg_broadcast_img_changed(context).await
+            } else {
+                match avatar_action {
+                    AvatarAction::Delete => stock_str::msg_grp_img_deleted(context, from_id).await,
+                    AvatarAction::Change(_) => {
+                        stock_str::msg_grp_img_changed(context, from_id).await
+                    }
+                }
+            },
+        );
     }
 
     if let Some(avatar_action) = &mime_parser.group_avatar {

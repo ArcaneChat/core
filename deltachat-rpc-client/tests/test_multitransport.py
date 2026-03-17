@@ -1,7 +1,7 @@
 import pytest
 
 from deltachat_rpc_client import EventType
-from deltachat_rpc_client.const import DownloadState
+from deltachat_rpc_client.const import ChatType, DownloadState
 from deltachat_rpc_client.rpc import JsonRpcError
 
 
@@ -225,6 +225,9 @@ def test_transport_synchronization(acfactory, log) -> None:
     log.section("ac1 changes the primary transport")
     ac1.set_config("configured_addr", transport3["addr"])
 
+    # One event for updated `add_timestamp` of the new primary transport,
+    # one event for the `configured_addr` update.
+    ac1_clone.wait_for_event(EventType.TRANSPORTS_MODIFIED)
     ac1_clone.wait_for_event(EventType.TRANSPORTS_MODIFIED)
     [transport1, transport3] = ac1_clone.list_transports()
     assert ac1_clone.get_config("configured_addr") == addr3
@@ -315,20 +318,16 @@ def test_transport_limit(acfactory) -> None:
     account.add_transport_from_qr(qr)
 
 
-def test_message_info_imap_urls(acfactory, log) -> None:
+def test_message_info_imap_urls(acfactory) -> None:
     """Test that message info contains IMAP URLs of where the message was received."""
     alice, bob = acfactory.get_online_accounts(2)
 
-    log.section("Alice adds ac1 clone removes second transport")
     qr = acfactory.get_account_qr()
     for i in range(3):
         alice.add_transport_from_qr(qr)
         # Wait for all transports to go IDLE after adding each one.
         for _ in range(i + 1):
             alice.bring_online()
-
-    new_alice_addr = alice.list_transports()[2]["addr"]
-    alice.set_config("configured_addr", new_alice_addr)
 
     # Enable multi-device mode so messages are not deleted immediately.
     alice.set_config("bcc_self", "1")
@@ -337,12 +336,53 @@ def test_message_info_imap_urls(acfactory, log) -> None:
     # This is where he will send the message.
     bob_chat = bob.create_chat(alice)
 
-    # Alice changes the transport again.
-    alice.set_config("configured_addr", alice.list_transports()[3]["addr"])
+    # Alice switches to another transport and removes the rest of the transports.
+    new_alice_addr = alice.list_transports()[1]["addr"]
+    alice.set_config("configured_addr", new_alice_addr)
+    removed_addrs = []
+    for transport in alice.list_transports():
+        if transport["addr"] != new_alice_addr:
+            alice.delete_transport(transport["addr"])
+            removed_addrs.append(transport["addr"])
+    alice.stop_io()
+    alice.start_io()
 
     bob_chat.send_text("Hello!")
 
     msg = alice.wait_for_incoming_msg()
-    for alice_transport in alice.list_transports():
-        addr = alice_transport["addr"]
-        assert (addr == new_alice_addr) == (addr in msg.get_info())
+    msg_info = msg.get_info()
+    assert new_alice_addr in msg_info
+    for removed_addr in removed_addrs:
+        assert removed_addr not in msg_info
+    assert f"{new_alice_addr}/INBOX" in msg_info
+
+
+def test_remove_primary_transport(acfactory, log) -> None:
+    """Test that after removing the primary relay, Alice can still receive messages."""
+    alice, bob = acfactory.get_online_accounts(2)
+    qr = acfactory.get_account_qr()
+
+    alice.add_transport_from_qr(qr)
+    alice.bring_online()
+
+    bob_chat = bob.create_chat(alice)
+    alice.create_chat(bob)
+
+    log.section("Alice sets up second transport")
+    [transport1, transport2] = alice.list_transports()
+    alice.set_config("configured_addr", transport2["addr"])
+
+    bob_chat.send_text("Hello!")
+    msg1 = alice.wait_for_incoming_msg().get_snapshot()
+    assert msg1.text == "Hello!"
+
+    log.section("Alice removes the primary relay")
+    alice.delete_transport(transport1["addr"])
+    alice.stop_io()
+    alice.start_io()
+
+    bob_chat.send_text("Hello again!")
+    msg2 = alice.wait_for_incoming_msg().get_snapshot()
+    assert msg2.text == "Hello again!"
+    assert msg2.chat.get_basic_snapshot().chat_type == ChatType.SINGLE
+    assert msg2.chat == alice.create_chat(bob)

@@ -1,7 +1,7 @@
 //! # Chat module.
 
 use std::cmp;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::io::Cursor;
 use std::marker::Sync;
@@ -42,6 +42,7 @@ use crate::message::{self, Message, MessageState, MsgId, Viewtype};
 use crate::mimefactory::{MimeFactory, RenderedEmail};
 use crate::mimeparser::SystemMessage;
 use crate::param::{Param, Params};
+use crate::pgp::addresses_from_public_key;
 use crate::receive_imf::ReceivedMsg;
 use crate::smtp::{self, send_msg_to_smtp};
 use crate::stock_str;
@@ -257,7 +258,11 @@ impl ChatId {
                         ChatIdBlocked::get_for_contact(context, contact_id, create_blocked)
                             .await
                             .map(|chat| chat.id)?;
-                    ContactId::scaleup_origin(context, &[contact_id], Origin::CreateChat).await?;
+                    if create_blocked != Blocked::Yes {
+                        info!(context, "Scale up origin of {contact_id} to CreateChat.");
+                        ContactId::scaleup_origin(context, &[contact_id], Origin::CreateChat)
+                            .await?;
+                    }
                     chat_id
                 } else {
                     warn!(
@@ -471,7 +476,7 @@ impl ChatId {
 
     /// Adds message "Messages are end-to-end encrypted".
     pub(crate) async fn add_e2ee_notice(self, context: &Context, timestamp: i64) -> Result<()> {
-        let text = stock_str::messages_e2e_encrypted(context).await;
+        let text = stock_str::messages_e2ee_info_msg(context).await;
         add_info_msg_with_cmd(
             context,
             self,
@@ -1153,7 +1158,7 @@ SELECT id, rfc724_mid, pre_rfc724_mid, timestamp, ?, 1 FROM msgs WHERE chat_id=?
             return Ok(stock_str::encr_none(context).await);
         }
 
-        let mut ret = stock_str::messages_e2e_encrypted(context).await + "\n";
+        let mut ret = stock_str::messages_are_e2ee(context).await + "\n";
 
         for &contact_id in get_chat_contacts(context, self)
             .await?
@@ -1170,8 +1175,13 @@ SELECT id, rfc724_mid, pre_rfc724_mid, timestamp, ?, 1 FROM msgs WHERE chat_id=?
             let fingerprint = contact
                 .fingerprint()
                 .context("Contact does not have a fingerprint in encrypted chat")?;
-            if contact.public_key(context).await?.is_some() {
-                ret += &format!("\n{addr}\n{fingerprint}\n");
+            if let Some(public_key) = contact.public_key(context).await? {
+                if let Some(relay_addrs) = addresses_from_public_key(&public_key) {
+                    let relays = relay_addrs.join(",");
+                    ret += &format!("\n{addr}({relays})\n{fingerprint}\n");
+                } else {
+                    ret += &format!("\n{addr}\n{fingerprint}\n");
+                }
             } else {
                 ret += &format!("\n{addr}\n(key missing)\n{fingerprint}\n");
             }
@@ -1772,16 +1782,6 @@ impl Chat {
                 .set_i64(Param::GroupNameTimestamp, msg.timestamp_sort)
                 .set_i64(Param::GroupDescriptionTimestamp, msg.timestamp_sort);
             self.update_param(context).await?;
-            // TODO: Remove this compat code needed because Core <= v1.143:
-            // - doesn't accept synchronization of QR code tokens for unpromoted groups, so we also
-            //   send them when the group is promoted.
-            // - doesn't sync QR code tokens for unpromoted groups and the group might be created
-            //   before an upgrade.
-            context
-                .sync_qr_code_tokens(Some(self.grpid.as_str()))
-                .await
-                .log_err(context)
-                .ok();
         }
 
         let is_bot = context.get_config_bool(Config::Bot).await?;
@@ -3406,6 +3406,38 @@ pub(crate) async fn mark_old_messages_as_noticed(
     Ok(())
 }
 
+/// Marks last incoming message in a chat as fresh.
+pub async fn markfresh_chat(context: &Context, chat_id: ChatId) -> Result<()> {
+    let affected_rows = context
+        .sql
+        .execute(
+            "UPDATE msgs
+                SET state=?1
+              WHERE id=(SELECT id
+                          FROM msgs
+                         WHERE state IN (?1, ?2, ?3) AND hidden=0 AND chat_id=?4
+                      ORDER BY timestamp DESC, id DESC
+                         LIMIT 1)
+                AND state!=?1",
+            (
+                MessageState::InFresh,
+                MessageState::InNoticed,
+                MessageState::InSeen,
+                chat_id,
+            ),
+        )
+        .await?;
+
+    if affected_rows == 0 {
+        return Ok(());
+    }
+
+    context.emit_msgs_changed_without_msg_id(chat_id);
+    chatlist_events::emit_chatlist_item_changed(context, chat_id);
+
+    Ok(())
+}
+
 /// Returns all database message IDs of the given types.
 ///
 /// If `chat_id` is None, return messages from any chat.
@@ -3894,8 +3926,6 @@ pub(crate) async fn add_contact_to_chat_ex(
         );
         return Ok(false);
     }
-
-    let sync_qr_code_tokens;
     if from_handshake && chat.param.get_int(Param::Unpromoted).unwrap_or_default() == 1 {
         let smeared_time = smeared_time(context);
         chat.param
@@ -3903,11 +3933,7 @@ pub(crate) async fn add_contact_to_chat_ex(
             .set_i64(Param::GroupNameTimestamp, smeared_time)
             .set_i64(Param::GroupDescriptionTimestamp, smeared_time);
         chat.update_param(context).await?;
-        sync_qr_code_tokens = true;
-    } else {
-        sync_qr_code_tokens = false;
     }
-
     if context.is_self_addr(contact.get_addr()).await? {
         // ourself is added using ContactId::SELF, do not add this address explicitly.
         // if SELF is not in the group, members cannot be added at all.
@@ -3956,20 +3982,6 @@ pub(crate) async fn add_contact_to_chat_ex(
         send_msg(context, chat_id, &mut msg).await?;
 
         sync = Nosync;
-        // TODO: Remove this compat code needed because Core <= v1.143:
-        // - doesn't accept synchronization of QR code tokens for unpromoted groups, so we also send
-        //   them when the group is promoted.
-        // - doesn't sync QR code tokens for unpromoted groups and the group might be created before
-        //   an upgrade.
-        if sync_qr_code_tokens
-            && context
-                .sync_qr_code_tokens(Some(chat.grpid.as_str()))
-                .await
-                .log_err(context)
-                .is_ok()
-        {
-            context.scheduler.interrupt_smtp().await;
-        }
     }
     context.emit_event(EventType::ChatModified(chat_id));
     if sync.into() {
@@ -4263,9 +4275,7 @@ async fn set_chat_description_ex(
 
     if chat.is_promoted() {
         let mut msg = Message::new(Viewtype::Text);
-        msg.text =
-            "[Chat description changed. To see this and other new features, please update the app]"
-                .to_string();
+        msg.text = stock_str::msg_chat_description_changed(context, ContactId::SELF).await;
         msg.param.set_cmd(SystemMessage::GroupDescriptionChanged);
 
         msg.id = send_msg(context, chat_id, &mut msg).await?;
@@ -4350,8 +4360,11 @@ async fn rename_ex(
                 && sanitize_single_line(&chat.name) != new_name
             {
                 msg.viewtype = Viewtype::Text;
-                msg.text =
-                    stock_str::msg_grp_name(context, &chat.name, &new_name, ContactId::SELF).await;
+                msg.text = if chat.typ == Chattype::OutBroadcast {
+                    stock_str::msg_broadcast_name_changed(context, &chat.name, &new_name).await
+                } else {
+                    stock_str::msg_grp_name(context, &chat.name, &new_name, ContactId::SELF).await
+                };
                 msg.param.set_cmd(SystemMessage::GroupNameChanged);
                 if !chat.name.is_empty() {
                     msg.param.set(Param::Arg, &chat.name);
@@ -4412,7 +4425,11 @@ pub async fn set_chat_profile_image(
     if new_image.is_empty() {
         chat.param.remove(Param::ProfileImage);
         msg.param.remove(Param::Arg);
-        msg.text = stock_str::msg_grp_img_deleted(context, ContactId::SELF).await;
+        msg.text = if chat.typ == Chattype::OutBroadcast {
+            stock_str::msg_broadcast_img_changed(context).await
+        } else {
+            stock_str::msg_grp_img_deleted(context, ContactId::SELF).await
+        };
     } else {
         let mut image_blob = BlobObject::create_and_deduplicate(
             context,
@@ -4422,7 +4439,11 @@ pub async fn set_chat_profile_image(
         image_blob.recode_to_avatar_size(context).await?;
         chat.param.set(Param::ProfileImage, image_blob.as_name());
         msg.param.set(Param::Arg, image_blob.as_name());
-        msg.text = stock_str::msg_grp_img_changed(context, ContactId::SELF).await;
+        msg.text = if chat.typ == Chattype::OutBroadcast {
+            stock_str::msg_broadcast_img_changed(context).await
+        } else {
+            stock_str::msg_grp_img_changed(context, ContactId::SELF).await
+        };
     }
     chat.update_param(context).await?;
     if chat.is_promoted() {
@@ -5059,18 +5080,18 @@ async fn set_contacts_by_fingerprints(
         matches!(chat.typ, Chattype::Group | Chattype::OutBroadcast),
         "{id} is not a group or broadcast",
     );
-    let mut contacts = HashSet::new();
+    let mut contacts = BTreeSet::new();
     for (fingerprint, addr) in fingerprint_addrs {
         let contact = Contact::add_or_lookup_ex(context, "", addr, fingerprint, Origin::Hidden)
             .await?
             .0;
         contacts.insert(contact);
     }
-    let contacts_old = HashSet::<ContactId>::from_iter(get_chat_contacts(context, id).await?);
+    let contacts_old = BTreeSet::<ContactId>::from_iter(get_chat_contacts(context, id).await?);
     if contacts == contacts_old {
         return Ok(());
     }
-    context
+    let broadcast_contacts_added = context
         .sql
         .transaction(move |transaction| {
             // For broadcast channels, we only add members,
@@ -5087,12 +5108,31 @@ async fn set_contacts_by_fingerprints(
             let mut statement = transaction.prepare(
                 "INSERT OR IGNORE INTO chats_contacts (chat_id, contact_id) VALUES (?, ?)",
             )?;
+            let mut broadcast_contacts_added = Vec::new();
             for contact_id in &contacts {
-                statement.execute((id, contact_id))?;
+                if statement.execute((id, contact_id))? > 0 && chat.typ == Chattype::OutBroadcast {
+                    broadcast_contacts_added.push(*contact_id);
+                }
             }
-            Ok(())
+            Ok(broadcast_contacts_added)
         })
         .await?;
+    let timestamp = smeared_time(context);
+    for added_id in broadcast_contacts_added {
+        let msg = stock_str::msg_add_member_local(context, added_id, ContactId::UNDEFINED).await;
+        add_info_msg_with_cmd(
+            context,
+            id,
+            &msg,
+            SystemMessage::MemberAddedToGroup,
+            Some(timestamp),
+            timestamp,
+            None,
+            Some(ContactId::SELF),
+            Some(added_id),
+        )
+        .await?;
+    }
     context.emit_event(EventType::ChatModified(id));
     Ok(())
 }

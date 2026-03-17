@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use std::convert::TryFrom;
 use std::fmt::Write;
 use std::future::Future;
+use std::mem::ManuallyDrop;
 use std::ptr;
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -679,7 +680,6 @@ pub unsafe extern "C" fn dc_event_get_data2_int(event: *mut dc_event_t) -> libc:
         | EventType::ChatModified(_)
         | EventType::ChatDeleted { .. }
         | EventType::WebxdcRealtimeAdvertisementReceived { .. }
-        | EventType::IncomingCallAccepted { .. }
         | EventType::OutgoingCallAccepted { .. }
         | EventType::CallEnded { .. }
         | EventType::EventChannelOverflow { .. }
@@ -702,6 +702,9 @@ pub unsafe extern "C" fn dc_event_get_data2_int(event: *mut dc_event_t) -> libc:
         } => status_update_serial.to_u32() as libc::c_int,
         EventType::WebxdcRealtimeData { data, .. } => data.len() as libc::c_int,
         EventType::IncomingCall { has_video, .. } => *has_video as libc::c_int,
+        EventType::IncomingCallAccepted {
+            from_this_device, ..
+        } => *from_this_device as libc::c_int,
 
         #[allow(unreachable_patterns)]
         #[cfg(test)]
@@ -1515,6 +1518,23 @@ pub unsafe extern "C" fn dc_marknoticed_chat(context: *mut dc_context_t, chat_id
         chat::marknoticed_chat(ctx, ChatId::new(chat_id))
             .await
             .context("Failed marknoticed chat")
+            .log_err(ctx)
+            .unwrap_or(())
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dc_markfresh_chat(context: *mut dc_context_t, chat_id: u32) {
+    if context.is_null() {
+        eprintln!("ignoring careless call to dc_markfresh_chat()");
+        return;
+    }
+    let ctx = &*context;
+
+    block_on(async move {
+        chat::markfresh_chat(ctx, ChatId::new(chat_id))
+            .await
+            .context("Failed markfresh chat")
             .log_err(ctx)
             .unwrap_or(())
     })
@@ -5170,10 +5190,10 @@ pub unsafe extern "C" fn dc_jsonrpc_init(
         return ptr::null_mut();
     }
 
-    let account_manager = Arc::from_raw(account_manager);
-    let cmd_api = block_on(deltachat_jsonrpc::api::CommandApi::from_arc(
-        account_manager.clone(),
-    ));
+    let account_manager = ManuallyDrop::new(Arc::from_raw(account_manager));
+    let cmd_api = block_on(deltachat_jsonrpc::api::CommandApi::from_arc(Arc::clone(
+        &account_manager,
+    )));
 
     let (request_handle, receiver) = RpcClient::new();
     let handle = RpcSession::new(request_handle, cmd_api);

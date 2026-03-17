@@ -7,16 +7,23 @@ use std::io::Cursor;
 use anyhow::{Context as _, Result, bail, ensure};
 use base64::Engine as _;
 use deltachat_contact_tools::EmailAddress;
-use pgp::composed::Deserializable;
+use pgp::composed::{Deserializable, SignedKeyDetails};
 pub use pgp::composed::{SignedPublicKey, SignedSecretKey};
+use pgp::crypto::aead::AeadAlgorithm;
+use pgp::crypto::hash::HashAlgorithm;
+use pgp::crypto::sym::SymmetricKeyAlgorithm;
+use pgp::packet::{
+    Features, KeyFlags, Notation, PacketTrait as _, SignatureConfig, SignatureType, Subpacket,
+    SubpacketData,
+};
 use pgp::ser::Serialize;
-use pgp::types::{KeyDetails, KeyId};
+use pgp::types::{CompressionAlgorithm, KeyDetails, KeyVersion};
+use rand_old::thread_rng;
 use tokio::runtime::Handle;
 
 use crate::context::Context;
 use crate::events::EventType;
 use crate::log::LogExt;
-use crate::pgp::KeyPair;
 use crate::tools::{self, time_elapsed};
 
 /// Convenience trait for working with keys.
@@ -113,19 +120,155 @@ pub trait DcKey: Serialize + Deserializable + Clone {
 
     /// Whether the key is private (or public).
     fn is_private() -> bool;
+}
 
-    /// Returns the OpenPGP Key ID.
-    fn key_id(&self) -> KeyId;
+/// Converts secret key to public key.
+pub(crate) fn secret_key_to_public_key(
+    context: &Context,
+    mut signed_secret_key: SignedSecretKey,
+    timestamp: u32,
+    addr: &str,
+    relay_addrs: &str,
+) -> Result<SignedPublicKey> {
+    info!(context, "Converting secret key to public key.");
+    let timestamp = pgp::types::Timestamp::from_secs(timestamp);
+
+    // Subpackets that we want to share between DKS and User ID signature.
+    let common_subpackets = || -> Result<Vec<Subpacket>> {
+        let keyflags = {
+            let mut keyflags = KeyFlags::default();
+            keyflags.set_certify(true);
+            keyflags.set_sign(true);
+            keyflags
+        };
+        let features = {
+            let mut features = Features::default();
+            features.set_seipd_v1(true);
+            features.set_seipd_v2(true);
+            features
+        };
+
+        Ok(vec![
+            Subpacket::regular(SubpacketData::SignatureCreationTime(timestamp))?,
+            Subpacket::regular(SubpacketData::IssuerFingerprint(
+                signed_secret_key.fingerprint(),
+            ))?,
+            Subpacket::regular(SubpacketData::KeyFlags(keyflags))?,
+            Subpacket::regular(SubpacketData::Features(features))?,
+            Subpacket::regular(SubpacketData::PreferredSymmetricAlgorithms(smallvec![
+                SymmetricKeyAlgorithm::AES256,
+                SymmetricKeyAlgorithm::AES192,
+                SymmetricKeyAlgorithm::AES128
+            ]))?,
+            Subpacket::regular(SubpacketData::PreferredHashAlgorithms(smallvec![
+                HashAlgorithm::Sha256,
+                HashAlgorithm::Sha384,
+                HashAlgorithm::Sha512,
+                HashAlgorithm::Sha224,
+            ]))?,
+            Subpacket::regular(SubpacketData::PreferredCompressionAlgorithms(smallvec![
+                CompressionAlgorithm::ZLIB,
+                CompressionAlgorithm::ZIP,
+            ]))?,
+            Subpacket::regular(SubpacketData::PreferredAeadAlgorithms(smallvec![(
+                SymmetricKeyAlgorithm::AES256,
+                AeadAlgorithm::Ocb
+            )]))?,
+            Subpacket::regular(SubpacketData::IsPrimary(true))?,
+        ])
+    };
+
+    // RFC 4880 required that Transferrable Public Key (aka OpenPGP Certificate)
+    // contains at least one User ID:
+    // <https://www.rfc-editor.org/rfc/rfc4880#section-11.1>
+    // RFC 9580 does not require User ID even for V4 certificates anymore:
+    // <https://www.rfc-editor.org/rfc/rfc9580.html#name-openpgp-version-4-certifica>
+    //
+    // We do not use and do not expect User ID in any keys,
+    // but nevertheless include User ID in V4 keys for compatibility with clients that follow RFC 4880.
+    // RFC 9580 also recommends including User ID into V4 keys:
+    // <https://www.rfc-editor.org/rfc/rfc9580.html#section-5.2.3.10-8>
+    //
+    // We do not support keys older than V4 and are not going
+    // to include User ID in newer V6 keys as all clients that support V6
+    // should support keys without User ID.
+    let users = if signed_secret_key.version() == KeyVersion::V4 {
+        let user_id = format!("<{addr}>");
+
+        let mut rng = thread_rng();
+        // Self-signature is a "positive certification",
+        // see <https://www.ietf.org/archive/id/draft-gallagher-openpgp-signatures-02.html#name-certification-signature-typ>.
+        let mut user_id_signature_config = SignatureConfig::from_key(
+            &mut rng,
+            &signed_secret_key.primary_key,
+            SignatureType::CertPositive,
+        )?;
+        user_id_signature_config.hashed_subpackets = common_subpackets()?;
+        user_id_signature_config.unhashed_subpackets = vec![Subpacket::regular(
+            SubpacketData::IssuerKeyId(signed_secret_key.legacy_key_id()),
+        )?];
+        let user_id_packet =
+            pgp::packet::UserId::from_str(pgp::types::PacketHeaderVersion::New, &user_id)?;
+        let signature = user_id_signature_config.sign_certification(
+            &signed_secret_key.primary_key,
+            &signed_secret_key.primary_key.public_key(),
+            &pgp::types::Password::empty(),
+            user_id_packet.tag(),
+            &user_id_packet,
+        )?;
+        vec![user_id_packet.into_signed(signature)]
+    } else {
+        vec![]
+    };
+
+    let direct_signatures = {
+        let mut rng = thread_rng();
+        let mut direct_key_signature_config = SignatureConfig::from_key(
+            &mut rng,
+            &signed_secret_key.primary_key,
+            SignatureType::Key,
+        )?;
+        direct_key_signature_config.hashed_subpackets = common_subpackets()?;
+        let notation = Notation {
+            readable: true,
+            name: "relays@chatmail.at".into(),
+            value: relay_addrs.to_string().into(),
+        };
+        direct_key_signature_config
+            .hashed_subpackets
+            .push(Subpacket::regular(SubpacketData::Notation(notation))?);
+        let direct_key_signature = direct_key_signature_config.sign_key(
+            &signed_secret_key.primary_key,
+            &pgp::types::Password::empty(),
+            signed_secret_key.primary_key.public_key(),
+        )?;
+        vec![direct_key_signature]
+    };
+
+    signed_secret_key.details = SignedKeyDetails {
+        revocation_signatures: vec![],
+        direct_signatures,
+        users,
+        user_attributes: vec![],
+    };
+
+    Ok(signed_secret_key.to_public_key())
 }
 
 /// Attempts to load own public key.
 ///
-/// Returns `None` if no key is generated yet.
+/// Returns `None` if no secret key is generated yet.
 pub(crate) async fn load_self_public_key_opt(context: &Context) -> Result<Option<SignedPublicKey>> {
-    let Some(public_key_bytes) = context
+    let mut lock = context.self_public_key.lock().await;
+
+    if let Some(ref public_key) = *lock {
+        return Ok(Some(public_key.clone()));
+    }
+
+    let Some(secret_key_bytes) = context
         .sql
         .query_row_optional(
-            "SELECT public_key
+            "SELECT private_key
              FROM keypairs
              WHERE id=(SELECT value FROM config WHERE keyname='key_id')",
             (),
@@ -138,8 +281,27 @@ pub(crate) async fn load_self_public_key_opt(context: &Context) -> Result<Option
     else {
         return Ok(None);
     };
-    let public_key = SignedPublicKey::from_slice(&public_key_bytes)?;
-    Ok(Some(public_key))
+    let signed_secret_key = SignedSecretKey::from_slice(&secret_key_bytes)?;
+    let timestamp = context
+        .sql
+        .query_get_value::<u32>(
+            "SELECT MAX(timestamp)
+             FROM (SELECT add_timestamp AS timestamp
+                   FROM transports
+                   UNION ALL
+                   SELECT remove_timestamp AS timestamp
+                   FROM removed_transports)",
+            (),
+        )
+        .await?
+        .context("No transports configured")?;
+    let addr = context.get_primary_self_addr().await?;
+    let all_addrs = context.get_all_self_addrs().await?.join(",");
+    let signed_public_key =
+        secret_key_to_public_key(context, signed_secret_key, timestamp, &addr, &all_addrs)?;
+    *lock = Some(signed_public_key.clone());
+
+    Ok(Some(signed_public_key))
 }
 
 /// Loads own public key.
@@ -149,8 +311,11 @@ pub(crate) async fn load_self_public_key(context: &Context) -> Result<SignedPubl
     match load_self_public_key_opt(context).await? {
         Some(public_key) => Ok(public_key),
         None => {
-            let keypair = generate_keypair(context).await?;
-            Ok(keypair.public)
+            generate_keypair(context).await?;
+            let public_key = load_self_public_key_opt(context)
+                .await?
+                .context("Secret key generated, but public key cannot be created")?;
+            Ok(public_key)
         }
     }
 }
@@ -215,8 +380,8 @@ pub(crate) async fn load_self_secret_key(context: &Context) -> Result<SignedSecr
     match private_key {
         Some(bytes) => SignedSecretKey::from_slice(&bytes),
         None => {
-            let keypair = generate_keypair(context).await?;
-            Ok(keypair.secret)
+            let secret = generate_keypair(context).await?;
+            Ok(secret)
         }
     }
 }
@@ -262,10 +427,6 @@ impl DcKey for SignedPublicKey {
     fn dc_fingerprint(&self) -> Fingerprint {
         self.fingerprint().into()
     }
-
-    fn key_id(&self) -> KeyId {
-        KeyDetails::legacy_key_id(self)
-    }
 }
 
 impl DcKey for SignedSecretKey {
@@ -289,16 +450,12 @@ impl DcKey for SignedSecretKey {
     fn dc_fingerprint(&self) -> Fingerprint {
         self.fingerprint().into()
     }
-
-    fn key_id(&self) -> KeyId {
-        KeyDetails::legacy_key_id(&**self)
-    }
 }
 
-async fn generate_keypair(context: &Context) -> Result<KeyPair> {
+async fn generate_keypair(context: &Context) -> Result<SignedSecretKey> {
     let addr = context.get_primary_self_addr().await?;
     let addr = EmailAddress::new(&addr)?;
-    let _guard = context.generating_key_mutex.lock().await;
+    let _public_key_guard = context.self_public_key.lock().await;
 
     // Check if the key appeared while we were waiting on the lock.
     match load_keypair(context).await? {
@@ -321,51 +478,52 @@ async fn generate_keypair(context: &Context) -> Result<KeyPair> {
     }
 }
 
-pub(crate) async fn load_keypair(context: &Context) -> Result<Option<KeyPair>> {
+pub(crate) async fn load_keypair(context: &Context) -> Result<Option<SignedSecretKey>> {
     let res = context
         .sql
         .query_row_optional(
-            "SELECT public_key, private_key
-             FROM keypairs
-             WHERE id=(SELECT value FROM config WHERE keyname='key_id')",
+            "SELECT private_key
+                 FROM keypairs
+                 WHERE id=(SELECT value FROM config WHERE keyname='key_id')",
             (),
             |row| {
-                let pub_bytes: Vec<u8> = row.get(0)?;
-                let sec_bytes: Vec<u8> = row.get(1)?;
-                Ok((pub_bytes, sec_bytes))
+                let sec_bytes: Vec<u8> = row.get(0)?;
+                Ok(sec_bytes)
             },
         )
         .await?;
 
-    Ok(if let Some((pub_bytes, sec_bytes)) = res {
-        Some(KeyPair {
-            public: SignedPublicKey::from_slice(&pub_bytes)?,
-            secret: SignedSecretKey::from_slice(&sec_bytes)?,
-        })
+    let signed_secret_key = if let Some(sec_bytes) = res {
+        Some(SignedSecretKey::from_slice(&sec_bytes)?)
     } else {
         None
-    })
+    };
+
+    Ok(signed_secret_key)
 }
 
-/// Store the keypair as an owned keypair for addr in the database.
+/// Stores own keypair in the database and sets it as a default.
 ///
-/// This will save the keypair as keys for the given address.  The
-/// "self" here refers to the fact that this DC instance owns the
-/// keypair.  Usually `addr` will be [Config::ConfiguredAddr].
-///
-/// If either the public or private keys are already present in the
-/// database, this entry will be removed first regardless of the
-/// address associated with it.  Practically this means saving the
-/// same key again overwrites it.
-///
-/// [Config::ConfiguredAddr]: crate::config::Config::ConfiguredAddr
-pub(crate) async fn store_self_keypair(context: &Context, keypair: &KeyPair) -> Result<()> {
+/// Fails if we already have a key, so it is not possible to
+/// have more than one key for new setups. Existing setups
+/// may still have more than one key for compatibility.
+pub(crate) async fn store_self_keypair(
+    context: &Context,
+    signed_secret_key: &SignedSecretKey,
+) -> Result<()> {
+    // This public key is stored in the database
+    // only for backwards compatibility.
+    //
+    // It should not be used e.g. in Autocrypt headers or vCards.
+    // Use `secret_key_to_public_key()` function instead,
+    // which adds relay list to the signature.
+    let signed_public_key = signed_secret_key.to_public_key();
     let mut config_cache_lock = context.sql.config_cache.write().await;
     let new_key_id = context
         .sql
         .transaction(|transaction| {
-            let public_key = DcKey::to_bytes(&keypair.public);
-            let secret_key = DcKey::to_bytes(&keypair.secret);
+            let public_key = DcKey::to_bytes(&signed_public_key);
+            let secret_key = DcKey::to_bytes(signed_secret_key);
 
             // private_key and public_key columns
             // are UNIQUE since migration 107,
@@ -403,9 +561,7 @@ pub(crate) async fn store_self_keypair(context: &Context, keypair: &KeyPair) -> 
 /// Use import/export APIs instead.
 pub async fn preconfigure_keypair(context: &Context, secret_data: &str) -> Result<()> {
     let secret = SignedSecretKey::from_asc(secret_data)?;
-    let public = secret.to_public_key();
-    let keypair = KeyPair { public, secret };
-    store_self_keypair(context, &keypair).await?;
+    store_self_keypair(context, &secret).await?;
     Ok(())
 }
 
@@ -484,7 +640,7 @@ mod tests {
     use crate::config::Config;
     use crate::test_utils::{TestContext, alice_keypair};
 
-    static KEYPAIR: LazyLock<KeyPair> = LazyLock::new(alice_keypair);
+    static KEYPAIR: LazyLock<SignedSecretKey> = LazyLock::new(alice_keypair);
 
     #[test]
     fn test_from_armored_string() {
@@ -554,12 +710,12 @@ i8pcjGO+IZffvyZJVRWfVooBJmWWbPB1pueo3tx8w3+fcuzpxz+RLFKaPyqXO+dD
 
     #[test]
     fn test_asc_roundtrip() {
-        let key = KEYPAIR.public.clone();
+        let key = KEYPAIR.clone().to_public_key();
         let asc = key.to_asc(Some(("spam", "ham")));
         let key2 = SignedPublicKey::from_asc(&asc).unwrap();
         assert_eq!(key, key2);
 
-        let key = KEYPAIR.secret.clone();
+        let key = KEYPAIR.clone();
         let asc = key.to_asc(Some(("spam", "ham")));
         let key2 = SignedSecretKey::from_asc(&asc).unwrap();
         assert_eq!(key, key2);
@@ -567,8 +723,8 @@ i8pcjGO+IZffvyZJVRWfVooBJmWWbPB1pueo3tx8w3+fcuzpxz+RLFKaPyqXO+dD
 
     #[test]
     fn test_from_slice_roundtrip() {
-        let public_key = KEYPAIR.public.clone();
-        let private_key = KEYPAIR.secret.clone();
+        let private_key = KEYPAIR.clone();
+        let public_key = KEYPAIR.clone().to_public_key();
 
         let binary = DcKey::to_bytes(&public_key);
         let public_key2 = SignedPublicKey::from_slice(&binary).expect("invalid public key");
@@ -610,7 +766,7 @@ i8pcjGO+IZffvyZJVRWfVooBJmWWbPB1pueo3tx8w3+fcuzpxz+RLFKaPyqXO+dD
             b"\x02\xfc\xaa".as_slice(),
             b"\x01\x02\x03\x04\x05".as_slice(),
         ] {
-            let private_key = KEYPAIR.secret.clone();
+            let private_key = KEYPAIR.clone();
 
             let mut binary = DcKey::to_bytes(&private_key);
             binary.extend(garbage);
@@ -624,7 +780,7 @@ i8pcjGO+IZffvyZJVRWfVooBJmWWbPB1pueo3tx8w3+fcuzpxz+RLFKaPyqXO+dD
 
     #[test]
     fn test_base64_roundtrip() {
-        let key = KEYPAIR.public.clone();
+        let key = KEYPAIR.clone().to_public_key();
         let base64 = key.to_base64();
         let key2 = SignedPublicKey::from_base64(&base64).unwrap();
         assert_eq!(key, key2);

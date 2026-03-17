@@ -3,23 +3,25 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, Cursor};
 
-use anyhow::{Context as _, Result, bail};
-use deltachat_contact_tools::EmailAddress;
+use anyhow::{Context as _, Result, ensure};
+use deltachat_contact_tools::{EmailAddress, may_be_valid_addr};
 use pgp::armor::BlockType;
 use pgp::composed::{
-    ArmorOptions, DecryptionOptions, Deserializable, DetachedSignature, EncryptionCaps,
-    KeyType as PgpKeyType, Message, MessageBuilder, SecretKeyParamsBuilder, SignedPublicKey,
-    SignedPublicSubKey, SignedSecretKey, SubkeyParamsBuilder, SubpacketConfig, TheRing,
+    ArmorOptions, Deserializable, DetachedSignature, EncryptionCaps, KeyType as PgpKeyType,
+    Message, MessageBuilder, SecretKeyParamsBuilder, SignedKeyDetails, SignedPublicKey,
+    SignedPublicSubKey, SignedSecretKey, SubkeyParamsBuilder, SubpacketConfig,
 };
 use pgp::crypto::aead::{AeadAlgorithm, ChunkSize};
 use pgp::crypto::ecc_curve::ECCCurve;
 use pgp::crypto::hash::HashAlgorithm;
 use pgp::crypto::sym::SymmetricKeyAlgorithm;
-use pgp::packet::{SignatureConfig, SignatureType, Subpacket, SubpacketData};
+use pgp::packet::{Signature, SignatureConfig, SignatureType, Subpacket, SubpacketData};
 use pgp::types::{
-    CompressionAlgorithm, KeyDetails, KeyVersion, Password, SigningKey as _, StringToKey,
+    CompressionAlgorithm, Imprint, KeyDetails, KeyVersion, Password, SignedUser, SigningKey as _,
+    StringToKey,
 };
 use rand_old::{Rng as _, thread_rng};
+use sha2::Sha256;
 use tokio::runtime::Handle;
 
 use crate::key::{DcKey, Fingerprint};
@@ -63,34 +65,11 @@ pub fn split_armored_data(buf: &[u8]) -> Result<(BlockType, BTreeMap<String, Str
     Ok((typ, headers, bytes))
 }
 
-/// A PGP keypair.
-///
-/// This has it's own struct to be able to keep the public and secret
-/// keys together as they are one unit.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct KeyPair {
-    /// Public key.
-    pub public: SignedPublicKey,
-
-    /// Secret key.
-    pub secret: SignedSecretKey,
-}
-
-impl KeyPair {
-    /// Creates new keypair from a secret key.
-    ///
-    /// Public key is split off the secret key.
-    pub fn new(secret: SignedSecretKey) -> Result<Self> {
-        let public = secret.to_public_key();
-        Ok(Self { public, secret })
-    }
-}
-
 /// Create a new key pair.
 ///
 /// Both secret and public key consist of signing primary key and encryption subkey
 /// as [described in the Autocrypt standard](https://autocrypt.org/level1.html#openpgp-based-key-data).
-pub(crate) fn create_keypair(addr: EmailAddress) -> Result<KeyPair> {
+pub(crate) fn create_keypair(addr: EmailAddress) -> Result<SignedSecretKey> {
     let signing_key_type = PgpKeyType::Ed25519Legacy;
     let encryption_key_type = PgpKeyType::ECDH(ECCCurve::Curve25519);
 
@@ -99,6 +78,7 @@ pub(crate) fn create_keypair(addr: EmailAddress) -> Result<KeyPair> {
         .key_type(signing_key_type)
         .can_certify(true)
         .can_sign(true)
+        .feature_seipd_v2(true)
         .primary_user_id(user_id)
         .passphrase(None)
         .preferred_symmetric_algorithms(smallvec![
@@ -135,12 +115,7 @@ pub(crate) fn create_keypair(addr: EmailAddress) -> Result<KeyPair> {
         .verify_bindings()
         .context("Invalid secret key generated")?;
 
-    let key_pair = KeyPair::new(secret_key)?;
-    key_pair
-        .public
-        .verify_bindings()
-        .context("Invalid public key generated")?;
-    Ok(key_pair)
+    Ok(secret_key)
 }
 
 /// Selects a subkey of the public key to use for encryption.
@@ -320,95 +295,6 @@ pub fn pk_calc_signature(
     Ok(sig.to_armored_string(ArmorOptions::default())?)
 }
 
-/// Decrypts the message:
-/// - with keys from the private key keyring (passed in `private_keys_for_decryption`)
-///   if the message was asymmetrically encrypted,
-/// - with a shared secret/password (passed in `shared_secrets`),
-///   if the message was symmetrically encrypted.
-///
-/// Returns the decrypted and decompressed message.
-pub fn decrypt(
-    ctext: Vec<u8>,
-    private_keys_for_decryption: &[SignedSecretKey],
-    mut shared_secrets: &[String],
-) -> Result<pgp::composed::Message<'static>> {
-    let cursor = Cursor::new(ctext);
-    let (msg, _headers) = Message::from_armor(cursor)?;
-
-    let skeys: Vec<&SignedSecretKey> = private_keys_for_decryption.iter().collect();
-    let empty_pw = Password::empty();
-
-    let decrypt_options = DecryptionOptions::new();
-    let symmetric_encryption_res = check_symmetric_encryption(&msg);
-    if symmetric_encryption_res.is_err() {
-        shared_secrets = &[];
-    }
-
-    // We always try out all passwords here,
-    // but benchmarking (see `benches/decrypting.rs`)
-    // showed that the performance impact is negligible.
-    // We can improve this in the future if necessary.
-    let message_password: Vec<Password> = shared_secrets
-        .iter()
-        .map(|p| Password::from(p.as_str()))
-        .collect();
-    let message_password: Vec<&Password> = message_password.iter().collect();
-
-    let ring = TheRing {
-        secret_keys: skeys,
-        key_passwords: vec![&empty_pw],
-        message_password,
-        session_keys: vec![],
-        decrypt_options,
-    };
-
-    let res = msg.decrypt_the_ring(ring, true);
-
-    let (msg, _ring_result) = match res {
-        Ok(it) => it,
-        Err(err) => {
-            if let Err(reason) = symmetric_encryption_res {
-                bail!("{err:#} (Note: symmetric decryption was not tried: {reason})")
-            } else {
-                bail!("{err:#}");
-            }
-        }
-    };
-
-    // remove one layer of compression
-    let msg = msg.decompress()?;
-
-    Ok(msg)
-}
-
-/// Returns Ok(()) if we want to try symmetrically decrypting the message,
-/// and Err with a reason if symmetric decryption should not be tried.
-///
-/// A DOS attacker could send a message with a lot of encrypted session keys,
-/// all of which use a very hard-to-compute string2key algorithm.
-/// We would then try to decrypt all of the encrypted session keys
-/// with all of the known shared secrets.
-/// In order to prevent this, we do not try to symmetrically decrypt messages
-/// that use a string2key algorithm other than 'Salted'.
-fn check_symmetric_encryption(msg: &Message<'_>) -> std::result::Result<(), &'static str> {
-    let Message::Encrypted { esk, .. } = msg else {
-        return Err("not encrypted");
-    };
-
-    if esk.len() > 1 {
-        return Err("too many esks");
-    }
-
-    let [pgp::composed::Esk::SymKeyEncryptedSessionKey(esk)] = &esk[..] else {
-        return Err("not symmetrically encrypted");
-    };
-
-    match esk.s2k() {
-        Some(StringToKey::Salted { .. }) => Ok(()),
-        _ => Err("unsupported string2key algorithm"),
-    }
-}
-
 /// Returns fingerprints
 /// of all keys from the `public_keys_for_validation` keyring that
 /// have valid signatures in `msg` and corresponding intended recipient fingerprints
@@ -481,7 +367,7 @@ pub async fn symm_encrypt_autocrypt_setup(passphrase: &str, plain: Vec<u8>) -> R
 /// `shared secret` is the secret that will be used for symmetric encryption.
 pub async fn symm_encrypt_message(
     plain: Vec<u8>,
-    private_key_for_signing: SignedSecretKey,
+    private_key_for_signing: Option<SignedSecretKey>,
     shared_secret: &str,
     compress: bool,
 ) -> Result<String> {
@@ -504,8 +390,10 @@ pub async fn symm_encrypt_message(
         );
         msg.encrypt_with_password(&mut rng, s2k, &shared_secret)?;
 
-        let hash_algorithm = private_key_for_signing.hash_alg();
-        msg.sign(&*private_key_for_signing, Password::empty(), hash_algorithm);
+        if let Some(private_key_for_signing) = private_key_for_signing.as_deref() {
+            let hash_algorithm = private_key_for_signing.hash_alg();
+            msg.sign(private_key_for_signing, Password::empty(), hash_algorithm);
+        }
         if compress {
             msg.compression(CompressionAlgorithm::ZLIB);
         }
@@ -534,6 +422,166 @@ pub async fn symm_decrypt<T: BufRead + std::fmt::Debug + 'static + Send>(
     .await?
 }
 
+/// Merges and minimizes OpenPGP certificates.
+///
+/// Keeps at most one direct key signature and
+/// at most one User ID with exactly one signature.
+///
+/// See <https://openpgp.dev/book/adv/certificates.html#merging>
+/// and <https://openpgp.dev/book/adv/certificates.html#certificate-minimization>.
+///
+/// `new_certificate` does not necessarily contain newer data.
+/// It may come not directly from the key owner,
+/// e.g. via protected Autocrypt header or protected attachment
+/// in a signed message, but from Autocrypt-Gossip header or a vCard.
+/// Gossiped key may be older than the one we have
+/// or even have some packets maliciously dropped
+/// (for example, all encryption subkeys dropped)
+/// or restored from some older version of the certificate.
+pub fn merge_openpgp_certificates(
+    old_certificate: SignedPublicKey,
+    new_certificate: SignedPublicKey,
+) -> Result<SignedPublicKey> {
+    old_certificate
+        .verify_bindings()
+        .context("First key cannot be verified")?;
+    new_certificate
+        .verify_bindings()
+        .context("Second key cannot be verified")?;
+
+    // Decompose certificates.
+    let SignedPublicKey {
+        primary_key: old_primary_key,
+        details: old_details,
+        public_subkeys: old_public_subkeys,
+    } = old_certificate;
+    let SignedPublicKey {
+        primary_key: new_primary_key,
+        details: new_details,
+        public_subkeys: _new_public_subkeys,
+    } = new_certificate;
+
+    // Public keys may be serialized differently, e.g. using old and new packet type,
+    // so we compare imprints instead of comparing the keys
+    // directly with `old_primary_key == new_primary_key`.
+    // Imprints, like fingerprints, are calculated over normalized packets.
+    // On error we print fingerprints as this is what is used in the database
+    // and what most tools show.
+    let old_imprint = old_primary_key.imprint::<Sha256>()?;
+    let new_imprint = new_primary_key.imprint::<Sha256>()?;
+    ensure!(
+        old_imprint == new_imprint,
+        "Cannot merge certificates with different primary keys {} and {}",
+        old_primary_key.fingerprint(),
+        new_primary_key.fingerprint()
+    );
+
+    // Decompose old and the new key details.
+    //
+    // Revocation signatures are currently ignored so we do not store them.
+    //
+    // User attributes are thrown away on purpose,
+    // the only defined in RFC 9580 attribute is the Image Attribute
+    // (<https://www.rfc-editor.org/rfc/rfc9580.html#section-5.12.1>
+    // which we do not use and do not want to gossip.
+    let SignedKeyDetails {
+        revocation_signatures: _old_revocation_signatures,
+        direct_signatures: old_direct_signatures,
+        users: old_users,
+        user_attributes: _old_user_attributes,
+    } = old_details;
+    let SignedKeyDetails {
+        revocation_signatures: _new_revocation_signatures,
+        direct_signatures: new_direct_signatures,
+        users: new_users,
+        user_attributes: _new_user_attributes,
+    } = new_details;
+
+    // Select at most one direct key signature, the newest one.
+    let best_direct_key_signature: Option<Signature> = old_direct_signatures
+        .into_iter()
+        .chain(new_direct_signatures)
+        .filter(|x: &Signature| x.verify_key(&old_primary_key).is_ok())
+        .max_by_key(|x: &Signature|
+            // Converting to seconds because `Ord` is not derived for `Timestamp`:
+            // <https://github.com/rpgp/rpgp/issues/737>
+            x.created().map_or(0, |ts| ts.as_secs()));
+    let direct_signatures: Vec<Signature> = best_direct_key_signature.into_iter().collect();
+
+    // Select at most one User ID.
+    //
+    // We prefer User IDs marked as primary,
+    // but will select non-primary otherwise
+    // because sometimes keys have no primary User ID,
+    // such as Alice's key in `test-data/key/alice-secret.asc`.
+    let best_user: Option<SignedUser> = old_users
+        .into_iter()
+        .chain(new_users.clone())
+        .filter_map(|SignedUser { id, signatures }| {
+            // Select the best signature for each User ID.
+            // If User ID has no valid signatures, it is filtered out.
+            let best_user_signature: Option<Signature> = signatures
+                .into_iter()
+                .filter(|signature: &Signature| {
+                    signature
+                        .verify_certification(&old_primary_key, pgp::types::Tag::UserId, &id)
+                        .is_ok()
+                })
+                .max_by_key(|signature: &Signature| {
+                    signature.created().map_or(0, |ts| ts.as_secs())
+                });
+            best_user_signature.map(|signature| (id, signature))
+        })
+        .max_by_key(|(_id, signature)| signature.created().map_or(0, |ts| ts.as_secs()))
+        .map(|(id, signature)| SignedUser {
+            id,
+            signatures: vec![signature],
+        });
+    let users: Vec<SignedUser> = best_user.into_iter().collect();
+
+    let public_subkeys = old_public_subkeys;
+
+    Ok(SignedPublicKey {
+        primary_key: old_primary_key,
+        details: SignedKeyDetails {
+            revocation_signatures: vec![],
+            direct_signatures,
+            users,
+            user_attributes: vec![],
+        },
+        public_subkeys,
+    })
+}
+
+/// Returns relays addresses from the public key signature.
+///
+/// Not more than 3 relays are returned for each key.
+pub(crate) fn addresses_from_public_key(public_key: &SignedPublicKey) -> Option<Vec<String>> {
+    for signature in &public_key.details.direct_signatures {
+        // The signature should be verified already when importing the key,
+        // but we double-check here.
+        let signature_is_valid = signature.verify_key(&public_key.primary_key).is_ok();
+        debug_assert!(signature_is_valid);
+        if signature_is_valid {
+            for notation in signature.notations() {
+                if notation.name == "relays@chatmail.at"
+                    && let Ok(value) = str::from_utf8(&notation.value)
+                {
+                    return Some(
+                        value
+                            .split(",")
+                            .map(|s| s.to_string())
+                            .filter(|s| may_be_valid_addr(s))
+                            .take(3)
+                            .collect(),
+                    );
+                }
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::LazyLock;
@@ -541,14 +589,42 @@ mod tests {
 
     use super::*;
     use crate::{
-        key::{load_self_public_key, load_self_secret_key},
-        test_utils::{TestContextManager, alice_keypair, bob_keypair},
+        config::Config,
+        decrypt,
+        key::{load_self_public_key, self_fingerprint, store_self_keypair},
+        mimefactory::{render_outer_message, wrap_encrypted_part},
+        test_utils::{TestContext, TestContextManager, alice_keypair, bob_keypair},
+        token,
     };
     use pgp::composed::Esk;
     use pgp::packet::PublicKeyEncryptedSessionKey;
 
-    #[expect(clippy::type_complexity)]
-    fn pk_decrypt_and_validate<'a>(
+    async fn decrypt_bytes(
+        bytes: Vec<u8>,
+        private_keys_for_decryption: &[SignedSecretKey],
+        auth_tokens_for_decryption: &[String],
+    ) -> Result<pgp::composed::Message<'static>> {
+        let t = &TestContext::new().await;
+        t.set_config(Config::ConfiguredAddr, Some("alice@example.org"))
+            .await
+            .expect("Failed to configure address");
+
+        for secret in auth_tokens_for_decryption {
+            token::save(t, token::Namespace::Auth, None, secret, 0).await?;
+        }
+        let [secret_key] = private_keys_for_decryption else {
+            panic!("Only one private key is allowed anymore");
+        };
+        store_self_keypair(t, secret_key).await?;
+
+        let mime_message = wrap_encrypted_part(bytes.try_into().unwrap());
+        let rendered = render_outer_message(vec![], mime_message);
+        let parsed = mailparse::parse_mail(rendered.as_bytes())?;
+        let (decrypted, _fp) = decrypt::decrypt(t, &parsed).await?.unwrap();
+        Ok(decrypted)
+    }
+
+    async fn pk_decrypt_and_validate<'a>(
         ctext: &'a [u8],
         private_keys_for_decryption: &'a [SignedSecretKey],
         public_keys_for_validation: &[SignedPublicKey],
@@ -557,7 +633,7 @@ mod tests {
         HashMap<Fingerprint, Vec<Fingerprint>>,
         Vec<u8>,
     )> {
-        let mut msg = decrypt(ctext.to_vec(), private_keys_for_decryption, &[])?;
+        let mut msg = decrypt_bytes(ctext.to_vec(), private_keys_for_decryption, &[]).await?;
         let content = msg.as_data_vec()?;
         let ret_signature_fingerprints =
             valid_signature_fingerprints(&msg, public_keys_for_validation);
@@ -596,7 +672,7 @@ mod tests {
     fn test_create_keypair() {
         let keypair0 = create_keypair(EmailAddress::new("foo@bar.de").unwrap()).unwrap();
         let keypair1 = create_keypair(EmailAddress::new("two@zwo.de").unwrap()).unwrap();
-        assert_ne!(keypair0.public, keypair1.public);
+        assert_ne!(keypair0.public_key(), keypair1.public_key());
     }
 
     /// [SignedSecretKey] and [SignedPublicKey] objects
@@ -613,10 +689,10 @@ mod tests {
             let alice = alice_keypair();
             let bob = bob_keypair();
             TestKeys {
-                alice_secret: alice.secret.clone(),
-                alice_public: alice.public,
-                bob_secret: bob.secret.clone(),
-                bob_public: bob.public,
+                alice_secret: alice.clone(),
+                alice_public: alice.to_public_key(),
+                bob_secret: bob.clone(),
+                bob_public: bob.to_public_key(),
             }
         }
     }
@@ -671,6 +747,7 @@ mod tests {
             &decrypt_keyring,
             &sig_check_keyring,
         )
+        .await
         .unwrap();
         assert_eq!(content, CLEARTEXT);
         assert_eq!(valid_signatures.len(), 1);
@@ -686,6 +763,7 @@ mod tests {
             &decrypt_keyring,
             &sig_check_keyring,
         )
+        .await
         .unwrap();
         assert_eq!(content, CLEARTEXT);
         assert_eq!(valid_signatures.len(), 1);
@@ -698,7 +776,9 @@ mod tests {
     async fn test_decrypt_no_sig_check() {
         let keyring = vec![KEYS.alice_secret.clone()];
         let (_msg, valid_signatures, content) =
-            pk_decrypt_and_validate(ctext_signed().await.as_bytes(), &keyring, &[]).unwrap();
+            pk_decrypt_and_validate(ctext_signed().await.as_bytes(), &keyring, &[])
+                .await
+                .unwrap();
         assert_eq!(content, CLEARTEXT);
         assert_eq!(valid_signatures.len(), 0);
     }
@@ -713,6 +793,7 @@ mod tests {
             &decrypt_keyring,
             &sig_check_keyring,
         )
+        .await
         .unwrap();
         assert_eq!(content, CLEARTEXT);
         assert_eq!(valid_signatures.len(), 0);
@@ -723,57 +804,64 @@ mod tests {
         let decrypt_keyring = vec![KEYS.bob_secret.clone()];
         let ctext_unsigned = include_bytes!("../test-data/message/ctext_unsigned.asc");
         let (_msg, valid_signatures, content) =
-            pk_decrypt_and_validate(ctext_unsigned, &decrypt_keyring, &[]).unwrap();
+            pk_decrypt_and_validate(ctext_unsigned, &decrypt_keyring, &[])
+                .await
+                .unwrap();
         assert_eq!(content, CLEARTEXT);
         assert_eq!(valid_signatures.len(), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_encrypt_decrypt_broadcast() -> Result<()> {
-        let mut tcm = TestContextManager::new();
-        let alice = &tcm.alice().await;
-        let bob = &tcm.bob().await;
+    async fn test_dont_decrypt_expensive_message_happy_path() -> Result<()> {
+        let s2k = StringToKey::Salted {
+            hash_alg: HashAlgorithm::default(),
+            salt: [1; 8],
+        };
 
-        let plain = Vec::from(b"this is the secret message");
-        let shared_secret = "shared secret";
-        let ctext = symm_encrypt_message(
-            plain.clone(),
-            load_self_secret_key(alice).await?,
-            shared_secret,
-            true,
-        )
-        .await?;
+        test_dont_decrypt_expensive_message_ex(s2k, false, None).await
+    }
 
-        let bob_private_keyring = crate::key::load_self_secret_keyring(bob).await?;
-        let mut decrypted = decrypt(
-            ctext.into(),
-            &bob_private_keyring,
-            &[shared_secret.to_string()],
-        )?;
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_dont_decrypt_expensive_message_bad_s2k() -> Result<()> {
+        let s2k = StringToKey::new_default(&mut thread_rng()); // Default is IteratedAndSalted
 
-        assert_eq!(decrypted.as_data_vec()?, plain);
+        test_dont_decrypt_expensive_message_ex(s2k, false, Some("unsupported string2key algorithm"))
+            .await
+    }
 
-        Ok(())
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_dont_decrypt_expensive_message_multiple_secrets() -> Result<()> {
+        let s2k = StringToKey::Salted {
+            hash_alg: HashAlgorithm::default(),
+            salt: [1; 8],
+        };
+
+        // This error message is actually not great,
+        // but grepping for it will lead to the correct code
+        test_dont_decrypt_expensive_message_ex(s2k, true, Some("decrypt_with_keys: missing key"))
+            .await
     }
 
     /// Test that we don't try to decrypt a message
     /// that is symmetrically encrypted
     /// with an expensive string2key algorithm
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_dont_decrypt_expensive_message() -> Result<()> {
+    /// or multiple shared secrets.
+    /// This is to prevent possible DOS attacks on the app.
+    async fn test_dont_decrypt_expensive_message_ex(
+        s2k: StringToKey,
+        encrypt_twice: bool,
+        expected_error_msg: Option<&str>,
+    ) -> Result<()> {
         let mut tcm = TestContextManager::new();
         let bob = &tcm.bob().await;
 
         let plain = Vec::from(b"this is the secret message");
         let shared_secret = "shared secret";
+        let bob_fp = self_fingerprint(bob).await?;
 
-        // Create a symmetrically encrypted message
-        // with an IteratedAndSalted string2key algorithm:
-
-        let shared_secret_pw = Password::from(shared_secret.to_string());
+        let shared_secret_pw = Password::from(format!("securejoin/{bob_fp}/{shared_secret}"));
         let msg = MessageBuilder::from_bytes("", plain);
         let mut rng = thread_rng();
-        let s2k = StringToKey::new_default(&mut rng); // Default is IteratedAndSalted
 
         let mut msg = msg.seipd_v2(
             &mut rng,
@@ -781,24 +869,28 @@ mod tests {
             AeadAlgorithm::Ocb,
             ChunkSize::C8KiB,
         );
-        msg.encrypt_with_password(&mut rng, s2k, &shared_secret_pw)?;
+        msg.encrypt_with_password(&mut rng, s2k.clone(), &shared_secret_pw)?;
+        if encrypt_twice {
+            msg.encrypt_with_password(&mut rng, s2k, &shared_secret_pw)?;
+        }
 
         let ctext = msg.to_armored_string(&mut rng, Default::default())?;
 
         // Trying to decrypt it should fail with a helpful error message:
 
         let bob_private_keyring = crate::key::load_self_secret_keyring(bob).await?;
-        let error = decrypt(
+        let res = decrypt_bytes(
             ctext.into(),
             &bob_private_keyring,
             &[shared_secret.to_string()],
         )
-        .unwrap_err();
+        .await;
 
-        assert_eq!(
-            error.to_string(),
-            "missing key (Note: symmetric decryption was not tried: unsupported string2key algorithm)"
-        );
+        if let Some(expected_error_msg) = expected_error_msg {
+            assert_eq!(format!("{:#}", res.unwrap_err()), expected_error_msg);
+        } else {
+            res.unwrap();
+        }
 
         Ok(())
     }
@@ -825,12 +917,11 @@ mod tests {
 
         // Trying to decrypt it should fail with an OK error message:
         let bob_private_keyring = crate::key::load_self_secret_keyring(bob).await?;
-        let error = decrypt(ctext.into(), &bob_private_keyring, &[]).unwrap_err();
+        let error = decrypt_bytes(ctext.into(), &bob_private_keyring, &[])
+            .await
+            .unwrap_err();
 
-        assert_eq!(
-            error.to_string(),
-            "missing key (Note: symmetric decryption was not tried: not symmetrically encrypted)"
-        );
+        assert_eq!(format!("{error:#}"), "decrypt_with_keys: missing key");
 
         Ok(())
     }
@@ -863,5 +954,25 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn test_merge_openpgp_certificates() {
+        let alice = alice_keypair().to_public_key();
+        let bob = bob_keypair().to_public_key();
+
+        // Merging certificate with itself does not change it.
+        assert_eq!(
+            merge_openpgp_certificates(alice.clone(), alice.clone()).unwrap(),
+            alice
+        );
+        assert_eq!(
+            merge_openpgp_certificates(bob.clone(), bob.clone()).unwrap(),
+            bob
+        );
+
+        // Cannot merge certificates with different primary key.
+        assert!(merge_openpgp_certificates(alice.clone(), bob.clone()).is_err());
+        assert!(merge_openpgp_certificates(bob.clone(), alice.clone()).is_err());
     }
 }

@@ -1946,10 +1946,22 @@ pub async fn markseen_msgs(context: &Context, msg_ids: Vec<MsgId>) -> Result<()>
             // We also don't send read receipts for contact requests.
             // Read receipts will not be sent even after accepting the chat.
             let to_id = if curr_blocked == Blocked::Not
+                && !curr_hidden
                 && curr_param.get_bool(Param::WantsMdn).unwrap_or_default()
                 && curr_param.get_cmd() == SystemMessage::Unknown
                 && context.should_send_mdns().await?
             {
+                // Clear WantsMdn to not handle a MDN twice
+                // if the state later is InFresh again as markfresh_chat() was called.
+                // BccSelf MDN messages in the next branch may be sent twice for syncing.
+                context
+                    .sql
+                    .execute(
+                        "UPDATE msgs SET param=? WHERE id=?",
+                        (curr_param.clone().remove(Param::WantsMdn).to_string(), id),
+                    )
+                    .await
+                    .context("failed to clear WantsMdn")?;
                 Some(curr_from_id)
             } else if context.get_config_bool(Config::BccSelf).await? {
                 Some(ContactId::SELF)
@@ -1967,6 +1979,7 @@ pub async fn markseen_msgs(context: &Context, msg_ids: Vec<MsgId>) -> Result<()>
                     .context("failed to insert into smtp_mdns")?;
                 context.scheduler.interrupt_smtp().await;
             }
+
             if !curr_hidden {
                 updated_chat_ids.insert(curr_chat_id);
             }
@@ -2077,6 +2090,22 @@ pub(crate) async fn set_msg_failed(
         chatlist_events::emit_chatlist_item_changed(context, msg.chat_id);
     }
     Ok(())
+}
+
+/// Inserts a tombstone into `msgs` table
+/// to prevent downloading the same message in the future.
+///
+/// Returns tombstone database row ID.
+pub(crate) async fn insert_tombstone(context: &Context, rfc724_mid: &str) -> Result<MsgId> {
+    let row_id = context
+        .sql
+        .insert(
+            "INSERT INTO msgs(rfc724_mid, chat_id) VALUES (?,?)",
+            (rfc724_mid, DC_CHAT_ID_TRASH),
+        )
+        .await?;
+    let msg_id = MsgId::new(u32::try_from(row_id)?);
+    Ok(msg_id)
 }
 
 /// The number of messages assigned to unblocked chats

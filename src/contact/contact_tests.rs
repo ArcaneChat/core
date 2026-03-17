@@ -841,7 +841,10 @@ Me (alice@example.org):
 
 bob@example.net (bob@example.net):
 CCCB 5AA9 F6E1 141C 9431
-65F1 DB18 B18C BCF7 0487"
+65F1 DB18 B18C BCF7 0487
+
+Relays:
+bob@example.net"
     );
     let contact = Contact::get_by_id(alice, contact_bob_id).await?;
     assert!(contact.e2ee_avail(alice).await?);
@@ -1145,8 +1148,11 @@ async fn test_make_n_import_vcard() -> Result<()> {
     let alice = &tcm.alice().await;
     let bob = &tcm.bob().await;
     bob.set_config(Config::Displayname, Some("Bob")).await?;
-    bob.set_config(Config::Selfstatus, Some("It's me, bob"))
-        .await?;
+    bob.set_config(
+        Config::Selfstatus,
+        Some("It's me,\nbob; and here's a backslash: \\"),
+    )
+    .await?;
     let avatar_path = bob.dir.path().join("avatar.png");
     let avatar_bytes = include_bytes!("../../test-data/image/avatar64x64.png");
     let avatar_base64 = base64::engine::general_purpose::STANDARD.encode(avatar_bytes);
