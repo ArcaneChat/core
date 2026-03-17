@@ -151,27 +151,20 @@ pub enum Chattype {
     /// which would make it hard to grep for it.
     InBroadcast = 165,
 
-    /// Outgoing super group (admin's view).
+    /// Super group: a semi-public, symmetrically-encrypted group where all members can send.
     ///
-    /// A semi-public group with symmetric encryption.
-    /// All members can send messages, but only the admin (group creator)
-    /// can add/remove members or modify group settings.
+    /// Unlike [`OutBroadcast`]/[`InBroadcast`] (one-to-many read-only channels), every member
+    /// of a super group can send messages.  Only the admin (group creator) can add/remove
+    /// members or modify group settings.
     ///
-    /// Uses a shared symmetric key for encryption (like [`OutBroadcast`]),
-    /// so members do not need to share their personal public keys with others.
-    /// The full member list is known to all members.
+    /// Uses a shared symmetric key (like broadcast channels) so that joining members do not
+    /// reveal their personal public key to all other members.  The full member list is visible
+    /// to all participants.
+    ///
+    /// Whether the local user is the admin is stored in [`crate::param::Param::SuperGroupAdmin`].
     ///
     /// Created by [`crate::chat::create_super_group`].
-    OutSuperGroup = 170,
-
-    /// Incoming super group (non-admin member's view).
-    ///
-    /// Unlike [`InBroadcast`], members of this chat **can** send messages.
-    /// Only the admin can add/remove members or change group settings.
-    ///
-    /// Uses a shared symmetric key for encryption.
-    /// Members know the full member list.
-    InSuperGroup = 175,
+    SuperGroup = 170,
 }
 
 pub const DC_MSG_ID_DAYMARKER: u32 = 9;

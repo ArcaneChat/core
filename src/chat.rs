@@ -365,8 +365,18 @@ impl ChatId {
         let mut delete = false;
 
         match chat.typ {
-            Chattype::OutBroadcast | Chattype::OutSuperGroup => {
+            Chattype::OutBroadcast => {
                 bail!("Can't block chat of type {:?}", chat.typ)
+            }
+            Chattype::SuperGroup => {
+                // Admin can't block the super group they created,
+                // but non-admin members can leave/block it like a broadcast channel.
+                if chat.is_self_super_group_admin() {
+                    bail!("Can't block chat of type {:?}", chat.typ)
+                }
+                if self.set_blocked(context, Blocked::Yes).await? {
+                    context.emit_event(EventType::ChatModified(self));
+                }
             }
             Chattype::Single => {
                 for contact_id in get_chat_contacts(context, self).await? {
@@ -383,7 +393,7 @@ impl ChatId {
                 info!(context, "Can't block groups yet, deleting the chat.");
                 delete = true;
             }
-            Chattype::Mailinglist | Chattype::InBroadcast | Chattype::InSuperGroup => {
+            Chattype::Mailinglist | Chattype::InBroadcast => {
                 if self.set_blocked(context, Blocked::Yes).await? {
                     context.emit_event(EventType::ChatModified(self));
                 }
@@ -440,7 +450,7 @@ impl ChatId {
 
         match chat.typ {
             Chattype::Single | Chattype::Group | Chattype::OutBroadcast | Chattype::InBroadcast
-            | Chattype::OutSuperGroup | Chattype::InSuperGroup => {
+            | Chattype::SuperGroup => {
                 // Previously accepting a chat literally created a chat because unaccepted chats
                 // went to "contact requests" list rather than normal chatlist.
                 // But for groups we use lower origin because users don't always check all members
@@ -1486,7 +1496,7 @@ impl Chat {
                 return Ok(Some(reason));
             }
         }
-        // InSuperGroup members can send messages.
+        // SuperGroup members (both admin and non-admin) can send messages.
 
         // Do potentially slow checks last and after calls to `skip_fn` which should be fast.
         let reason = NotAMember;
@@ -1520,11 +1530,36 @@ impl Chat {
     /// The function does not check if the chat type allows editing of concrete elements.
     pub async fn is_self_in_chat(&self, context: &Context) -> Result<bool> {
         match self.typ {
-            Chattype::Single | Chattype::OutBroadcast | Chattype::OutSuperGroup | Chattype::Mailinglist => Ok(true),
-            Chattype::Group | Chattype::InBroadcast | Chattype::InSuperGroup => {
+            Chattype::Single | Chattype::OutBroadcast | Chattype::Mailinglist => Ok(true),
+            Chattype::Group | Chattype::InBroadcast | Chattype::SuperGroup => {
                 is_contact_in_chat(context, self.id, ContactId::SELF).await
             }
         }
+    }
+
+    /// Returns `true` if the local user is the admin of this [`Chattype::SuperGroup`].
+    ///
+    /// Returns `false` for non-super-group chats and for non-admin super group members.
+    pub fn is_self_super_group_admin(&self) -> bool {
+        self.typ == Chattype::SuperGroup
+            && self
+                .param
+                .get_int(Param::SuperGroupAdmin)
+                .map(|v| v == ContactId::SELF.to_u32() as i32)
+                .unwrap_or(false)
+    }
+
+    /// Returns the [`ContactId`] of the admin of this [`Chattype::SuperGroup`], if known.
+    ///
+    /// Returns `None` for non-super-group chats or when the admin is unknown.
+    /// Returns `Some(ContactId::SELF)` when the local user is the admin.
+    pub fn get_super_group_admin_id(&self) -> Option<ContactId> {
+        if self.typ != Chattype::SuperGroup {
+            return None;
+        }
+        self.param
+            .get_int(Param::SuperGroupAdmin)
+            .map(|v| ContactId::new(v as u32))
     }
 
     pub(crate) async fn update_param(&mut self, context: &Context) -> Result<()> {
@@ -1699,7 +1734,7 @@ impl Chat {
                 }
                 Chattype::Mailinglist => false,
                 Chattype::OutBroadcast | Chattype::InBroadcast => true,
-                Chattype::OutSuperGroup | Chattype::InSuperGroup => true,
+                Chattype::SuperGroup => true,
             };
         Ok(is_encrypted)
     }
@@ -1778,7 +1813,7 @@ impl Chat {
             }
         } else if matches!(
             self.typ,
-            Chattype::Group | Chattype::OutBroadcast | Chattype::OutSuperGroup
+            Chattype::Group | Chattype::OutBroadcast | Chattype::SuperGroup
         ) && self.param.get_int(Param::Unpromoted).unwrap_or_default() == 1
         {
             msg.param.set_int(Param::AttachChatAvatarAndDescription, 1);
@@ -2091,8 +2126,7 @@ impl Chat {
             }
             Chattype::OutBroadcast
             | Chattype::InBroadcast
-            | Chattype::OutSuperGroup
-            | Chattype::InSuperGroup
+            | Chattype::SuperGroup
             | Chattype::Group
             | Chattype::Mailinglist => {
                 if !self.grpid.is_empty() {
@@ -3769,17 +3803,19 @@ pub(crate) async fn delete_broadcast_secret(context: &Context, chat_id: ChatId) 
 /// where all members can send messages, but only the admin (group creator)
 /// can add/remove members and change group settings.
 ///
-/// After creation, the group is in "promoted" state (unlike regular groups)
-/// and is ready for members to join via invite links.
+/// The local user becomes the admin of the group, which is stored
+/// in [`Param::SuperGroupAdmin`] as `ContactId::SELF`.
+///
+/// After creation, the group is ready for members to join via invite links.
 ///
 /// Returns the created chat's id.
 pub async fn create_super_group(context: &Context, chat_name: String) -> Result<ChatId> {
     let grpid = create_id();
     let secret = create_broadcast_secret();
-    create_out_super_group_ex(context, Sync, grpid, chat_name, secret).await
+    create_super_group_ex(context, Sync, grpid, chat_name, secret).await
 }
 
-pub(crate) async fn create_out_super_group_ex(
+pub(crate) async fn create_super_group_ex(
     context: &Context,
     sync: sync::Sync,
     grpid: String,
@@ -3790,6 +3826,10 @@ pub(crate) async fn create_out_super_group_ex(
     if chat_name.is_empty() {
         bail!("Invalid super group name: {chat_name}.");
     }
+
+    // Store that self is the admin via Param::SuperGroupAdmin = ContactId::SELF.
+    let mut param = Params::new();
+    param.set_int(Param::SuperGroupAdmin, ContactId::SELF.to_u32() as i32);
 
     let timestamp = create_smeared_timestamp(context);
     let trans_fn = |t: &mut rusqlite::Transaction| -> Result<ChatId> {
@@ -3802,19 +3842,28 @@ pub(crate) async fn create_out_super_group_ex(
 
         t.execute(
             "INSERT INTO chats
-            (type, name, name_normalized, grpid, created_timestamp)
-            VALUES(?, ?, ?, ?, ?)",
+            (type, name, name_normalized, grpid, param, created_timestamp)
+            VALUES(?, ?, ?, ?, ?, ?)",
             (
-                Chattype::OutSuperGroup,
+                Chattype::SuperGroup,
                 &chat_name,
                 normalize_text(&chat_name),
                 &grpid,
+                param.to_string(),
                 timestamp,
             ),
         )?;
         let chat_id = ChatId::new(t.last_insert_rowid().try_into()?);
 
         t.execute(SQL_INSERT_BROADCAST_SECRET, (chat_id, &secret))?;
+
+        // Add self (the admin) to the contacts table so is_self_in_chat() works correctly.
+        t.execute(
+            "INSERT OR IGNORE INTO chats_contacts (chat_id, contact_id, add_timestamp)
+             VALUES (?, ?, ?)",
+            (chat_id, ContactId::SELF, timestamp),
+        )?;
+
         Ok(chat_id)
     };
     let chat_id = context.sql.transaction(trans_fn).await?;
@@ -3972,7 +4021,7 @@ pub(crate) async fn add_contact_to_chat_ex(
         chat.typ == Chattype::Group
             || (from_handshake
                 && (chat.typ == Chattype::OutBroadcast
-                    || chat.typ == Chattype::OutSuperGroup)),
+                    || chat.typ == Chattype::SuperGroup)),
         "{chat_id} is not a group where one can add members",
     );
     ensure!(
@@ -3980,7 +4029,7 @@ pub(crate) async fn add_contact_to_chat_ex(
         "invalid contact_id {contact_id} for adding to group"
     );
     ensure!(
-        !matches!(chat.typ, Chattype::OutBroadcast | Chattype::OutSuperGroup)
+        !matches!(chat.typ, Chattype::OutBroadcast | Chattype::SuperGroup)
             || contact_id != ContactId::SELF,
         "Cannot add SELF to broadcast channel or super group."
     );
@@ -4036,7 +4085,7 @@ pub(crate) async fn add_contact_to_chat_ex(
 
         let contact_addr = contact.get_addr().to_lowercase();
         let added_by = if from_handshake
-            && matches!(chat.typ, Chattype::OutBroadcast | Chattype::OutSuperGroup)
+            && matches!(chat.typ, Chattype::OutBroadcast | Chattype::SuperGroup)
         {
             // The contact was added via a QR code rather than explicit user action,
             // so it could be confusing to say 'You added member Alice'.
@@ -4054,7 +4103,7 @@ pub(crate) async fn add_contact_to_chat_ex(
         msg.param.set_optional(Param::Arg4, fingerprint);
         msg.param
             .set_int(Param::ContactAddedRemoved, contact.id.to_u32() as i32);
-        if matches!(chat.typ, Chattype::OutBroadcast | Chattype::OutSuperGroup) {
+        if matches!(chat.typ, Chattype::OutBroadcast | Chattype::SuperGroup) {
             let secret = load_broadcast_secret(context, chat_id)
                 .await?
                 .context("Failed to find broadcast/super group shared secret")?;
@@ -4202,12 +4251,23 @@ pub async fn remove_contact_from_chat(
     );
 
     let chat = Chat::load_from_db(context, chat_id).await?;
-    if matches!(chat.typ, Chattype::InBroadcast | Chattype::InSuperGroup) {
+    if chat.typ == Chattype::InBroadcast {
         ensure!(
             contact_id == ContactId::SELF,
-            "Cannot remove other member from incoming broadcast channel or super group"
+            "Cannot remove other member from incoming broadcast channel"
         );
         delete_broadcast_secret(context, chat_id).await?;
+    } else if chat.typ == Chattype::SuperGroup {
+        if contact_id == ContactId::SELF {
+            // Non-admin members leave: delete the symmetric key so they can't decrypt future msgs.
+            delete_broadcast_secret(context, chat_id).await?;
+        } else {
+            // Only the admin can remove others.
+            ensure!(
+                chat.is_self_super_group_admin(),
+                "Only the super group admin can remove other members"
+            );
+        }
     }
 
     if matches!(
@@ -4215,8 +4275,7 @@ pub async fn remove_contact_from_chat(
         Chattype::Group
             | Chattype::OutBroadcast
             | Chattype::InBroadcast
-            | Chattype::OutSuperGroup
-            | Chattype::InSuperGroup
+            | Chattype::SuperGroup
     ) {
         if !chat.is_self_in_chat(context).await? {
             let err_msg = format!(
@@ -4228,7 +4287,7 @@ pub async fn remove_contact_from_chat(
             let mut sync = Nosync;
 
             if chat.is_promoted()
-                && !matches!(chat.typ, Chattype::OutBroadcast | Chattype::OutSuperGroup)
+                && !matches!(chat.typ, Chattype::OutBroadcast | Chattype::SuperGroup)
             {
                 remove_from_chat_contacts_table(context, chat_id, contact_id).await?;
             } else {
@@ -4286,7 +4345,7 @@ async fn send_member_removal_msg(
     let mut msg = Message::new(Viewtype::Text);
 
     if contact_id == ContactId::SELF {
-        if matches!(chat.typ, Chattype::InBroadcast | Chattype::InSuperGroup) {
+        if matches!(chat.typ, Chattype::InBroadcast) || chat.typ == Chattype::SuperGroup {
             msg.text = stock_str::msg_you_left_broadcast(context).await;
         } else {
             msg.text = stock_str::msg_group_left_local(context, ContactId::SELF).await;
@@ -4335,7 +4394,7 @@ async fn set_chat_description_ex(
     ensure!(
         matches!(
             chat.typ,
-            Chattype::Group | Chattype::OutBroadcast | Chattype::OutSuperGroup
+            Chattype::Group | Chattype::OutBroadcast | Chattype::SuperGroup
         ),
         "Can only set description for groups / broadcasts / super groups"
     );
@@ -4430,7 +4489,7 @@ async fn rename_ex(
     if chat.typ == Chattype::Group
         || chat.typ == Chattype::Mailinglist
         || chat.typ == Chattype::OutBroadcast
-        || chat.typ == Chattype::OutSuperGroup
+        || chat.typ == Chattype::SuperGroup
     {
         if chat.name == new_name {
             success = true;
@@ -4451,7 +4510,7 @@ async fn rename_ex(
                 && sanitize_single_line(&chat.name) != new_name
             {
                 msg.viewtype = Viewtype::Text;
-                msg.text = if matches!(chat.typ, Chattype::OutBroadcast | Chattype::OutSuperGroup) {
+                msg.text = if matches!(chat.typ, Chattype::OutBroadcast | Chattype::SuperGroup) {
                     stock_str::msg_broadcast_name_changed(context, &chat.name, &new_name).await
                 } else {
                     stock_str::msg_grp_name(context, &chat.name, &new_name, ContactId::SELF).await
@@ -4498,7 +4557,7 @@ pub async fn set_chat_profile_image(
     ensure!(
         matches!(
             chat.typ,
-            Chattype::Group | Chattype::OutBroadcast | Chattype::OutSuperGroup
+            Chattype::Group | Chattype::OutBroadcast | Chattype::SuperGroup
         ),
         "Can only set profile image for groups / broadcasts / super groups"
     );
@@ -4520,7 +4579,7 @@ pub async fn set_chat_profile_image(
         chat.param.remove(Param::ProfileImage);
         msg.param.remove(Param::Arg);
         msg.text =
-            if matches!(chat.typ, Chattype::OutBroadcast | Chattype::OutSuperGroup) {
+            if matches!(chat.typ, Chattype::OutBroadcast | Chattype::SuperGroup) {
                 stock_str::msg_broadcast_img_changed(context).await
             } else {
                 stock_str::msg_grp_img_deleted(context, ContactId::SELF).await
@@ -4535,7 +4594,7 @@ pub async fn set_chat_profile_image(
         chat.param.set(Param::ProfileImage, image_blob.as_name());
         msg.param.set(Param::Arg, image_blob.as_name());
         msg.text =
-            if matches!(chat.typ, Chattype::OutBroadcast | Chattype::OutSuperGroup) {
+            if matches!(chat.typ, Chattype::OutBroadcast | Chattype::SuperGroup) {
                 stock_str::msg_broadcast_img_changed(context).await
             } else {
                 stock_str::msg_grp_img_changed(context, ContactId::SELF).await
@@ -5173,7 +5232,7 @@ async fn set_contacts_by_fingerprints(
         "Cannot add key-contacts to unencrypted chat {id}"
     );
     ensure!(
-        matches!(chat.typ, Chattype::Group | Chattype::OutBroadcast | Chattype::OutSuperGroup),
+        matches!(chat.typ, Chattype::Group | Chattype::OutBroadcast | Chattype::SuperGroup),
         "{id} is not a group or broadcast",
     );
     let mut contacts = BTreeSet::new();
@@ -5195,7 +5254,7 @@ async fn set_contacts_by_fingerprints(
             // and are using sync messages as a basic way to ensure consistency between devices.
             // For groups, we also remove members,
             // because the sync message is used in order to sync unpromoted groups.
-            if !matches!(chat.typ, Chattype::OutBroadcast | Chattype::OutSuperGroup) {
+            if !matches!(chat.typ, Chattype::OutBroadcast | Chattype::SuperGroup) {
                 transaction.execute("DELETE FROM chats_contacts WHERE chat_id=?", (id,))?;
             }
 
@@ -5207,7 +5266,7 @@ async fn set_contacts_by_fingerprints(
             let mut broadcast_contacts_added = Vec::new();
             for contact_id in &contacts {
                 if statement.execute((id, contact_id))? > 0
-                    && matches!(chat.typ, Chattype::OutBroadcast | Chattype::OutSuperGroup)
+                    && matches!(chat.typ, Chattype::OutBroadcast | Chattype::SuperGroup)
                 {
                     broadcast_contacts_added.push(*contact_id);
                 }
@@ -5348,7 +5407,7 @@ impl Context {
                         return Ok(());
                     }
                     SyncAction::CreateOutSuperGroup { chat_name, secret } => {
-                        create_out_super_group_ex(
+                        create_super_group_ex(
                             self,
                             Nosync,
                             grpid.to_string(),

@@ -101,7 +101,7 @@ pub async fn get_securejoin_qr(context: &Context, chat: Option<ChatId>) -> Resul
             ensure!(
                 matches!(
                     chat.typ,
-                    Chattype::Group | Chattype::OutBroadcast | Chattype::OutSuperGroup
+                    Chattype::Group | Chattype::OutBroadcast | Chattype::SuperGroup
                 ),
                 "Can't generate SecureJoin QR code for chat {id} of type {}",
                 chat.typ
@@ -111,7 +111,7 @@ pub async fn get_securejoin_qr(context: &Context, chat: Option<ChatId>) -> Resul
                 error!(context, "get_securejoin_qr: {}.", err);
                 bail!(err);
             }
-            if matches!(chat.typ, Chattype::OutBroadcast | Chattype::OutSuperGroup) {
+            if matches!(chat.typ, Chattype::OutBroadcast | Chattype::SuperGroup) {
                 // If the user created the broadcast/super group before updating Delta Chat,
                 // then the secret will be missing, and the user needs to recreate it:
                 if load_broadcast_secret(context, chat.id).await?.is_none() {
@@ -178,7 +178,7 @@ pub async fn get_securejoin_qr(context: &Context, chat: Option<ChatId>) -> Resul
             format!(
                 "https://i.delta.chat/#{fingerprint}&v=3&x={grpid}&j={invitenumber}&s={auth}&a={self_addr_urlencoded}&n={self_name_urlencoded}&b={chat_name_urlencoded}",
             )
-        } else if chat.typ == Chattype::OutSuperGroup {
+        } else if chat.typ == Chattype::SuperGroup {
             // Super groups use j for the invitenumber (like broadcasts) and k for the group name
             // to distinguish from regular groups (g) and broadcast channels (b).
             format!(
@@ -838,7 +838,7 @@ pub(crate) async fn observe_securejoin_on_other_device(
                 .get_header(HeaderDef::ChatSuperGroup)
                 .is_some()
             {
-                Chattype::OutSuperGroup
+                Chattype::SuperGroup
             } else {
                 Chattype::OutBroadcast
             }

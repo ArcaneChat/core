@@ -477,8 +477,7 @@ impl MimeFactory {
                     chat.typ,
                     Chattype::OutBroadcast
                         | Chattype::InBroadcast
-                        | Chattype::OutSuperGroup
-                        | Chattype::InSuperGroup
+                        | Chattype::SuperGroup
                 )
             {
                 info!(
@@ -713,7 +712,7 @@ impl MimeFactory {
 
                 if (chat.typ == Chattype::Group
                     || chat.typ == Chattype::OutBroadcast
-                    || chat.typ == Chattype::OutSuperGroup)
+                    || chat.typ == Chattype::SuperGroup)
                     && quoted_msg_subject.is_none_or_empty()
                 {
                     let re = if self.in_reply_to.is_empty() {
@@ -906,8 +905,7 @@ impl MimeFactory {
                 chat.typ,
                 Chattype::OutBroadcast
                     | Chattype::InBroadcast
-                    | Chattype::OutSuperGroup
-                    | Chattype::InSuperGroup
+                    | Chattype::SuperGroup
             )
         {
             headers.push((
@@ -916,7 +914,7 @@ impl MimeFactory {
                     .into(),
             ));
 
-            if matches!(chat.typ, Chattype::OutSuperGroup | Chattype::InSuperGroup) {
+            if matches!(chat.typ, Chattype::SuperGroup) {
                 headers.push((
                     "Chat-Super-Group",
                     mail_builder::headers::text::Text::new("1".to_string()).into(),
@@ -1383,7 +1381,7 @@ impl MimeFactory {
             // Mailinglists and broadcast channels can actually never be verified:
             Chattype::Mailinglist => false,
             Chattype::OutBroadcast | Chattype::InBroadcast => false,
-            Chattype::OutSuperGroup | Chattype::InSuperGroup => false,
+            Chattype::SuperGroup => false,
         };
 
         if send_verified_headers {
@@ -1428,8 +1426,7 @@ impl MimeFactory {
         if chat.typ == Chattype::Group
             || chat.typ == Chattype::OutBroadcast
             || chat.typ == Chattype::InBroadcast
-            || chat.typ == Chattype::OutSuperGroup
-            || chat.typ == Chattype::InSuperGroup
+            || chat.typ == Chattype::SuperGroup
         {
             headers.push((
                 "Chat-Group-Name",
@@ -2256,7 +2253,7 @@ fn should_encrypt_with_broadcast_secret(msg: &Message, chat: &Chat) -> bool {
     // For super groups (OutSuperGroup/InSuperGroup), regular messages are also symmetrically encrypted.
     // Member-added messages in super groups go to a single recipient (the new member)
     // with PGP encryption so they can receive the group key before having it.
-    matches!(chat.typ, Chattype::OutBroadcast | Chattype::OutSuperGroup | Chattype::InSuperGroup)
+    matches!(chat.typ, Chattype::OutBroadcast | Chattype::SuperGroup)
         && must_have_only_one_recipient(msg, chat).is_none()
 }
 
@@ -2279,7 +2276,7 @@ fn should_encrypt_symmetrically(msg: &Message, chat: &Chat) -> bool {
 /// For super groups: member-added goes to the single new member (to deliver the group key
 /// via PGP encryption before they have it). Member-removed goes to the removed member.
 fn must_have_only_one_recipient<'a>(msg: &'a Message, chat: &Chat) -> Option<Result<&'a str>> {
-    if matches!(chat.typ, Chattype::OutBroadcast | Chattype::OutSuperGroup)
+    if matches!(chat.typ, Chattype::OutBroadcast | Chattype::SuperGroup)
         && matches!(
             msg.param.get_cmd(),
             SystemMessage::MemberRemovedFromGroup | SystemMessage::MemberAddedToGroup

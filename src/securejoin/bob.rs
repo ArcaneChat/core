@@ -477,7 +477,7 @@ async fn joining_chat_id(
             let chattype = if matches!(invite, QrInvite::Group { .. }) {
                 Chattype::Group
             } else if matches!(invite, QrInvite::SuperGroup { .. }) {
-                Chattype::InSuperGroup
+                Chattype::SuperGroup
             } else {
                 Chattype::InBroadcast
             };
@@ -488,13 +488,24 @@ async fn joining_chat_id(
                     chat_id
                 }
                 None => {
+                    // For SuperGroup, store the admin contact (the inviter).
+                    let param = if matches!(invite, QrInvite::SuperGroup { .. }) {
+                        let mut p = Params::new();
+                        p.set_int(
+                            Param::SuperGroupAdmin,
+                            invite.contact_id().to_u32() as i32,
+                        );
+                        Some(p.to_string())
+                    } else {
+                        None
+                    };
                     ChatId::create_multiuser_record(
                         context,
                         chattype,
                         grpid,
                         name,
                         Blocked::Not,
-                        None,
+                        param,
                         smeared_time(context),
                     )
                     .await?

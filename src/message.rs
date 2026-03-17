@@ -944,7 +944,7 @@ impl Message {
                     Some(Contact::get_by_id(context, self.from_id).await?)
                 }
                 Chattype::Single | Chattype::OutBroadcast | Chattype::InBroadcast
-                | Chattype::OutSuperGroup | Chattype::InSuperGroup => None,
+                | Chattype::SuperGroup => None,
             }
         } else {
             None
