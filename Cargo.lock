@@ -194,9 +194,9 @@ dependencies = [
 
 [[package]]
 name = "astral-tokio-tar"
-version = "0.5.6"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec179a06c1769b1e42e1e2cbe74c7dcdb3d6383c838454d063eaac5bbb7ebbe5"
+checksum = "3c23f3af104b40a3430ccb90ed5f7bd877a8dc5c26fc92fde51a22b40890dcf9"
 dependencies = [
  "filetime",
  "futures-core",
@@ -497,15 +497,16 @@ dependencies = [
 
 [[package]]
 name = "blake3"
-version = "1.8.2"
+version = "1.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3888aaa89e4b2a40fca9848e400f6a658a5a3978de7be858e209cafa8be9a4a0"
+checksum = "2468ef7d57b3fb7e16b576e8377cdbde2320c60e1491e961d11da40fc4f02a2d"
 dependencies = [
  "arrayref",
  "arrayvec",
  "cc",
  "cfg-if",
- "constant_time_eq",
+ "constant_time_eq 0.4.2",
+ "cpufeatures",
 ]
 
 [[package]]
@@ -964,6 +965,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c74b8349d32d297c9134b8c88677813a227df8f779daa29bfc29c183fe3dca6"
 
 [[package]]
+name = "constant_time_eq"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
+
+[[package]]
 name = "convert_case"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1300,7 +1307,7 @@ dependencies = [
 
 [[package]]
 name = "deltachat"
-version = "2.46.0-dev"
+version = "2.46.0"
 dependencies = [
  "anyhow",
  "astral-tokio-tar",
@@ -1358,7 +1365,6 @@ dependencies = [
  "ratelimit",
  "regex",
  "rusqlite",
- "rustls-pki-types",
  "sanitize-filename",
  "sdp",
  "serde",
@@ -1410,7 +1416,7 @@ dependencies = [
 
 [[package]]
 name = "deltachat-jsonrpc"
-version = "2.46.0-dev"
+version = "2.46.0"
 dependencies = [
  "anyhow",
  "async-channel 2.5.0",
@@ -1431,7 +1437,7 @@ dependencies = [
 
 [[package]]
 name = "deltachat-repl"
-version = "2.46.0-dev"
+version = "2.46.0"
 dependencies = [
  "anyhow",
  "deltachat",
@@ -1447,7 +1453,7 @@ dependencies = [
 
 [[package]]
 name = "deltachat-rpc-server"
-version = "2.46.0-dev"
+version = "2.46.0"
 dependencies = [
  "anyhow",
  "deltachat",
@@ -1476,7 +1482,7 @@ dependencies = [
 
 [[package]]
 name = "deltachat_ffi"
-version = "2.46.0-dev"
+version = "2.46.0"
 dependencies = [
  "anyhow",
  "deltachat",
@@ -3026,7 +3032,7 @@ dependencies = [
  "arrayvec",
  "cc",
  "cfg-if",
- "constant_time_eq",
+ "constant_time_eq 0.3.1",
 ]
 
 [[package]]

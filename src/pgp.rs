@@ -1,15 +1,14 @@
 //! OpenPGP helper module using [rPGP facilities](https://github.com/rpgp/rpgp).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::{BufRead, Cursor};
+use std::collections::{HashMap, HashSet};
+use std::io::Cursor;
 
 use anyhow::{Context as _, Result, ensure};
 use deltachat_contact_tools::{EmailAddress, may_be_valid_addr};
-use pgp::armor::BlockType;
 use pgp::composed::{
     ArmorOptions, Deserializable, DetachedSignature, EncryptionCaps, KeyType as PgpKeyType,
-    Message, MessageBuilder, SecretKeyParamsBuilder, SignedKeyDetails, SignedPublicKey,
-    SignedPublicSubKey, SignedSecretKey, SubkeyParamsBuilder, SubpacketConfig,
+    MessageBuilder, SecretKeyParamsBuilder, SignedKeyDetails, SignedPublicKey, SignedPublicSubKey,
+    SignedSecretKey, SubkeyParamsBuilder, SubpacketConfig,
 };
 use pgp::crypto::aead::{AeadAlgorithm, ChunkSize};
 use pgp::crypto::ecc_curve::ECCCurve;
@@ -26,44 +25,8 @@ use tokio::runtime::Handle;
 
 use crate::key::{DcKey, Fingerprint};
 
-#[cfg(test)]
-pub(crate) const HEADER_AUTOCRYPT: &str = "autocrypt-prefer-encrypt";
-
-pub(crate) const HEADER_SETUPCODE: &str = "passphrase-begin";
-
 /// Preferred symmetric encryption algorithm.
 const SYMMETRIC_KEY_ALGORITHM: SymmetricKeyAlgorithm = SymmetricKeyAlgorithm::AES128;
-
-/// Split data from PGP Armored Data as defined in <https://tools.ietf.org/html/rfc4880#section-6.2>.
-///
-/// Returns (type, headers, base64 encoded body).
-pub fn split_armored_data(buf: &[u8]) -> Result<(BlockType, BTreeMap<String, String>, Vec<u8>)> {
-    use std::io::Read;
-
-    let cursor = Cursor::new(buf);
-    let mut dearmor = pgp::armor::Dearmor::new(cursor);
-
-    let mut bytes = Vec::with_capacity(buf.len());
-
-    dearmor.read_to_end(&mut bytes)?;
-    let typ = dearmor.typ.context("failed to parse type")?;
-
-    // normalize headers
-    let headers = dearmor
-        .headers
-        .into_iter()
-        .map(|(key, values)| {
-            (
-                key.trim().to_lowercase(),
-                values
-                    .last()
-                    .map_or_else(String::new, |s| s.trim().to_string()),
-            )
-        })
-        .collect();
-
-    Ok((typ, headers, bytes))
-}
 
 /// Create a new key pair.
 ///
@@ -151,7 +114,6 @@ pub async fn pk_encrypt(
     public_keys_for_encryption: Vec<SignedPublicKey>,
     private_key_for_signing: SignedSecretKey,
     compress: bool,
-    anonymous_recipients: bool,
     seipd_version: SeipdVersion,
 ) -> Result<String> {
     Handle::current()
@@ -198,11 +160,7 @@ pub async fn pk_encrypt(
                     let mut msg = msg.seipd_v1(&mut rng, SYMMETRIC_KEY_ALGORITHM);
 
                     for pkey in pkeys {
-                        if anonymous_recipients {
-                            msg.encrypt_to_key_anonymous(&mut rng, &pkey)?;
-                        } else {
-                            msg.encrypt_to_key(&mut rng, &pkey)?;
-                        }
+                        msg.encrypt_to_key_anonymous(&mut rng, &pkey)?;
                     }
 
                     let hash_algorithm = private_key_for_signing.hash_alg();
@@ -227,11 +185,7 @@ pub async fn pk_encrypt(
                     );
 
                     for pkey in pkeys {
-                        if anonymous_recipients {
-                            msg.encrypt_to_key_anonymous(&mut rng, &pkey)?;
-                        } else {
-                            msg.encrypt_to_key(&mut rng, &pkey)?;
-                        }
+                        msg.encrypt_to_key_anonymous(&mut rng, &pkey)?;
                     }
 
                     let hash_algorithm = private_key_for_signing.hash_alg();
@@ -344,24 +298,6 @@ pub fn pk_validate(
     Ok(ret)
 }
 
-/// Symmetric encryption for the autocrypt setup message (ASM).
-pub async fn symm_encrypt_autocrypt_setup(passphrase: &str, plain: Vec<u8>) -> Result<String> {
-    let passphrase = Password::from(passphrase.to_string());
-
-    tokio::task::spawn_blocking(move || {
-        let mut rng = thread_rng();
-        let s2k = StringToKey::new_default(&mut rng);
-        let builder = MessageBuilder::from_bytes("", plain);
-        let mut builder = builder.seipd_v1(&mut rng, SYMMETRIC_KEY_ALGORITHM);
-        builder.encrypt_with_password(s2k, &passphrase)?;
-
-        let encoded_msg = builder.to_armored_string(&mut rng, Default::default())?;
-
-        Ok(encoded_msg)
-    })
-    .await?
-}
-
 /// Symmetrically encrypt the message.
 /// This is used for broadcast channels and for version 2 of the Securejoin protocol.
 /// `shared secret` is the secret that will be used for symmetric encryption.
@@ -401,23 +337,6 @@ pub async fn symm_encrypt_message(
         let encoded_msg = msg.to_armored_string(&mut rng, Default::default())?;
 
         Ok(encoded_msg)
-    })
-    .await?
-}
-
-/// Symmetric decryption.
-pub async fn symm_decrypt<T: BufRead + std::fmt::Debug + 'static + Send>(
-    passphrase: &str,
-    ctext: T,
-) -> Result<Vec<u8>> {
-    let passphrase = passphrase.to_string();
-    tokio::task::spawn_blocking(move || {
-        let (enc_msg, _) = Message::from_armor(ctext)?;
-        let password = Password::from(passphrase);
-
-        let msg = enc_msg.decrypt_with_password(&password)?;
-        let res = msg.decompress()?.as_data_vec()?;
-        Ok(res)
     })
     .await?
 }
@@ -596,7 +515,7 @@ mod tests {
         test_utils::{TestContext, TestContextManager, alice_keypair, bob_keypair},
         token,
     };
-    use pgp::composed::Esk;
+    use pgp::composed::{Esk, Message};
     use pgp::packet::PublicKeyEncryptedSessionKey;
 
     async fn decrypt_bytes(
@@ -642,33 +561,6 @@ mod tests {
     }
 
     #[test]
-    fn test_split_armored_data_1() {
-        let (typ, _headers, base64) = split_armored_data(
-            b"-----BEGIN PGP MESSAGE-----\nNoVal:\n\naGVsbG8gd29ybGQ=\n-----END PGP MESSAGE-----",
-        )
-        .unwrap();
-
-        assert_eq!(typ, BlockType::Message);
-        assert!(!base64.is_empty());
-        assert_eq!(
-            std::string::String::from_utf8(base64).unwrap(),
-            "hello world"
-        );
-    }
-
-    #[test]
-    fn test_split_armored_data_2() {
-        let (typ, headers, base64) = split_armored_data(
-            b"-----BEGIN PGP PRIVATE KEY BLOCK-----\nAutocrypt-Prefer-Encrypt: mutual \n\naGVsbG8gd29ybGQ=\n-----END PGP PRIVATE KEY BLOCK-----"
-        )
-            .unwrap();
-
-        assert_eq!(typ, BlockType::PrivateKey);
-        assert!(!base64.is_empty());
-        assert_eq!(headers.get(HEADER_AUTOCRYPT), Some(&"mutual".to_string()));
-    }
-
-    #[test]
     fn test_create_keypair() {
         let keypair0 = create_keypair(EmailAddress::new("foo@bar.de").unwrap()).unwrap();
         let keypair1 = create_keypair(EmailAddress::new("two@zwo.de").unwrap()).unwrap();
@@ -707,7 +599,6 @@ mod tests {
 
     /// A ciphertext encrypted to Alice & Bob, signed by Alice.
     async fn ctext_signed() -> &'static String {
-        let anonymous_recipients = true;
         CTEXT_SIGNED
             .get_or_init(|| async {
                 let keyring = vec![KEYS.alice_public.clone(), KEYS.bob_public.clone()];
@@ -718,7 +609,6 @@ mod tests {
                     keyring,
                     KEYS.alice_secret.clone(),
                     compress,
-                    anonymous_recipients,
                     SeipdVersion::V2,
                 )
                 .await
@@ -905,12 +795,12 @@ mod tests {
         let pk_for_encryption = load_self_public_key(alice).await?;
 
         // Encrypt a message, but only to self, not to Bob:
+        let compress = true;
         let ctext = pk_encrypt(
             plain,
             vec![pk_for_encryption],
             KEYS.alice_secret.clone(),
-            true,
-            true,
+            compress,
             SeipdVersion::V2,
         )
         .await?;
