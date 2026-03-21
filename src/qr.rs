@@ -117,6 +117,30 @@ pub enum Qr {
         is_v3: bool,
     },
 
+    /// Ask whether to join the super group.
+    AskJoinSuperGroup {
+        /// The user-visible name of this super group.
+        name: String,
+
+        /// A string of random characters,
+        /// uniquely identifying this super group across all databases/clients.
+        grpid: String,
+
+        /// ID of the contact who owns the super group and created the QR code.
+        contact_id: ContactId,
+
+        /// Fingerprint of the contact's key as scanned from the QR code.
+        fingerprint: Fingerprint,
+
+        /// Invite number.
+        invitenumber: String,
+        /// Authentication code.
+        authcode: String,
+
+        /// Whether the inviter supports the new Securejoin v3 protocol
+        is_v3: bool,
+    },
+
     /// Contact fingerprint is verified.
     ///
     /// Ask the user if they want to start chatting.
@@ -266,6 +290,27 @@ pub enum Qr {
         authcode: String,
     },
 
+    /// Ask the user if they want to withdraw their own super group invite QR code.
+    WithdrawJoinSuperGroup {
+        /// The user-visible name of this super group.
+        name: String,
+
+        /// A string of random characters, uniquely identifying this super group.
+        grpid: String,
+
+        /// Contact ID. Always `ContactId::SELF`.
+        contact_id: ContactId,
+
+        /// Fingerprint of the contact's key as scanned from the QR code.
+        fingerprint: Fingerprint,
+
+        /// Invite number.
+        invitenumber: String,
+
+        /// Authentication code.
+        authcode: String,
+    },
+
     /// Ask the user if they want to revive their own QR code.
     ReviveVerifyContact {
         /// Contact ID.
@@ -312,6 +357,27 @@ pub enum Qr {
         /// Called `grpid` for historic reasons:
         /// The id of multi-user chats is always called `grpid` in the database
         /// because groups were once the only multi-user chats.
+        grpid: String,
+
+        /// Contact ID. Always `ContactId::SELF`.
+        contact_id: ContactId,
+
+        /// Fingerprint of the contact's key as scanned from the QR code.
+        fingerprint: Fingerprint,
+
+        /// Invite number.
+        invitenumber: String,
+
+        /// Authentication code.
+        authcode: String,
+    },
+
+    /// Ask the user if they want to revive their own super group invite QR code.
+    ReviveJoinSuperGroup {
+        /// The user-visible name of this super group.
+        name: String,
+
+        /// A string of random characters, uniquely identifying this super group.
         grpid: String,
 
         /// Contact ID. Always `ContactId::SELF`.
@@ -509,6 +575,7 @@ async fn decode_openpgp(context: &Context, qr: &str) -> Result<Qr> {
 
     let grpname = decode_name(&param, "g")?;
     let broadcast_name = decode_name(&param, "b")?;
+    let super_group_name = decode_name(&param, "k")?;
 
     let mut is_v3 = param.get("v") == Some(&"3");
 
@@ -568,7 +635,7 @@ async fn decode_openpgp(context: &Context, qr: &str) -> Result<Qr> {
                     is_v3,
                 })
             }
-        } else if let (Some(grpid), Some(name)) = (grpid, broadcast_name) {
+        } else if let (Some(grpid), Some(name)) = (grpid.clone(), broadcast_name) {
             if context
                 .is_self_addr(&addr)
                 .await
@@ -595,6 +662,42 @@ async fn decode_openpgp(context: &Context, qr: &str) -> Result<Qr> {
                 }
             } else {
                 Ok(Qr::AskJoinBroadcast {
+                    name,
+                    grpid,
+                    contact_id,
+                    fingerprint,
+                    invitenumber,
+                    authcode,
+                    is_v3,
+                })
+            }
+        } else if let (Some(grpid), Some(name)) = (grpid, super_group_name) {
+            if context
+                .is_self_addr(&addr)
+                .await
+                .with_context(|| format!("Can't check if {addr:?} is our address"))?
+            {
+                if token::exists(context, token::Namespace::Auth, &authcode).await? {
+                    Ok(Qr::WithdrawJoinSuperGroup {
+                        name,
+                        grpid,
+                        contact_id,
+                        fingerprint,
+                        invitenumber,
+                        authcode,
+                    })
+                } else {
+                    Ok(Qr::ReviveJoinSuperGroup {
+                        name,
+                        grpid,
+                        contact_id,
+                        fingerprint,
+                        invitenumber,
+                        authcode,
+                    })
+                }
+            } else {
+                Ok(Qr::AskJoinSuperGroup {
                     name,
                     grpid,
                     contact_id,
@@ -919,6 +1022,12 @@ pub async fn set_config_from_qr(context: &Context, qr: &str) -> Result<()> {
             invitenumber,
             authcode,
             ..
+        }
+        | Qr::WithdrawJoinSuperGroup {
+            grpid,
+            invitenumber,
+            authcode,
+            ..
         } => {
             token::delete(context, &grpid).await?;
             context
@@ -950,6 +1059,12 @@ pub async fn set_config_from_qr(context: &Context, qr: &str) -> Result<()> {
             ..
         }
         | Qr::ReviveJoinBroadcast {
+            invitenumber,
+            authcode,
+            grpid,
+            ..
+        }
+        | Qr::ReviveJoinSuperGroup {
             invitenumber,
             authcode,
             grpid,

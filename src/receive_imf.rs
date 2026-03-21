@@ -1832,6 +1832,19 @@ async fn add_parts(
                 chat_id = direct_chat.id;
                 chat_id_blocked = direct_chat.blocked;
                 chat = Chat::load_from_db(context, chat_id).await?;
+            } else if chat.typ == Chattype::SuperGroup {
+                // For super groups, all members can send, but we only accept messages
+                // from known members. If the sender is not in our member list,
+                // the message might be from someone the admin added after our last sync.
+                // Add them to our member list so they can participate.
+                chat::add_to_chat_contacts_table(
+                    context,
+                    mime_parser.timestamp_sent,
+                    chat_id,
+                    &[from_id],
+                )
+                .await?;
+                context.emit_event(EventType::ChatModified(chat_id));
             }
         }
     }
@@ -1849,6 +1862,9 @@ async fn add_parts(
         }
         Chattype::InBroadcast => {
             apply_in_broadcast_changes(context, mime_parser, &mut chat, from_id).await?
+        }
+        Chattype::SuperGroup => {
+            apply_super_group_changes(context, mime_parser, &mut chat, from_id).await?
         }
     };
 
@@ -3356,7 +3372,12 @@ async fn apply_chat_name_avatar_and_description_changes(
         {
             let old_name = &sanitize_single_line(old_name);
             better_msg.get_or_insert(
-                if matches!(chat.typ, Chattype::InBroadcast | Chattype::OutBroadcast) {
+                if matches!(
+                    chat.typ,
+                    Chattype::InBroadcast
+                        | Chattype::OutBroadcast
+                        | Chattype::SuperGroup
+                ) {
                     stock_str::msg_broadcast_name_changed(context, old_name, grpname).await
                 } else {
                     stock_str::msg_grp_name(context, old_name, grpname, from_id).await
@@ -3536,12 +3557,19 @@ async fn create_or_lookup_mailinglist_or_broadcast(
     }
 
     let chattype = if mime_parser.was_encrypted() {
-        Chattype::InBroadcast
+        if mime_parser
+            .get_header(HeaderDef::ChatSuperGroup)
+            .is_some()
+        {
+            Chattype::SuperGroup
+        } else {
+            Chattype::InBroadcast
+        }
     } else {
         Chattype::Mailinglist
     };
 
-    let name = if chattype == Chattype::InBroadcast {
+    let name = if matches!(chattype, Chattype::InBroadcast | Chattype::SuperGroup) {
         mime_parser
             .get_header(HeaderDef::ChatGroupName)
             .unwrap_or("Broadcast Channel")
@@ -3550,12 +3578,19 @@ async fn create_or_lookup_mailinglist_or_broadcast(
     };
 
     if allow_creation {
-        // Broadcast channel / mailinglist does not exist but should be created
-        let param = mime_parser.list_post.as_ref().map(|list_post| {
+        // Broadcast channel / super group / mailinglist does not exist but should be created
+        let param = if chattype == Chattype::SuperGroup {
+            // Store the admin (sender of the first message we receive from this super group).
             let mut p = Params::new();
-            p.set(Param::ListPost, list_post);
-            p.to_string()
-        });
+            p.set_int(Param::SuperGroupAdmin, from_id.to_u32() as i32);
+            Some(p.to_string())
+        } else {
+            mime_parser.list_post.as_ref().map(|list_post| {
+                let mut p = Params::new();
+                p.set(Param::ListPost, list_post);
+                p.to_string()
+            })
+        };
 
         let chat_id = ChatId::create_multiuser_record(
             context,
@@ -3574,7 +3609,7 @@ async fn create_or_lookup_mailinglist_or_broadcast(
             )
         })?;
 
-        if chattype == Chattype::InBroadcast {
+        if matches!(chattype, Chattype::InBroadcast | Chattype::SuperGroup) {
             chat::add_to_chat_contacts_table(
                 context,
                 mime_parser.timestamp_sent,
@@ -3917,7 +3952,164 @@ async fn apply_in_broadcast_changes(
     })
 }
 
-/// Creates ad-hoc group and returns chat ID on success.
+/// Applies incoming changes for a [`Chattype::SuperGroup`] chat.
+///
+/// This handles:
+/// - Name / avatar / description changes sent by any member
+/// - Member additions (admin adds others; self being added to the group)
+/// - Member removals (admin removes others; self being removed)
+/// - Receiving the group encryption key when joining (non-admin members)
+///
+/// Whether the local device is the admin is determined by [`Chat::is_self_super_group_admin`].
+async fn apply_super_group_changes(
+    context: &Context,
+    mime_parser: &MimeMessage,
+    chat: &mut Chat,
+    from_id: ContactId,
+) -> Result<GroupChangesInfo> {
+    ensure!(chat.typ == Chattype::SuperGroup);
+
+    if let Some(part) = mime_parser.parts.first()
+        && let Some(error) = &part.error
+    {
+        warn!(
+            context,
+            "Not applying super group changes from message with error: {error}"
+        );
+        return Ok(GroupChangesInfo::default());
+    }
+
+    let mut send_event_chat_modified = false;
+    let mut better_msg = None;
+    let mut added_removed_id: Option<ContactId> = None;
+    let is_admin = chat.is_self_super_group_admin();
+
+    // Always try to apply name / avatar / description changes.
+    apply_chat_name_avatar_and_description_changes(
+        context,
+        mime_parser,
+        from_id,
+        chat,
+        &mut send_event_chat_modified,
+        &mut better_msg,
+    )
+    .await?;
+
+    if let Some(added_fpr) = mime_parser.get_header(HeaderDef::ChatGroupMemberAddedFpr) {
+        if is_admin && from_id == ContactId::SELF {
+            // Admin's own multi-device echo: update member list.
+            let added_id = lookup_key_contact_by_fingerprint(context, added_fpr).await?;
+            if let Some(added_id) = added_id {
+                if chat::is_contact_in_chat(context, chat.id, added_id).await? {
+                    info!(context, "No-op super group addition (TRASH)");
+                    better_msg.get_or_insert("".to_string());
+                } else {
+                    chat::add_to_chat_contacts_table(
+                        context,
+                        mime_parser.timestamp_sent,
+                        chat.id,
+                        &[added_id],
+                    )
+                    .await?;
+                    let msg = stock_str::msg_add_member_local(
+                        context,
+                        added_id,
+                        ContactId::UNDEFINED,
+                    )
+                    .await;
+                    better_msg.get_or_insert(msg);
+                    added_removed_id = Some(added_id);
+                    send_event_chat_modified = true;
+                }
+            } else {
+                warn!(context, "Failed to find contact with fpr {added_fpr}");
+            }
+        } else if !is_admin {
+            // Non-admin: check if self was added (the member-added message targets self).
+            if let Some(added_addr) = mime_parser.get_header(HeaderDef::ChatGroupMemberAdded)
+                && context.is_self_addr(added_addr).await?
+            {
+                let msg = if chat.is_self_in_chat(context).await? {
+                    info!(context, "No-op super group \'Member added\' message (TRASH)");
+                    "".to_string()
+                } else {
+                    stock_str::msg_you_joined_broadcast(context).await
+                };
+                better_msg.get_or_insert(msg);
+                send_event_chat_modified = true;
+            }
+        }
+    } else if let Some(removed_fpr) = mime_parser.get_header(HeaderDef::ChatGroupMemberRemovedFpr) {
+        send_event_chat_modified = true;
+        let removed_id = lookup_key_contact_by_fingerprint(context, removed_fpr).await?;
+
+        if is_admin {
+            // Admin side: someone left or was removed.
+            if removed_id == Some(from_id) {
+                // The sender left the group voluntarily.
+                chat::remove_from_chat_contacts_table_without_trace(context, chat.id, from_id).await?;
+                info!(context, "Super group leave message (TRASH)");
+                better_msg = Some("".to_string());
+            } else if from_id == ContactId::SELF
+                && let Some(removed_id) = removed_id
+            {
+                // Admin explicitly removed someone.
+                chat::remove_from_chat_contacts_table_without_trace(context, chat.id, removed_id)
+                    .await?;
+                better_msg.get_or_insert(
+                    stock_str::msg_del_member_local(context, removed_id, ContactId::SELF).await,
+                );
+                added_removed_id = Some(removed_id);
+            }
+        } else {
+            // Non-admin member side: only relevant if self is removed.
+            if removed_fpr != self_fingerprint(context).await? {
+                logged_debug_assert!(context, false, "Ignoring unexpected removal message");
+                return Ok(GroupChangesInfo::default());
+            }
+            chat::delete_broadcast_secret(context, chat.id).await?;
+            if from_id == ContactId::SELF {
+                better_msg.get_or_insert(stock_str::msg_you_left_broadcast(context).await);
+            } else {
+                better_msg.get_or_insert(
+                    stock_str::msg_del_member_local(context, ContactId::SELF, from_id).await,
+                );
+            }
+            chat::remove_from_chat_contacts_table_without_trace(context, chat.id, ContactId::SELF)
+                .await?;
+        }
+    } else if !is_admin && !chat.is_self_in_chat(context).await? {
+        // Non-admin: first message seen in the group – add self to member list.
+        chat::add_to_chat_contacts_table(
+            context,
+            mime_parser.timestamp_sent,
+            chat.id,
+            &[ContactId::SELF],
+        )
+        .await?;
+        send_event_chat_modified = true;
+    }
+
+    // Save the symmetric key if the admin included it (targeted at new non-admin members).
+    if let Some(secret) = mime_parser.get_header(HeaderDef::ChatBroadcastSecret) {
+        if validate_broadcast_secret(secret) {
+            save_broadcast_secret(context, chat.id, secret).await?;
+        } else {
+            warn!(context, "Not saving invalid super group secret");
+        }
+    }
+
+    if send_event_chat_modified {
+        context.emit_event(EventType::ChatModified(chat.id));
+        chatlist_events::emit_chatlist_item_changed(context, chat.id);
+    }
+    Ok(GroupChangesInfo {
+        better_msg,
+        added_removed_id,
+        silent: false,
+        extra_msgs: vec![],
+    })
+}
 async fn create_adhoc_group(
     context: &Context,
     mime_parser: &MimeMessage,

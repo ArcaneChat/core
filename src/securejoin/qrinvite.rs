@@ -43,6 +43,16 @@ pub enum QrInvite {
         #[serde(default)]
         is_v3: bool,
     },
+    SuperGroup {
+        contact_id: ContactId,
+        fingerprint: Fingerprint,
+        name: String,
+        grpid: String,
+        invitenumber: String,
+        authcode: String,
+        #[serde(default)]
+        is_v3: bool,
+    },
 }
 
 impl QrInvite {
@@ -54,7 +64,8 @@ impl QrInvite {
         match self {
             Self::Contact { contact_id, .. }
             | Self::Group { contact_id, .. }
-            | Self::Broadcast { contact_id, .. } => *contact_id,
+            | Self::Broadcast { contact_id, .. }
+            | Self::SuperGroup { contact_id, .. } => *contact_id,
         }
     }
 
@@ -63,7 +74,8 @@ impl QrInvite {
         match self {
             Self::Contact { fingerprint, .. }
             | Self::Group { fingerprint, .. }
-            | Self::Broadcast { fingerprint, .. } => fingerprint,
+            | Self::Broadcast { fingerprint, .. }
+            | Self::SuperGroup { fingerprint, .. } => fingerprint,
         }
     }
 
@@ -72,7 +84,8 @@ impl QrInvite {
         match self {
             Self::Contact { invitenumber, .. }
             | Self::Group { invitenumber, .. }
-            | Self::Broadcast { invitenumber, .. } => invitenumber,
+            | Self::Broadcast { invitenumber, .. }
+            | Self::SuperGroup { invitenumber, .. } => invitenumber,
         }
     }
 
@@ -81,7 +94,8 @@ impl QrInvite {
         match self {
             Self::Contact { authcode, .. }
             | Self::Group { authcode, .. }
-            | Self::Broadcast { authcode, .. } => authcode,
+            | Self::Broadcast { authcode, .. }
+            | Self::SuperGroup { authcode, .. } => authcode,
         }
     }
 
@@ -90,6 +104,7 @@ impl QrInvite {
             QrInvite::Contact { is_v3, .. } => is_v3,
             QrInvite::Group { is_v3, .. } => is_v3,
             QrInvite::Broadcast { is_v3, .. } => is_v3,
+            QrInvite::SuperGroup { is_v3, .. } => is_v3,
         }
     }
 }
@@ -138,6 +153,23 @@ impl TryFrom<Qr> for QrInvite {
                 invitenumber,
                 is_v3,
             } => Ok(QrInvite::Broadcast {
+                name,
+                grpid,
+                contact_id,
+                fingerprint,
+                authcode,
+                invitenumber,
+                is_v3,
+            }),
+            Qr::AskJoinSuperGroup {
+                name,
+                grpid,
+                contact_id,
+                fingerprint,
+                authcode,
+                invitenumber,
+                is_v3,
+            } => Ok(QrInvite::SuperGroup {
                 name,
                 grpid,
                 contact_id,

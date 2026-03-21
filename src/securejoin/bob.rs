@@ -55,7 +55,7 @@ pub(super) async fn start_protocol(context: &Context, invite: QrInvite) -> Resul
                 .await?;
             context.emit_event(EventType::ContactsChanged(None));
         }
-        QrInvite::Broadcast { .. } => {}
+        QrInvite::Broadcast { .. } | QrInvite::SuperGroup { .. } => {}
     }
 
     let has_key = context
@@ -71,7 +71,9 @@ pub(super) async fn start_protocol(context: &Context, invite: QrInvite) -> Resul
         // `joining_chat_id` is `Some` if group chat
         // already exists and we are in the chat.
         let joining_chat_id = match invite {
-            QrInvite::Group { ref grpid, .. } | QrInvite::Broadcast { ref grpid, .. } => {
+            QrInvite::Group { ref grpid, .. }
+            | QrInvite::Broadcast { ref grpid, .. }
+            | QrInvite::SuperGroup { ref grpid, .. } => {
                 if let Some((joining_chat_id, _blocked)) =
                     chat::get_chat_id_by_grpid(context, grpid).await?
                 {
@@ -144,6 +146,27 @@ pub(super) async fn start_protocol(context: &Context, invite: QrInvite) -> Resul
             }
 
             // If we were not in the broadcast channel before, show a 'please wait' info message.
+            if !is_contact_in_chat(context, joining_chat_id, ContactId::SELF).await? {
+                let msg =
+                    stock_str::secure_join_broadcast_started(context, invite.contact_id()).await;
+                chat::add_info_msg(context, joining_chat_id, &msg).await?;
+            }
+            Ok(joining_chat_id)
+        }
+        QrInvite::SuperGroup { .. } => {
+            let joining_chat_id = joining_chat_id(context, &invite, private_chat_id).await?;
+            // We created the super group already, now we need to add Alice (the admin) to it.
+            if !is_contact_in_chat(context, joining_chat_id, invite.contact_id()).await? {
+                chat::add_to_chat_contacts_table(
+                    context,
+                    time(),
+                    joining_chat_id,
+                    &[invite.contact_id()],
+                )
+                .await?;
+            }
+
+            // If we were not in the super group before, show a 'please wait' info message.
             if !is_contact_in_chat(context, joining_chat_id, ContactId::SELF).await? {
                 let msg =
                     stock_str::secure_join_broadcast_started(context, invite.contact_id()).await;
@@ -269,7 +292,7 @@ pub(super) async fn handle_auth_required_or_pubkey(
             .await?;
 
         match invite {
-            QrInvite::Contact { .. } | QrInvite::Broadcast { .. } => {}
+            QrInvite::Contact { .. } | QrInvite::Broadcast { .. } | QrInvite::SuperGroup { .. } => {}
             QrInvite::Group { .. } => {
                 // The message reads "Alice replied, waiting to be added to the group…",
                 // so only show it when joining a group and not for a 1:1 chat or broadcast channel.
@@ -405,11 +428,13 @@ impl BobHandshakeMsg {
                 QrInvite::Contact { .. } => "vc-request",
                 QrInvite::Group { .. } => "vg-request",
                 QrInvite::Broadcast { .. } => "vg-request",
+                QrInvite::SuperGroup { .. } => "vg-request",
             },
             Self::RequestWithAuth => match invite {
                 QrInvite::Contact { .. } => "vc-request-with-auth",
                 QrInvite::Group { .. } => "vg-request-with-auth",
                 QrInvite::Broadcast { .. } => "vg-request-with-auth",
+                QrInvite::SuperGroup { .. } => "vg-request-with-auth",
             },
         }
     }
@@ -424,6 +449,7 @@ async fn private_chat_id(context: &Context, invite: &QrInvite) -> Result<ChatId>
         QrInvite::Contact { .. } => Blocked::Not,
         QrInvite::Group { .. } => Blocked::Yes,
         QrInvite::Broadcast { .. } => Blocked::Yes,
+        QrInvite::SuperGroup { .. } => Blocked::Yes,
     };
 
     ChatId::create_for_contact_with_blocked(context, invite.contact_id(), hidden)
@@ -445,9 +471,13 @@ async fn joining_chat_id(
 ) -> Result<ChatId> {
     match invite {
         QrInvite::Contact { .. } => Ok(alice_chat_id),
-        QrInvite::Group { grpid, name, .. } | QrInvite::Broadcast { name, grpid, .. } => {
+        QrInvite::Group { grpid, name, .. }
+        | QrInvite::Broadcast { name, grpid, .. }
+        | QrInvite::SuperGroup { name, grpid, .. } => {
             let chattype = if matches!(invite, QrInvite::Group { .. }) {
                 Chattype::Group
+            } else if matches!(invite, QrInvite::SuperGroup { .. }) {
+                Chattype::SuperGroup
             } else {
                 Chattype::InBroadcast
             };
@@ -458,13 +488,24 @@ async fn joining_chat_id(
                     chat_id
                 }
                 None => {
+                    // For SuperGroup, store the admin contact (the inviter).
+                    let param = if matches!(invite, QrInvite::SuperGroup { .. }) {
+                        let mut p = Params::new();
+                        p.set_int(
+                            Param::SuperGroupAdmin,
+                            invite.contact_id().to_u32() as i32,
+                        );
+                        Some(p.to_string())
+                    } else {
+                        None
+                    };
                     ChatId::create_multiuser_record(
                         context,
                         chattype,
                         grpid,
                         name,
                         Blocked::Not,
-                        None,
+                        param,
                         smeared_time(context),
                     )
                     .await?

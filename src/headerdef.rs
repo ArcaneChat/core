@@ -106,6 +106,13 @@ pub enum HeaderDef {
     /// used to encrypt and decrypt messages.
     /// This secret is sent to a new member in the member-addition message.
     ChatBroadcastSecret,
+
+    /// Marker header present in super group messages.
+    ///
+    /// When present alongside `Chat-List-ID`, indicates that the message
+    /// belongs to a super group (where all members can send) rather than
+    /// a regular broadcast channel (where only the admin can send).
+    ChatSuperGroup,
     /// A message with a large attachment is split into two messages:
     /// A pre-message, which contains everything but the attachment,
     /// and a Post-Message.

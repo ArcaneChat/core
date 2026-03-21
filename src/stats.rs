@@ -846,6 +846,7 @@ pub(crate) async fn count_securejoin_invite(context: &Context, invite: &QrInvite
         QrInvite::Contact { .. } => "contact",
         QrInvite::Group { .. } => "group",
         QrInvite::Broadcast { .. } => "broadcast",
+        QrInvite::SuperGroup { .. } => "super_group",
     };
 
     context

@@ -264,6 +264,13 @@ pub enum Param {
 
     /// For (pre-)Message: File byte size of Post-Message attachment
     PostMessageFileBytes = b'9',
+
+    /// For [`crate::constants::Chattype::SuperGroup`] chats: contact ID of the group admin.
+    ///
+    /// Stored as a decimal string (`u32`).
+    /// If this equals `ContactId::SELF` (0) the local device is the admin.
+    /// For regular members this stores the `ContactId` of the admin.
+    SuperGroupAdmin = b'Z',
 }
 
 /// An object for handling key=value parameter lists.
