@@ -16,6 +16,10 @@ use deltachat::chat::{
 };
 use deltachat::chatlist::Chatlist;
 use deltachat::config::{get_all_ui_config_keys, Config};
+use deltachat::constants::{
+    DC_GCL_ADD_ALLDONE_HINT, DC_GCL_ADD_SELF, DC_GCL_ADDRESS, DC_GCL_ARCHIVED_ONLY,
+    DC_GCL_FOR_FORWARDING, DC_GCL_NO_SPECIALS,
+};
 use deltachat::constants::DC_MSG_ID_DAYMARKER;
 use deltachat::contact::{may_be_valid_addr, Contact, ContactId, Origin};
 use deltachat::context::get_info;
@@ -741,17 +745,39 @@ impl CommandApi {
     //   chat list
     // ---------------------------------------------
 
+    /// Returns chat list entry IDs.
+    ///
+    /// * `archived_only` - Only return archived chats. If not set, only unarchived chats are returned.
+    /// * `no_specials` - Do not add the archive link entry to the chatlist.
+    /// * `for_forwarding` - Sort "Saved messages" to the top of the chatlist; typically used when forwarding.
+    /// * `add_alldone_hint` - Add a hint entry `DC_CHAT_ID_ALLDONE_HINT` to the chatlist if there are only archived chats.
     async fn get_chatlist_entries(
         &self,
         account_id: u32,
-        list_flags: Option<u32>,
+        archived_only: Option<bool>,
+        no_specials: Option<bool>,
+        for_forwarding: Option<bool>,
+        add_alldone_hint: Option<bool>,
         query_string: Option<String>,
         query_contact_id: Option<u32>,
     ) -> Result<Vec<u32>> {
         let ctx = self.get_context(account_id).await?;
+        let mut list_flags: usize = 0;
+        if archived_only.unwrap_or_default() {
+            list_flags |= DC_GCL_ARCHIVED_ONLY;
+        }
+        if no_specials.unwrap_or_default() {
+            list_flags |= DC_GCL_NO_SPECIALS;
+        }
+        if for_forwarding.unwrap_or_default() {
+            list_flags |= DC_GCL_FOR_FORWARDING;
+        }
+        if add_alldone_hint.unwrap_or_default() {
+            list_flags |= DC_GCL_ADD_ALLDONE_HINT;
+        }
         let list = Chatlist::try_load(
             &ctx,
-            list_flags.unwrap_or(0) as usize,
+            list_flags,
             query_string.as_deref(),
             query_contact_id.map(ContactId::new),
         )
@@ -1685,17 +1711,24 @@ impl CommandApi {
     ///
     /// By default, key-contacts are listed.
     ///
-    /// * `list_flags` - A combination of flags:
-    ///   - `DC_GCL_ADD_SELF` - Add SELF unless filtered by other parameters.
-    ///   - `DC_GCL_ADDRESS` - List address-contacts instead of key-contacts.
+    /// * `add_self` - Add SELF contact to the list unless filtered by other parameters.
+    /// * `address_book` - List address-contacts instead of key-contacts.
     /// * `query` - A string to filter the list.
     async fn get_contact_ids(
         &self,
         account_id: u32,
-        list_flags: u32,
+        add_self: Option<bool>,
+        address_book: Option<bool>,
         query: Option<String>,
     ) -> Result<Vec<u32>> {
         let ctx = self.get_context(account_id).await?;
+        let mut list_flags: u32 = 0;
+        if add_self.unwrap_or_default() {
+            list_flags |= DC_GCL_ADD_SELF;
+        }
+        if address_book.unwrap_or_default() {
+            list_flags |= DC_GCL_ADDRESS;
+        }
         let contacts = Contact::get_all(&ctx, list_flags, query.as_deref()).await?;
         Ok(contacts.into_iter().map(|c| c.to_u32()).collect())
     }
@@ -1707,10 +1740,18 @@ impl CommandApi {
     async fn get_contacts(
         &self,
         account_id: u32,
-        list_flags: u32,
+        add_self: Option<bool>,
+        address_book: Option<bool>,
         query: Option<String>,
     ) -> Result<Vec<ContactObject>> {
         let ctx = self.get_context(account_id).await?;
+        let mut list_flags: u32 = 0;
+        if add_self.unwrap_or_default() {
+            list_flags |= DC_GCL_ADD_SELF;
+        }
+        if address_book.unwrap_or_default() {
+            list_flags |= DC_GCL_ADDRESS;
+        }
         let contact_ids = Contact::get_all(&ctx, list_flags, query.as_deref()).await?;
         let mut contacts: Vec<ContactObject> = Vec::with_capacity(contact_ids.len());
         for id in contact_ids {
