@@ -146,7 +146,7 @@ impl Context {
         if let Err(err) = res.as_ref() {
             // We are using Anyhow's .context() and to show the
             // inner error, too, we need the {:#}:
-            let error_msg = stock_str::configuration_failed(self, &format!("{err:#}")).await;
+            let error_msg = stock_str::configuration_failed(self, &format!("{err:#}"));
             progress!(self, 0, Some(error_msg.clone()));
             bail!(error_msg);
         } else {
@@ -242,11 +242,6 @@ impl Context {
                         let add_timestamp: i64 = row.get(1)?;
                         Ok((id, add_timestamp))
                     },
-                )?;
-                transaction.execute("DELETE FROM imap WHERE transport_id=?", (transport_id,))?;
-                transaction.execute(
-                    "DELETE FROM imap_sync WHERE transport_id=?",
-                    (transport_id,),
                 )?;
 
                 // Removal timestamp should not be lower than addition timestamp
@@ -637,10 +632,7 @@ async fn configure(ctx: &Context, param: &EnteredLoginParam) -> Result<Option<&'
     let imap_session = match imap.connect(ctx, configuring).await {
         Ok(imap_session) => imap_session,
         Err(err) => {
-            bail!(
-                "{}",
-                nicer_configuration_error(ctx, format!("{err:#}")).await
-            );
+            bail!("{}", nicer_configuration_error(ctx, format!("{err:#}")));
         }
     };
 
@@ -781,7 +773,7 @@ async fn get_autoconfig(
     None
 }
 
-async fn nicer_configuration_error(context: &Context, e: String) -> String {
+fn nicer_configuration_error(context: &Context, e: String) -> String {
     if e.to_lowercase().contains("could not resolve")
         || e.to_lowercase().contains("connection attempts")
         || e.to_lowercase()
@@ -790,7 +782,7 @@ async fn nicer_configuration_error(context: &Context, e: String) -> String {
         || e.to_lowercase()
             .contains("failed to lookup address information")
     {
-        return stock_str::error_no_network(context).await;
+        return stock_str::error_no_network(context);
     }
 
     e

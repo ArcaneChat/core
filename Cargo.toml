@@ -1,6 +1,6 @@
 [package]
 name = "deltachat"
-version = "2.46.0"
+version = "2.48.0-dev"
 edition = "2024"
 license = "MPL-2.0"
 rust-version = "1.88"
@@ -87,7 +87,7 @@ rand = { workspace = true }
 regex = { workspace = true }
 rusqlite = { workspace = true, features = ["sqlcipher"] }
 sanitize-filename = { workspace = true }
-sdp = "0.10.0"
+sdp = "0.17.1"
 serde_json = { workspace = true }
 serde_urlencoded = "0.7.1"
 serde = { workspace = true, features = ["derive"] }

@@ -32,7 +32,7 @@ use crate::message::{Message, MsgId, Viewtype};
 use crate::mimeparser::{SystemMessage, is_hidden};
 use crate::param::Param;
 use crate::peer_channels::{create_iroh_header, get_iroh_topic_for_msg};
-use crate::pgp::{SeipdVersion, addresses_from_public_key};
+use crate::pgp::{SeipdVersion, addresses_from_public_key, pubkey_supports_seipdv2};
 use crate::simplify::escape_message_footer_marks;
 use crate::stock_str;
 use crate::tools::{
@@ -732,7 +732,7 @@ impl MimeFactory {
                     Some(name) => name,
                     None => context.get_config(Config::Addr).await?.unwrap_or_default(),
                 };
-                stock_str::subject_for_new_contact(context, self_name).await
+                stock_str::subject_for_new_contact(context, self_name)
             }
             Loaded::Mdn { .. } => "Receipt Notification".to_string(), // untranslated to no reveal sender's language
         };
@@ -852,7 +852,13 @@ impl MimeFactory {
 
         let rfc724_mid = match &self.loaded {
             Loaded::Message { msg, .. } => match &self.pre_message_mode {
-                PreMessageMode::Pre { .. } => create_outgoing_rfc724_mid(),
+                PreMessageMode::Pre { .. } => {
+                    if msg.pre_rfc724_mid.is_empty() {
+                        create_outgoing_rfc724_mid()
+                    } else {
+                        msg.pre_rfc724_mid.clone()
+                    }
+                }
                 _ => msg.rfc724_mid.clone(),
             },
             Loaded::Mdn { .. } => create_outgoing_rfc724_mid(),
@@ -1176,14 +1182,13 @@ impl MimeFactory {
             } else {
                 // Asymmetric encryption
 
-                let seipd_version = if encryption_pubkeys.is_empty() {
-                    // If message is sent only to self,
-                    // use v2 SEIPD.
+                // Use SEIPDv2 if all recipients support it.
+                let seipd_version = if encryption_pubkeys
+                    .iter()
+                    .all(|(_addr, pubkey)| pubkey_supports_seipdv2(pubkey))
+                {
                     SeipdVersion::V2
                 } else {
-                    // If message is sent to others,
-                    // they may not support v2 SEIPD yet,
-                    // so use v1 SEIPD.
                     SeipdVersion::V1
                 };
 
@@ -1525,7 +1530,7 @@ impl MimeFactory {
                 let description = chat::get_chat_description(context, chat.id).await?;
                 headers.push((
                     "Chat-Group-Description",
-                    mail_builder::headers::text::Text::new(description.clone()).into(),
+                    mail_builder::headers::raw::Raw::new(b_encode(&description)).into(),
                 ));
                 if let Some(ts) = chat.param.get_i64(Param::GroupDescriptionTimestamp) {
                     headers.push((

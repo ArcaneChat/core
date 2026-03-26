@@ -296,6 +296,11 @@ impl Imap {
         Ok(imap)
     }
 
+    /// Returns transport ID of the IMAP client.
+    pub fn transport_id(&self) -> u32 {
+        self.transport_id
+    }
+
     /// Connects to IMAP server and returns a new IMAP session.
     ///
     /// Calling this function is not enough to perform IMAP operations. Use [`Imap::prepare`]
@@ -437,7 +442,7 @@ impl Imap {
 
                 Err(err) => {
                     let imap_user = lp.user.to_owned();
-                    let message = stock_str::cannot_login(context, &imap_user).await;
+                    let message = stock_str::cannot_login(context, &imap_user);
 
                     warn!(context, "IMAP failed to login: {err:#}.");
                     first_error.get_or_insert(format_err!("{message} ({err:#})"));
@@ -551,8 +556,13 @@ impl Imap {
         folder: &str,
         folder_meaning: FolderMeaning,
     ) -> Result<bool> {
+        let transport_id = session.transport_id();
+
         if should_ignore_folder(context, folder, folder_meaning).await? {
-            info!(context, "Not fetching from {folder:?}.");
+            info!(
+                context,
+                "Transport {transport_id}: Not fetching from {folder:?}."
+            );
             session.new_mail = false;
             return Ok(false);
         }
@@ -561,15 +571,21 @@ impl Imap {
             .select_with_uidvalidity(context, folder)
             .await
             .with_context(|| format!("Failed to select folder {folder:?}"))?;
+
+        if !session.new_mail {
+            info!(
+                context,
+                "Transport {transport_id}: No new emails in folder {folder:?}."
+            );
+            return Ok(false);
+        }
+        // Make sure not to return before setting new_mail to false
+        // Otherwise, we will skip IDLE and go into an infinite loop
+        session.new_mail = false;
+
         if !folder_exists {
             return Ok(false);
         }
-
-        if !session.new_mail {
-            info!(context, "No new emails in folder {folder:?}.");
-            return Ok(false);
-        }
-        session.new_mail = false;
 
         let mut read_cnt = 0;
         loop {
@@ -1087,15 +1103,22 @@ impl Session {
             return Ok(());
         }
 
+        context
+            .sql
+            .execute(
+                "DELETE FROM imap_markseen WHERE id NOT IN (SELECT imap.id FROM imap)",
+                (),
+            )
+            .await?;
+
         let transport_id = self.transport_id();
-        let rows = context
+        let mut rows = context
             .sql
             .query_map_vec(
                 "SELECT imap.id, uid, folder FROM imap, imap_markseen
                  WHERE imap.id = imap_markseen.id
                  AND imap.transport_id=?
-                 AND target = folder
-                 ORDER BY folder, uid",
+                 AND target = folder",
                 (transport_id,),
                 |row| {
                     let rowid: i64 = row.get(0)?;
@@ -1105,6 +1128,16 @@ impl Session {
                 },
             )
             .await?;
+
+        // Number of SQL results is expected to be low as
+        // we usually don't have many messages to mark on IMAP at once.
+        // We are sorting outside of SQL to avoid SQLite constructing a query plan
+        // that scans the whole `imap` table. Scanning `imap_markseen` is fine
+        // as it should not have many items.
+        // If you change the SQL query, test it with `EXPLAIN QUERY PLAN`.
+        rows.sort_unstable_by(|(_rowid1, uid1, folder1), (_rowid2, uid2, folder2)| {
+            (folder1, uid1).cmp(&(folder2, uid2))
+        });
 
         for (folder, rowid_set, uid_set) in UidGrouper::from(rows) {
             let folder_exists = match self.select_with_uidvalidity(context, &folder).await {
@@ -1237,6 +1270,7 @@ impl Session {
             // have been modified while our request was in progress.
             // We may or may not have these new flags as a part of the response,
             // so better skip next IDLE and do another round of flag synchronization.
+            info!(context, "Got unsolicited fetch, will skip idle");
             self.new_mail = true;
         }
 
@@ -1562,11 +1596,18 @@ impl Session {
             return Ok(());
         }
 
+        let transport_id = self.transport_id();
+
         let Some(device_token) = context.push_subscriber.device_token().await else {
             return Ok(());
         };
 
         if self.can_metadata() && self.can_push() {
+            info!(
+                context,
+                "Transport {transport_id}: Subscribing for push notifications."
+            );
+
             let old_encrypted_device_token =
                 context.get_config(Config::EncryptedDeviceToken).await?;
 

@@ -128,13 +128,7 @@ pub async fn pk_encrypt(
                 hashed.push(Subpacket::critical(SubpacketData::SignatureCreationTime(
                     pgp::types::Timestamp::now(),
                 ))?);
-                // Test "elena" uses old Delta Chat.
-                let skip = private_key_for_signing.dc_fingerprint().hex()
-                    == "B86586B6DEF437D674BFAFC02A6B2EBC633B9E82";
                 for key in &public_keys_for_encryption {
-                    if skip {
-                        break;
-                    }
                     let data = SubpacketData::IntendedRecipientFingerprint(key.fingerprint());
                     let subpkt = match private_key_for_signing.version() < KeyVersion::V6 {
                         true => Subpacket::regular(data)?,
@@ -499,6 +493,35 @@ pub(crate) fn addresses_from_public_key(public_key: &SignedPublicKey) -> Option<
         }
     }
     None
+}
+
+/// Returns true if public key advertises SEIPDv2 feature.
+pub(crate) fn pubkey_supports_seipdv2(public_key: &SignedPublicKey) -> bool {
+    // If any Direct Key Signature or any User ID signature has SEIPDv2 feature,
+    // assume that recipient can handle SEIPDv2.
+    //
+    // Third-party User ID signatures are dropped during certificate merging.
+    // We don't check if the User ID is primary User ID.
+    // Primary User ID is preferred during merging
+    // and if some key has only non-primary User ID
+    // it is acceptable. It is anyway unlikely that SEIPDv2
+    // is advertised in a key without DKS or primary User ID.
+    public_key
+        .details
+        .direct_signatures
+        .iter()
+        .chain(
+            public_key
+                .details
+                .users
+                .iter()
+                .flat_map(|user| user.signatures.iter()),
+        )
+        .any(|signature| {
+            signature
+                .features()
+                .is_some_and(|features| features.seipd_v2())
+        })
 }
 
 #[cfg(test)]
