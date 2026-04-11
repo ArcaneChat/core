@@ -17,8 +17,7 @@ use crate::aheader::{Aheader, EncryptPreference};
 use crate::blob::BlobObject;
 use crate::chat::{self, Chat, PARAM_BROADCAST_SECRET, load_broadcast_secret};
 use crate::config::Config;
-use crate::constants::{ASM_SUBJECT, BROADCAST_INCOMPATIBILITY_MSG};
-use crate::constants::{Chattype, DC_FROM_HANDSHAKE};
+use crate::constants::{BROADCAST_INCOMPATIBILITY_MSG, Chattype, DC_FROM_HANDSHAKE};
 use crate::contact::{Contact, ContactId, Origin};
 use crate::context::Context;
 use crate::download::PostMsgMetadata;
@@ -33,7 +32,7 @@ use crate::message::{Message, MsgId, Viewtype};
 use crate::mimeparser::{SystemMessage, is_hidden};
 use crate::param::Param;
 use crate::peer_channels::{create_iroh_header, get_iroh_topic_for_msg};
-use crate::pgp::{SeipdVersion, addresses_from_public_key};
+use crate::pgp::{SeipdVersion, addresses_from_public_key, pubkey_supports_seipdv2};
 use crate::simplify::escape_message_footer_marks;
 use crate::stock_str;
 use crate::tools::{
@@ -740,7 +739,7 @@ impl MimeFactory {
                     Some(name) => name,
                     None => context.get_config(Config::Addr).await?.unwrap_or_default(),
                 };
-                stock_str::subject_for_new_contact(context, self_name).await
+                stock_str::subject_for_new_contact(context, self_name)
             }
             Loaded::Mdn { .. } => "Receipt Notification".to_string(), // untranslated to no reveal sender's language
         };
@@ -860,7 +859,13 @@ impl MimeFactory {
 
         let rfc724_mid = match &self.loaded {
             Loaded::Message { msg, .. } => match &self.pre_message_mode {
-                PreMessageMode::Pre { .. } => create_outgoing_rfc724_mid(),
+                PreMessageMode::Pre { .. } => {
+                    if msg.pre_rfc724_mid.is_empty() {
+                        create_outgoing_rfc724_mid()
+                    } else {
+                        msg.pre_rfc724_mid.clone()
+                    }
+                }
                 _ => msg.rfc724_mid.clone(),
             },
             Loaded::Mdn { .. } => create_outgoing_rfc724_mid(),
@@ -1182,17 +1187,6 @@ impl MimeFactory {
                 _ => None,
             };
 
-            // Do not anonymize OpenPGP recipients.
-            //
-            // This is disabled to avoid interoperability problems
-            // with old core versions <1.160.0 that do not support
-            // receiving messages with wildcard Key IDs:
-            // <https://github.com/chatmail/core/issues/7378>
-            //
-            // The option should be changed to true
-            // once new core versions are sufficiently deployed.
-            let anonymous_recipients = false;
-
             if context.get_config_bool(Config::TestHooks).await?
                 && let Some(hook) = &*context.pre_encrypt_mime_hook.lock()
             {
@@ -1207,14 +1201,13 @@ impl MimeFactory {
             } else {
                 // Asymmetric encryption
 
-                let seipd_version = if encryption_pubkeys.is_empty() {
-                    // If message is sent only to self,
-                    // use v2 SEIPD.
+                // Use SEIPDv2 if all recipients support it.
+                let seipd_version = if encryption_pubkeys
+                    .iter()
+                    .all(|(_addr, pubkey)| pubkey_supports_seipdv2(pubkey))
+                {
                     SeipdVersion::V2
                 } else {
-                    // If message is sent to others,
-                    // they may not support v2 SEIPD yet,
-                    // so use v1 SEIPD.
                     SeipdVersion::V1
                 };
 
@@ -1230,7 +1223,6 @@ impl MimeFactory {
                         encryption_keyring,
                         message,
                         compress,
-                        anonymous_recipients,
                         seipd_version,
                     )
                     .await?
@@ -1559,7 +1551,7 @@ impl MimeFactory {
                 let description = chat::get_chat_description(context, chat.id).await?;
                 headers.push((
                     "Chat-Group-Description",
-                    mail_builder::headers::text::Text::new(description.clone()).into(),
+                    mail_builder::headers::raw::Raw::new(b_encode(&description)).into(),
                 ));
                 if let Some(ts) = chat.param.get_i64(Param::GroupDescriptionTimestamp) {
                     headers.push((
@@ -1595,14 +1587,6 @@ impl MimeFactory {
                     "Auto-Submitted",
                     mail_builder::headers::raw::Raw::new("auto-generated").into(),
                 ));
-            }
-            SystemMessage::AutocryptSetupMessage => {
-                headers.push((
-                    "Autocrypt-Setup-Message",
-                    mail_builder::headers::raw::Raw::new("v1").into(),
-                ));
-
-                placeholdertext = Some(ASM_SUBJECT.to_string());
             }
             SystemMessage::SecurejoinMessage => {
                 let step = msg.param.get(Param::Arg).unwrap_or_default();

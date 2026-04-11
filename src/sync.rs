@@ -65,6 +65,10 @@ pub(crate) struct TransportData {
 
     /// Timestamp of when the transport was last time (re)configured.
     pub(crate) timestamp: i64,
+
+    /// Whether the transport is published.
+    /// See [`Context::set_transport_unpublished`] for details.
+    pub(crate) is_published: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -225,9 +229,9 @@ impl Context {
             let mut msg = Message {
                 chat_id,
                 viewtype: Viewtype::Text,
-                text: stock_str::sync_msg_body(self).await,
+                text: stock_str::sync_msg_body(self),
                 hidden: true,
-                subject: stock_str::sync_msg_subject(self).await,
+                subject: stock_str::sync_msg_subject(self),
                 ..Default::default()
             };
             msg.param.set_cmd(SystemMessage::MultiDeviceSync);

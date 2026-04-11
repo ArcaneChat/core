@@ -819,9 +819,12 @@ async fn load_imf_email(context: &Context, imf_raw: &[u8]) -> Message {
         .set_config(Config::ShowEmails, Some("2"))
         .await
         .unwrap();
-    receive_imf(context, imf_raw, false).await.unwrap();
-    let chats = Chatlist::try_load(context, 0, None, None).await.unwrap();
-    let msg_id = chats.get_msg_id(0).unwrap().unwrap();
+    let received_msg = receive_imf(context, imf_raw, false)
+        .await
+        .expect("receive_imf failure")
+        .expect("No message received");
+    assert_eq!(received_msg.msg_ids.len(), 1);
+    let msg_id = received_msg.msg_ids[0];
     Message::load_from_db(context, msg_id).await.unwrap()
 }
 
@@ -2872,9 +2875,8 @@ async fn test_rfc1847_encapsulation() -> Result<()> {
 
     // Alice sends a message to Bob using Thunderbird.
     let raw = include_bytes!("../../test-data/message/rfc1847_encapsulation.eml");
-    receive_imf(bob, raw, false).await?;
 
-    let msg = bob.get_last_msg().await;
+    let msg = load_imf_email(bob, raw).await;
     assert!(msg.get_showpadlock());
 
     Ok(())
@@ -3082,8 +3084,8 @@ async fn test_auto_accept_for_bots() -> Result<()> {
 async fn test_auto_accept_group_for_bots() -> Result<()> {
     let t = TestContext::new_alice().await;
     t.set_config(Config::Bot, Some("1")).await.unwrap();
-    receive_imf(&t, GRP_MAIL, false).await?;
-    let msg = t.get_last_msg().await;
+    let msg = load_imf_email(&t, GRP_MAIL).await;
+
     let chat = chat::Chat::load_from_db(&t, msg.chat_id).await?;
     assert!(!chat.is_contact_request());
     Ok(())
@@ -3327,7 +3329,7 @@ async fn test_outgoing_undecryptable() -> Result<()> {
     assert!(
         dev_msg
             .text
-            .contains("⚠️ It seems you are using Delta Chat on multiple devices that cannot decrypt each other's outgoing messages. To fix this, on the older device use \"Settings / Add Second Device\" and follow the instructions.")
+            .starts_with("⚠️ It seems you are using Delta Chat on multiple devices that cannot decrypt each other's outgoing messages. To fix this, on the older device use \"Settings / Add Second Device\" and follow the instructions. (Error:")
     );
 
     let raw = include_bytes!("../../test-data/message/thunderbird_encrypted_signed.eml");
@@ -3556,9 +3558,9 @@ async fn test_messed_up_message_id() -> Result<()> {
     let t = TestContext::new_bob().await;
 
     let raw = include_bytes!("../../test-data/message/messed_up_message_id.eml");
-    receive_imf(&t, raw, false).await?;
+    let msg = load_imf_email(&t, raw).await;
     assert_eq!(
-        t.get_last_msg().await.rfc724_mid,
+        msg.rfc724_mid,
         "0bb9ffe1-2596-d997-95b4-1fef8cc4808e@example.org"
     );
 
@@ -5108,97 +5110,75 @@ async fn test_dont_verify_by_verified_by_unknown() -> Result<()> {
     Ok(())
 }
 
+/// Tests that second device assigns outgoing encrypted messages
+/// to 1:1 chat with key-contact even if the key of the contact is unknown.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_recv_outgoing_msg_before_securejoin() -> Result<()> {
     let mut tcm = TestContextManager::new();
     let bob = &tcm.bob().await;
-    let a0 = &tcm.elena().await;
-    let a1 = &tcm.elena().await;
-
-    tcm.execute_securejoin(bob, a0).await;
-    let chat_id_a0_bob = a0.create_chat_id(bob).await;
-    let sent_msg = a0.send_text(chat_id_a0_bob, "Hi").await;
-    bob.recv_msg(&sent_msg).await;
-    let msg_a1 = a1.recv_msg(&sent_msg).await;
-    assert!(msg_a1.get_showpadlock());
-    let chat_a1 = Chat::load_from_db(a1, msg_a1.chat_id).await?;
-    assert_eq!(chat_a1.typ, Chattype::Group);
-    assert!(!chat_a1.is_encrypted(a1).await?);
-    assert_eq!(
-        chat::get_chat_contacts(a1, chat_a1.id).await?,
-        [a1.add_or_lookup_address_contact_id(bob).await]
-    );
-    assert_eq!(
-        chat_a1.why_cant_send(a1).await?,
-        Some(CantSendReason::NotAMember)
-    );
-
-    let sent_msg = a0.send_text(chat_id_a0_bob, "Hi again").await;
-    bob.recv_msg(&sent_msg).await;
-    let msg_a1 = a1.recv_msg(&sent_msg).await;
-    assert!(msg_a1.get_showpadlock());
-    assert_eq!(msg_a1.chat_id, chat_a1.id);
-    let chat_a1 = Chat::load_from_db(a1, msg_a1.chat_id).await?;
-    assert_eq!(
-        chat_a1.why_cant_send(a1).await?,
-        Some(CantSendReason::NotAMember)
-    );
-
-    let msg_a1 = tcm.send_recv(bob, a1, "Hi back").await;
-    assert!(msg_a1.get_showpadlock());
-    let chat_a1 = Chat::load_from_db(a1, msg_a1.chat_id).await?;
-    assert_eq!(chat_a1.typ, Chattype::Single);
-    assert!(chat_a1.is_encrypted(a1).await?);
-    // Weird, but fine, anyway the bigger problem is the conversation split into two chats.
-    assert_eq!(
-        chat_a1.why_cant_send(a1).await?,
-        Some(CantSendReason::ContactRequest)
-    );
-
     let a0 = &tcm.alice().await;
     let a1 = &tcm.alice().await;
+
     tcm.execute_securejoin(bob, a0).await;
     let chat_id_a0_bob = a0.create_chat_id(bob).await;
     let sent_msg = a0.send_text(chat_id_a0_bob, "Hi").await;
-    bob.recv_msg(&sent_msg).await;
+
+    // Device a1 does not have Bob's key.
+    // Message is still received in an encrypted 1:1 chat with Bob.
+    // a1 learns the fingerprint of Bob from the Intended Recipient Fingerprint packet,
+    // but not the key.
     let msg_a1 = a1.recv_msg(&sent_msg).await;
     assert!(msg_a1.get_showpadlock());
     let chat_a1 = Chat::load_from_db(a1, msg_a1.chat_id).await?;
     assert_eq!(chat_a1.typ, Chattype::Single);
     assert!(chat_a1.is_encrypted(a1).await?);
+
+    // Cannot send because a1 does not have Bob's key.
+    assert!(!chat_a1.can_send(a1).await?);
+    assert_eq!(
+        chat_a1.why_cant_send(a1).await?,
+        Some(CantSendReason::MissingKey)
+    );
+
     assert_eq!(
         chat::get_chat_contacts(a1, chat_a1.id).await?,
-        [a1.add_or_lookup_contact_id(bob).await]
+        [a1.add_or_lookup_contact_id_no_key(bob).await]
     );
-    assert!(chat_a1.can_send(a1).await?);
+    assert!(!chat_a1.can_send(a1).await?);
+
+    let a1_chat_id = a1.create_chat_id(bob).await;
+    assert_eq!(a1_chat_id, msg_a1.chat_id);
     Ok(())
 }
 
+/// Tests that outgoing message cannot be assigned to 1:1 chat
+/// without the intended recipient fingerprint.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_recv_outgoing_msg_before_having_key_and_after() -> Result<()> {
+async fn test_recv_outgoing_msg_no_intended_recipient_fingerprint() -> Result<()> {
     let mut tcm = TestContextManager::new();
-    let a0 = &tcm.elena().await;
-    let a1 = &tcm.elena().await;
-    let bob = &tcm.bob().await;
+    let alice = &tcm.alice().await;
 
-    tcm.execute_securejoin(bob, a0).await;
-    let chat_id_a0_bob = a0.create_chat_id(bob).await;
-    let sent_msg = a0.send_text(chat_id_a0_bob, "Hi").await;
-    let msg_a1 = a1.recv_msg(&sent_msg).await;
-    assert!(msg_a1.get_showpadlock());
-    let chat_a1 = Chat::load_from_db(a1, msg_a1.chat_id).await?;
-    assert_eq!(chat_a1.typ, Chattype::Group);
-    assert!(!chat_a1.is_encrypted(a1).await?);
+    let payload = include_bytes!(
+        "../../test-data/message/alice_to_bob_no_intended_recipient_fingerprint.eml"
+    );
 
-    // Device a1 somehow learns Bob's key and creates the corresponding chat. However, this doesn't
-    // help because we only look up key contacts by address in a particular chat and the new chat
-    // isn't referenced by the received message. This is fixed by sending and receiving Intended
-    // Recipient Fingerprint subpackets which elena doesn't send.
-    a1.create_chat_id(bob).await;
-    let sent_msg = a0.send_text(chat_id_a0_bob, "Hi again").await;
-    let msg_a1 = a1.recv_msg(&sent_msg).await;
-    assert!(msg_a1.get_showpadlock());
-    assert_eq!(msg_a1.chat_id, chat_a1.id);
+    // Alice does not have Bob's key.
+    // Message is encrypted, but is received in ad hoc group with Bob's address.
+    let rcvd_msg = receive_imf(alice, payload, false).await?.unwrap();
+    let msg_alice = Message::load_from_db(alice, rcvd_msg.msg_ids[0]).await?;
+
+    assert!(msg_alice.get_showpadlock());
+    let chat_alice = Chat::load_from_db(alice, msg_alice.chat_id).await?;
+    assert_eq!(chat_alice.typ, Chattype::Group);
+    assert!(!chat_alice.is_encrypted(alice).await?);
+
+    // Cannot send because Bob's key is unknown.
+    assert!(!chat_alice.can_send(alice).await?);
+    assert_eq!(
+        chat_alice.why_cant_send(alice).await?,
+        Some(CantSendReason::NotAMember)
+    );
+
     Ok(())
 }
 

@@ -296,7 +296,7 @@ pub(crate) async fn load_self_public_key_opt(context: &Context) -> Result<Option
         .await?
         .context("No transports configured")?;
     let addr = context.get_primary_self_addr().await?;
-    let all_addrs = context.get_all_self_addrs().await?.join(",");
+    let all_addrs = context.get_published_self_addrs().await?.join(",");
     let signed_public_key =
         secret_key_to_public_key(context, signed_secret_key, timestamp, &addr, &all_addrs)?;
     *lock = Some(signed_public_key.clone());
@@ -756,8 +756,7 @@ i8pcjGO+IZffvyZJVRWfVooBJmWWbPB1pueo3tx8w3+fcuzpxz+RLFKaPyqXO+dD
     /// this resulted in various number of garbage
     /// octets at the end of the key, starting from 3 octets,
     /// but possibly 4 or 5 and maybe more octets
-    /// if the key is imported or transferred
-    /// using Autocrypt Setup Message multiple times.
+    /// if the key is imported multiple times.
     #[test]
     fn test_ignore_trailing_garbage() {
         // Test several variants of garbage.

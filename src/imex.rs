@@ -28,11 +28,9 @@ use crate::tools::{
     write_file,
 };
 
-mod key_transfer;
 mod transfer;
 
 use ::pgp::types::KeyDetails;
-pub use key_transfer::{continue_key_transfer, initiate_key_transfer};
 pub use transfer::{BackupProvider, get_backup};
 
 // Name of the database file in the backup.
@@ -1136,6 +1134,18 @@ mod tests {
 
         // Assert that the config cache has the new value now.
         assert!(context2.is_configured().await?);
+
+        Ok(())
+    }
+
+    /// Tests importing a backup from Delta Chat 1.30.3 for Android (core v1.86.0).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_import_ancient_backup() -> Result<()> {
+        let mut tcm = TestContextManager::new();
+        let context = &tcm.unconfigured().await;
+
+        let backup_path = Path::new("test-data/core-1.86.0-backup.tar");
+        imex(context, ImexMode::ImportBackup, backup_path, None).await?;
 
         Ok(())
     }

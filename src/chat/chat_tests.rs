@@ -806,7 +806,7 @@ async fn test_self_talk() -> Result<()> {
     assert!(chat.visibility == ChatVisibility::Normal);
     assert!(!chat.is_device_talk());
     assert!(chat.can_send(&t).await?);
-    assert_eq!(chat.name, stock_str::saved_messages(&t).await);
+    assert_eq!(chat.name, stock_str::saved_messages(&t));
     assert!(chat.get_profile_image(&t).await?.is_some());
 
     let msg_id = send_text_msg(&t, chat.id, "foo self".to_string()).await?;
@@ -866,7 +866,6 @@ async fn test_add_device_msg_unlabelled() {
     assert_eq!(msg1.from_id, ContactId::DEVICE);
     assert_eq!(msg1.to_id, ContactId::SELF);
     assert!(!msg1.is_info());
-    assert!(!msg1.is_setupmessage());
 
     let msg2 = message::Message::load_from_db(&t, msg2_id.unwrap()).await;
     assert!(msg2.is_ok());
@@ -899,7 +898,6 @@ async fn test_add_device_msg_labelled() -> Result<()> {
     assert_eq!(msg1.from_id, ContactId::DEVICE);
     assert_eq!(msg1.to_id, ContactId::SELF);
     assert!(!msg1.is_info());
-    assert!(!msg1.is_setupmessage());
 
     // check device chat
     let chat_id = msg1.chat_id;
@@ -913,7 +911,7 @@ async fn test_add_device_msg_labelled() -> Result<()> {
     assert!(!chat.can_send(&t).await?);
     assert!(chat.why_cant_send(&t).await? == Some(CantSendReason::DeviceChat));
 
-    assert_eq!(chat.name, stock_str::device_messages(&t).await);
+    assert_eq!(chat.name, stock_str::device_messages(&t));
     let device_msg_icon = chat.get_profile_image(&t).await?.unwrap();
     assert_eq!(
         device_msg_icon.metadata()?.len(),
@@ -2794,7 +2792,7 @@ async fn test_broadcast_members_cant_see_each_other() -> Result<()> {
         assert_eq!(parsed.decoded_data_contains("bob@example.net"), false);
 
         let parsed_by_bob = bob.parse_msg(&vc_pubkey).await;
-        assert!(parsed_by_bob.decrypting_failed);
+        assert!(parsed_by_bob.decryption_error.is_some());
 
         charlie.recv_msg_trash(&vc_pubkey).await;
     }
@@ -2823,7 +2821,7 @@ async fn test_broadcast_members_cant_see_each_other() -> Result<()> {
         assert_eq!(parsed.decoded_data_contains("bob@example.net"), false);
 
         let parsed_by_bob = bob.parse_msg(&member_added).await;
-        assert!(parsed_by_bob.decrypting_failed);
+        assert!(parsed_by_bob.decryption_error.is_some());
 
         let rcvd = charlie.recv_msg(&member_added).await;
         assert_eq!(rcvd.param.get_cmd(), SystemMessage::MemberAddedToGroup);
@@ -2838,7 +2836,7 @@ async fn test_broadcast_members_cant_see_each_other() -> Result<()> {
         assert_eq!(parsed.decoded_data_contains("bob@example.net"), false);
 
         let parsed_by_bob = bob.parse_msg(&hi_msg).await;
-        assert_eq!(parsed_by_bob.decrypting_failed, false);
+        assert!(parsed_by_bob.decryption_error.is_none());
     }
 
     tcm.section("Alice removes Charlie. Bob must not see it.");
@@ -2855,7 +2853,7 @@ async fn test_broadcast_members_cant_see_each_other() -> Result<()> {
         assert_eq!(parsed.decoded_data_contains("bob@example.net"), false);
 
         let parsed_by_bob = bob.parse_msg(&member_removed).await;
-        assert!(parsed_by_bob.decrypting_failed);
+        assert!(parsed_by_bob.decryption_error.is_some());
 
         let rcvd = charlie.recv_msg(&member_removed).await;
         assert_eq!(rcvd.param.get_cmd(), SystemMessage::MemberRemovedFromGroup);
@@ -3337,7 +3335,12 @@ async fn test_chat_description(
         initial_description
     );
 
-    for description in ["This is a cool chat", "", "ä ẟ 😂"] {
+    for description in [
+        &"This<>is 'a' \"cool\" chat:/\\|?*".repeat(50),
+        "multiple\nline\n\nbreaks\n\n\r\n.",
+        "",
+        "ä ẟ 😂",
+    ] {
         tcm.section(&format!(
             "Alice sets the chat description to '{description}'"
         ));
@@ -3794,7 +3797,7 @@ async fn test_leave_broadcast_multidevice() -> Result<()> {
     assert_eq!(rcvd.chat_id, bob1_hello.chat_id);
     assert!(rcvd.is_info());
     assert_eq!(rcvd.get_info_type(), SystemMessage::MemberRemovedFromGroup);
-    assert_eq!(rcvd.text, stock_str::msg_you_left_broadcast(bob1).await);
+    assert_eq!(rcvd.text, stock_str::msg_you_left_broadcast(bob1));
 
     Ok(())
 }
@@ -6182,6 +6185,57 @@ async fn test_super_group_all_members_can_send() -> Result<()> {
     assert!(bob_chat.can_send(bob).await?);
     let alice_chat = Chat::load_from_db(alice, alice_chat_id).await?;
     assert!(alice_chat.can_send(alice).await?);
+
+    Ok(())
+}
+
+/// Tests that if the message arrives late,
+/// it can still be sorted above the last seen message.
+///
+/// Versions 2.47 and below always sorted incoming messages
+/// after the last seen message, but with
+/// the introduction of multi-relay it is possible
+/// that some messages arrive only to some relays
+/// and are fetched after the already arrived seen message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_late_message_above_seen() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+    let charlie = &tcm.charlie().await;
+
+    let alice_chat_id = alice
+        .create_group_with_members("Group", &[bob, charlie])
+        .await;
+    let alice_sent = alice.send_text(alice_chat_id, "Hello everyone!").await;
+    let bob_chat_id = bob.recv_msg(&alice_sent).await.chat_id;
+    bob_chat_id.accept(bob).await?;
+    let charlie_chat_id = charlie.recv_msg(&alice_sent).await.chat_id;
+    charlie_chat_id.accept(charlie).await?;
+
+    // Bob sends a message, but the message is delayed.
+    let bob_sent = bob.send_text(bob_chat_id, "Hello from Bob!").await;
+    SystemTime::shift(Duration::from_secs(1000));
+
+    let charlie_sent = charlie
+        .send_text(charlie_chat_id, "Hello from Charlie!")
+        .await;
+
+    // Alice immediately receives a message from Charlie and reads it.
+    let alice_received_from_charlie = alice.recv_msg(&charlie_sent).await;
+    assert_eq!(
+        alice_received_from_charlie.get_text(),
+        "Hello from Charlie!"
+    );
+    message::markseen_msgs(alice, vec![alice_received_from_charlie.id]).await?;
+
+    // Bob message arrives later, it should be above the message from Charlie.
+    let alice_received_from_bob = alice.recv_msg(&bob_sent).await;
+    assert_eq!(alice_received_from_bob.get_text(), "Hello from Bob!");
+
+    // The last message in the chat is still from Charlie.
+    let last_msg = alice.get_last_msg_in(alice_chat_id).await;
+    assert_eq!(last_msg.get_text(), "Hello from Charlie!");
 
     Ok(())
 }

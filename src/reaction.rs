@@ -347,8 +347,7 @@ impl Chat {
         if self
             .param
             .get_i64(Param::LastReactionTimestamp)
-            .filter(|&reaction_timestamp| reaction_timestamp > timestamp)
-            .is_none()
+            .is_none_or(|reaction_timestamp| reaction_timestamp <= timestamp)
         {
             return Ok(None);
         };
@@ -1031,13 +1030,11 @@ Content-Transfer-Encoding: base64\r
         let alice_secret_key = load_self_secret_key(alice).await?;
         let public_keys_for_encryption = vec![alice_public_key, bob_public_key];
         let compress = true;
-        let anonymous_recipients = true;
         let encrypted_payload = pk_encrypt(
             plain_text.as_bytes().to_vec(),
             public_keys_for_encryption,
             alice_secret_key,
             compress,
-            anonymous_recipients,
             SeipdVersion::V2,
         )
         .await?;

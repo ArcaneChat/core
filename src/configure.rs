@@ -28,8 +28,8 @@ use crate::constants::NON_ALPHANUMERIC_WITHOUT_DOT;
 use crate::context::Context;
 use crate::imap::Imap;
 use crate::log::warn;
-use crate::login_param::EnteredCertificateChecks;
 pub use crate::login_param::EnteredLoginParam;
+use crate::login_param::{EnteredCertificateChecks, TransportListEntry};
 use crate::message::Message;
 use crate::net::proxy::ProxyConfig;
 use crate::oauth2::get_oauth2_addr;
@@ -110,6 +110,7 @@ impl Context {
     ///   from a server encoded in a QR code.
     /// - [Self::list_transports()] to get a list of all configured transports.
     /// - [Self::delete_transport()] to remove a transport.
+    /// - [Self::set_transport_unpublished()] to set whether contacts see this transport.
     pub async fn add_or_update_transport(&self, param: &mut EnteredLoginParam) -> Result<()> {
         self.stop_io().await;
         let result = self.add_transport_inner(param).await;
@@ -145,7 +146,7 @@ impl Context {
         if let Err(err) = res.as_ref() {
             // We are using Anyhow's .context() and to show the
             // inner error, too, we need the {:#}:
-            let error_msg = stock_str::configuration_failed(self, &format!("{err:#}")).await;
+            let error_msg = stock_str::configuration_failed(self, &format!("{err:#}"));
             progress!(self, 0, Some(error_msg.clone()));
             bail!(error_msg);
         } else {
@@ -188,14 +189,22 @@ impl Context {
     /// Returns the list of all email accounts that are used as a transport in the current profile.
     /// Use [Self::add_or_update_transport()] to add or change a transport
     /// and [Self::delete_transport()] to delete a transport.
-    pub async fn list_transports(&self) -> Result<Vec<EnteredLoginParam>> {
+    pub async fn list_transports(&self) -> Result<Vec<TransportListEntry>> {
         let transports = self
             .sql
-            .query_map_vec("SELECT entered_param FROM transports", (), |row| {
-                let entered_param: String = row.get(0)?;
-                let transport: EnteredLoginParam = serde_json::from_str(&entered_param)?;
-                Ok(transport)
-            })
+            .query_map_vec(
+                "SELECT entered_param, is_published FROM transports",
+                (),
+                |row| {
+                    let param: String = row.get(0)?;
+                    let param: EnteredLoginParam = serde_json::from_str(&param)?;
+                    let is_published: bool = row.get(1)?;
+                    Ok(TransportListEntry {
+                        param,
+                        is_unpublished: !is_published,
+                    })
+                },
+            )
             .await?;
 
         Ok(transports)
@@ -234,11 +243,6 @@ impl Context {
                         Ok((id, add_timestamp))
                     },
                 )?;
-                transaction.execute("DELETE FROM imap WHERE transport_id=?", (transport_id,))?;
-                transaction.execute(
-                    "DELETE FROM imap_sync WHERE transport_id=?",
-                    (transport_id,),
-                )?;
 
                 // Removal timestamp should not be lower than addition timestamp
                 // to be accepted by other devices when synced.
@@ -258,6 +262,44 @@ impl Context {
         send_sync_transports(self).await?;
         self.quota.write().await.remove(&removed_transport_id);
 
+        Ok(())
+    }
+
+    /// Change whether the transport is unpublished.
+    ///
+    /// Unpublished transports are not advertised to contacts,
+    /// and self-sent messages are not sent there,
+    /// so that we don't cause extra messages to the corresponding inbox,
+    /// but can still receive messages from contacts who don't know our new transport addresses yet.
+    ///
+    /// The default is false, but when the user updates from a version that didn't have this flag,
+    /// existing secondary transports are set to unpublished,
+    /// so that an existing transport address doesn't suddenly get spammed with a lot of messages.
+    pub async fn set_transport_unpublished(&self, addr: &str, unpublished: bool) -> Result<()> {
+        self.sql
+            .transaction(|trans| {
+                let primary_addr: String = trans
+                    .query_row(
+                        "SELECT value FROM config WHERE keyname='configured_addr'",
+                        (),
+                        |row| row.get(0),
+                    )
+                    .context("Select primary address")?;
+                if primary_addr == addr && unpublished {
+                    bail!("Can't set primary relay as unpublished");
+                }
+                // We need to update the timestamp so that the key's timestamp changes
+                // and is recognized as newer by our peers
+                trans
+                    .execute(
+                        "UPDATE transports SET is_published=?, add_timestamp=? WHERE addr=? AND is_published!=?1",
+                        (!unpublished, time(), addr),
+                    )
+                    .context("Update transports")?;
+                Ok(())
+            })
+            .await?;
+        send_sync_transports(self).await?;
         Ok(())
     }
 
@@ -590,10 +632,7 @@ async fn configure(ctx: &Context, param: &EnteredLoginParam) -> Result<Option<&'
     let imap_session = match imap.connect(ctx, configuring).await {
         Ok(imap_session) => imap_session,
         Err(err) => {
-            bail!(
-                "{}",
-                nicer_configuration_error(ctx, format!("{err:#}")).await
-            );
+            bail!("{}", nicer_configuration_error(ctx, format!("{err:#}")));
         }
     };
 
@@ -734,7 +773,7 @@ async fn get_autoconfig(
     None
 }
 
-async fn nicer_configuration_error(context: &Context, e: String) -> String {
+fn nicer_configuration_error(context: &Context, e: String) -> String {
     if e.to_lowercase().contains("could not resolve")
         || e.to_lowercase().contains("connection attempts")
         || e.to_lowercase()
@@ -743,7 +782,7 @@ async fn nicer_configuration_error(context: &Context, e: String) -> String {
         || e.to_lowercase()
             .contains("failed to lookup address information")
     {
-        return stock_str::error_no_network(context).await;
+        return stock_str::error_no_network(context);
     }
 
     e

@@ -306,20 +306,17 @@ pub unsafe extern "C" fn dc_set_stock_translation(
     let msg = to_string_lossy(stock_msg);
     let ctx = &*context;
 
-    block_on(async move {
-        match StockMessage::from_u32(stock_id)
-            .with_context(|| format!("Invalid stock message ID {stock_id}"))
+    match StockMessage::from_u32(stock_id)
+        .with_context(|| format!("Invalid stock message ID {stock_id}"))
+        .log_err(ctx)
+    {
+        Ok(id) => ctx
+            .set_stock_translation(id, msg)
+            .context("set_stock_translation failed")
             .log_err(ctx)
-        {
-            Ok(id) => ctx
-                .set_stock_translation(id, msg)
-                .await
-                .context("set_stock_translation failed")
-                .log_err(ctx)
-                .is_ok() as libc::c_int,
-            Err(_) => 0,
-        }
-    })
+            .is_ok() as libc::c_int,
+        Err(_) => 0,
+    }
 }
 
 #[no_mangle]
@@ -2447,45 +2444,6 @@ pub unsafe extern "C" fn dc_imex_has_backup(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dc_initiate_key_transfer(context: *mut dc_context_t) -> *mut libc::c_char {
-    if context.is_null() {
-        eprintln!("ignoring careless call to dc_initiate_key_transfer()");
-        return ptr::null_mut(); // NULL explicitly defined as "error"
-    }
-    let ctx = &*context;
-
-    match block_on(imex::initiate_key_transfer(ctx))
-        .context("dc_initiate_key_transfer()")
-        .log_err(ctx)
-    {
-        Ok(res) => res.strdup(),
-        Err(_) => ptr::null_mut(),
-    }
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn dc_continue_key_transfer(
-    context: *mut dc_context_t,
-    msg_id: u32,
-    setup_code: *const libc::c_char,
-) -> libc::c_int {
-    if context.is_null() || msg_id <= constants::DC_MSG_ID_LAST_SPECIAL || setup_code.is_null() {
-        eprintln!("ignoring careless call to dc_continue_key_transfer()");
-        return 0;
-    }
-    let ctx = &*context;
-
-    block_on(imex::continue_key_transfer(
-        ctx,
-        MsgId::new(msg_id),
-        &to_string_lossy(setup_code),
-    ))
-    .context("dc_continue_key_transfer")
-    .log_err(ctx)
-    .is_ok() as libc::c_int
-}
-
-#[no_mangle]
 pub unsafe extern "C" fn dc_stop_ongoing_process(context: *mut dc_context_t) {
     if context.is_null() {
         eprintln!("ignoring careless call to dc_stop_ongoing_process()");
@@ -3818,16 +3776,6 @@ pub unsafe extern "C" fn dc_msg_get_webxdc_href(msg: *mut dc_msg_t) -> *mut libc
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dc_msg_is_setupmessage(msg: *mut dc_msg_t) -> libc::c_int {
-    if msg.is_null() {
-        eprintln!("ignoring careless call to dc_msg_is_setupmessage()");
-        return 0;
-    }
-    let ffi_msg = &*msg;
-    ffi_msg.message.is_setupmessage().into()
-}
-
-#[no_mangle]
 pub unsafe extern "C" fn dc_msg_has_html(msg: *mut dc_msg_t) -> libc::c_int {
     if msg.is_null() {
         eprintln!("ignoring careless call to dc_msg_has_html()");
@@ -3835,20 +3783,6 @@ pub unsafe extern "C" fn dc_msg_has_html(msg: *mut dc_msg_t) -> libc::c_int {
     }
     let ffi_msg = &*msg;
     ffi_msg.message.has_html().into()
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn dc_msg_get_setupcodebegin(msg: *mut dc_msg_t) -> *mut libc::c_char {
-    if msg.is_null() {
-        eprintln!("ignoring careless call to dc_msg_get_setupcodebegin()");
-        return "".strdup();
-    }
-    let ffi_msg = &*msg;
-    let ctx = &*ffi_msg.context;
-
-    block_on(ffi_msg.message.get_setupcodebegin(ctx))
-        .unwrap_or_default()
-        .strdup()
 }
 
 #[no_mangle]

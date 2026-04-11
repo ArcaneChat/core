@@ -1,5 +1,136 @@
 # Changelog
 
+## [2.48.0] - 2026-03-30
+
+### Fixes
+
+- Fix reordering problems in multi-relay setups by not sorting received messages below the last seen one.
+- Always sort "Messages are end-to-end encrypted" notice to the beginning.
+- Make Message-ID of pre-messages stable across resends ([#8007](https://github.com/chatmail/core/pull/8007)).
+- Delete `imap_markseen` entries not corresponding to any `imap` rows.
+- Cleanup `imap` and `imap_sync` records without transport in housekeeping.
+- When receiving MDN, mark all preceding messages as noticed, even having same timestamp ([#7928](https://github.com/chatmail/core/pull/7928)).
+- Remove migration 108 preventing upgrades from core 1.86.0 to the latest version.
+
+### Features / Changes
+
+- Improve IMAP loop logs.
+- Add decryption error to the device message about outgoing message decryption failure.
+- Log received message sort timestamp.
+
+### Performance
+
+- Move sorting outside of SQL query in `store_seen_flags_on_imap`.
+
+### API-Changes
+
+- Add JSON-RPC API `markfresh_chat()`.
+- ffi: Correctly declare `dc_event_channel_new()` as having no params ([#7831](https://github.com/chatmail/core/pull/7831)).
+
+### Refactor
+
+- Remove `wal_checkpoint_mutex`, lock `write_mutex` before getting sql connection instead.
+- Replace async `RwLock` with sync `RwLock` for stock strings.
+- Cleanup remaining Autocrypt Setup Message processing in `mimeparser`.
+- SecureJoin: do not check for self address in forwarding protection.
+- Fix clippy warnings.
+
+### CI
+
+- Update {c,py}.delta.chat website deployments.
+- Use environments for {rs,cffi,js.jsonrpc}.delta.chat deployments.
+- Fix https://docs.zizmor.sh/audits/#bot-conditions.
+
+### Documentation
+
+- Add SQL performance tips to STYLE.md.
+
+### Tests
+
+- Remove `test_old_message_5`.
+- Do not rely on loading newest chat in `load_imf_email()`.
+- Use `load_imf_email()` more.
+- The message is sorted correctly in the chat even if it arrives late.
+
+### Miscellaneous Tasks
+
+- cargo: update rustls-webpki to 0.103.10.
+
+## [2.47.0] - 2026-03-24
+
+### Fixes
+
+- Don't fall into infinite loop if the folder is missing ([#8021](https://github.com/chatmail/core/pull/8021)).
+- Delete `available_post_msgs` row if the message is already downloaded.
+- Delete `available_post_msgs` row if there is no corresponding IMAP entry.
+- Make newlines work in chat descriptions ([#8012](https://github.com/chatmail/core/pull/8012)).
+
+### Features / Changes
+
+- use SEIPDv2 if all recipients support it.
+
+### Documentation
+
+- Add shadowsocks spec to standards.md.
+- Document Header Confidentiality Policy.
+- `deltachat_rpc_client`: make sphinx documentation display method parameters.
+- Remove `draft/aeap-mvp.md` which is superseded by key-contacts and multi-relay.
+
+### Refactor
+
+- Remove code to send messages without intended recipient fingerprint.
+
+### Tests
+
+- Make `add_or_lookup_contact_id_no_key` public.
+
+### Miscellaneous Tasks
+
+- cargo: bump sdp from 0.10.0 to 0.17.1.
+- Add RUSTSEC-2026-0049 exception to deny.toml.
+
+## [2.46.0] - 2026-03-19
+
+### API-Changes
+
+- [**breaking**] remove functions for sending and receiving Autocrypt Setup Message.
+- Add `list_transports_ex()` and `set_transport_unpublished()` functions.
+- Add API `dc_markfresh_chat` to mark messages as "fresh".
+
+### Features / Changes
+
+- add `IncomingCallAccepted.from_this_device`.
+- decode `dcaccount://` URLs and error out on empty URLs early.
+- enable anonymous OpenPGP key IDs.
+- tls: do not verify TLS certificates for hostnames starting with `_`.
+
+### Fixes
+
+- Mark call message as seen when accepting/declining a call ([#7842](https://github.com/chatmail/core/pull/7842)).
+- do not send MDNs for hidden messages.
+- call sync_all() instead of sync_data() when writing accounts.toml.
+- fsync() the rename() of accounts.toml.
+- count recipients by Intended Recipient Fingerprints.
+
+### Miscellaneous Tasks
+
+- deps: bump zizmorcore/zizmor-action from 0.5.0 to 0.5.2.
+- cargo: bump astral-tokio-tar from 0.5.6 to 0.6.0.
+- deps: bump actions/upload-artifact from 6 to 7.
+- cargo: bump blake3 from 1.8.2 to 1.8.3.
+- add constant_time_eq 0.3.1 to deny.toml.
+
+### Refactor
+
+- use re-exported rustls::pki_types.
+- import tokio_rustls::rustls.
+- Move transport_tests to their own file.
+
+### Tests
+
+- Shift time even more in flaky test_sync_broadcast_and_send_message.
+- test markfresh_chat()
+
 ## [2.45.0] - 2026-03-14
 
 ### API-Changes
@@ -7907,3 +8038,6 @@ https://github.com/chatmail/core/pulls?q=is%3Apr+is%3Aclosed
 [2.43.0]: https://github.com/chatmail/core/compare/v2.42.0..v2.43.0
 [2.44.0]: https://github.com/chatmail/core/compare/v2.43.0..v2.44.0
 [2.45.0]: https://github.com/chatmail/core/compare/v2.44.0..v2.45.0
+[2.46.0]: https://github.com/chatmail/core/compare/v2.45.0..v2.46.0
+[2.47.0]: https://github.com/chatmail/core/compare/v2.46.0..v2.47.0
+[2.48.0]: https://github.com/chatmail/core/compare/v2.47.0..v2.48.0

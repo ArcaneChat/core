@@ -31,7 +31,6 @@ use crate::location::get_poi_location;
 use crate::log::warn;
 use crate::mimeparser::{SystemMessage, parse_message_id};
 use crate::param::{Param, Params};
-use crate::pgp::split_armored_data;
 use crate::reaction::get_msg_reactions;
 use crate::sql;
 use crate::summary::Summary;
@@ -600,7 +599,7 @@ impl Message {
 
         if let Some(msg) = &mut msg {
             msg.additional_text =
-                Self::get_additional_text(context, msg.download_state, &msg.param).await?;
+                Self::get_additional_text(context, msg.download_state, &msg.param)?;
         }
 
         Ok(msg)
@@ -609,7 +608,7 @@ impl Message {
     /// Returns additional text which is appended to the message's text field
     /// when it is loaded from the database.
     /// Currently this is used to add infomation to pre-messages of what the download will be and how large it is
-    async fn get_additional_text(
+    fn get_additional_text(
         context: &Context,
         download_state: DownloadState,
         param: &Params,
@@ -632,7 +631,7 @@ impl Message {
             return match viewtype {
                 Viewtype::File => Ok(format!(" [{file_name} – {file_size}]")),
                 _ => {
-                    let translated_viewtype = viewtype.to_locale_string(context).await;
+                    let translated_viewtype = viewtype.to_locale_string(context);
                     Ok(format!(" [{translated_viewtype} – {file_size}]"))
                 }
             };
@@ -828,7 +827,11 @@ impl Message {
 
     /// Returns the timestamp of the message for sorting.
     pub fn get_sort_timestamp(&self) -> i64 {
-        self.timestamp_sort
+        if self.timestamp_sort != 0 {
+            self.timestamp_sort
+        } else {
+            self.timestamp_sent
+        }
     }
 
     /// Returns the text of the message.
@@ -1070,34 +1073,6 @@ impl Message {
     pub fn is_system_message(&self) -> bool {
         let cmd = self.param.get_cmd();
         cmd != SystemMessage::Unknown
-    }
-
-    /// Returns true if the message is an Autocrypt Setup Message.
-    pub fn is_setupmessage(&self) -> bool {
-        if self.viewtype != Viewtype::File {
-            return false;
-        }
-
-        self.param.get_cmd() == SystemMessage::AutocryptSetupMessage
-    }
-
-    /// Returns the first characters of the setup code.
-    ///
-    /// This is used to pre-fill the first entry field of the setup code.
-    pub async fn get_setupcodebegin(&self, context: &Context) -> Option<String> {
-        if !self.is_setupmessage() {
-            return None;
-        }
-
-        if let Some(filename) = self.get_file(context)
-            && let Ok(ref buf) = read_file(context, &filename).await
-            && let Ok((typ, headers, _)) = split_armored_data(buf)
-            && typ == pgp::armor::BlockType::Message
-        {
-            return headers.get(crate::pgp::HEADER_SETUPCODE).cloned();
-        }
-
-        None
     }
 
     /// Sets or unsets message text.

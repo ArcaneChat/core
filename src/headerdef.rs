@@ -132,7 +132,6 @@ pub enum HeaderDef {
     /// [Autocrypt](https://autocrypt.org/) header.
     Autocrypt,
     AutocryptGossip,
-    AutocryptSetupMessage,
     SecureJoin,
 
     /// Deprecated header containing Group-ID in `vg-request-with-auth` message.
@@ -215,10 +214,10 @@ mod tests {
     /// Test that headers are parsed case-insensitively
     fn test_get_header_value_case() {
         let (headers, _) =
-            mailparse::parse_headers(b"fRoM: Bob\naUtoCryPt-SeTup-MessAge: v99").unwrap();
+            mailparse::parse_headers(b"fRoM: Bob\naUtoCryPt-GoSsIp: fooBaR").unwrap();
         assert_eq!(
-            headers.get_header_value(HeaderDef::AutocryptSetupMessage),
-            Some("v99".to_string())
+            headers.get_header_value(HeaderDef::AutocryptGossip),
+            Some("fooBaR".to_string())
         );
         assert_eq!(
             headers.get_header_value(HeaderDef::From_),

@@ -883,6 +883,24 @@ pub async fn housekeeping(context: &Context) -> Result<()> {
         .log_err(context)
         .ok();
 
+    // Cleanup `imap` and `imap_sync` entries for deleted transports.
+    //
+    // Transports may be deleted directly or via sync messages,
+    // so it is easier to cleanup orphaned entries in a single place.
+    context
+        .sql
+        .execute(
+            "DELETE FROM imap WHERE transport_id NOT IN (SELECT transports.id FROM transports)",
+            (),
+        )
+        .await
+        .log_err(context)
+        .ok();
+    context.sql.execute(
+        "DELETE FROM imap_sync WHERE transport_id NOT IN (SELECT transports.id FROM transports)",
+        (),
+    ).await.log_err(context).ok();
+
     // Delete POI locations
     // which don't have corresponding message.
     delete_orphaned_poi_locations(context)
@@ -901,7 +919,7 @@ async fn maybe_add_mvbox_move_deprecation_message(context: &Context) -> Result<(
     if !context.get_config_bool(Config::OnlyFetchMvbox).await?
         && context.get_config_bool(Config::MvboxMove).await?
     {
-        let mut msg = Message::new_text(stock_str::mvbox_move_deprecation(context).await);
+        let mut msg = Message::new_text(stock_str::mvbox_move_deprecation(context));
         add_device_msg(context, Some("mvbox_move_deprecation"), Some(&mut msg)).await?;
     }
     Ok(())

@@ -86,7 +86,9 @@ pub(crate) struct MimeMessage {
     /// messages to this address to post them to the list.
     pub list_post: Option<String>,
     pub chat_disposition_notification_to: Option<SingleInfo>,
-    pub decrypting_failed: bool,
+
+    /// Decryption error if decryption of the message has failed.
+    pub decryption_error: Option<String>,
 
     /// Valid signature fingerprint if a message is an
     /// Autocrypt encrypted and signed message and corresponding intended recipient fingerprints
@@ -199,6 +201,9 @@ pub enum SystemMessage {
     MemberRemovedFromGroup = 5,
 
     /// Autocrypt Setup Message.
+    ///
+    /// Deprecated as of 2026-03-15, such messages should not be created
+    /// but may exist in the database.
     AutocryptSetupMessage = 6,
 
     /// Secure-join message.
@@ -258,8 +263,6 @@ pub enum SystemMessage {
     /// Group or broadcast channel description changed.
     GroupDescriptionChanged = 70,
 }
-
-const MIME_AC_SETUP_FILE: &str = "application/autocrypt-setup";
 
 impl MimeMessage {
     /// Parse a mime message.
@@ -663,7 +666,7 @@ impl MimeMessage {
             from,
             incoming,
             chat_disposition_notification_to,
-            decrypting_failed: mail.is_err(),
+            decryption_error: mail.err().map(|err| format!("{err:#}")),
 
             // only non-empty if it was a valid autocrypt message
             signature,
@@ -742,20 +745,8 @@ impl MimeMessage {
     }
 
     /// Parses system messages.
-    fn parse_system_message_headers(&mut self, context: &Context) {
-        if self.get_header(HeaderDef::AutocryptSetupMessage).is_some() && !self.incoming {
-            self.parts.retain(|part| {
-                part.mimetype
-                    .as_ref()
-                    .is_none_or(|mimetype| mimetype.as_ref() == MIME_AC_SETUP_FILE)
-            });
-
-            if self.parts.len() == 1 {
-                self.is_system_message = SystemMessage::AutocryptSetupMessage;
-            } else {
-                warn!(context, "could not determine ASM mime-part");
-            }
-        } else if let Some(value) = self.get_header(HeaderDef::ChatContent) {
+    fn parse_system_message_headers(&mut self) {
+        if let Some(value) = self.get_header(HeaderDef::ChatContent) {
             if value == "location-streaming-enabled" {
                 self.is_system_message = SystemMessage::LocationStreamingEnabled;
             } else if value == "ephemeral-timer-changed" {
@@ -904,7 +895,7 @@ impl MimeMessage {
     }
 
     async fn parse_headers(&mut self, context: &Context) -> Result<()> {
-        self.parse_system_message_headers(context);
+        self.parse_system_message_headers();
         self.parse_avatar_headers(context)?;
         self.parse_videochat_headers();
         if self.delivery_report.is_none() {
@@ -915,7 +906,7 @@ impl MimeMessage {
             && let Some(ref subject) = self.get_subject()
         {
             let mut prepend_subject = true;
-            if !self.decrypting_failed {
+            if self.decryption_error.is_none() {
                 let colon = subject.find(':');
                 if colon == Some(2)
                     || colon == Some(3)
@@ -956,7 +947,7 @@ impl MimeMessage {
         self.parse_attachments();
 
         // See if an MDN is requested from the other side
-        if !self.decrypting_failed
+        if self.decryption_error.is_none()
             && !self.parts.is_empty()
             && let Some(ref dn_to) = self.chat_disposition_notification_to
         {
@@ -1088,7 +1079,7 @@ impl MimeMessage {
     #[cfg(test)]
     /// Returns whether the decrypted data contains the given `&str`.
     pub(crate) fn decoded_data_contains(&self, s: &str) -> bool {
-        assert!(!self.decrypting_failed);
+        assert!(self.decryption_error.is_none());
         let decoded_str = str::from_utf8(&self.decoded_data).unwrap();
         decoded_str.contains(s)
     }

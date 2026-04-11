@@ -1,16 +1,18 @@
-name: Build & deploy documentation on rs.delta.chat, c.delta.chat, and py.delta.chat
+name: Build & deploy documentation on rs.delta.chat, c.delta.chat, py.delta.chat and cffi.delta.chat
 
 on:
   push:
     branches:
       - main
-      - build_jsonrpc_docs_ci
 
 permissions: {}
 
 jobs:
   build-rs:
     runs-on: ubuntu-latest
+    environment:
+      name: rs.delta.chat
+      url: https://rs.delta.chat/
 
     steps:
       - uses: actions/checkout@v6
@@ -23,12 +25,15 @@ jobs:
       - name: Upload to rs.delta.chat
         run: |
           mkdir -p "$HOME/.ssh"
-          echo "${{ secrets.KEY }}" > "$HOME/.ssh/key"
+          echo "${{ secrets.RS_DOCS_SSH_KEY }}" > "$HOME/.ssh/key"
           chmod 600 "$HOME/.ssh/key"
-          rsync -avzh -e "ssh -i $HOME/.ssh/key -o StrictHostKeyChecking=no" $GITHUB_WORKSPACE/target/doc "${{ secrets.USERNAME }}@rs.delta.chat:/var/www/html/rs/"
+          rsync -avzh -e "ssh -i $HOME/.ssh/key -o StrictHostKeyChecking=no" $GITHUB_WORKSPACE/target/doc "${{ secrets.RS_DOCS_SSH_USER }}@rs.delta.chat:/var/www/html/rs.delta.chat/"
 
   build-python:
     runs-on: ubuntu-latest
+    environment:
+      name: py.delta.chat
+      url: https://py.delta.chat/
 
     steps:
       - uses: actions/checkout@v6
@@ -42,12 +47,15 @@ jobs:
       - name: Upload to py.delta.chat
         run: |
           mkdir -p "$HOME/.ssh"
-          echo "${{ secrets.CODESPEAK_KEY }}" > "$HOME/.ssh/key"
+          echo "${{ secrets.PY_DOCS_SSH_KEY }}" > "$HOME/.ssh/key"
           chmod 600 "$HOME/.ssh/key"
-          rsync -avzh -e "ssh -i $HOME/.ssh/key -o StrictHostKeyChecking=no" $GITHUB_WORKSPACE/result/html/ "delta@py.delta.chat:/home/delta/build/master"
+          rsync -avzh --delete -e "ssh -i $HOME/.ssh/key -o StrictHostKeyChecking=no" $GITHUB_WORKSPACE/result/html/ "${{ secrets.PY_DOCS_SSH_USER }}@py.delta.chat:/var/www/html/py.delta.chat"
 
   build-c:
     runs-on: ubuntu-latest
+    environment:
+      name: c.delta.chat
+      url: https://c.delta.chat/
 
     steps:
       - uses: actions/checkout@v6
@@ -61,12 +69,16 @@ jobs:
       - name: Upload to c.delta.chat
         run: |
           mkdir -p "$HOME/.ssh"
-          echo "${{ secrets.CODESPEAK_KEY }}" > "$HOME/.ssh/key"
+          echo "${{ secrets.C_DOCS_SSH_KEY }}" > "$HOME/.ssh/key"
           chmod 600 "$HOME/.ssh/key"
-          rsync -avzh -e "ssh -i $HOME/.ssh/key -o StrictHostKeyChecking=no" $GITHUB_WORKSPACE/result/html/ "delta@c.delta.chat:/home/delta/build-c/master"
+          rsync -avzh --delete -e "ssh -i $HOME/.ssh/key -o StrictHostKeyChecking=no" $GITHUB_WORKSPACE/result/html/ "${{ secrets.C_DOCS_SSH_USER }}@c.delta.chat:/var/www/html/c.delta.chat"
 
   build-ts:
     runs-on: ubuntu-latest
+    environment:
+      name: js.jsonrpc.delta.chat
+      url: https://js.jsonrpc.delta.chat/
+
     defaults:
       run:
         working-directory: ./deltachat-jsonrpc/typescript
@@ -90,6 +102,27 @@ jobs:
       - name: Upload to js.jsonrpc.delta.chat
         run: |
           mkdir -p "$HOME/.ssh"
-          echo "${{ secrets.KEY }}" > "$HOME/.ssh/key"
+          echo "${{ secrets.JS_JSONRPC_DOCS_SSH_KEY }}" > "$HOME/.ssh/key"
           chmod 600 "$HOME/.ssh/key"
-          rsync -avzh -e "ssh -i $HOME/.ssh/key -o StrictHostKeyChecking=no" $GITHUB_WORKSPACE/deltachat-jsonrpc/typescript/docs/ "${{ secrets.USERNAME }}@js.jsonrpc.delta.chat:/var/www/html/js-jsonrpc/"
+          rsync -avzh --delete -e "ssh -i $HOME/.ssh/key -o StrictHostKeyChecking=no" $GITHUB_WORKSPACE/deltachat-jsonrpc/typescript/docs/ "${{ secrets.JS_JSONRPC_DOCS_SSH_USER }}@js.jsonrpc.delta.chat:/var/www/html/js.jsonrpc.delta.chat/"
+
+  build-cffi:
+    runs-on: ubuntu-latest
+    environment:
+      name: cffi.delta.chat
+      url: https://cffi.delta.chat/
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          show-progress: false
+          persist-credentials: false
+      - name: Build the documentation with cargo
+        run: |
+          cargo doc --package deltachat_ffi --no-deps
+      - name: Upload to cffi.delta.chat
+        run: |
+          mkdir -p "$HOME/.ssh"
+          echo "${{ secrets.CFFI_DOCS_SSH_KEY }}" > "$HOME/.ssh/key"
+          chmod 600 "$HOME/.ssh/key"
+          rsync -avzh --delete -e "ssh -i $HOME/.ssh/key -o StrictHostKeyChecking=no" $GITHUB_WORKSPACE/target/doc/ "${{ secrets.CFFI_DOCS_SSH_USER }}@delta.chat:/var/www/html/cffi.delta.chat/"

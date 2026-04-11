@@ -109,10 +109,9 @@ impl Context {
     /// called.
     pub(crate) async fn quota_needs_update(&self, transport_id: u32, ratelimit_secs: u64) -> bool {
         let quota = self.quota.read().await;
-        quota
-            .get(&transport_id)
-            .filter(|quota| time_elapsed(&quota.modified) < Duration::from_secs(ratelimit_secs))
-            .is_none()
+        quota.get(&transport_id).is_none_or(|quota| {
+            time_elapsed(&quota.modified) >= Duration::from_secs(ratelimit_secs)
+        })
     }
 
     /// Updates `quota.recent`, sets `quota.modified` to the current time
@@ -124,11 +123,15 @@ impl Context {
     /// in case for some providers the quota is always at ~100%
     /// and new space is allocated as needed.
     pub(crate) async fn update_recent_quota(&self, session: &mut ImapSession) -> Result<()> {
+        let transport_id = session.transport_id();
+
+        info!(self, "Transport {transport_id}: Updating quota.");
+
         let quota = if session.can_check_quota() {
             let folders = get_watched_folders(self).await?;
             get_unique_quota_roots_and_usage(session, folders).await
         } else {
-            Err(anyhow!(stock_str::not_supported_by_provider(self).await))
+            Err(anyhow!(stock_str::not_supported_by_provider(self)))
         };
 
         if let Ok(quota) = &quota {
@@ -143,26 +146,29 @@ impl Context {
                             Some(&highest.to_string()),
                         )
                         .await?;
-                        let mut msg =
-                            Message::new_text(stock_str::quota_exceeding(self, highest).await);
+                        let mut msg = Message::new_text(stock_str::quota_exceeding(self, highest));
                         add_device_msg_with_importance(self, None, Some(&mut msg), true).await?;
                     } else if highest <= QUOTA_ALLCLEAR_PERCENTAGE {
                         self.set_config_internal(Config::QuotaExceeding, None)
                             .await?;
                     }
                 }
-                Err(err) => warn!(self, "cannot get highest quota usage: {:#}", err),
+                Err(err) => warn!(
+                    self,
+                    "Transport {transport_id}: Cannot get highest quota usage: {err:#}"
+                ),
             }
         }
 
         self.quota.write().await.insert(
-            session.transport_id(),
+            transport_id,
             QuotaInfo {
                 recent: quota,
                 modified: tools::Time::now(),
             },
         );
 
+        info!(self, "Transport {transport_id}: Updated quota.");
         self.emit_event(EventType::ConnectivityChanged);
         Ok(())
     }
