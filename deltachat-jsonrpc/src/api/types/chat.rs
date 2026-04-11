@@ -71,6 +71,19 @@ pub struct FullChat {
     can_send: bool,
     was_seen_recently: bool,
     mailing_list_address: Option<String>,
+
+    /// Whether the local user is the admin of this super group.
+    ///
+    /// Only meaningful when [`FullChat::chat_type`] is [`JsonrpcChatType::SuperGroup`];
+    /// `false` for all other chat types.
+    is_self_super_group_admin: bool,
+
+    /// The contact ID of the admin of this super group.
+    ///
+    /// Only meaningful when [`FullChat::chat_type`] is [`JsonrpcChatType::SuperGroup`].
+    /// Returns `None` for non-super-group chats or when the admin is not yet known.
+    /// Returns the special self-contact ID when the local user is the admin.
+    super_group_admin_id: Option<u32>,
 }
 
 impl FullChat {
@@ -128,6 +141,8 @@ impl FullChat {
             can_send,
             was_seen_recently,
             mailing_list_address,
+            is_self_super_group_admin: chat.is_self_super_group_admin(),
+            super_group_admin_id: chat.get_super_group_admin_id().map(|id| id.to_u32()),
         })
     }
 }
@@ -264,6 +279,12 @@ pub enum JsonrpcChatType {
     Mailinglist,
     OutBroadcast,
     InBroadcast,
+    /// A super group: an encrypted many-to-many chat where all members can send.
+    ///
+    /// Unlike broadcast channels, all members can send messages.
+    /// Use [`FullChat::is_self_super_group_admin`] to check if the local user is the admin,
+    /// and [`FullChat::super_group_admin_id`] to get the admin's contact ID.
+    SuperGroup,
 }
 
 impl From<Chattype> for JsonrpcChatType {
@@ -274,6 +295,7 @@ impl From<Chattype> for JsonrpcChatType {
             Chattype::Mailinglist => JsonrpcChatType::Mailinglist,
             Chattype::OutBroadcast => JsonrpcChatType::OutBroadcast,
             Chattype::InBroadcast => JsonrpcChatType::InBroadcast,
+            Chattype::SuperGroup => JsonrpcChatType::SuperGroup,
         }
     }
 }
@@ -286,6 +308,7 @@ impl From<JsonrpcChatType> for Chattype {
             JsonrpcChatType::Mailinglist => Chattype::Mailinglist,
             JsonrpcChatType::OutBroadcast => Chattype::OutBroadcast,
             JsonrpcChatType::InBroadcast => Chattype::InBroadcast,
+            JsonrpcChatType::SuperGroup => Chattype::SuperGroup,
         }
     }
 }

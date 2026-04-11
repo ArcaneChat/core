@@ -1094,6 +1094,25 @@ impl CommandApi {
             .map(|id| id.to_u32())
     }
 
+    /// Create a new **super group**.
+    ///
+    /// Super groups are encrypted many-to-many chats where **all** members can send messages,
+    /// unlike broadcast channels which are read-only for recipients.
+    ///
+    /// The creator becomes the admin of the super group.
+    /// Others can join via a QR code invite generated with [`CommandApi::get_securejoin_qr`].
+    ///
+    /// After creation, the chat contains only the creator and is in _unpromoted_ state;
+    /// see [`CommandApi::create_group_chat`] for more information on the unpromoted state.
+    ///
+    /// Returns the created chat's id.
+    async fn create_super_group(&self, account_id: u32, chat_name: String) -> Result<u32> {
+        let ctx = self.get_context(account_id).await?;
+        chat::create_super_group(&ctx, chat_name)
+            .await
+            .map(|id| id.to_u32())
+    }
+
     /// Set group name.
     ///
     /// If the group is already _promoted_ (any message was sent to the group),

@@ -4046,7 +4046,7 @@ async fn apply_super_group_changes(
                         &[ContactId::SELF],
                     )
                     .await?;
-                    stock_str::msg_you_joined_broadcast(context).await
+                    stock_str::msg_you_joined_broadcast(context)
                 };
                 better_msg.get_or_insert(msg);
                 send_event_chat_modified = true;
@@ -4082,7 +4082,7 @@ async fn apply_super_group_changes(
             }
             chat::delete_broadcast_secret(context, chat.id).await?;
             if from_id == ContactId::SELF {
-                better_msg.get_or_insert(stock_str::msg_you_left_broadcast(context).await);
+                better_msg.get_or_insert(stock_str::msg_you_left_broadcast(context));
             } else {
                 better_msg.get_or_insert(
                     stock_str::msg_del_member_local(context, ContactId::SELF, from_id).await,

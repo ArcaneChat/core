@@ -219,6 +219,53 @@ pub enum QrObject {
         /// Authentication code.
         authcode: String,
     },
+    /// Ask the user whether to join the super group.
+    AskJoinSuperGroup {
+        /// The user-visible name of this super group.
+        name: String,
+        /// A string of random characters, uniquely identifying this super group.
+        grpid: String,
+        /// ID of the contact who owns the super group and created the QR code.
+        contact_id: u32,
+        /// Fingerprint of the super group owner's key as scanned from the QR code.
+        fingerprint: String,
+        /// Invite number.
+        invitenumber: String,
+        /// Authentication code.
+        authcode: String,
+        /// Whether the inviter supports the new Securejoin v3 protocol.
+        is_v3: bool,
+    },
+    /// Ask the user if they want to withdraw their own super group invite QR code.
+    WithdrawJoinSuperGroup {
+        /// The user-visible name of this super group.
+        name: String,
+        /// A string of random characters, uniquely identifying this super group.
+        grpid: String,
+        /// Contact ID. Always `ContactId::SELF`.
+        contact_id: u32,
+        /// Fingerprint of the contact key as scanned from the QR code.
+        fingerprint: String,
+        /// Invite number.
+        invitenumber: String,
+        /// Authentication code.
+        authcode: String,
+    },
+    /// Ask the user if they want to revive their own super group invite QR code.
+    ReviveJoinSuperGroup {
+        /// The user-visible name of this super group.
+        name: String,
+        /// A string of random characters, uniquely identifying this super group.
+        grpid: String,
+        /// Contact ID. Always `ContactId::SELF`.
+        contact_id: u32,
+        /// Fingerprint of the contact key as scanned from the QR code.
+        fingerprint: String,
+        /// Invite number.
+        invitenumber: String,
+        /// Authentication code.
+        authcode: String,
+    },
     /// `dclogin:` scheme parameters.
     ///
     /// Ask the user if they want to login with the email address.
@@ -412,6 +459,65 @@ impl From<Qr> for QrObject {
                 let contact_id = contact_id.to_u32();
                 let fingerprint = fingerprint.to_string();
                 QrObject::ReviveJoinBroadcast {
+                    name,
+                    grpid,
+                    contact_id,
+                    fingerprint,
+                    invitenumber,
+                    authcode,
+                }
+            }
+            Qr::AskJoinSuperGroup {
+                name,
+                grpid,
+                contact_id,
+                fingerprint,
+                invitenumber,
+                authcode,
+                is_v3,
+            } => {
+                let contact_id = contact_id.to_u32();
+                let fingerprint = fingerprint.to_string();
+                QrObject::AskJoinSuperGroup {
+                    name,
+                    grpid,
+                    contact_id,
+                    fingerprint,
+                    invitenumber,
+                    authcode,
+                    is_v3,
+                }
+            }
+            Qr::WithdrawJoinSuperGroup {
+                name,
+                grpid,
+                contact_id,
+                fingerprint,
+                invitenumber,
+                authcode,
+            } => {
+                let contact_id = contact_id.to_u32();
+                let fingerprint = fingerprint.to_string();
+                QrObject::WithdrawJoinSuperGroup {
+                    name,
+                    grpid,
+                    contact_id,
+                    fingerprint,
+                    invitenumber,
+                    authcode,
+                }
+            }
+            Qr::ReviveJoinSuperGroup {
+                name,
+                grpid,
+                contact_id,
+                fingerprint,
+                invitenumber,
+                authcode,
+            } => {
+                let contact_id = contact_id.to_u32();
+                let fingerprint = fingerprint.to_string();
+                QrObject::ReviveJoinSuperGroup {
                     name,
                     grpid,
                     contact_id,
