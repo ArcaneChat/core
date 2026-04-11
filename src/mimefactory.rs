@@ -2250,7 +2250,7 @@ fn hidden_recipients() -> Address<'static> {
 fn should_encrypt_with_broadcast_secret(msg: &Message, chat: &Chat) -> bool {
     // For broadcast channels (OutBroadcast), only regular messages are symmetrically encrypted.
     // Member-added/removed messages go to a single recipient and are PGP encrypted.
-    // For super groups (OutSuperGroup/InSuperGroup), regular messages are also symmetrically encrypted.
+    // For super groups, regular messages are also symmetrically encrypted.
     // Member-added messages in super groups go to a single recipient (the new member)
     // with PGP encryption so they can receive the group key before having it.
     matches!(chat.typ, Chattype::OutBroadcast | Chattype::SuperGroup)

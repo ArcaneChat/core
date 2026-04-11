@@ -3875,7 +3875,7 @@ pub(crate) async fn create_super_group_ex(
 
     if sync.into() {
         let id = SyncId::Grpid(grpid);
-        let action = SyncAction::CreateOutSuperGroup { chat_name, secret };
+        let action = SyncAction::CreateSuperGroup { chat_name, secret };
         self::sync(context, id, action).await.log_err(context).ok();
     }
 
@@ -5325,7 +5325,7 @@ pub(crate) enum SyncAction {
         secret: String,
     },
     /// Create super group with the given name.
-    CreateOutSuperGroup {
+    CreateSuperGroup {
         chat_name: String,
         secret: String,
     },
@@ -5406,7 +5406,7 @@ impl Context {
                         .await?;
                         return Ok(());
                     }
-                    SyncAction::CreateOutSuperGroup { chat_name, secret } => {
+                    SyncAction::CreateSuperGroup { chat_name, secret } => {
                         create_super_group_ex(
                             self,
                             Nosync,
@@ -5444,7 +5444,7 @@ impl Context {
             SyncAction::SetVisibility(v) => chat_id.set_visibility_ex(self, Nosync, *v).await,
             SyncAction::SetMuted(duration) => set_muted_ex(self, Nosync, chat_id, *duration).await,
             SyncAction::CreateOutBroadcast { .. }
-            | SyncAction::CreateOutSuperGroup { .. }
+            | SyncAction::CreateSuperGroup { .. }
             | SyncAction::CreateGroupEncrypted(..) => {
                 // Create action should have been handled above already.
                 Err(anyhow!("sync_alter_chat({id:?}, {action:?}): Bad request."))

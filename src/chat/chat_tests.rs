@@ -6109,3 +6109,79 @@ async fn test_leftgrps() -> Result<()> {
 
     Ok(())
 }
+
+/// Tests that when a super group is created, the creator is marked as admin.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_super_group_admin_flag() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+
+    // Alice creates a super group — she is the admin.
+    let alice_chat_id = create_super_group(alice, "Test Super Group".to_string()).await?;
+    let alice_chat = Chat::load_from_db(alice, alice_chat_id).await?;
+    assert_eq!(alice_chat.typ, Chattype::SuperGroup);
+    assert!(alice_chat.is_self_super_group_admin());
+    // Admin ID for self is ContactId::SELF.
+    assert_eq!(alice_chat.get_super_group_admin_id(), Some(ContactId::SELF));
+
+    // Bob joins via QR code.
+    let qr = get_securejoin_qr(alice, Some(alice_chat_id)).await?;
+    tcm.exec_securejoin_qr(bob, alice, &qr).await;
+
+    // On Bob's side the chat should be SuperGroup with alice as admin.
+    let bob_alice_contact = bob.add_or_lookup_contact_id(alice).await;
+    let bob_chats = Chatlist::try_load(bob, 0, None, None).await?;
+    let mut bob_chat_id = None;
+    for i in 0..bob_chats.len() {
+        let cid = bob_chats.get_chat_id(i)?;
+        let c = Chat::load_from_db(bob, cid).await?;
+        if c.typ == Chattype::SuperGroup {
+            bob_chat_id = Some(cid);
+            break;
+        }
+    }
+    let bob_chat_id = bob_chat_id.expect("Bob should have a super group chat");
+    let bob_chat = Chat::load_from_db(bob, bob_chat_id).await?;
+    assert_eq!(bob_chat.typ, Chattype::SuperGroup);
+    // Bob is NOT the admin.
+    assert!(!bob_chat.is_self_super_group_admin());
+    // Bob can query Alice's contact ID as the admin.
+    assert_eq!(bob_chat.get_super_group_admin_id(), Some(bob_alice_contact));
+
+    Ok(())
+}
+
+/// Tests that non-admin members of a super group can send messages.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_super_group_all_members_can_send() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+
+    // Alice creates a super group and Bob joins.
+    let alice_chat_id = create_super_group(alice, "Test Super Group".to_string()).await?;
+    let qr = get_securejoin_qr(alice, Some(alice_chat_id)).await?;
+    tcm.exec_securejoin_qr(bob, alice, &qr).await;
+
+    // Find Bob's super group chat.
+    let bob_chats = Chatlist::try_load(bob, 0, None, None).await?;
+    let mut bob_chat_id = None;
+    for i in 0..bob_chats.len() {
+        let cid = bob_chats.get_chat_id(i)?;
+        let c = Chat::load_from_db(bob, cid).await?;
+        if c.typ == Chattype::SuperGroup {
+            bob_chat_id = Some(cid);
+            break;
+        }
+    }
+    let bob_chat_id = bob_chat_id.expect("Bob should have a super group chat");
+    let bob_chat = Chat::load_from_db(bob, bob_chat_id).await?;
+
+    // Both admin and non-admin can send.
+    assert!(bob_chat.can_send(bob).await?);
+    let alice_chat = Chat::load_from_db(alice, alice_chat_id).await?;
+    assert!(alice_chat.can_send(alice).await?);
+
+    Ok(())
+}

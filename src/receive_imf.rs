@@ -4031,9 +4031,16 @@ async fn apply_super_group_changes(
                 && context.is_self_addr(added_addr).await?
             {
                 let msg = if chat.is_self_in_chat(context).await? {
-                    info!(context, "No-op super group \'Member added\' message (TRASH)");
+                    info!(context, "No-op super group 'Member added' message (TRASH)");
                     "".to_string()
                 } else {
+                    chat::add_to_chat_contacts_table(
+                        context,
+                        mime_parser.timestamp_sent,
+                        chat.id,
+                        &[ContactId::SELF],
+                    )
+                    .await?;
                     stock_str::msg_you_joined_broadcast(context).await
                 };
                 better_msg.get_or_insert(msg);
