@@ -59,9 +59,12 @@ impl Lot {
                 Qr::WithdrawVerifyContact { .. } => None,
                 Qr::WithdrawVerifyGroup { grpname, .. } => Some(Cow::Borrowed(grpname)),
                 Qr::WithdrawJoinBroadcast { name, .. } => Some(Cow::Borrowed(name)),
+                Qr::WithdrawJoinSuperGroup { name, .. } => Some(Cow::Borrowed(name)),
                 Qr::ReviveVerifyContact { .. } => None,
                 Qr::ReviveVerifyGroup { grpname, .. } => Some(Cow::Borrowed(grpname)),
                 Qr::ReviveJoinBroadcast { name, .. } => Some(Cow::Borrowed(name)),
+                Qr::ReviveJoinSuperGroup { name, .. } => Some(Cow::Borrowed(name)),
+                Qr::AskJoinSuperGroup { name, .. } => Some(Cow::Borrowed(name)),
                 Qr::Login { address, .. } => Some(Cow::Borrowed(address)),
             },
             Self::Error(err) => Some(Cow::Borrowed(err)),
@@ -115,9 +118,12 @@ impl Lot {
                 Qr::WithdrawVerifyContact { .. } => LotState::QrWithdrawVerifyContact,
                 Qr::WithdrawVerifyGroup { .. } => LotState::QrWithdrawVerifyGroup,
                 Qr::WithdrawJoinBroadcast { .. } => LotState::QrWithdrawJoinBroadcast,
+                Qr::WithdrawJoinSuperGroup { .. } => LotState::QrWithdrawJoinSuperGroup,
                 Qr::ReviveVerifyContact { .. } => LotState::QrReviveVerifyContact,
                 Qr::ReviveVerifyGroup { .. } => LotState::QrReviveVerifyGroup,
                 Qr::ReviveJoinBroadcast { .. } => LotState::QrReviveJoinBroadcast,
+                Qr::ReviveJoinSuperGroup { .. } => LotState::QrReviveJoinSuperGroup,
+                Qr::AskJoinSuperGroup { .. } => LotState::QrAskJoinSuperGroup,
                 Qr::Login { .. } => LotState::QrLogin,
             },
             Self::Error(_err) => LotState::QrError,
@@ -142,11 +148,12 @@ impl Lot {
                 Qr::Url { .. } => Default::default(),
                 Qr::Text { .. } => Default::default(),
                 Qr::WithdrawVerifyContact { contact_id, .. } => contact_id.to_u32(),
-                Qr::WithdrawVerifyGroup { .. } | Qr::WithdrawJoinBroadcast { .. } => {
+                Qr::WithdrawVerifyGroup { .. } | Qr::WithdrawJoinBroadcast { .. } | Qr::WithdrawJoinSuperGroup { .. } => {
                     Default::default()
                 }
                 Qr::ReviveVerifyContact { contact_id, .. } => contact_id.to_u32(),
-                Qr::ReviveVerifyGroup { .. } | Qr::ReviveJoinBroadcast { .. } => Default::default(),
+                Qr::ReviveVerifyGroup { .. } | Qr::ReviveJoinBroadcast { .. } | Qr::ReviveJoinSuperGroup { .. } => Default::default(),
+                Qr::AskJoinSuperGroup { .. } => Default::default(),
                 Qr::Login { .. } => Default::default(),
             },
             Self::Error(_) => Default::default(),
@@ -177,6 +184,9 @@ pub enum LotState {
 
     /// text1=broadcast_name
     QrAskJoinBroadcast = 204,
+
+    /// text1=super_group_name
+    QrAskJoinSuperGroup = 206,
 
     /// id=contact
     QrFprOk = 210,
@@ -215,6 +225,8 @@ pub enum LotState {
     QrWithdrawVerifyGroup = 502,
     /// text1=broadcast channel name
     QrWithdrawJoinBroadcast = 504,
+    /// text1=super group name
+    QrWithdrawJoinSuperGroup = 506,
 
     QrReviveVerifyContact = 510,
 
@@ -222,6 +234,8 @@ pub enum LotState {
     QrReviveVerifyGroup = 512,
     /// text1=groupname
     QrReviveJoinBroadcast = 514,
+    /// text1=super group name
+    QrReviveJoinSuperGroup = 516,
 
     /// text1=email_address
     QrLogin = 520,
