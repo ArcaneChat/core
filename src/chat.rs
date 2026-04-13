@@ -4334,7 +4334,7 @@ async fn send_member_removal_msg(
     let mut msg = Message::new(Viewtype::Text);
 
     if contact_id == ContactId::SELF {
-        if matches!(chat.typ, Chattype::InBroadcast) || chat.typ == Chattype::SuperGroup {
+        if matches!(chat.typ, Chattype::InBroadcast | Chattype::SuperGroup) {
             msg.text = stock_str::msg_you_left_broadcast(context);
         } else {
             msg.text = stock_str::msg_group_left_local(context, ContactId::SELF).await;
