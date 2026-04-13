@@ -4002,7 +4002,8 @@ pub(crate) async fn add_contact_to_chat_ex(
         chat.typ == Chattype::Group
             || (from_handshake
                 && (chat.typ == Chattype::OutBroadcast
-                    || chat.typ == Chattype::SuperGroup)),
+                    || chat.typ == Chattype::SuperGroup))
+            || chat.is_self_super_group_admin(),
         "{chat_id} is not a group where one can add members",
     );
     ensure!(
@@ -4092,7 +4093,14 @@ pub(crate) async fn add_contact_to_chat_ex(
         }
         send_msg(context, chat_id, &mut msg).await?;
 
-        sync = Nosync;
+        // For regular groups, the member-added message is gossip-encrypted to all members
+        // (including Alice's other devices), so no separate multi-device sync is needed.
+        // For super groups, the member-added message only goes to the new member via PGP,
+        // so Alice's other devices won't receive it. Don't clear the sync flag here so that
+        // sync_contacts() below will inform Alice's other devices about the new member.
+        if !matches!(chat.typ, Chattype::SuperGroup) {
+            sync = Nosync;
+        }
     }
     context.emit_event(EventType::ChatModified(chat_id));
     if sync.into() {

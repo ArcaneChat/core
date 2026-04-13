@@ -662,9 +662,9 @@ pub(crate) async fn handle_securejoin_handshake(
 
                 let chat = Chat::load_from_db(context, joining_chat_id).await?;
 
-                if chat.typ == Chattype::OutBroadcast {
-                    // We don't use the membership consistency algorithm for broadcast channels,
-                    // so, sync the memberlist when adding a contact
+                if matches!(chat.typ, Chattype::OutBroadcast | Chattype::SuperGroup) {
+                    // We don't use the membership consistency algorithm for broadcast channels
+                    // and super groups, so sync the memberlist when adding a contact
                     chat.sync_contacts(context).await.log_err(context).ok();
                 } else {
                     ContactId::scaleup_origin(context, &[contact_id], Origin::SecurejoinInvited)

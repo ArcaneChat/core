@@ -110,7 +110,7 @@ async fn generate_join_group_qr_code(context: &Context, chat_id: ChatId) -> Resu
     };
 
     let qrcode_description = match chat.typ {
-        crate::constants::Chattype::Group => {
+        crate::constants::Chattype::Group | crate::constants::Chattype::SuperGroup => {
             stock_str::secure_join_group_qr_description(context, &chat)
         }
         crate::constants::Chattype::OutBroadcast => {

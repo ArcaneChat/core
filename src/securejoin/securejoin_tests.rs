@@ -4,7 +4,7 @@ use deltachat_contact_tools::EmailAddress;
 use regex::Regex;
 
 use super::*;
-use crate::chat::{CantSendReason, add_contact_to_chat, remove_contact_from_chat};
+use crate::chat::{CantSendReason, add_contact_to_chat, create_super_group, remove_contact_from_chat};
 use crate::chatlist::Chatlist;
 use crate::constants::Chattype;
 use crate::constants::DC_CHAT_ID_TRASH;
@@ -1581,6 +1581,40 @@ async fn test_auth_token_is_synchronized() -> Result<()> {
         .await?
         .unwrap();
     assert_eq!(auth_count, 2);
+
+    Ok(())
+}
+
+/// Tests that a member can join a super group via the invite QR code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_super_group_securejoin() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+
+    // Alice creates a super group and gets the invite QR code.
+    let super_group_id = create_super_group(alice, "Super Group".to_string()).await?;
+    let qr = get_securejoin_qr(alice, Some(super_group_id)).await?;
+    assert!(qr.contains("https://i.delta.chat/"));
+
+    // Also verify the SVG generation works (was previously broken for SuperGroup).
+    let svg =
+        crate::qr_code_generator::get_securejoin_qr_svg(alice, Some(super_group_id)).await?;
+    assert!(svg.contains("<svg"));
+
+    // Bob scans the QR code and joins the super group.
+    let bob_chat_id = tcm.exec_securejoin_qr(bob, alice, &qr).await;
+
+    // Bob is now in the super group.
+    let bob_chat = Chat::load_from_db(bob, bob_chat_id).await?;
+    assert_eq!(bob_chat.typ, Chattype::SuperGroup);
+    assert!(crate::chat::is_contact_in_chat(bob, bob_chat_id, ContactId::SELF).await?);
+
+    // Alice's super group should also have Bob as a member.
+    let alice_bob_contact_id = alice.add_or_lookup_contact_id(bob).await;
+    assert!(
+        crate::chat::is_contact_in_chat(alice, super_group_id, alice_bob_contact_id).await?
+    );
 
     Ok(())
 }
