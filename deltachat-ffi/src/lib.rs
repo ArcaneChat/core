@@ -2826,7 +2826,7 @@ pub unsafe extern "C" fn dc_array_search_id(
 // Returns 1 if location belongs to the track of the user,
 // 0 if location was reported independently.
 #[no_mangle]
-pub unsafe fn dc_array_is_independent(
+pub unsafe extern "C" fn dc_array_is_independent(
     array: *const dc_array_t,
     index: libc::size_t,
 ) -> libc::c_int {
@@ -4062,16 +4062,6 @@ pub unsafe extern "C" fn dc_msg_get_saved_msg_id(msg: *const dc_msg_t) -> u32 {
             .map(|id| id.to_u32())
             .unwrap_or(0)
     })
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn dc_msg_force_plaintext(msg: *mut dc_msg_t) {
-    if msg.is_null() {
-        eprintln!("ignoring careless call to dc_msg_force_plaintext()");
-        return;
-    }
-    let ffi_msg = &mut *msg;
-    ffi_msg.message.force_plaintext();
 }
 
 #[no_mangle]

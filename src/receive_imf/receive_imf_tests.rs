@@ -13,9 +13,10 @@ use crate::constants::DC_GCL_FOR_FORWARDING;
 use crate::contact;
 use crate::imap::prefetch_should_download;
 use crate::imex::{ImexMode, imex};
+use crate::key;
 use crate::securejoin::get_securejoin_qr;
 use crate::test_utils::{
-    E2EE_INFO_MSGS, TestContext, TestContextManager, get_chat_msg, mark_as_verified,
+    E2EE_INFO_MSGS, TestContext, TestContextManager, alice_keypair, get_chat_msg, mark_as_verified,
 };
 use crate::tools::{SystemTime, time};
 
@@ -4377,39 +4378,42 @@ async fn test_recreate_member_list_on_missing_add_of_self() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_keep_member_list_if_possibly_nomember() -> Result<()> {
-    let alice = TestContext::new_alice().await;
-    let bob = TestContext::new_bob().await;
-    let alice_chat_id = create_group(&alice, "Group").await?;
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+    let alice_chat_id = create_group(alice, "Group").await?;
     add_contact_to_chat(
-        &alice,
+        alice,
         alice_chat_id,
-        alice.add_or_lookup_contact_id(&bob).await,
+        alice.add_or_lookup_contact_id(bob).await,
     )
     .await?;
-    send_text_msg(&alice, alice_chat_id, "populate".to_string()).await?;
+    send_text_msg(alice, alice_chat_id, "populate".to_string()).await?;
     let bob_chat_id = bob.recv_msg(&alice.pop_sent_msg().await).await.chat_id;
 
-    let fiona = TestContext::new_fiona().await;
+    let fiona = &tcm.fiona().await;
     add_contact_to_chat(
-        &alice,
+        alice,
         alice_chat_id,
-        alice.add_or_lookup_contact_id(&fiona).await,
+        alice.add_or_lookup_contact_id(fiona).await,
     )
     .await?;
     let fiona_chat_id = fiona.recv_msg(&alice.pop_sent_msg().await).await.chat_id;
-    fiona_chat_id.accept(&fiona).await?;
+    fiona_chat_id.accept(fiona).await?;
 
     SystemTime::shift(Duration::from_secs(60));
-    chat::set_chat_name(&fiona, fiona_chat_id, "Renamed").await?;
-    bob.recv_msg(&fiona.pop_sent_msg().await).await;
+    chat::set_chat_name(fiona, fiona_chat_id, "Renamed").await?;
+
+    // Message about chat name change from non-member is trashed.
+    bob.recv_msg_trash(&fiona.pop_sent_msg().await).await;
 
     // Bob missed the message adding fiona, but mustn't recreate the member list or apply the group
     // name change.
-    assert_eq!(get_chat_contacts(&bob, bob_chat_id).await?.len(), 2);
-    assert!(is_contact_in_chat(&bob, bob_chat_id, ContactId::SELF).await?);
-    let bob_alice_contact = bob.add_or_lookup_contact_id(&alice).await;
-    assert!(is_contact_in_chat(&bob, bob_chat_id, bob_alice_contact).await?);
-    let chat = Chat::load_from_db(&bob, bob_chat_id).await?;
+    assert_eq!(get_chat_contacts(bob, bob_chat_id).await?.len(), 2);
+    assert!(is_contact_in_chat(bob, bob_chat_id, ContactId::SELF).await?);
+    let bob_alice_contact = bob.add_or_lookup_contact_id(alice).await;
+    assert!(is_contact_in_chat(bob, bob_chat_id, bob_alice_contact).await?);
+    let chat = Chat::load_from_db(bob, bob_chat_id).await?;
     assert_eq!(chat.get_name(), "Group");
     Ok(())
 }
@@ -5362,6 +5366,46 @@ async fn test_outgoing_unencrypted_chat_assignment() {
     assert_eq!(received.chat_id, chat.id);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_incoming_reply_with_date_in_past() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+
+    let msg0 = receive_imf(
+        alice,
+        b"From: bob@example.net\n\
+          To: alice@example.org\n\
+          Message-ID: <message@example.net>\n\
+          Date: Sun, 22 Mar 2020 22:22:22 +0000\n\
+          \n\
+          This device has an atomic clock\n",
+        false,
+    )
+    .await?
+    .unwrap();
+
+    let msg1 = receive_imf(
+        alice,
+        b"From: bob@example.net\n\
+          To: alice@example.org\n\
+          Message-ID: <message1@example.net>\n\
+          In-Reply-To: <message@example.net>\n\
+          Date: Sun, 22 Mar 2020 11:11:11 +0000\n\
+          \n\
+          And this one has a wind-up clock\n",
+        false,
+    )
+    .await?
+    .unwrap();
+    assert_eq!(msg1.chat_id, msg0.chat_id);
+    assert!(msg1.sort_timestamp >= msg0.sort_timestamp);
+    assert_eq!(
+        alice.get_last_msg_in(msg0.chat_id).await.id,
+        *msg1.msg_ids.last().unwrap()
+    );
+    Ok(())
+}
+
 /// Tests Bob receiving a message from Alice
 /// in a new group she just created
 /// with only Alice and Bob.
@@ -5560,4 +5604,91 @@ async fn test_calendar_alternative() -> Result<()> {
     assert_eq!(html, "<b>Hello!</b>");
 
     Ok(())
+}
+
+/// Tests that outgoing encrypted messages are detected
+/// by verifying own signature, completely ignoring From address.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_outgoing_determined_by_signature() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+
+    // alice_dev2: same key, different address.
+    let different_from = "very@different.from";
+    assert!(!alice.is_self_addr(different_from).await?);
+    let alice_dev2 = &tcm.unconfigured().await;
+    alice_dev2.configure_addr(different_from).await;
+    key::store_self_keypair(alice_dev2, &alice_keypair()).await?;
+    assert_ne!(
+        alice.get_config(Config::Addr).await?.unwrap(),
+        different_from
+    );
+
+    // Send message from alice_dev2 and check alice sees it as outgoing
+    let chat_id = alice_dev2.create_chat_id(bob).await;
+    let sent_msg = alice_dev2.send_text(chat_id, "hello from new device").await;
+    let msg = alice.recv_msg(&sent_msg).await;
+    assert_eq!(msg.state, MessageState::OutDelivered);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_mark_message_as_delivered_only_after_sent_out_fully() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+    alice.set_config_bool(Config::BccSelf, true).await?;
+    let alice_chat_id = alice.create_chat_id(bob).await;
+
+    let file_bytes = include_bytes!("../../test-data/image/screenshot.gif");
+    let mut msg = Message::new(Viewtype::Image);
+    msg.set_file_from_bytes(alice, "a.jpg", file_bytes, None)?;
+    let msg_id = chat::send_msg(alice, alice_chat_id, &mut msg)
+        .await
+        .unwrap();
+
+    let (pre_msg_id, pre_msg_payload) = first_row_in_smtp_queue(alice).await;
+    assert_eq!(msg_id, pre_msg_id);
+    assert!(pre_msg_payload.len() < file_bytes.len());
+
+    assert_eq!(msg_id.get_state(alice).await?, MessageState::OutPending);
+    // Alice receives her own pre-message because of bcc_self
+    // This should not yet mark the message as delivered,
+    // because not everything was sent,
+    // but it does remove the pre-message from the SMTP queue
+    receive_imf(alice, pre_msg_payload.as_bytes(), false).await?;
+    assert_eq!(msg_id.get_state(alice).await?, MessageState::OutPending);
+
+    let (post_msg_id, post_msg_payload) = first_row_in_smtp_queue(alice).await;
+    assert_eq!(msg_id, post_msg_id);
+    assert!(post_msg_payload.len() > file_bytes.len());
+
+    assert_eq!(msg_id.get_state(alice).await?, MessageState::OutPending);
+    // Alice receives her own post-message because of bcc_self
+    // This should now mark the message as delivered,
+    // because everything was sent by now.
+    receive_imf(alice, post_msg_payload.as_bytes(), false).await?;
+    assert_eq!(msg_id.get_state(alice).await?, MessageState::OutDelivered);
+
+    Ok(())
+}
+
+/// Queries the first sent message in the SMTP queue
+/// without removing it from the SMTP queue.
+/// This simulates the case that a message is successfully sent out,
+/// but the 'OK' answer from the server doesn't arrive,
+/// so that the SMTP row stays in the database.
+pub(crate) async fn first_row_in_smtp_queue(alice: &TestContext) -> (MsgId, String) {
+    alice
+        .sql
+        .query_row_optional("SELECT msg_id, mime FROM smtp ORDER BY id", (), |row| {
+            let msg_id: MsgId = row.get(0)?;
+            let mime: String = row.get(1)?;
+            Ok((msg_id, mime))
+        })
+        .await
+        .expect("query_row_optional failed")
+        .expect("No SMTP row found")
 }

@@ -364,18 +364,14 @@ uint32_t        dc_get_id                    (dc_context_t* context);
  * To get these events, you have to create an event emitter using this function
  * and call dc_get_next_event() on the emitter.
  *
+ * Events are broadcasted to all existing event emitters.
+ * Events emitted before creation of event emitter
+ * are not available to event emitter.
+ *
  * @memberof dc_context_t
  * @param context The context object as created by dc_context_new().
  * @return Returns the event emitter, NULL on errors.
  *     Must be freed using dc_event_emitter_unref() after usage.
- *
- * Note: Use only one event emitter per context.
- * The result of having multiple event emitters is unspecified.
- * Currently events are broadcasted to all existing event emitters,
- * but previous versions delivered events to only one event emitter
- * and this behavior may change again in the future.
- * Events emitted before creation of event emitter
- * may or may not be available to event emitter.
  */
 dc_event_emitter_t* dc_get_event_emitter(dc_context_t* context);
 
@@ -3323,18 +3319,14 @@ void           dc_accounts_set_push_device_token (dc_accounts_t* accounts, const
  * This is similar to dc_get_event_emitter(), which, however,
  * must not be called for accounts handled by the account manager.
  *
+ * Events are broadcasted to all existing event emitters.
+ * Events emitted before creation of event emitter
+ * are not available to event emitter.
+ *
  * @memberof dc_accounts_t
  * @param accounts The account manager as created by dc_accounts_new().
  * @return Returns the event emitter, NULL on errors.
  *     Must be freed using dc_event_emitter_unref() after usage.
- *
- * Note: Use only one event emitter per account manager.
- * The result of having multiple event emitters is unspecified.
- * Currently events are broadcasted to all existing event emitters,
- * but previous versions delivered events to only one event emitter
- * and this behavior may change again in the future.
- * Events emitted before creation of event emitter
- * are not available to event emitter.
  */
 dc_event_emitter_t* dc_accounts_get_event_emitter (dc_accounts_t* accounts);
 
@@ -4981,17 +4973,6 @@ uint32_t        dc_msg_get_original_msg_id    (const dc_msg_t* msg);
  */
 uint32_t        dc_msg_get_saved_msg_id     (const dc_msg_t* msg);
 
-
-/**
- * Force the message to be sent in plain text.
- *
- * This API is for bots, there is no need to expose it in the UI.
- *
- * @memberof dc_msg_t
- * @param msg The message object.
- */
-void            dc_msg_force_plaintext        (dc_msg_t* msg);
-
 void            dc_msg_force_sticker          (dc_msg_t* msg);
 char*           dc_msg_get_poi_location       (dc_msg_t* msg);
 
@@ -5982,21 +5963,14 @@ void dc_event_channel_unref(dc_event_channel_t* event_channel);
  * To get these events, you have to create an event emitter using this function
  * and call dc_get_next_event() on the emitter.
  *
- * This is similar to dc_get_event_emitter(), which, however,
- * must not be called for accounts handled by the account manager.
+ * Events are broadcasted to all existing event emitters.
+ * Events emitted before creation of event emitter
+ * are not available to event emitter.
  * 
  * @memberof dc_event_channel_t
  * @param The event channel.
  * @return Returns the event emitter, NULL on errors.
  *     Must be freed using dc_event_emitter_unref() after usage.
- * 
- * Note: Use only one event emitter per account manager / event channel.
- * The result of having multiple event emitters is unspecified.
- * Currently events are broadcasted to all existing event emitters,
- * but previous versions delivered events to only one event emitter
- * and this behavior may change again in the future.
- * Events emitted before creation of event emitter
- * are not available to event emitter.
  */
 dc_event_emitter_t* dc_event_channel_get_event_emitter(dc_event_channel_t* event_channel);
 

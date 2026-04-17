@@ -1,5 +1,66 @@
 # Changelog
 
+## [2.49.0] - 2026-04-13
+
+### Features / Changes
+
+- Flipped Exif orientations ([#8057](https://github.com/chatmail/core/pull/8057)).
+
+### Fixes
+
+- Determine whether a message is an own message by looking at signature. multiple devices can temporarly have different sets of self addresses, and still need to properly recognize incoming versus outgoing messages. Disclaimer: some LLM tooling was initially involved but i went over everything by hand, and also addressed review comments..
+- Mark a message as delivered only after it has been fully sent out ([#8062](https://github.com/chatmail/core/pull/8062)).
+- Do not create 1:1 chat on second device when scanning a QR code.
+- Do not URL-encode proxy hostnames.
+- Assign webxdc updates from post-message to webxdc instance.
+- Let search also return hidden contacts if search value is an email address.
+- Add missing `extern "C"` to `dc_array_is_independent`.
+- Make start messages stick to the top of the chat.
+- For bots, wait with emitting IncomingMsg until the Post-Msg arrived ([#8104](https://github.com/chatmail/core/pull/8104)).
+- Trash message about group name change from non-member.
+
+### API-Changes
+
+- [**breaking**] remove `dc_msg_force_plaintext`.
+- @deltachat/stdio-rpc-server: also export a class.
+
+### CI
+
+- Make sure `-dev` version suffix is not forgotten after release.
+
+### Documentation
+
+- Document that events are broadcasted to all event emitters.
+- Fix broken link for i-d "Common PGP/MIME Message Mangling".
+
+### Refactor
+
+- ignore ForcePlaintext in saved messages chat.
+- @deltachat/stdio-rpc-server: make `getRPCServerPath` and `startDeltaChat` synchronous.
+- @deltachat/stdio-rpc-server: remove `await` from README example.
+- less nested `remove_contact_from_chat`.
+
+### Tests
+
+- Add test for `tweak_sort_timestamp()`.
+- Test that messages are only marked as delivered after being fully sent out ([#8077](https://github.com/chatmail/core/pull/8077)).
+- Fix flaky `test_no_old_msg_is_fresh`: Wait for incoming message before sending outgoing one.
+- Use TestContextManager in `test_keep_member_list_if_possibly_nomember`.
+
+### Miscellaneous Tasks
+
+- cargo: bump chrono from 0.4.43 to 0.4.44.
+- cargo: bump tracing-subscriber from 0.3.22 to 0.3.23.
+- cargo: bump tempfile from 3.26.0 to 3.27.0.
+- cargo: bump pin-project from 1.1.10 to 1.1.11.
+- cargo: bump tokio from 1.49.0 to 1.50.0.
+- cargo: bump libc from 0.2.182 to 0.2.183.
+- cargo: bump quote from 1.0.44 to 1.0.45.
+- cargo: bump image from 0.25.9 to 0.25.10.
+- cargo: bump proptest from 1.10.0 to 1.11.0.
+- deps: bump dependabot/fetch-metadata from 2.4.0 to 3.0.0.
+- bump version to 2.49.0-dev.
+
 ## [2.48.0] - 2026-03-30
 
 ### Fixes
@@ -8041,3 +8102,4 @@ https://github.com/chatmail/core/pulls?q=is%3Apr+is%3Aclosed
 [2.46.0]: https://github.com/chatmail/core/compare/v2.45.0..v2.46.0
 [2.47.0]: https://github.com/chatmail/core/compare/v2.46.0..v2.47.0
 [2.48.0]: https://github.com/chatmail/core/compare/v2.47.0..v2.48.0
+[2.49.0]: https://github.com/chatmail/core/compare/v2.48.0..v2.49.0
