@@ -3102,14 +3102,7 @@ async fn apply_group_changes(
     // For admin groups, determine if the sender is the admin.
     // The admin fingerprint is encoded in the grpid as FINGERPRINT.GRPID.
     let sender_is_admin = if let Some(admin_fpr) = admin_group_fingerprint(&chat.grpid) {
-        let from_fpr = if from_id == ContactId::SELF {
-            self_fingerprint_opt(context).await?.map(|s| s.to_string())
-        } else {
-            Contact::get_by_id(context, from_id)
-                .await?
-                .fingerprint()
-                .map(|f| f.hex())
-        };
+        let from_fpr = get_contact_fingerprint(context, from_id).await?;
         from_fpr.as_deref() == Some(admin_fpr)
     } else {
         true // Not an admin group; all members can modify.
@@ -3377,20 +3370,13 @@ async fn apply_chat_name_avatar_and_description_changes(
 
     // For admin groups, only the admin can change name, description, and avatar.
     let is_sender_admin = if let Some(admin_fpr) = admin_group_fingerprint(&chat.grpid) {
-        let from_fpr = if from_id == ContactId::SELF {
-            self_fingerprint_opt(context).await?.map(|s| s.to_string())
-        } else {
-            Contact::get_by_id(context, from_id)
-                .await?
-                .fingerprint()
-                .map(|f| f.hex())
-        };
+        let from_fpr = get_contact_fingerprint(context, from_id).await?;
         from_fpr.as_deref() == Some(admin_fpr)
     } else {
         true // Not an admin group; all members can modify.
     };
-    // Treat non-admin as non-member for group state changes in admin groups.
-    let is_from_in_chat = is_from_in_chat && is_sender_admin;
+    // For group state changes (name/description/avatar), treat non-admins as non-members.
+    let can_modify_group_state = is_from_in_chat && is_sender_admin;
 
     let group_name_timestamp = mime_parser
         .get_header(HeaderDef::ChatGroupNameTimestamp)
@@ -3414,7 +3400,7 @@ async fn apply_chat_name_avatar_and_description_changes(
         let chat_group_name_timestamp = chat.param.get_i64(Param::GroupNameTimestamp).unwrap_or(0);
         let group_name_timestamp = group_name_timestamp.unwrap_or(mime_parser.timestamp_sent);
         // To provide group name consistency, compare names if timestamps are equal.
-        if is_from_in_chat
+        if can_modify_group_state
             && (chat_group_name_timestamp, grpname) < (group_name_timestamp, &chat.name)
             && chat
                 .id
@@ -3436,7 +3422,7 @@ async fn apply_chat_name_avatar_and_description_changes(
             .get_header(HeaderDef::ChatGroupNameChanged)
             .is_some()
         {
-            if is_from_in_chat {
+            if can_modify_group_state {
                 let old_name = &sanitize_single_line(old_name);
                 better_msg.get_or_insert(
                     if matches!(chat.typ, Chattype::InBroadcast | Chattype::OutBroadcast) {
@@ -3446,7 +3432,7 @@ async fn apply_chat_name_avatar_and_description_changes(
                     },
                 );
             } else {
-                // Attempt to change group name by non-member, trash it.
+                // Attempt to change group name by non-member or non-admin, trash it.
                 *better_msg = Some(String::new());
             }
         }
@@ -3471,7 +3457,7 @@ async fn apply_chat_name_avatar_and_description_changes(
 
         let new_timestamp = timestamp_in_header.unwrap_or(mime_parser.timestamp_sent);
         // To provide consistency, compare descriptions if timestamps are equal.
-        if is_from_in_chat
+        if can_modify_group_state
             && (old_timestamp, &old_description) < (new_timestamp, &new_description)
             && chat
                 .id
@@ -3493,11 +3479,11 @@ async fn apply_chat_name_avatar_and_description_changes(
             .get_header(HeaderDef::ChatGroupDescriptionChanged)
             .is_some()
         {
-            if is_from_in_chat {
+            if can_modify_group_state {
                 better_msg
                     .get_or_insert(stock_str::msg_chat_description_changed(context, from_id).await);
             } else {
-                // Attempt to change group description by non-member, trash it.
+                // Attempt to change group description by non-member or non-admin, trash it.
                 *better_msg = Some(String::new());
             }
         }
@@ -3509,7 +3495,7 @@ async fn apply_chat_name_avatar_and_description_changes(
         && value == "group-avatar-changed"
         && let Some(avatar_action) = &mime_parser.group_avatar
     {
-        if is_from_in_chat {
+        if can_modify_group_state {
             // this is just an explicit message containing the group-avatar,
             // apart from that, the group-avatar is send along with various other messages
             better_msg.get_or_insert(
@@ -3527,13 +3513,13 @@ async fn apply_chat_name_avatar_and_description_changes(
                 },
             );
         } else {
-            // Attempt to change group avatar by non-member, trash it.
+            // Attempt to change group avatar by non-member or non-admin, trash it.
             *better_msg = Some(String::new());
         }
     }
 
     if let Some(avatar_action) = &mime_parser.group_avatar
-        && is_from_in_chat
+        && can_modify_group_state
         && chat
             .param
             .update_timestamp(Param::AvatarTimestamp, mime_parser.timestamp_sent)?
@@ -4379,6 +4365,20 @@ async fn lookup_key_contact_by_address(
         }
     };
     Ok(contact_id)
+}
+
+/// Returns the fingerprint of the given contact as a hex string.
+///
+/// For [`ContactId::SELF`], uses the local device's own fingerprint.
+async fn get_contact_fingerprint(context: &Context, contact_id: ContactId) -> Result<Option<String>> {
+    if contact_id == ContactId::SELF {
+        Ok(self_fingerprint_opt(context).await?.map(|s| s.to_string()))
+    } else {
+        Ok(Contact::get_by_id(context, contact_id)
+            .await?
+            .fingerprint()
+            .map(|f| f.hex()))
+    }
 }
 
 async fn lookup_key_contact_by_fingerprint(
