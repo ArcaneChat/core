@@ -15,7 +15,8 @@ use num_traits::FromPrimitive;
 use regex::Regex;
 
 use crate::chat::{
-    self, Chat, ChatId, ChatIdBlocked, ChatVisibility, is_contact_in_chat, save_broadcast_secret,
+    self, Chat, ChatId, ChatIdBlocked, ChatVisibility, admin_group_fingerprint,
+    is_contact_in_chat, save_broadcast_secret,
 };
 use crate::config::Config;
 use crate::constants::{self, Blocked, Chattype, DC_CHAT_ID_TRASH, EDITED_PREFIX, ShowEmails};
@@ -3098,6 +3099,22 @@ async fn apply_group_changes(
     let is_from_in_chat =
         !chat_contacts.contains(&ContactId::SELF) || chat_contacts.contains(&from_id);
 
+    // For admin groups, determine if the sender is the admin.
+    // The admin fingerprint is encoded in the grpid as FINGERPRINT.GRPID.
+    let sender_is_admin = if let Some(admin_fpr) = admin_group_fingerprint(&chat.grpid) {
+        let from_fpr = if from_id == ContactId::SELF {
+            self_fingerprint_opt(context).await?.map(|s| s.to_string())
+        } else {
+            Contact::get_by_id(context, from_id)
+                .await?
+                .fingerprint()
+                .map(|f| f.hex())
+        };
+        from_fpr.as_deref() == Some(admin_fpr)
+    } else {
+        true // Not an admin group; all members can modify.
+    };
+
     if let Some(removed_addr) = mime_parser.get_header(HeaderDef::ChatGroupMemberRemoved) {
         if !is_from_in_chat {
             better_msg = Some(String::new());
@@ -3111,17 +3128,28 @@ async fn apply_group_changes(
                 lookup_key_contact_by_address(context, removed_addr, Some(chat.id)).await?;
         }
         if let Some(id) = removed_id {
-            better_msg = if id == from_id {
-                silent = true;
-                Some(stock_str::msg_group_left_local(context, from_id).await)
+            // In admin groups, non-admins can only remove themselves (leave the group).
+            if !sender_is_admin && id != from_id {
+                info!(
+                    context,
+                    "Ignoring member removal by non-admin in admin group {}", chat.id
+                );
+                removed_id = None;
+                better_msg = Some(String::new());
             } else {
-                Some(stock_str::msg_del_member_local(context, id, from_id).await)
-            };
+                better_msg = if id == from_id {
+                    silent = true;
+                    Some(stock_str::msg_group_left_local(context, from_id).await)
+                } else {
+                    Some(stock_str::msg_del_member_local(context, id, from_id).await)
+                };
+            }
         } else {
             warn!(context, "Removed {removed_addr:?} has no contact id.")
         }
     } else if let Some(added_addr) = mime_parser.get_header(HeaderDef::ChatGroupMemberAdded) {
-        if !is_from_in_chat {
+        if !is_from_in_chat || !sender_is_admin {
+            // In admin groups, only the admin can add members.
             better_msg = Some(String::new());
         } else if let Some(key) = mime_parser.gossiped_keys.get(added_addr) {
             if !chat_contacts.contains(&from_id) {
@@ -3346,6 +3374,23 @@ async fn apply_chat_name_avatar_and_description_changes(
     better_msg: &mut Option<String>,
 ) -> Result<()> {
     // ========== Apply chat name changes ==========
+
+    // For admin groups, only the admin can change name, description, and avatar.
+    let is_sender_admin = if let Some(admin_fpr) = admin_group_fingerprint(&chat.grpid) {
+        let from_fpr = if from_id == ContactId::SELF {
+            self_fingerprint_opt(context).await?.map(|s| s.to_string())
+        } else {
+            Contact::get_by_id(context, from_id)
+                .await?
+                .fingerprint()
+                .map(|f| f.hex())
+        };
+        from_fpr.as_deref() == Some(admin_fpr)
+    } else {
+        true // Not an admin group; all members can modify.
+    };
+    // Treat non-admin as non-member for group state changes in admin groups.
+    let is_from_in_chat = is_from_in_chat && is_sender_admin;
 
     let group_name_timestamp = mime_parser
         .get_header(HeaderDef::ChatGroupNameTimestamp)
