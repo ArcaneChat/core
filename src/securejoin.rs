@@ -657,10 +657,25 @@ pub(crate) async fn handle_securejoin_handshake(
                 ChatId::create_for_contact(context, contact_id).await?;
             }
             if let Some(joining_chat_id) = joining_chat_id {
+                let chat = Chat::load_from_db(context, joining_chat_id).await?;
+
+                // In admin groups, only the admin may add members.
+                // If we are not the admin, abort the secure-join instead of
+                // forwarding an add-member message that will be rejected anyway.
+                if let Some(admin_fpr) = admin_group_fingerprint(&chat.grpid) {
+                    let my_fpr = self_fingerprint(context).await?;
+                    if my_fpr != admin_fpr {
+                        warn!(
+                            context,
+                            "Aborting secure-join: we are not the admin of group {}.",
+                            chat.id
+                        );
+                        return Ok(HandshakeMessage::Ignore);
+                    }
+                }
+
                 chat::add_contact_to_chat_ex(context, Nosync, joining_chat_id, contact_id, true)
                     .await?;
-
-                let chat = Chat::load_from_db(context, joining_chat_id).await?;
 
                 if chat.typ == Chattype::OutBroadcast {
                     // We don't use the membership consistency algorithm for broadcast channels,
