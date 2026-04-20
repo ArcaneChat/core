@@ -1080,6 +1080,21 @@ impl CommandApi {
             .map(|id| id.to_u32())
     }
 
+    /// Create a new encrypted group chat with an admin.
+    ///
+    /// Similar to [`Self::create_group_chat`], but only the creator (admin) can add/remove
+    /// members or change the group name, description, or avatar.
+    /// Other members can send messages and leave the group.
+    ///
+    /// The admin is identified by their PGP key fingerprint, which is encoded in the group ID.
+    /// The `groupAdminId` field in [`FullChat`] will be set to the admin's contact ID.
+    async fn create_group_with_admin(&self, account_id: u32, name: String) -> Result<u32> {
+        let ctx = self.get_context(account_id).await?;
+        chat::create_group_with_admin(&ctx, &name)
+            .await
+            .map(|id| id.to_u32())
+    }
+
     /// Deprecated 2025-07 in favor of create_broadcast().
     async fn create_broadcast_list(&self, account_id: u32) -> Result<u32> {
         self.create_broadcast(account_id, "Channel".to_string())

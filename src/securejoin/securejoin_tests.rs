@@ -1584,3 +1584,67 @@ async fn test_auth_token_is_synchronized() -> Result<()> {
 
     Ok(())
 }
+
+/// Tests that a non-admin inviter aborts the secure-join process
+/// when asked to add a member to an admin group they are not the admin of.
+///
+/// Alice (the admin) creates an admin group, Bob joins via Alice's QR code.
+/// Bob then generates his own QR code for the group, Fiona scans it.
+/// Bob processes Fiona's `vg-request-with-auth` but must abort because Bob is
+/// not the admin — Fiona must NOT end up in the group.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_non_admin_inviter_aborts_securejoin() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+    let fiona = &tcm.fiona().await;
+
+    // Alice creates an admin group and Bob joins via Alice's QR code.
+    let alice_group = chat::create_group_with_admin(alice, "Admin Group").await?;
+    let alice_qr = get_securejoin_qr(alice, Some(alice_group)).await?;
+    let bob_group = tcm.exec_securejoin_qr(bob, alice, &alice_qr).await;
+
+    // Confirm that Bob is in the group.
+    let alice_members = chat::get_chat_contacts(alice, alice_group).await?;
+    assert!(alice_members.contains(&alice.add_or_lookup_contact_id(bob).await));
+
+    // Bob (non-admin) generates a QR code for the same group.
+    let bob_qr = get_securejoin_qr(bob, Some(bob_group)).await?;
+
+    // Fiona scans Bob's QR code and starts the secure-join with Bob as inviter.
+    // Because Bob is not the admin, Bob must abort instead of adding Fiona.
+    let fiona_chat_id = join_securejoin(fiona, &bob_qr).await?;
+
+    // Pump messages manually so Bob aborts cleanly.
+    loop {
+        let mut something_sent = false;
+        if let Some(sent) = fiona.pop_sent_msg_opt(std::time::Duration::ZERO).await {
+            bob.recv_msg_opt(&sent).await;
+            something_sent = true;
+        }
+        if let Some(sent) = bob.pop_sent_msg_opt(std::time::Duration::ZERO).await {
+            fiona.recv_msg_opt(&sent).await;
+            something_sent = true;
+        }
+        if !something_sent {
+            break;
+        }
+    }
+
+    // Fiona's chat should have no members (secure-join was aborted by Bob).
+    let fiona_members = chat::get_chat_contacts(fiona, fiona_chat_id).await?;
+    assert!(
+        fiona_members.is_empty(),
+        "Fiona's group should be empty after non-admin Bob aborted the secure-join; got {fiona_members:?}"
+    );
+
+    // Alice's group must also not contain Fiona.
+    let alice_members_after = chat::get_chat_contacts(alice, alice_group).await?;
+    let fiona_contact_on_alice = alice.add_or_lookup_contact_id(fiona).await;
+    assert!(
+        !alice_members_after.contains(&fiona_contact_on_alice),
+        "Fiona must not appear in Alice's admin group after non-admin invite"
+    );
+
+    Ok(())
+}

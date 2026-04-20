@@ -22,6 +22,7 @@ use crate::net::http::post_empty;
 use crate::net::proxy::{DEFAULT_SOCKS_PORT, ProxyConfig};
 use crate::token;
 use crate::tools::{time, validate_id};
+use crate::chat::{ADMIN_GROUP_ID_SEPARATOR};
 
 const OPENPGP4FPR_SCHEME: &str = "OPENPGP4FPR:"; // yes: uppercase
 const IDELTACHAT_SCHEME: &str = "https://i.delta.chat/#";
@@ -502,13 +503,27 @@ async fn decode_openpgp(context: &Context, qr: &str) -> Result<Qr> {
         .get("s")
         .filter(|&s| validate_id(s))
         .map(|s| s.to_string());
-    let grpid = param
-        .get("x")
-        .filter(|&s| validate_id(s))
-        .map(|s| s.to_string());
 
     let grpname = decode_name(&param, "g")?;
+    let admin_grpname = decode_name(&param, "z")?;
     let broadcast_name = decode_name(&param, "b")?;
+
+    // For admin groups, reconstruct the full grpid as FINGERPRINT.base_grpid.
+    // The base_grpid comes from x= and the fingerprint is already present in the QR code.
+    let grpid = if admin_grpname.is_some() {
+        param
+            .get("x")
+            .filter(|&s| validate_id(s))
+            .map(|base_id| format!("{}{ADMIN_GROUP_ID_SEPARATOR}{base_id}", fingerprint.hex()))
+    } else {
+        param
+            .get("x")
+            .filter(|&s| validate_id(s))
+            .map(|s| s.to_string())
+    };
+
+    // Use admin_grpname as grpname when present (admin group).
+    let grpname = grpname.or(admin_grpname);
 
     let mut is_v3 = param.get("v") == Some(&"3");
 

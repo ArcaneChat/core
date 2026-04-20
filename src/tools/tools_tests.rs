@@ -223,6 +223,37 @@ fn test_validate_id() {
 }
 
 #[test]
+fn test_validate_group_id() {
+    // Regular group IDs pass validate_group_id.
+    for _ in 0..10 {
+        assert!(validate_group_id(&create_id()));
+    }
+
+    // Admin group grpid: 40-char uppercase hex fingerprint + '.' + base_id.
+    // A fingerprint almost always contains digits, e.g. '1' which has is_ascii_uppercase() == false,
+    // so it must NOT be rejected.
+    assert!(validate_group_id(
+        "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2.aaaaaaaaaaaa"
+    ));
+    // All-letter fingerprint (edge case, still valid).
+    assert!(validate_group_id(
+        "AABBCCDDEEFFAABBCCDDEEFFAABBCCDDEEFFAABB.aaaaaaaaaaaa"
+    ));
+    // Lowercase in fingerprint part is invalid.
+    assert!(!validate_group_id(
+        "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2.aaaaaaaaaaaa"
+    ));
+    // Too-short fingerprint part.
+    assert!(!validate_group_id("ABCDEF.aaaaaaaaaaaa"));
+    // Invalid base_id (too short).
+    assert!(!validate_group_id("A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2.short"));
+    // No separator.
+    assert!(!validate_group_id(
+        "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2aaaaaaaaaaaa"
+    ));
+}
+
+#[test]
 fn test_create_id_invalid_chars() {
     for _ in 1..1000 {
         let buf = create_id();

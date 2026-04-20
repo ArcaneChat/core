@@ -5,8 +5,8 @@ use tokio::fs;
 use super::*;
 use crate::chat::{
     CantSendReason, ChatItem, ChatVisibility, add_contact_to_chat, add_to_chat_contacts_table,
-    create_group, get_chat_contacts, get_chat_msgs, is_contact_in_chat, remove_contact_from_chat,
-    send_text_msg,
+    create_group, create_group_with_admin, get_chat_contacts, get_chat_msgs, is_contact_in_chat,
+    remove_contact_from_chat, send_text_msg,
 };
 use crate::chatlist::Chatlist;
 use crate::constants::DC_GCL_FOR_FORWARDING;
@@ -5671,6 +5671,145 @@ async fn test_mark_message_as_delivered_only_after_sent_out_fully() -> Result<()
     // because everything was sent by now.
     receive_imf(alice, post_msg_payload.as_bytes(), false).await?;
     assert_eq!(msg_id.get_state(alice).await?, MessageState::OutDelivered);
+
+    Ok(())
+}
+
+/// Tests that a non-admin member's message does not implicitly create an admin
+/// group on the receiver's side when the receiver hasn't seen the group yet.
+///
+/// Security property: the admin fingerprint embedded in the grpid must match
+/// the sender's fingerprint before we create a new group locally. This prevents
+/// a non-admin from abusing the secure-join "add member" flow to inject a fake
+/// admin group into a recipient's chat list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_admin_group_not_created_from_non_admin_message() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+    let fiona = &tcm.fiona().await;
+
+    // Create the admin group on Alice's side and add Bob and Fiona.
+    let alice_group = create_group_with_admin(alice, "Admin Group").await?;
+    let bob_contact = alice.add_or_lookup_contact_id(bob).await;
+    let fiona_contact = alice.add_or_lookup_contact_id(fiona).await;
+    add_contact_to_chat(alice, alice_group, bob_contact).await?;
+    add_contact_to_chat(alice, alice_group, fiona_contact).await?;
+
+    // Alice sends the first group message.  Only Bob receives it; Fiona does not.
+    // This lets Bob learn Fiona's public key (via Autocrypt-Gossip) so that
+    // subsequent messages Bob sends can be encrypted for Fiona as well.
+    let alice_sent = alice.send_text(alice_group, "Hello from Alice!").await;
+    let bob_msg = bob.recv_msg(&alice_sent).await;
+    let bob_group = bob_msg.chat_id;
+
+    // Verify the admin group was properly created on Bob's side.
+    let bob_chat = chat::Chat::load_from_db(bob, bob_group).await?;
+    assert!(
+        bob_chat.grpid.contains('.'),
+        "Bob's group should have an admin grpid (FINGERPRINT.base)"
+    );
+
+    // Fiona has NOT yet received any message from the admin group.
+    // She has zero knowledge of the group at this point.
+
+    // Bob (a non-admin member) sends a message to the admin group.
+    // Bob's SMTP output will be encrypted for Alice AND Fiona (Bob learned Fiona's
+    // key from Alice's first message gossip).
+    bob_group.accept(bob).await?;
+    let bob_sent = bob.send_text(bob_group, "Hello from Bob!").await;
+
+    // Fiona receives Bob's message.  Since Bob's fingerprint does NOT match the
+    // admin fingerprint embedded in the grpid, the group must NOT be created on
+    // Fiona's side.
+    let received = receive_imf(fiona, bob_sent.payload().as_bytes(), false)
+        .await?;
+    // Either the message was discarded entirely or it went to trash / 1:1 chat.
+    // Either way, no new *admin group* chat should have appeared.
+    if let Some(ref r) = received {
+        let chat = chat::Chat::load_from_db(fiona, r.chat_id).await?;
+        assert!(
+            !chat.grpid.contains('.'),
+            "Fiona should not have an admin group created from a non-admin sender, \
+             but got grpid={:?}",
+            chat.grpid
+        );
+    }
+
+    // Explicitly verify that Fiona has no admin group in her entire chat list.
+    let fiona_chats = Chatlist::try_load(fiona, 0, None, None).await?;
+    for i in 0..fiona_chats.len() {
+        let chat_id = fiona_chats.get_chat_id(i)?;
+        let chat = chat::Chat::load_from_db(fiona, chat_id).await?;
+        assert!(
+            !chat.grpid.contains('.'),
+            "Fiona should not have an admin group, but found chat with grpid={:?}",
+            chat.grpid
+        );
+    }
+
+    Ok(())
+}
+
+/// Tests that the admin of an admin group does not accept member-list changes
+/// gossiped by a non-admin member.
+///
+/// The admin already has the group.  A non-admin member (Bob) sends a message
+/// with a new contact (Fiona) in the `To:` header along with
+/// `Chat-Group-Member-Timestamps`.  The admin must NOT add Fiona to the group
+/// as a result of processing Bob's message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_admin_group_rejects_member_gossip_from_non_admin() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+    let fiona = &tcm.fiona().await;
+
+    // Alice creates an admin group and adds only Bob (not Fiona yet).
+    let alice_group = create_group_with_admin(alice, "Admin Group").await?;
+    let bob_contact_on_alice = alice.add_or_lookup_contact_id(bob).await;
+    add_contact_to_chat(alice, alice_group, bob_contact_on_alice).await?;
+
+    // Alice sends the first message so Bob learns the group (and Fiona's key
+    // from Alice's Autocrypt-Gossip, if she were there — but she's not yet).
+    let alice_sent = alice.send_text(alice_group, "Hello from Alice!").await;
+    let bob_msg = bob.recv_msg(&alice_sent).await;
+    let bob_group = bob_msg.chat_id;
+
+    // Confirm Alice's group has only SELF + Bob.
+    let alice_members_before = get_chat_contacts(alice, alice_group).await?;
+    assert_eq!(alice_members_before.len(), 2, "Alice's group should have 2 members before Bob's message");
+    let fiona_contact_on_alice = alice.add_or_lookup_contact_id(fiona).await;
+    assert!(
+        !alice_members_before.contains(&fiona_contact_on_alice),
+        "Fiona should not be in Alice's group yet"
+    );
+
+    // Bob (non-admin) somehow has Fiona's key and adds her to his local copy
+    // of the group, then sends a message that includes Fiona in To: with
+    // Chat-Group-Member-Timestamps — simulating a rogue/modified client that
+    // bypasses the send-side admin check.
+    bob_group.accept(bob).await?;
+    let fiona_contact_on_bob = bob.add_or_lookup_contact_id(fiona).await;
+    // Insert directly into chats_contacts, bypassing the admin send-side guard,
+    // to simulate a rogue client that forced the addition.
+    add_to_chat_contacts_table(bob, 0, bob_group, &[fiona_contact_on_bob]).await?;
+    let bob_sent = bob.send_text(bob_group, "Hello from Bob!").await;
+
+    // Alice receives Bob's message.
+    alice.recv_msg(&bob_sent).await;
+
+    // Alice's member list must NOT have grown: Fiona must still be absent.
+    let alice_members_after = get_chat_contacts(alice, alice_group).await?;
+    assert!(
+        !alice_members_after.contains(&fiona_contact_on_alice),
+        "Alice should not have added Fiona based on a non-admin's message"
+    );
+    assert_eq!(
+        alice_members_after.len(),
+        alice_members_before.len(),
+        "Alice's group member count should be unchanged after non-admin gossip"
+    );
 
     Ok(())
 }

@@ -33,7 +33,7 @@ use crate::param::{Param, Params};
 use crate::simplify::{SimplifiedText, simplify};
 use crate::sync::SyncItems;
 use crate::tools::{
-    get_filemeta, parse_receive_headers, smeared_time, time, truncate_msg_text, validate_id,
+    get_filemeta, parse_receive_headers, smeared_time, time, truncate_msg_text, validate_group_id,
 };
 use crate::{chatlist_events, location, tools};
 
@@ -1094,9 +1094,11 @@ impl MimeMessage {
     }
 
     /// Returns `Chat-Group-ID` header value if it is a valid group ID.
+    ///
+    /// Accepts both regular group IDs and admin group IDs (`FINGERPRINT.base_grpid`).
     pub fn get_chat_group_id(&self) -> Option<&str> {
         self.get_header(HeaderDef::ChatGroupId)
-            .filter(|s| validate_id(s))
+            .filter(|s| validate_group_id(s))
     }
 
     async fn parse_mime_recursive<'a>(
