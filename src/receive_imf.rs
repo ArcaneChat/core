@@ -3207,6 +3207,7 @@ async fn apply_group_changes(
         // Avoid insertion of `from_id` into a group with inappropriate encryption state.
         if from_is_key_contact != chat.grpid.is_empty()
             && chat.member_list_is_stale(context).await?
+            && sender_is_admin
         {
             info!(context, "Member list is stale.");
             let mut new_members: HashSet<ContactId> =
@@ -3243,6 +3244,7 @@ async fn apply_group_changes(
             send_event_chat_modified = true;
         } else if let Some(ref chat_group_member_timestamps) =
             mime_parser.chat_group_member_timestamps()
+            && sender_is_admin
         {
             send_event_chat_modified |= update_chats_contacts_timestamps(
                 context,
