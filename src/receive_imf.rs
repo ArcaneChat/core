@@ -2897,6 +2897,22 @@ async fn create_group(
             // otherwise, a pending "quit" message may pop up
             && mime_parser.get_header(HeaderDef::ChatGroupMemberRemoved).is_none()
     {
+        // For admin groups the grpid encodes the admin's fingerprint.
+        // Only accept group creation if the sender is that admin;
+        // otherwise a non-admin could send a message with the admin-grpid
+        // and implicitly create the group on receivers that are not yet
+        // members, potentially manipulating group state.
+        if let Some(admin_fpr) = admin_group_fingerprint(grpid) {
+            let from_fpr = get_contact_fingerprint(context, from_id).await?;
+            if from_fpr.as_deref() != Some(admin_fpr) {
+                info!(
+                    context,
+                    "Ignoring creation of admin group {grpid}: sender {from_id} is not the admin."
+                );
+                return Ok(None);
+            }
+        }
+
         // Group does not exist but should be created.
         let grpname = mime_parser
             .get_header(HeaderDef::ChatGroupName)
