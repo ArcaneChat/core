@@ -230,7 +230,7 @@ fn test_validate_group_id() {
     }
 
     // Admin group grpid: 40-char uppercase hex fingerprint + '.' + base_id.
-    // A fingerprint almost always contains digits, e.g. '1' has is_ascii_uppercase() == false,
+    // A fingerprint almost always contains digits, e.g. '1' which has is_ascii_uppercase() == false,
     // so it must NOT be rejected.
     assert!(validate_group_id(
         "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2.aaaaaaaaaaaa"

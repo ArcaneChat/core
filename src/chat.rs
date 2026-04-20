@@ -3630,8 +3630,7 @@ pub async fn get_admin_contact_id(
         }
     }
 
-    // `admin_group_fingerprint` guarantees admin_fpr is non-empty, so the extra
-    // `fingerprint!=''` guard is not needed but is harmless.
+    // `admin_group_fingerprint` guarantees admin_fpr is non-empty.
     let contact_id = context
         .sql
         .query_row_optional(

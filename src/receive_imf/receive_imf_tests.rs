@@ -5687,18 +5687,18 @@ async fn test_admin_group_not_created_from_non_admin_message() -> Result<()> {
     let mut tcm = TestContextManager::new();
     let alice = &tcm.alice().await;
     let bob = &tcm.bob().await;
-    let carol = &tcm.fiona().await;
+    let fiona = &tcm.fiona().await;
 
-    // Create the admin group on Alice's side and add Bob and Carol.
+    // Create the admin group on Alice's side and add Bob and Fiona.
     let alice_group = create_group_with_admin(alice, "Admin Group").await?;
     let bob_contact = alice.add_or_lookup_contact_id(bob).await;
-    let carol_contact = alice.add_or_lookup_contact_id(carol).await;
+    let fiona_contact = alice.add_or_lookup_contact_id(fiona).await;
     add_contact_to_chat(alice, alice_group, bob_contact).await?;
-    add_contact_to_chat(alice, alice_group, carol_contact).await?;
+    add_contact_to_chat(alice, alice_group, fiona_contact).await?;
 
-    // Alice sends the first group message.  Only Bob receives it; Carol does not.
-    // This lets Bob learn Carol's public key (via Autocrypt-Gossip) so that
-    // subsequent messages Bob sends can be encrypted for Carol as well.
+    // Alice sends the first group message.  Only Bob receives it; Fiona does not.
+    // This lets Bob learn Fiona's public key (via Autocrypt-Gossip) so that
+    // subsequent messages Bob sends can be encrypted for Fiona as well.
     let alice_sent = alice.send_text(alice_group, "Hello from Alice!").await;
     let bob_msg = bob.recv_msg(&alice_sent).await;
     let bob_group = bob_msg.chat_id;
@@ -5710,40 +5710,40 @@ async fn test_admin_group_not_created_from_non_admin_message() -> Result<()> {
         "Bob's group should have an admin grpid (FINGERPRINT.base)"
     );
 
-    // Carol has NOT yet received any message from the admin group.
+    // Fiona has NOT yet received any message from the admin group.
     // She has zero knowledge of the group at this point.
 
     // Bob (a non-admin member) sends a message to the admin group.
-    // Bob's SMTP output will be encrypted for Alice AND Carol (Bob learned Carol's
+    // Bob's SMTP output will be encrypted for Alice AND Fiona (Bob learned Fiona's
     // key from Alice's first message gossip).
     bob_group.accept(bob).await?;
     let bob_sent = bob.send_text(bob_group, "Hello from Bob!").await;
 
-    // Carol receives Bob's message.  Since Bob's fingerprint does NOT match the
+    // Fiona receives Bob's message.  Since Bob's fingerprint does NOT match the
     // admin fingerprint embedded in the grpid, the group must NOT be created on
-    // Carol's side.
-    let received = receive_imf(carol, bob_sent.payload().as_bytes(), false)
+    // Fiona's side.
+    let received = receive_imf(fiona, bob_sent.payload().as_bytes(), false)
         .await?;
     // Either the message was discarded entirely or it went to trash / 1:1 chat.
     // Either way, no new *admin group* chat should have appeared.
     if let Some(ref r) = received {
-        let chat = chat::Chat::load_from_db(carol, r.chat_id).await?;
+        let chat = chat::Chat::load_from_db(fiona, r.chat_id).await?;
         assert!(
             !chat.grpid.contains('.'),
-            "Carol should not have an admin group created from a non-admin sender, \
+            "Fiona should not have an admin group created from a non-admin sender, \
              but got grpid={:?}",
             chat.grpid
         );
     }
 
-    // Explicitly verify that Carol has no admin group in her entire chat list.
-    let carol_chats = Chatlist::try_load(carol, 0, None, None).await?;
-    for i in 0..carol_chats.len() {
-        let chat_id = carol_chats.get_chat_id(i)?;
-        let chat = chat::Chat::load_from_db(carol, chat_id).await?;
+    // Explicitly verify that Fiona has no admin group in her entire chat list.
+    let fiona_chats = Chatlist::try_load(fiona, 0, None, None).await?;
+    for i in 0..fiona_chats.len() {
+        let chat_id = fiona_chats.get_chat_id(i)?;
+        let chat = chat::Chat::load_from_db(fiona, chat_id).await?;
         assert!(
             !chat.grpid.contains('.'),
-            "Carol should not have an admin group, but found chat with grpid={:?}",
+            "Fiona should not have an admin group, but found chat with grpid={:?}",
             chat.grpid
         );
     }
