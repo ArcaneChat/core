@@ -323,6 +323,29 @@ pub(crate) fn validate_id(s: &str) -> bool {
     s.chars().all(|c| alphabet.contains(c)) && s.len() > 10 && s.len() <= 32
 }
 
+/// Returns true if given string is a valid group ID.
+///
+/// Accepts both:
+/// - regular group IDs generated with `create_id()` (URL-safe base64, 11–32 chars), and
+/// - admin group IDs of the form `FINGERPRINT.BASEID` where `FINGERPRINT` is a 40-char
+///   uppercase hex string and `BASEID` satisfies [`validate_id`].
+///
+/// The separator `.` between the fingerprint and base ID is chosen because it does not appear
+/// in URL-safe base64 (`A-Za-z0-9-_`) or in uppercase hex (`A-F0-9`).
+pub(crate) fn validate_group_id(s: &str) -> bool {
+    if validate_id(s) {
+        return true;
+    }
+    // Admin group grpid: FINGERPRINT.base_grpid
+    if let Some((fpr, base_id)) = s.split_once('.') {
+        fpr.len() == 40
+            && fpr.chars().all(|c| c.is_ascii_hexdigit() && c.is_ascii_uppercase())
+            && validate_id(base_id)
+    } else {
+        false
+    }
+}
+
 pub(crate) fn validate_broadcast_secret(s: &str) -> bool {
     let alphabet = base64::alphabet::URL_SAFE.as_str();
     s.chars().all(|c| alphabet.contains(c)) && s.len() >= 43 && s.len() <= 100
