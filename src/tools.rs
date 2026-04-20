@@ -339,7 +339,7 @@ pub(crate) fn validate_group_id(s: &str) -> bool {
     // Admin group grpid: FINGERPRINT.base_grpid
     if let Some((fpr, base_id)) = s.split_once('.') {
         fpr.len() == 40
-            && fpr.chars().all(|c| c.is_ascii_hexdigit() && c.is_ascii_uppercase())
+            && fpr.chars().all(|c| matches!(c, '0'..='9' | 'A'..='F'))
             && validate_id(base_id)
     } else {
         false
