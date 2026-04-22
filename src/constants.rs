@@ -199,7 +199,7 @@ pub const WORSE_IMAGE_BYTES: usize = 130_000;
 // max. width/height and bytes of an avatar
 pub(crate) const BALANCED_AVATAR_SIZE: u32 = 512;
 pub(crate) const BALANCED_AVATAR_BYTES: usize = 60_000;
-pub(crate) const WORSE_AVATAR_SIZE: u32 = 128;
+pub(crate) const WORSE_AVATAR_SIZE: u32 = 256;
 pub(crate) const WORSE_AVATAR_BYTES: usize = 20_000; // this also fits to Outlook servers don't allowing headers larger than 32k.
 
 // max. width/height of images scaled down because of being too huge
@@ -209,11 +209,6 @@ pub const WORSE_IMAGE_SIZE: u32 = 640;
 /// Limit for received images size. Bigger images become `Viewtype::File` to avoid excessive memory
 /// usage by UIs.
 pub const MAX_RCVD_IMAGE_PIXELS: u32 = 50_000_000;
-
-// Key for the folder configuration version (see below).
-pub(crate) const DC_FOLDERS_CONFIGURED_KEY: &str = "folders_configured";
-// this value can be increased if the folder configuration is changed and must be redone on next program start
-pub(crate) const DC_FOLDERS_CONFIGURED_VERSION: i32 = 5;
 
 // If more recipients are needed in SMTP's `RCPT TO:` header, the recipient list is split into
 // chunks. This does not affect MIME's `To:` header. Can be overwritten by setting
@@ -248,6 +243,9 @@ Here is what to do:
  • Have all recipients scan the QR code, or send them the link
 
 If you have any questions, please send an email to delta@merlinux.eu or ask at https://support.delta.chat/."#;
+
+/// How many recent messages should be re-sent to a new broadcast member.
+pub(crate) const N_MSGS_TO_NEW_BROADCAST_MEMBER: usize = 10;
 
 #[cfg(test)]
 mod tests {

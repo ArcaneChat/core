@@ -1919,7 +1919,7 @@ CREATE INDEX gossip_timestamp_index ON gossip_timestamp (chat_id, fingerprint);
 
     inc_and_check(&mut migration_version, 131)?;
     if dbversion < migration_version {
-        let entered_param = EnteredLoginParam::load(context).await?;
+        let entered_param = EnteredLoginParam::load_legacy(context).await?;
         let configured_param = ConfiguredLoginParam::load_legacy(context).await?;
 
         sql.execute_migration_transaction(
@@ -2311,6 +2311,66 @@ ALTER TABLE contacts ADD COLUMN name_normalized TEXT;
             UPDATE transports SET is_published=0 WHERE addr!=(
                 SELECT value FROM config WHERE keyname='configured_addr'
             )",
+            migration_version,
+        )
+        .await?;
+    }
+
+    inc_and_check(&mut migration_version, 150)?;
+    if dbversion < migration_version {
+        sql.execute_migration_transaction(
+            |transaction| {
+                let only_fetch_mvbox = transaction
+                    .query_row(
+                        "SELECT value FROM config WHERE keyname='only_fetch_mvbox'",
+                        (),
+                        |row| {
+                            let value: String = row.get(0)?;
+                            Ok(value)
+                        },
+                    )
+                    .optional()?
+                    .as_deref()
+                    == Some("1");
+
+                if only_fetch_mvbox {
+                    let mvbox_folder = transaction
+                        .query_row(
+                            "SELECT value FROM config WHERE keyname='configured_mvbox_folder'",
+                            (),
+                            |row| {
+                                let value: String = row.get(0)?;
+                                Ok(value)
+                            },
+                        )
+                        .optional()?
+                        .unwrap_or_else(|| "DeltaChat".to_string());
+
+                    transaction.execute(
+                        "UPDATE transports
+                         SET entered_param=json_set(entered_param, '$.imap.folder', ?1),
+                             configured_param=json_set(configured_param', '$.imap_folder', ?1)",
+                        (mvbox_folder,),
+                    )?;
+                }
+                Ok(())
+            },
+            migration_version,
+        )
+        .await?;
+    }
+
+    inc_and_check(&mut migration_version, 151)?;
+    if dbversion < migration_version {
+        sql.execute_migration(
+            "CREATE TABLE tls_spki (
+               host TEXT NOT NULL UNIQUE,
+               spki_hash TEXT NOT NULL, -- base64 of SPKI SHA-256 hash
+               timestamp INTEGER NOT NULL -- timestamp of the last time we have seen this key
+             ) STRICT;
+             -- Index on host column is created implicitly because of UNIQUE constraint.
+             CREATE INDEX tls_spki_index_timestamp ON tls_spki (timestamp);
+            ",
             migration_version,
         )
         .await?;

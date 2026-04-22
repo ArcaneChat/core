@@ -34,6 +34,7 @@ async fn test_save_load_login_param() -> Result<()> {
             },
             user: "alice".to_string(),
         }],
+        imap_folder: None,
         imap_user: "".to_string(),
         imap_password: "foo".to_string(),
         smtp: vec![ConfiguredServerLoginParam {
@@ -117,8 +118,6 @@ async fn test_posteo_alias() -> Result<()> {
     t.set_config(Config::ConfiguredSendUser, Some(user)).await?;
     t.set_config(Config::ConfiguredSendPw, Some("foobarbaz"))
         .await?;
-    t.set_config(Config::ConfiguredSmtpCertificateChecks, Some("1"))
-        .await?; // Strict
     t.set_config(Config::ConfiguredServerFlags, Some("0"))
         .await?;
 
@@ -142,6 +141,7 @@ async fn test_posteo_alias() -> Result<()> {
                 user: user.to_string(),
             },
         ],
+        imap_folder: None,
         imap_user: "alice@posteo.de".to_string(),
         imap_password: "foobarbaz".to_string(),
         smtp: vec![
@@ -205,8 +205,6 @@ async fn test_empty_server_list_legacy() -> Result<()> {
         .await?; // Strict
     t.set_config(Config::ConfiguredSendPw, Some("foobarbaz"))
         .await?;
-    t.set_config(Config::ConfiguredSmtpCertificateChecks, Some("1"))
-        .await?; // Strict
     t.set_config(Config::ConfiguredServerFlags, Some("0"))
         .await?;
 
@@ -272,6 +270,7 @@ fn dummy_configured_login_param(
             },
             user: addr.to_string(),
         }],
+        imap_folder: None,
         imap_user: addr.to_string(),
         imap_password: "foobarbaz".to_string(),
         smtp: vec![ConfiguredServerLoginParam {

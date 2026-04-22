@@ -17,7 +17,7 @@ use crate::config::Config;
 use crate::contact::{Contact, ContactId, Origin};
 use crate::context::Context;
 use crate::key::Fingerprint;
-use crate::login_param::{EnteredCertificateChecks, EnteredLoginParam, EnteredServerLoginParam};
+use crate::login_param::{EnteredCertificateChecks, EnteredImapLoginParam, EnteredLoginParam};
 use crate::net::http::post_empty;
 use crate::net::proxy::{DEFAULT_SOCKS_PORT, ProxyConfig};
 use crate::token;
@@ -41,7 +41,7 @@ pub(crate) const DCBACKUP_SCHEME_PREFIX: &str = "DCBACKUP";
 
 /// Version written to Backups and Backup-QR-Codes.
 /// Imports will fail when they have a larger version.
-pub(crate) const DCBACKUP_VERSION: i32 = 4;
+pub(crate) const DCBACKUP_VERSION: i32 = 5;
 
 /// Scanned QR code.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -714,7 +714,6 @@ fn decode_account(qr: &str) -> Result<Qr> {
 }
 
 /// scheme: `https://t.me/socks?server=foo&port=123` or `https://t.me/socks?server=1.2.3.4&port=123`
-#[expect(clippy::arithmetic_side_effects)]
 fn decode_tg_socks_proxy(_context: &Context, qr: &str) -> Result<Qr> {
     let url = url::Url::parse(qr).context("Invalid t.me/socks url")?;
 
@@ -824,7 +823,7 @@ pub(crate) async fn login_param_from_account_qr(
 
         let param = EnteredLoginParam {
             addr,
-            imap: EnteredServerLoginParam {
+            imap: EnteredImapLoginParam {
                 password,
                 ..Default::default()
             },
@@ -844,7 +843,7 @@ pub(crate) async fn login_param_from_account_qr(
 
         let param = EnteredLoginParam {
             addr: email,
-            imap: EnteredServerLoginParam {
+            imap: EnteredImapLoginParam {
                 password,
                 ..Default::default()
             },

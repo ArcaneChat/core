@@ -390,27 +390,9 @@ char*           dc_get_blobdir               (const dc_context_t* context);
 /**
  * Configure the context. The configuration is handled by key=value pairs as:
  *
- * - `addr`         = Email address to use for configuration.
- *                    If dc_configure() fails this is not the email address actually in use.
- *                    Use `configured_addr` to find out the email address actually in use.
- * - `configured_addr` = Email address actually in use.
+ * - `configured_addr` = Email address in use.
  *                    Unless for testing, do not set this value using dc_set_config().
  *                    Instead, set `addr` and call dc_configure().
- * - `mail_server`  = IMAP-server, guessed if left out
- * - `mail_user`    = IMAP-username, guessed if left out
- * - `mail_pw`      = IMAP-password (always needed)
- * - `mail_port`    = IMAP-port, guessed if left out
- * - `mail_security`= IMAP-socket, one of @ref DC_SOCKET, defaults to #DC_SOCKET_AUTO
- * - `send_server`  = SMTP-server, guessed if left out
- * - `send_user`    = SMTP-user, guessed if left out
- * - `send_pw`      = SMTP-password, guessed if left out
- * - `send_port`    = SMTP-port, guessed if left out
- * - `send_security`= SMTP-socket, one of @ref DC_SOCKET, defaults to #DC_SOCKET_AUTO
- * - `server_flags` = IMAP-/SMTP-flags as a combination of @ref DC_LP flags, guessed if left out
- * - `proxy_enabled` = Proxy enabled. Disabled by default.
- * - `proxy_url` = Proxy URL. May contain multiple URLs separated by newline, but only the first one is used.
- * - `imap_certificate_checks` = how to check IMAP certificates, one of the @ref DC_CERTCK flags, defaults to #DC_CERTCK_AUTO (0)
- * - `smtp_certificate_checks` = deprecated option, should be set to the same value as `imap_certificate_checks` but ignored by the new core
  * - `displayname`  = Own name to use when sending messages. MUAs are allowed to spread this way e.g. using CC, defaults to empty
  * - `selfstatus`   = Own status to display, e.g. in e-mail footers, defaults to empty
  * - `selfavatar`   = File containing avatar. Will immediately be copied to the 
@@ -426,14 +408,6 @@ char*           dc_get_blobdir               (const dc_context_t* context);
  *                    1=send a copy of outgoing messages to self (default).
  *                    Sending messages to self is needed for a proper multi-account setup,
  *                    however, on the other hand, may lead to unwanted notifications in non-delta clients.
- * - `mvbox_move`   = 1=detect chat messages,
- *                    move them to the `DeltaChat` folder,
- *                    and watch the `DeltaChat` folder for updates (default),
- *                    0=do not move chat-messages
- * - `only_fetch_mvbox` = 1=Do not fetch messages from folders other than the
- *                    `DeltaChat` folder. Messages will still be fetched from the
- *                    spam folder.
- *                    0=watch all folders normally (default)
  * - `show_emails`  = DC_SHOW_EMAILS_OFF (0)=
  *                    show direct replies to chats only,
  *                    DC_SHOW_EMAILS_ACCEPTED_CONTACTS (1)=
@@ -521,6 +495,27 @@ char*           dc_get_blobdir               (const dc_context_t* context);
  *                       1 = Contacts (default, does not include contact requests),
  *                       2 = Nobody (calls never result in a notification).
  *
+ * Also, there are configs that are only needed
+ * if you want to use the deprecated dc_configure() API, such as:
+ *
+ * - `addr`         = Email address to use for configuration.
+ *                    If dc_configure() fails this is not the email address actually in use.
+ *                    Use `configured_addr` to find out the email address actually in use.
+ * - `mail_server`  = IMAP-server, guessed if left out
+ * - `mail_user`    = IMAP-username, guessed if left out
+ * - `mail_pw`      = IMAP-password (always needed)
+ * - `mail_port`    = IMAP-port, guessed if left out
+ * - `mail_security`= IMAP-socket, one of @ref DC_SOCKET, defaults to #DC_SOCKET_AUTO
+ * - `send_server`  = SMTP-server, guessed if left out
+ * - `send_user`    = SMTP-user, guessed if left out
+ * - `send_pw`      = SMTP-password, guessed if left out
+ * - `send_port`    = SMTP-port, guessed if left out
+ * - `send_security`= SMTP-socket, one of @ref DC_SOCKET, defaults to #DC_SOCKET_AUTO
+ * - `server_flags` = IMAP-/SMTP-flags as a combination of @ref DC_LP flags, guessed if left out
+ * - `proxy_enabled` = Proxy enabled. Disabled by default.
+ * - `proxy_url` = Proxy URL. May contain multiple URLs separated by newline, but only the first one is used.
+ * - `imap_certificate_checks` = how to check IMAP and SMTP certificates, one of the @ref DC_CERTCK flags, defaults to #DC_CERTCK_AUTO (0)
+
  * If you want to retrieve a value, use dc_get_config().
  *
  * @memberof dc_context_t
@@ -707,6 +702,12 @@ int              dc_get_push_state           (dc_context_t* context);
 
 /**
  * Configure a context.
+ *
+ * This way of configuring a context is deprecated,
+ * and does not allow to configure multiple transports.
+ * If you can, use the JSON-RPC API (../deltachat-jsonrpc/src/api.rs)
+ * `add_or_update_transport()`/`addOrUpdateTransport()` instead.
+ *
  * During configuration IO must not be started,
  * if needed stop IO using dc_accounts_stop_io() or dc_stop_io() first.
  * If the context is already configured,
@@ -4242,6 +4243,8 @@ char*             dc_msg_get_webxdc_blob      (const dc_msg_t* msg, const char* 
  *   true if the Webxdc should get internet access;
  *   this is the case i.e. for experimental maps integration.
  * - self_addr: address to be used for `window.webxdc.selfAddr` in JS land.
+ * - is_app_sender: Define if the local user is the one who initially shared the webxdc application in the chat.
+ * - is_broadcast: Define if the app runs in a broadcasting context.
  * - send_update_interval: Milliseconds to wait before calling `sendUpdate()` again since the last call.
  *   Should be exposed to `webxdc.sendUpdateInterval` in JS land.
  * - send_update_max_size: Maximum number of bytes accepted for a serialized update object.
@@ -5813,7 +5816,7 @@ int64_t         dc_lot_get_timestamp     (const dc_lot_t* lot);
  * These constants configure TLS certificate checks for IMAP and SMTP connections.
  *
  * These constants are set via dc_set_config()
- * using keys "imap_certificate_checks" and "smtp_certificate_checks".
+ * using key "imap_certificate_checks".
  *
  * @addtogroup DC_CERTCK
  * @{

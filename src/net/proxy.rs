@@ -171,7 +171,6 @@ pub enum ProxyConfig {
 }
 
 /// Constructs HTTP/1.1 `CONNECT` request for HTTP(S) proxy.
-#[expect(clippy::arithmetic_side_effects)]
 fn http_connect_request(host: &str, port: u16, auth: Option<(&str, &str)>) -> String {
     // According to <https://datatracker.ietf.org/doc/html/rfc7230#section-5.4>
     // clients MUST send `Host:` header in HTTP/1.1 requests,
@@ -320,7 +319,6 @@ impl ProxyConfig {
     /// config into `proxy_url` if `proxy_url` is unset or empty.
     ///
     /// Unsets `socks5_host`, `socks5_port`, `socks5_user` and `socks5_password` in any case.
-    #[expect(clippy::arithmetic_side_effects)]
     async fn migrate_socks_config(sql: &Sql) -> Result<()> {
         if sql.get_raw_config("proxy_url").await?.is_none() {
             // Load legacy SOCKS5 settings.
@@ -436,6 +434,8 @@ impl ProxyConfig {
                     "",
                     tcp_stream,
                     &context.tls_session_store,
+                    &context.spki_hash_store,
+                    &context.sql,
                 )
                 .await?;
                 let auth = if let Some((username, password)) = &https_config.user_password {

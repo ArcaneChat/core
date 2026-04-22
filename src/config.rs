@@ -42,50 +42,85 @@ use crate::{constants, stats};
 )]
 #[strum(serialize_all = "snake_case")]
 pub enum Config {
+    /// Deprecated(2026-04).
+    /// Use ConfiguredAddr, [`crate::login_param::EnteredLoginParam`],
+    /// or add_transport{from_qr}()/list_transports() instead.
+    ///
     /// Email address, used in the `From:` field.
     Addr,
 
+    /// Deprecated(2026-04).
+    /// Use EnteredLoginParam and add_transport{from_qr}()/list_transports() instead.
+    ///
     /// IMAP server hostname.
     MailServer,
 
+    /// Deprecated(2026-04).
+    /// Use EnteredLoginParam and add_transport{from_qr}()/list_transports() instead.
+    ///
     /// IMAP server username.
     MailUser,
 
+    /// Deprecated(2026-04).
+    /// Use EnteredLoginParam and add_transport{from_qr}()/list_transports() instead.
+    ///
     /// IMAP server password.
     MailPw,
 
+    /// Deprecated(2026-04).
+    /// Use EnteredLoginParam and add_transport{from_qr}()/list_transports() instead.
+    ///
     /// IMAP server port.
     MailPort,
 
+    /// Deprecated(2026-04).
+    /// Use EnteredLoginParam and add_transport{from_qr}()/list_transports() instead.
+    ///
     /// IMAP server security (e.g. TLS, STARTTLS).
     MailSecurity,
 
+    /// Deprecated(2026-04).
+    /// Use EnteredLoginParam and add_transport{from_qr}()/list_transports() instead.
+    ///
     /// How to check TLS certificates.
     ///
     /// "IMAP" in the name is for compatibility,
     /// this actually applies to both IMAP and SMTP connections.
     ImapCertificateChecks,
 
+    /// Deprecated(2026-04).
+    /// Use EnteredLoginParam and add_transport{from_qr}()/list_transports() instead.
+    ///
     /// SMTP server hostname.
     SendServer,
 
+    /// Deprecated(2026-04).
+    /// Use EnteredLoginParam and add_transport{from_qr}()/list_transports() instead.
+    ///
     /// SMTP server username.
     SendUser,
 
+    /// Deprecated(2026-04).
+    /// Use EnteredLoginParam and add_transport{from_qr}()/list_transports() instead.
+    ///
     /// SMTP server password.
     SendPw,
 
+    /// Deprecated(2026-04).
+    /// Use EnteredLoginParam and add_transport{from_qr}()/list_transports() instead.
+    ///
     /// SMTP server port.
     SendPort,
 
+    /// Deprecated(2026-04).
+    /// Use EnteredLoginParam and add_transport{from_qr}()/list_transports() instead.
+    ///
     /// SMTP server security (e.g. TLS, STARTTLS).
     SendSecurity,
 
-    /// Deprecated option for backwards compatibility.
+    /// Deprecated(2026-04).
+    /// Use EnteredLoginParam and add_transport{from_qr}()/list_transports() instead.
     ///
-    /// Certificate checks for SMTP are actually controlled by `imap_certificate_checks` config.
-    SmtpCertificateChecks,
-
     /// Whether to use OAuth 2.
     ///
     /// Historically contained other bitflags, which are now deprecated.
@@ -155,18 +190,6 @@ pub enum Config {
     #[strum(props(default = "1"))]
     MdnsEnabled,
 
-    /// True if chat messages should be moved to a separate folder. Auto-sent messages like sync
-    /// ones are moved there anyway.
-    #[strum(props(default = "1"))]
-    MvboxMove,
-
-    /// Watch for new messages in the "Mvbox" (aka DeltaChat folder) only.
-    ///
-    /// This will not entirely disable other folders, e.g. the spam folder will also still
-    /// be watched for new messages.
-    #[strum(props(default = "0"))]
-    OnlyFetchMvbox,
-
     /// Whether to show classic emails or only chat messages.
     #[strum(props(default = "2"))] // also change ShowEmails.default() on changes
     ShowEmails,
@@ -197,32 +220,47 @@ pub enum Config {
     /// The primary email address.
     ConfiguredAddr,
 
+    /// Deprecated(2026-04).
+    /// Use ConfiguredLoginParam and add_transport{from_qr}()/list_transports() instead.
+    ///
     /// List of configured IMAP servers as a JSON array.
     ConfiguredImapServers,
 
+    /// Deprecated(2026-04).
+    /// Use ConfiguredLoginParam and add_transport{from_qr}()/list_transports() instead.
+    ///
     /// Configured IMAP server hostname.
     ///
     /// This is replaced by `configured_imap_servers` for new configurations.
     ConfiguredMailServer,
 
-    /// Configured IMAP server port.
+    /// Deprecated(2026-04).
+    /// Use ConfiguredLoginParam and add_transport{from_qr}()/list_transports() instead.
     ///
-    /// This is replaced by `configured_imap_servers` for new configurations.
+    /// Configured IMAP server port.
     ConfiguredMailPort,
 
-    /// Configured IMAP server security (e.g. TLS, STARTTLS).
+    /// Deprecated(2026-04).
+    /// Use ConfiguredLoginParam and add_transport{from_qr}()/list_transports() instead.
     ///
-    /// This is replaced by `configured_imap_servers` for new configurations.
+    /// Configured IMAP server security (e.g. TLS, STARTTLS).
     ConfiguredMailSecurity,
 
-    /// Configured IMAP server username.
+    /// Deprecated(2026-04).
+    /// Use ConfiguredLoginParam and add_transport{from_qr}()/list_transports() instead.
     ///
-    /// This is set if user has configured username manually.
+    /// Configured IMAP server username.
     ConfiguredMailUser,
 
+    /// Deprecated(2026-04).
+    /// Use ConfiguredLoginParam and add_transport{from_qr}()/list_transports() instead.
+    ///
     /// Configured IMAP server password.
     ConfiguredMailPw,
 
+    /// Deprecated(2026-04).
+    /// Use ConfiguredLoginParam and add_transport{from_qr}()/list_transports() instead.
+    ///
     /// Configured TLS certificate checks.
     /// This option is saved on successful configuration
     /// and should not be modified manually.
@@ -231,45 +269,58 @@ pub enum Config {
     /// but has "IMAP" in the name for backwards compatibility.
     ConfiguredImapCertificateChecks,
 
+    /// Deprecated(2026-04).
+    /// Use ConfiguredLoginParam and add_transport{from_qr}()/list_transports() instead.
+    ///
     /// List of configured SMTP servers as a JSON array.
     ConfiguredSmtpServers,
 
+    /// Deprecated(2026-04).
+    /// Use ConfiguredLoginParam and add_transport{from_qr}()/list_transports() instead.
+    ///
     /// Configured SMTP server hostname.
     ///
     /// This is replaced by `configured_smtp_servers` for new configurations.
     ConfiguredSendServer,
 
+    /// Deprecated(2026-04).
+    /// Use ConfiguredLoginParam and add_transport{from_qr}()/list_transports() instead.
+    ///
     /// Configured SMTP server port.
     ///
     /// This is replaced by `configured_smtp_servers` for new configurations.
     ConfiguredSendPort,
 
+    /// Deprecated(2026-04).
+    /// Use ConfiguredLoginParam and add_transport{from_qr}()/list_transports() instead.
+    ///
     /// Configured SMTP server security (e.g. TLS, STARTTLS).
     ///
     /// This is replaced by `configured_smtp_servers` for new configurations.
     ConfiguredSendSecurity,
 
+    /// Deprecated(2026-04).
+    /// Use ConfiguredLoginParam and add_transport{from_qr}()/list_transports() instead.
+    ///
     /// Configured SMTP server username.
     ///
     /// This is set if user has configured username manually.
     ConfiguredSendUser,
 
+    /// Deprecated(2026-04).
+    /// Use ConfiguredLoginParam and add_transport{from_qr}()/list_transports() instead.
+    ///
     /// Configured SMTP server password.
     ConfiguredSendPw,
 
-    /// Deprecated, stored for backwards compatibility.
+    /// Deprecated(2026-04).
+    /// Use ConfiguredLoginParam and add_transport{from_qr}()/list_transports() instead.
     ///
-    /// ConfiguredImapCertificateChecks is actually used.
-    ConfiguredSmtpCertificateChecks,
-
     /// Whether OAuth 2 is used with configured provider.
     ConfiguredServerFlags,
 
     /// Configured folder for incoming messages.
     ConfiguredInboxFolder,
-
-    /// Configured folder for chat messages.
-    ConfiguredMvboxFolder,
 
     /// Unix timestamp of the last successful configuration.
     ConfiguredTimestamp,
@@ -277,6 +328,9 @@ pub enum Config {
     /// ID of the configured provider from the provider database.
     ConfiguredProvider,
 
+    /// Deprecated(2026-04).
+    /// Use [`Context::is_configured()`] instead.
+    ///
     /// True if account is configured.
     Configured,
 
@@ -467,7 +521,6 @@ impl Config {
             self,
             Self::Displayname
                 | Self::MdnsEnabled
-                | Self::MvboxMove
                 | Self::ShowEmails
                 | Self::Selfavatar
                 | Self::Selfstatus,
@@ -476,10 +529,7 @@ impl Config {
 
     /// Whether the config option needs an IO scheduler restart to take effect.
     pub(crate) fn needs_io_restart(&self) -> bool {
-        matches!(
-            self,
-            Config::MvboxMove | Config::OnlyFetchMvbox | Config::ConfiguredAddr
-        )
+        matches!(self, Config::ConfiguredAddr)
     }
 }
 
@@ -594,13 +644,6 @@ impl Context {
             .is_some_and(|x| x != 0))
     }
 
-    /// Returns true if movebox ("DeltaChat" folder) should be watched.
-    pub(crate) async fn should_watch_mvbox(&self) -> Result<bool> {
-        Ok(self.get_config_bool(Config::MvboxMove).await?
-            || self.get_config_bool(Config::OnlyFetchMvbox).await?
-            || !self.get_config_bool(Config::IsChatmail).await?)
-    }
-
     /// Returns true if sync messages should be sent.
     pub(crate) async fn should_send_sync_msgs(&self) -> Result<bool> {
         Ok(self.get_config_bool(Config::SyncMsgs).await?
@@ -682,8 +725,6 @@ impl Context {
             | Config::ProxyEnabled
             | Config::BccSelf
             | Config::MdnsEnabled
-            | Config::MvboxMove
-            | Config::OnlyFetchMvbox
             | Config::Configured
             | Config::Bot
             | Config::NotifyAboutWrongPw
@@ -705,11 +746,6 @@ impl Context {
     /// set to the default if there is one.
     pub async fn set_config(&self, key: Config, value: Option<&str>) -> Result<()> {
         Self::check_config(key, value)?;
-
-        let n_transports = self.count_transports().await?;
-        if n_transports > 1 && matches!(key, Config::MvboxMove | Config::OnlyFetchMvbox) {
-            bail!("Cannot reconfigure {key} when multiple transports are configured");
-        }
 
         let _pause = match key.needs_io_restart() {
             true => self.scheduler.pause(self).await?,
@@ -787,12 +823,6 @@ impl Context {
             Config::Addr => {
                 self.sql
                     .set_raw_config(key.as_ref(), value.map(|s| s.to_lowercase()).as_deref())
-                    .await?;
-            }
-            Config::MvboxMove => {
-                self.sql.set_raw_config(key.as_ref(), value).await?;
-                self.sql
-                    .set_raw_config(constants::DC_FOLDERS_CONFIGURED_KEY, None)
                     .await?;
             }
             Config::ConfiguredAddr => {

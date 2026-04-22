@@ -173,9 +173,7 @@ pub(crate) async fn download_msg(
     if msg_transport_id != transport_id {
         return Ok(None);
     }
-    session
-        .fetch_single_msg(context, &server_folder, server_uid, rfc724_mid)
-        .await?;
+    Box::pin(session.fetch_single_msg(context, &server_folder, server_uid, rfc724_mid)).await?;
     Ok(Some(()))
 }
 
@@ -204,8 +202,11 @@ impl Session {
         let mut uid_message_ids: BTreeMap<u32, String> = BTreeMap::new();
         uid_message_ids.insert(uid, rfc724_mid);
         let (sender, receiver) = async_channel::unbounded();
-        self.fetch_many_msgs(context, folder, vec![uid], &uid_message_ids, sender)
-            .await?;
+        {
+            let _fetch_msgs_lock_guard = context.fetch_msgs_mutex.lock().await;
+            self.fetch_many_msgs(context, folder, vec![uid], &uid_message_ids, sender)
+                .await?;
+        }
         if receiver.recv().await.is_err() {
             bail!("Failed to fetch UID {uid}");
         }

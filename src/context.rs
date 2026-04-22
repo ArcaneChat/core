@@ -20,16 +20,16 @@ use crate::constants::{self, DC_BACKGROUND_FETCH_QUOTA_CHECK_RATELIMIT, DC_VERSI
 use crate::contact::{Contact, ContactId};
 use crate::debug_logging::DebugLogging;
 use crate::events::{Event, EventEmitter, EventType, Events};
-use crate::imap::{FolderMeaning, Imap, ServerMetadata};
+use crate::imap::{Imap, ServerMetadata};
 use crate::key::self_fingerprint;
 use crate::log::warn;
 use crate::logged_debug_assert;
 use crate::message::{self, MessageState, MsgId};
-use crate::net::tls::TlsSessionStore;
+use crate::net::tls::{SpkiHashStore, TlsSessionStore};
 use crate::peer_channels::Iroh;
 use crate::push::PushSubscriber;
 use crate::quota::QuotaInfo;
-use crate::scheduler::{ConnectivityStore, SchedulerState, convert_folder_meaning};
+use crate::scheduler::{ConnectivityStore, SchedulerState};
 use crate::sql::Sql;
 use crate::stock_str::StockStrings;
 use crate::timesmearing::SmearedTimestamp;
@@ -308,6 +308,13 @@ pub struct InnerContext {
     /// TLS session resumption cache.
     pub(crate) tls_session_store: TlsSessionStore,
 
+    /// Store for TLS SPKI hashes.
+    ///
+    /// Used to remember public keys
+    /// of TLS certificates to accept them
+    /// even after they expire.
+    pub(crate) spki_hash_store: SpkiHashStore,
+
     /// Iroh for realtime peer channels.
     pub(crate) iroh: Arc<RwLock<Option<Iroh>>>,
 
@@ -511,6 +518,7 @@ impl Context {
             push_subscriber,
             push_subscribed: AtomicBool::new(false),
             tls_session_store: TlsSessionStore::new(),
+            spki_hash_store: SpkiHashStore::new(),
             iroh: Arc::new(RwLock::new(None)),
             self_fingerprint: OnceLock::new(),
             self_public_key: Mutex::new(None),
@@ -558,6 +566,15 @@ impl Context {
                 let _ = tokio::time::timeout(Duration::from_secs(60), iroh.close()).await;
             });
         }
+    }
+
+    /// Requests deletion of all messages from chatmail relays.
+    ///
+    /// Non-chatmail relays are excluded
+    /// to avoid accidentally deleting emails
+    /// from shared inboxes.
+    pub async fn clear_all_relay_storage(&self) -> Result<()> {
+        self.scheduler.clear_all_relay_storage().await
     }
 
     /// Restarts the IO scheduler if it was running before
@@ -628,17 +645,10 @@ impl Context {
             let mut session = connection.prepare(self).await?;
 
             // Fetch IMAP folders.
-            // Inbox is fetched before Mvbox because fetching from Inbox
-            // may result in moving some messages to Mvbox.
-            for folder_meaning in [FolderMeaning::Inbox, FolderMeaning::Mvbox] {
-                if let Some((_folder_config, watch_folder)) =
-                    convert_folder_meaning(self, folder_meaning).await?
-                {
-                    connection
-                        .fetch_move_delete(self, &mut session, &watch_folder, folder_meaning)
-                        .await?;
-                }
-            }
+            let folder = connection.folder.clone();
+            connection
+                .fetch_move_delete(self, &mut session, &folder)
+                .await?;
 
             // Update quota (to send warning if full) - but only check it once in a while.
             // note: For now this only checks quota of primary transport,
@@ -649,7 +659,7 @@ impl Context {
                     DC_BACKGROUND_FETCH_QUOTA_CHECK_RATELIMIT,
                 )
                 .await
-                && let Err(err) = self.update_recent_quota(&mut session).await
+                && let Err(err) = self.update_recent_quota(&mut session, &folder).await
             {
                 warn!(self, "Failed to update quota: {err:#}.");
             }
@@ -889,23 +899,6 @@ impl Context {
             Err(err) => format!("<key failure: {err}>"),
         };
 
-        let mvbox_move = self.get_config_int(Config::MvboxMove).await?;
-        let only_fetch_mvbox = self.get_config_int(Config::OnlyFetchMvbox).await?;
-        let folders_configured = self
-            .sql
-            .get_raw_config_int(constants::DC_FOLDERS_CONFIGURED_KEY)
-            .await?
-            .unwrap_or_default();
-
-        let configured_inbox_folder = self
-            .get_config(Config::ConfiguredInboxFolder)
-            .await?
-            .unwrap_or_else(|| "<unset>".to_string());
-        let configured_mvbox_folder = self
-            .get_config(Config::ConfiguredMvboxFolder)
-            .await?
-            .unwrap_or_else(|| "<unset>".to_string());
-
         let mut res = get_info();
 
         // insert values
@@ -981,14 +974,6 @@ impl Context {
                 .await?
                 .to_string(),
         );
-        res.insert("mvbox_move", mvbox_move.to_string());
-        res.insert("only_fetch_mvbox", only_fetch_mvbox.to_string());
-        res.insert(
-            constants::DC_FOLDERS_CONFIGURED_KEY,
-            folders_configured.to_string(),
-        );
-        res.insert("configured_inbox_folder", configured_inbox_folder);
-        res.insert("configured_mvbox_folder", configured_mvbox_folder);
         res.insert("mdns_enabled", mdns_enabled.to_string());
         res.insert("bcc_self", bcc_self.to_string());
         res.insert("sync_msgs", sync_msgs.to_string());
@@ -1300,12 +1285,6 @@ ORDER BY m.timestamp DESC,m.id DESC",
         };
 
         Ok(list)
-    }
-
-    /// Returns true if given folder name is the name of the "DeltaChat" folder.
-    pub async fn is_mvbox(&self, folder_name: &str) -> Result<bool> {
-        let mvbox = self.get_config(Config::ConfiguredMvboxFolder).await?;
-        Ok(mvbox.as_deref() == Some(folder_name))
     }
 
     pub(crate) fn derive_blobdir(dbfile: &Path) -> PathBuf {

@@ -194,6 +194,7 @@ fn new_address_with_name(name: &str, address: String) -> Address<'static> {
 }
 
 impl MimeFactory {
+    /// Returns `MimeFactory` for rendering `msg`.
     #[expect(clippy::arithmetic_side_effects)]
     pub async fn from_msg(context: &Context, msg: Message) -> Result<MimeFactory> {
         let now = time();
@@ -463,18 +464,21 @@ impl MimeFactory {
                 .into_iter()
                 .filter(|id| *id != ContactId::SELF)
                 .collect();
-            if recipient_ids.len() == 1
-                && !matches!(
-                    msg.param.get_cmd(),
-                    SystemMessage::MemberRemovedFromGroup | SystemMessage::SecurejoinMessage
-                )
-                && !matches!(chat.typ, Chattype::OutBroadcast | Chattype::InBroadcast)
+            if !matches!(
+                msg.param.get_cmd(),
+                SystemMessage::MemberRemovedFromGroup | SystemMessage::SecurejoinMessage
+            ) && !matches!(chat.typ, Chattype::OutBroadcast | Chattype::InBroadcast)
             {
+                let origin = match recipient_ids.len() {
+                    1 => Origin::OutgoingTo,
+                    // Use the same origin as ChatId::accept_ex() does for groups.
+                    _ => Origin::IncomingTo,
+                };
                 info!(
                     context,
-                    "Scale up origin of {} recipients to OutgoingTo.", chat.id
+                    "Scale up origin of {} recipients to {origin:?}.", chat.id
                 );
-                ContactId::scaleup_origin(context, &recipient_ids, Origin::OutgoingTo).await?;
+                ContactId::scaleup_origin(context, &recipient_ids, origin).await?;
             }
 
             if !msg.is_system_message()
@@ -1391,10 +1395,7 @@ impl MimeFactory {
             }
         }
 
-        if chat.typ == Chattype::Group
-            || chat.typ == Chattype::OutBroadcast
-            || chat.typ == Chattype::InBroadcast
-        {
+        if chat.typ == Chattype::Group || chat.typ == Chattype::OutBroadcast {
             headers.push((
                 "Chat-Group-Name",
                 mail_builder::headers::text::Text::new(chat.name.to_string()).into(),
@@ -1405,7 +1406,11 @@ impl MimeFactory {
                     mail_builder::headers::text::Text::new(ts.to_string()).into(),
                 ));
             }
-
+        }
+        if chat.typ == Chattype::Group
+            || chat.typ == Chattype::OutBroadcast
+            || chat.typ == Chattype::InBroadcast
+        {
             match command {
                 SystemMessage::MemberRemovedFromGroup => {
                     let email_to_remove = msg.param.get(Param::Arg).unwrap_or_default();
@@ -1884,7 +1889,6 @@ impl MimeFactory {
     }
 
     /// Render an MDN
-    #[expect(clippy::arithmetic_side_effects)]
     fn render_mdn(&mut self) -> Result<MimePart<'static>> {
         // RFC 6522, this also requires the `report-type` parameter which is equal
         // to the MIME subtype of the second body part of the multipart/report
@@ -2223,18 +2227,18 @@ fn should_encrypt_symmetrically(msg: &Message, chat: &Chat) -> bool {
 /// rather than all recipients.
 /// This function returns the fingerprint of the recipient the message should be sent to.
 fn must_have_only_one_recipient<'a>(msg: &'a Message, chat: &Chat) -> Option<Result<&'a str>> {
-    if chat.typ == Chattype::OutBroadcast
-        && matches!(
-            msg.param.get_cmd(),
-            SystemMessage::MemberRemovedFromGroup | SystemMessage::MemberAddedToGroup
-        )
-    {
-        let Some(fp) = msg.param.get(Param::Arg4) else {
-            return Some(Err(format_err!("Missing removed/added member")));
-        };
-        return Some(Ok(fp));
+    if chat.typ != Chattype::OutBroadcast {
+        None
+    } else if let Some(fp) = msg.param.get(Param::Arg4) {
+        Some(Ok(fp))
+    } else if matches!(
+        msg.param.get_cmd(),
+        SystemMessage::MemberRemovedFromGroup | SystemMessage::MemberAddedToGroup
+    ) {
+        Some(Err(format_err!("Missing removed/added member")))
+    } else {
+        None
     }
-    None
 }
 
 async fn build_body_file(context: &Context, msg: &Message) -> Result<MimePart<'static>> {
