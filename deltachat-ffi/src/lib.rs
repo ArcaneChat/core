@@ -60,7 +60,6 @@ use self::string::*;
 // - finally, this behaviour matches the old core-c API and UIs already depend on it
 
 const DC_GCM_ADDDAYMARKER: u32 = 0x01;
-const DC_GCM_INFO_ONLY: u32 = 0x02;
 
 // dc_context_t
 
@@ -276,7 +275,7 @@ pub unsafe extern "C" fn dc_get_config(
                 .strdup()
         } else {
             match config::Config::from_str(&key)
-                .with_context(|| format!("Invalid key {:?}", &key))
+                .with_context(|| format!("Invalid key {key:?}"))
                 .log_err(ctx)
             {
                 Ok(key) => ctx
@@ -1338,17 +1337,13 @@ pub unsafe extern "C" fn dc_get_chat_msgs(
     }
     let ctx = &*context;
 
-    let info_only = (flags & DC_GCM_INFO_ONLY) != 0;
     let add_daymarker = (flags & DC_GCM_ADDDAYMARKER) != 0;
     block_on(async move {
         Box::into_raw(Box::new(
             chat::get_chat_msgs_ex(
                 ctx,
                 ChatId::new(chat_id),
-                MessageListOptions {
-                    info_only,
-                    add_daymarker,
-                },
+                MessageListOptions { add_daymarker },
             )
             .await
             .unwrap_or_log_default(ctx, "failed to get chat msgs")
@@ -2546,7 +2541,7 @@ pub unsafe extern "C" fn dc_send_locations_to_chat(
     }
     let ctx = &*context;
 
-    block_on(location::send_locations_to_chat(
+    block_on(location::send_to_chat(
         ctx,
         ChatId::new(chat_id),
         seconds as i64,
@@ -2566,14 +2561,14 @@ pub unsafe extern "C" fn dc_is_sending_locations_to_chat(
         return 0;
     }
     let ctx = &*context;
-    let chat_id = if chat_id == 0 {
-        None
+    if chat_id == 0 {
+        block_on(location::is_sending(ctx))
+            .unwrap_or_log_default(ctx, "Failed is_sending_locations()") as libc::c_int
     } else {
-        Some(ChatId::new(chat_id))
-    };
-
-    block_on(location::is_sending_locations_to_chat(ctx, chat_id))
-        .unwrap_or_log_default(ctx, "Failed dc_is_sending_locations_to_chat()") as libc::c_int
+        block_on(location::is_sending_to_chat(ctx, ChatId::new(chat_id)))
+            .unwrap_or_log_default(ctx, "Failed is_sending_locations_to_chat()")
+            as libc::c_int
+    }
 }
 
 #[no_mangle]
@@ -2589,12 +2584,9 @@ pub unsafe extern "C" fn dc_set_location(
     }
     let ctx = &*context;
 
-    block_on(async move {
-        location::set(ctx, latitude, longitude, accuracy)
-            .await
-            .log_err(ctx)
-            .unwrap_or_default()
-    }) as libc::c_int
+    block_on(location::set(ctx, latitude, longitude, accuracy))
+        .log_err(ctx)
+        .unwrap_or_default() as libc::c_int
 }
 
 #[no_mangle]
@@ -2627,23 +2619,6 @@ pub unsafe extern "C" fn dc_get_locations(
             .unwrap_or_log_default(ctx, "Failed get_locations");
         Box::into_raw(Box::new(dc_array_t::from(res)))
     })
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn dc_delete_all_locations(context: *mut dc_context_t) {
-    if context.is_null() {
-        eprintln!("ignoring careless call to dc_delete_all_locations()");
-        return;
-    }
-    let ctx = &*context;
-
-    block_on(async move {
-        location::delete_all(ctx)
-            .await
-            .context("Failed to delete locations")
-            .log_err(ctx)
-            .ok()
-    });
 }
 
 #[no_mangle]

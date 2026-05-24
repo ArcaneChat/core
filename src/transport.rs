@@ -116,7 +116,7 @@ pub(crate) struct ConnectionCandidate {
 
 impl fmt::Display for ConnectionCandidate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}:{}", &self.host, self.port, self.security)?;
+        write!(f, "{}:{}:{}", self.host, self.port, self.security)?;
         Ok(())
     }
 }
@@ -131,7 +131,9 @@ pub(crate) struct ConfiguredServerLoginParam {
 
 impl fmt::Display for ConfiguredServerLoginParam {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}", self.connection, &self.user)?;
+        // Do not print the username,
+        // we do not want it to end up in the logs.
+        write!(f, "{}", self.connection)?;
         Ok(())
     }
 }
@@ -227,13 +229,21 @@ pub(crate) struct ConfiguredLoginParamJson {
 
 impl fmt::Display for ConfiguredLoginParam {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let addr = &self.addr;
         let provider_id = match self.provider {
             Some(provider) => provider.id,
             None => "none",
         };
         let certificate_checks = self.certificate_checks;
-        write!(f, "{addr} imap:[")?;
+        if let Ok(parsed_addr) = EmailAddress::new(&self.addr) {
+            // Only include the domain.
+            write!(f, "***@{}", parsed_addr.domain)?;
+        } else {
+            // Should not happen, but if the address
+            // does not have a distinct domain part,
+            // print it as is.
+            write!(f, "{}", self.addr)?;
+        };
+        write!(f, " imap:[")?;
         let mut first = true;
         for imap in &self.imap {
             if !first {
@@ -791,7 +801,18 @@ pub(crate) async fn sync_transports(
     context
         .sql
         .transaction(|transaction| {
+            let configured_addr = transaction.query_row(
+                "SELECT value FROM config WHERE keyname='configured_addr'",
+                (),
+                |row| {
+                    let addr: String = row.get(0)?;
+                    Ok(addr)
+                },
+            )?;
             for RemovedTransportData { addr, timestamp } in removed_transports {
+                if *addr == configured_addr {
+                    continue;
+                }
                 modified |= transaction.execute(
                     "DELETE FROM transports
                      WHERE addr=? AND add_timestamp<=?",

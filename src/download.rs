@@ -10,16 +10,10 @@ use crate::context::Context;
 use crate::imap::session::Session;
 use crate::log::warn;
 use crate::message::{self, Message, MsgId, rfc724_mid_exists};
-use crate::{EventType, chatlist_events};
+use crate::{EventType, chatlist_events, ephemeral};
 
 pub(crate) mod post_msg_metadata;
 pub(crate) use post_msg_metadata::PostMsgMetadata;
-
-/// If a message is downloaded only partially
-/// and `delete_server_after` is set to small timeouts (eg. "at once"),
-/// the user might have no chance to actually download that message.
-/// `MIN_DELETE_SERVER_AFTER` increases the timeout in this case.
-pub(crate) const MIN_DELETE_SERVER_AFTER: i64 = 48 * 60 * 60;
 
 /// From this point onward outgoing messages are considered large
 /// and get a Pre-Message, which announces the Post-Message.
@@ -174,6 +168,15 @@ pub(crate) async fn download_msg(
         return Ok(None);
     }
     Box::pin(session.fetch_single_msg(context, &server_folder, server_uid, rfc724_mid)).await?;
+
+    if ephemeral::should_delete_all_downloaded_messages(context, session.is_chatmail()).await? {
+        // Now that the message was downloaded, it likely needs to be deleted;
+        // trigger a re-check by interrupting the inbox folder.
+        // This is mainly needed to make the tests pass;
+        // on real devices, it would be fine to delete the message at the next iteration.
+        context.scheduler.interrupt_inbox().await;
+    }
+
     Ok(Some(()))
 }
 
@@ -358,7 +361,7 @@ mod tests {
 
     use super::*;
     use crate::chat::send_msg;
-    use crate::test_utils::TestContext;
+    use crate::test_utils::TestContextManager;
 
     #[test]
     fn test_downloadstate_values() {
@@ -378,12 +381,14 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_update_download_state() -> Result<()> {
-        let t = TestContext::new_alice().await;
-        let chat = t.create_chat_with_contact("Bob", "bob@example.org").await;
+        let mut tcm = TestContextManager::new();
+        let t = &tcm.alice().await;
+        let bob = &tcm.bob().await;
+        let chat_id = t.create_chat_id(bob).await;
 
         let mut msg = Message::new_text("Hi Bob".to_owned());
-        let msg_id = send_msg(&t, chat.id, &mut msg).await?;
-        let msg = Message::load_from_db(&t, msg_id).await?;
+        let msg_id = send_msg(t, chat_id, &mut msg).await?;
+        let msg = Message::load_from_db(t, msg_id).await?;
         assert_eq!(msg.download_state(), DownloadState::Done);
 
         for s in &[
@@ -393,17 +398,15 @@ mod tests {
             DownloadState::Done,
             DownloadState::Done,
         ] {
-            msg_id.update_download_state(&t, *s).await?;
-            let msg = Message::load_from_db(&t, msg_id).await?;
+            msg_id.update_download_state(t, *s).await?;
+            let msg = Message::load_from_db(t, msg_id).await?;
             assert_eq!(msg.download_state(), *s);
         }
         t.sql
             .execute("DELETE FROM msgs WHERE id=?", (msg_id,))
             .await?;
         // Nothing to do is ok.
-        msg_id
-            .update_download_state(&t, DownloadState::Done)
-            .await?;
+        msg_id.update_download_state(t, DownloadState::Done).await?;
 
         Ok(())
     }

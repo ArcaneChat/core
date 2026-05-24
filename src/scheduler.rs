@@ -15,7 +15,7 @@ use crate::config::Config;
 use crate::contact::{ContactId, RecentlySeenLoop};
 use crate::context::Context;
 use crate::download::{download_known_post_messages_without_pre_message, download_msgs};
-use crate::ephemeral::{self, delete_expired_imap_messages};
+use crate::ephemeral;
 use crate::events::EventType;
 use crate::imap::{Imap, session::Session};
 use crate::location;
@@ -250,16 +250,6 @@ impl SchedulerState {
         }
     }
 
-    pub(crate) async fn clear_all_relay_storage(&self) -> Result<()> {
-        let inner = self.inner.read().await;
-        if let InnerSchedulerState::Started(ref scheduler) = *inner {
-            scheduler.clear_all_relay_storage();
-            Ok(())
-        } else {
-            bail!("IO is not started");
-        }
-    }
-
     pub(crate) async fn interrupt_smtp(&self) {
         let inner = self.inner.read().await;
         if let InnerSchedulerState::Started(ref scheduler) = *inner {
@@ -358,7 +348,6 @@ async fn inbox_loop(
     let ImapConnectionHandlers {
         mut connection,
         stop_token,
-        clear_storage_request_receiver,
     } = inbox_handlers;
 
     let transport_id = connection.transport_id();
@@ -397,14 +386,7 @@ async fn inbox_loop(
                 }
             };
 
-            match inbox_fetch_idle(
-                &ctx,
-                &mut connection,
-                session,
-                &clear_storage_request_receiver,
-            )
-            .await
-            {
+            match inbox_fetch_idle(&ctx, &mut connection, session).await {
                 Err(err) => warn!(
                     ctx,
                     "Transport {transport_id}: Failed inbox fetch_idle: {err:#}."
@@ -425,29 +407,11 @@ async fn inbox_loop(
         .await;
 }
 
-async fn inbox_fetch_idle(
-    ctx: &Context,
-    imap: &mut Imap,
-    mut session: Session,
-    clear_storage_request_receiver: &Receiver<()>,
-) -> Result<Session> {
+async fn inbox_fetch_idle(ctx: &Context, imap: &mut Imap, mut session: Session) -> Result<Session> {
     let transport_id = session.transport_id();
 
-    // Clear IMAP storage on request.
-    //
-    // Only doing this for chatmail relays to avoid
-    // accidentally deleting all emails in a shared mailbox.
-    let should_clear_imap_storage =
-        clear_storage_request_receiver.try_recv().is_ok() && session.is_chatmail();
-    if should_clear_imap_storage {
-        info!(ctx, "Transport {transport_id}: Clearing IMAP storage.");
-        session.delete_all_messages(ctx, &imap.folder).await?;
-    }
-
     // Update quota no more than once a minute.
-    //
-    // Always update if we just cleared IMAP storage.
-    if (ctx.quota_needs_update(session.transport_id(), 60).await || should_clear_imap_storage)
+    if ctx.quota_needs_update(session.transport_id(), 60).await
         && let Err(err) = ctx.update_recent_quota(&mut session, &imap.folder).await
     {
         warn!(
@@ -519,14 +483,6 @@ async fn fetch_idle(ctx: &Context, connection: &mut Imap, mut session: Session) 
         .fetch_move_delete(ctx, &mut session, &watch_folder)
         .await
         .context("fetch_move_delete")?;
-
-    // Mark expired messages for deletion. Marked messages will be deleted from the server
-    // on the next iteration of `fetch_move_delete`. `delete_expired_imap_messages` is not
-    // called right before `fetch_move_delete` because it is not well optimized and would
-    // otherwise slow down message fetching.
-    delete_expired_imap_messages(ctx)
-        .await
-        .context("delete_expired_imap_messages")?;
 
     download_known_post_messages_without_pre_message(ctx, &mut session).await?;
     download_msgs(ctx, &mut session)
@@ -773,12 +729,6 @@ impl Scheduler {
         }
     }
 
-    fn clear_all_relay_storage(&self) {
-        for b in &self.inboxes {
-            b.conn_state.clear_relay_storage();
-        }
-    }
-
     fn interrupt_smtp(&self) {
         self.smtp.interrupt();
     }
@@ -912,13 +862,6 @@ struct SmtpConnectionHandlers {
 #[derive(Debug)]
 pub(crate) struct ImapConnectionState {
     state: ConnectionState,
-
-    /// Channel to request clearing the folder.
-    ///
-    /// IMAP loop receiving this should clear the folder
-    /// on the next iteration if IMAP server is a chatmail relay
-    /// and otherwise ignore the request.
-    clear_storage_request_sender: Sender<()>,
 }
 
 impl ImapConnectionState {
@@ -930,13 +873,11 @@ impl ImapConnectionState {
     ) -> Result<(Self, ImapConnectionHandlers)> {
         let stop_token = CancellationToken::new();
         let (idle_interrupt_sender, idle_interrupt_receiver) = channel::bounded(1);
-        let (clear_storage_request_sender, clear_storage_request_receiver) = channel::bounded(1);
 
         let handlers = ImapConnectionHandlers {
             connection: Imap::new(context, transport_id, login_param, idle_interrupt_receiver)
                 .await?,
             stop_token: stop_token.clone(),
-            clear_storage_request_receiver,
         };
 
         let state = ConnectionState {
@@ -945,10 +886,7 @@ impl ImapConnectionState {
             connectivity: handlers.connection.connectivity.clone(),
         };
 
-        let conn = ImapConnectionState {
-            state,
-            clear_storage_request_sender,
-        };
+        let conn = ImapConnectionState { state };
 
         Ok((conn, handlers))
     }
@@ -962,19 +900,10 @@ impl ImapConnectionState {
     fn stop(&self) {
         self.state.stop();
     }
-
-    /// Requests clearing relay storage and interrupts the inbox.
-    fn clear_relay_storage(&self) {
-        self.clear_storage_request_sender.try_send(()).ok();
-        self.state.interrupt();
-    }
 }
 
 #[derive(Debug)]
 struct ImapConnectionHandlers {
     connection: Imap,
     stop_token: CancellationToken,
-
-    /// Channel receiver to get requests to clear IMAP storage.
-    pub(crate) clear_storage_request_receiver: Receiver<()>,
 }

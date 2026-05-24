@@ -3,6 +3,7 @@
 use std::cmp;
 use std::collections::{BTreeMap, BTreeSet};
 use std::iter;
+use std::str::FromStr as _;
 use std::sync::LazyLock;
 
 use anyhow::{Context as _, Result, ensure};
@@ -11,14 +12,13 @@ use deltachat_contact_tools::{
     sanitize_single_line,
 };
 use mailparse::SingleInfo;
-use num_traits::FromPrimitive;
 use regex::Regex;
 
 use crate::chat::{
     self, Chat, ChatId, ChatIdBlocked, ChatVisibility, is_contact_in_chat, save_broadcast_secret,
 };
 use crate::config::Config;
-use crate::constants::{self, Blocked, Chattype, DC_CHAT_ID_TRASH, EDITED_PREFIX, ShowEmails};
+use crate::constants::{self, Blocked, Chattype, DC_CHAT_ID_TRASH, EDITED_PREFIX};
 use crate::contact::{self, Contact, ContactId, Origin, mark_contact_id_as_verified};
 use crate::context::Context;
 use crate::debug_logging::maybe_set_logging_xdc_inner;
@@ -505,6 +505,14 @@ pub(crate) async fn receive_imf_inner(
         Ok(mime_parser) => mime_parser,
     };
 
+    if !mime_parser.was_encrypted()
+        && mime_parser.get_header(HeaderDef::SecureJoin).is_none()
+        && context.get_config_bool(Config::ForceEncryption).await?
+    {
+        warn!(context, "Fetched unencrypted message, ignoring");
+        return trash().await;
+    }
+
     let rfc724_mid_orig = &mime_parser
         .get_rfc724_mid()
         .unwrap_or(rfc724_mid.to_string());
@@ -525,52 +533,15 @@ pub(crate) async fn receive_imf_inner(
         "Receiving message {rfc724_mid_orig:?}, seen={seen}...",
     );
 
-    // check, if the mail is already in our database.
-    // make sure, this check is done eg. before securejoin-processing.
-    let (replace_msg_id, replace_chat_id);
+    // These checks must be done before processing of SecureJoin and other special messages.
     if mime_parser.pre_message == mimeparser::PreMessageMode::Post {
         // Post-Message just replaces the attachment and modifies Params, not the whole message.
         // This is done in the `handle_post_message` method.
-        replace_msg_id = None;
-        replace_chat_id = None;
-    } else if let Some(old_msg_id) = message::rfc724_mid_exists(context, rfc724_mid).await? {
-        // This code handles the download of old partial download stub messages
-        // It will be removed after a transitioning period,
-        // after we have released a few versions with pre-messages
-        replace_msg_id = Some(old_msg_id);
-        replace_chat_id = if let Some(msg) = Message::load_from_db_optional(context, old_msg_id)
-            .await?
-            .filter(|msg| msg.download_state() != DownloadState::Done)
-        {
-            // The message was partially downloaded before.
-            match mime_parser.pre_message {
-                PreMessageMode::Post | PreMessageMode::None => {
-                    info!(context, "Message already partly in DB, replacing.");
-                    Some(msg.chat_id)
-                }
-                PreMessageMode::Pre { .. } => {
-                    info!(context, "Cannot replace pre-message with a pre-message");
-                    None
-                }
-            }
-        } else {
-            // The message was already fully downloaded
-            // or cannot be loaded because it is deleted.
-            None
-        };
-    } else {
-        replace_msg_id = if rfc724_mid_orig == rfc724_mid {
-            None
-        } else {
-            message::rfc724_mid_exists(context, rfc724_mid_orig).await?
-        };
-        replace_chat_id = None;
-    }
-
-    if replace_chat_id.is_some() {
-        // Need to update chat id in the db.
-    } else if let Some(msg_id) = replace_msg_id {
-        info!(context, "Message is already downloaded.");
+    } else if let Some(msg_id) = message::rfc724_mid_exists(context, rfc724_mid_orig).await? {
+        info!(
+            context,
+            "Message {rfc724_mid} is already in some chat or deleted."
+        );
         if mime_parser.incoming {
             return Ok(None);
         }
@@ -589,7 +560,7 @@ pub(crate) async fn receive_imf_inner(
             msg_id.set_delivered(context).await?;
         }
         return Ok(None);
-    };
+    }
 
     let prevent_rename = should_prevent_rename(&mime_parser);
 
@@ -639,8 +610,7 @@ pub(crate) async fn receive_imf_inner(
         mime_parser.get_header(HeaderDef::References),
         mime_parser.get_header(HeaderDef::InReplyTo),
     )
-    .await?
-    .filter(|p| Some(p.id) != replace_msg_id);
+    .await?;
 
     let mut chat_assignment =
         decide_chat_assignment(context, &mime_parser, &parent_message, rfc724_mid, from_id).await?;
@@ -720,20 +690,8 @@ pub(crate) async fn receive_imf_inner(
             MessengerMessage::No
         };
 
-        let show_emails = ShowEmails::from_i32(context.get_config_int(Config::ShowEmails).await?)
-            .unwrap_or_default();
-
         let allow_creation = if mime_parser.decryption_error.is_some() {
             false
-        } else if is_dc_message == MessengerMessage::No
-            && !context.get_config_bool(Config::IsChatmail).await?
-        {
-            // the message is a classic email in a classic profile
-            // (in chatmail profiles, we always show all messages, because shared dc-mua usage is not supported)
-            match show_emails {
-                ShowEmails::Off | ShowEmails::AcceptedContacts => false,
-                ShowEmails::All => true,
-            }
         } else {
             !mime_parser.parts.iter().all(|part| part.is_reaction)
         };
@@ -768,7 +726,6 @@ pub(crate) async fn receive_imf_inner(
             rfc724_mid_orig,
             from_id,
             seen,
-            replace_msg_id,
             prevent_rename,
             chat_id,
             chat_id_blocked,
@@ -857,8 +814,6 @@ UPDATE config SET value=? WHERE keyname='configured_addr' AND value!=?1
                 if transport_changed {
                     info!(context, "Primary transport changed to {from_addr:?}.");
                     context.sql.uncache_raw_config("configured_addr").await;
-
-                    // Regenerate User ID in V4 keys.
                     context.self_public_key.lock().await.take();
 
                     context.emit_event(EventType::TransportsModified);
@@ -955,10 +910,8 @@ UPDATE config SET value=? WHERE keyname='configured_addr' AND value!=?1
     }
 
     // Get user-configured server deletion
-    let delete_server_after = context.get_config_delete_server_after().await?;
-
     if !received_msg.msg_ids.is_empty() {
-        let target = if received_msg.needs_delete_job || delete_server_after == Some(0) {
+        let target = if received_msg.needs_delete_job {
             Some("".to_string())
         } else {
             None
@@ -1063,11 +1016,6 @@ UPDATE msgs SET state=? WHERE
             .await?;
     } else if received_msg.hidden {
         // No need to emit an event about the changed message
-    } else if let Some(replace_chat_id) = replace_chat_id {
-        match replace_chat_id == chat_id {
-            false => context.emit_msgs_changed_without_msg_id(replace_chat_id),
-            true => context.emit_msgs_changed(chat_id, replace_msg_id.unwrap_or_default()),
-        }
     } else if !chat_id.is_trash() {
         let fresh = received_msg.state == MessageState::InFresh
             && mime_parser.is_system_message != SystemMessage::CallAccepted
@@ -1075,8 +1023,15 @@ UPDATE msgs SET state=? WHERE
         let is_bot = context.get_config_bool(Config::Bot).await?;
         let is_pre_message = matches!(mime_parser.pre_message, PreMessageMode::Pre { .. });
         let skip_bot_notify = is_bot && is_pre_message;
-        let important =
-            mime_parser.incoming && fresh && !is_old_contact_request && !skip_bot_notify;
+        let is_empty = !is_pre_message
+            && mime_parser.parts.first().is_none_or(|p| {
+                p.typ == Viewtype::Text && p.msg.is_empty() && p.param.get(Param::Quote).is_none()
+            });
+        let important = mime_parser.incoming
+            && !is_empty
+            && fresh
+            && !is_old_contact_request
+            && !skip_bot_notify;
 
         for msg_id in &received_msg.msg_ids {
             chat_id.emit_msg_event(context, *msg_id, important);
@@ -1253,20 +1208,6 @@ async fn decide_chat_assignment(
                 .await?;
         }
         info!(context, "Outgoing undecryptable message (TRASH).");
-        true
-    } else if mime_parser.is_system_message != SystemMessage::AutocryptSetupMessage
-        && !mime_parser.has_chat_version()
-        && parent_message
-            .as_ref()
-            .is_none_or(|p| p.is_dc_message == MessengerMessage::No)
-        && !context.get_config_bool(Config::IsChatmail).await?
-        && ShowEmails::from_i32(context.get_config_int(Config::ShowEmails).await?)
-            .unwrap_or_default()
-            == ShowEmails::Off
-    {
-        info!(context, "Classical email not shown (TRASH).");
-        // the message is a classic email in a classic profile
-        // (in chatmail profiles, we always show all messages, because shared dc-mua usage is not supported)
         true
     } else if mime_parser
         .get_header(HeaderDef::XMozillaDraftInfo)
@@ -1808,7 +1749,6 @@ async fn add_parts(
     rfc724_mid: &str,
     from_id: ContactId,
     seen: bool,
-    mut replace_msg_id: Option<MsgId>,
     prevent_rename: bool,
     mut chat_id: ChatId,
     mut chat_id_blocked: Blocked,
@@ -1900,7 +1840,7 @@ async fn add_parts(
     // Extract ephemeral timer from the message
     let mut ephemeral_timer = if let Some(value) = mime_parser.get_header(HeaderDef::EphemeralTimer)
     {
-        match value.parse::<EphemeralTimer>() {
+        match EphemeralTimer::from_str(value) {
             Ok(timer) => timer,
             Err(err) => {
                 warn!(context, "Can't parse ephemeral timer \"{value}\": {err:#}.");
@@ -2178,7 +2118,7 @@ async fn add_parts(
                 chat_id,
                 from_id,
                 sort_timestamp,
-                Reaction::from(reaction_str.as_str()),
+                Reaction::new(reaction_str.as_str()),
                 is_incoming_fresh,
             )
             .await?;
@@ -2187,22 +2127,6 @@ async fn add_parts(
         let mut param = part.param.clone();
         if is_system_message != SystemMessage::Unknown {
             param.set_int(Param::Cmd, is_system_message as i32);
-        }
-
-        if let Some(replace_msg_id) = replace_msg_id {
-            let placeholder = Message::load_from_db(context, replace_msg_id)
-                .await
-                .context("Failed to load placeholder message")?;
-            for key in [
-                Param::WebxdcSummary,
-                Param::WebxdcSummaryTimestamp,
-                Param::WebxdcDocument,
-                Param::WebxdcDocumentTimestamp,
-            ] {
-                if let Some(value) = placeholder.param.get(key) {
-                    param.set(key, value);
-                }
-            }
         }
 
         let (msg, typ): (&str, Viewtype) = if let Some(better_msg) = &better_msg {
@@ -2247,10 +2171,9 @@ async fn add_parts(
             .sql
             .call_write(|conn| {
                 let mut stmt = conn.prepare_cached(
-            r#"
+                    "
 INSERT INTO msgs
   (
-    id,
     rfc724_mid, pre_rfc724_mid, chat_id,
     from_id, to_id, timestamp, timestamp_sent, 
     timestamp_rcvd, type, state, msgrmsg, 
@@ -2260,34 +2183,29 @@ INSERT INTO msgs
     ephemeral_timestamp, download_state, hop_info
   )
   VALUES (
-    ?,
     ?, ?, ?, ?, ?,
     ?, ?, ?, ?,
     ?, ?, ?, ?,
     ?, ?, ?, ?, ?, 1,
     ?, ?, ?, ?,
     ?, ?, ?, ?
-  )
-ON CONFLICT (id) DO UPDATE
-SET rfc724_mid=excluded.rfc724_mid, chat_id=excluded.chat_id,
-    from_id=excluded.from_id, to_id=excluded.to_id, timestamp_sent=excluded.timestamp_sent,
-    type=excluded.type, state=max(state,excluded.state), msgrmsg=excluded.msgrmsg,
-    txt=excluded.txt, txt_normalized=excluded.txt_normalized, subject=excluded.subject,
-    param=excluded.param,
-    hidden=excluded.hidden,bytes=excluded.bytes, mime_headers=excluded.mime_headers,
-    mime_compressed=excluded.mime_compressed, mime_in_reply_to=excluded.mime_in_reply_to,
-    mime_references=excluded.mime_references, mime_modified=excluded.mime_modified, error=excluded.error, ephemeral_timer=excluded.ephemeral_timer,
-    ephemeral_timestamp=excluded.ephemeral_timestamp, download_state=excluded.download_state, hop_info=excluded.hop_info
-RETURNING id
-"#)?;
-                let row_id: MsgId = stmt.query_row(params![
-                    replace_msg_id,
-                    if let PreMessageMode::Pre {post_msg_rfc724_mid, ..} = &mime_parser.pre_message {
+  )",
+                )?;
+                let params = params![
+                    if let PreMessageMode::Pre {
+                        post_msg_rfc724_mid,
+                        ..
+                    } = &mime_parser.pre_message
+                    {
                         post_msg_rfc724_mid
-                    } else { rfc724_mid_orig },
-                    if let PreMessageMode::Pre {..} = &mime_parser.pre_message {
+                    } else {
                         rfc724_mid_orig
-                    } else { "" },
+                    },
+                    if let PreMessageMode::Pre { .. } = &mime_parser.pre_message {
+                        rfc724_mid_orig
+                    } else {
+                        ""
+                    },
                     if trash { DC_CHAT_ID_TRASH } else { chat_id },
                     if trash { ContactId::UNDEFINED } else { from_id },
                     if trash { ContactId::UNDEFINED } else { to_id },
@@ -2296,13 +2214,27 @@ RETURNING id
                     if trash { 0 } else { mime_parser.timestamp_rcvd },
                     if trash {
                         Viewtype::Unknown
-                    } else if let PreMessageMode::Pre {..} = mime_parser.pre_message {
+                    } else if let PreMessageMode::Pre { .. } = mime_parser.pre_message {
                         Viewtype::Text
-                    } else { typ },
-                    if trash { MessageState::Undefined } else { state },
-                    if trash { MessengerMessage::No } else { is_dc_message },
+                    } else {
+                        typ
+                    },
+                    if trash {
+                        MessageState::Undefined
+                    } else {
+                        state
+                    },
+                    if trash {
+                        MessengerMessage::No
+                    } else {
+                        is_dc_message
+                    },
                     if trash || hidden { "" } else { msg },
-                    if trash || hidden { None } else { normalize_text(msg) },
+                    if trash || hidden {
+                        None
+                    } else {
+                        normalize_text(msg)
+                    },
                     if trash || hidden { "" } else { &subject },
                     if trash {
                         "".to_string()
@@ -2319,33 +2251,28 @@ RETURNING id
                     if trash { "" } else { mime_in_reply_to },
                     if trash { "" } else { mime_references },
                     !trash && save_mime_modified,
-                    if trash { "" } else { part.error.as_deref().unwrap_or_default() },
+                    if trash {
+                        ""
+                    } else {
+                        part.error.as_deref().unwrap_or_default()
+                    },
                     if trash { 0 } else { ephemeral_timer.to_u32() },
                     if trash { 0 } else { ephemeral_timestamp },
                     if trash {
                         DownloadState::Done
                     } else if mime_parser.decryption_error.is_some() {
                         DownloadState::Undecipherable
-                    } else if let PreMessageMode::Pre {..} = mime_parser.pre_message {
+                    } else if let PreMessageMode::Pre { .. } = mime_parser.pre_message {
                         DownloadState::Available
                     } else {
                         DownloadState::Done
                     },
                     if trash { "" } else { &mime_parser.hop_info },
-                ],
-                |row| {
-                    let msg_id: MsgId = row.get(0)?;
-                    Ok(msg_id)
-                }
-                )?;
+                ];
+                let row_id = MsgId::new(stmt.insert(params)?.try_into()?);
                 Ok(row_id)
             })
             .await?;
-
-        // We only replace placeholder with a first part,
-        // afterwards insert additional parts.
-        replace_msg_id = None;
-
         ensure_and_debug_assert!(!row_id.is_special(), "Rowid {row_id} is special");
         created_db_entries.push(row_id);
     }
@@ -2368,14 +2295,6 @@ RETURNING id
             *msg_id,
         )
         .await?;
-    }
-
-    if let Some(replace_msg_id) = replace_msg_id {
-        // Trash the "replace" placeholder with a message that has no parts. If it has the original
-        // "Message-ID", mark the placeholder for server-side deletion so as if the user deletes the
-        // fully downloaded message later, the server-side deletion is issued.
-        let on_server = rfc724_mid == rfc724_mid_orig;
-        replace_msg_id.trash(context, on_server).await?;
     }
 
     let unarchive = match mime_parser.get_header(HeaderDef::ChatGroupMemberRemoved) {
@@ -2431,76 +2350,81 @@ RETURNING id
 
 /// Checks for "Chat-Edit" and "Chat-Delete" headers,
 /// and edits/deletes existing messages accordingly.
-///
-/// Returns `true` if this message is an edit/deletion request.
 async fn handle_edit_delete(
     context: &Context,
     mime_parser: &MimeMessage,
     from_id: ContactId,
 ) -> Result<()> {
     if let Some(rfc724_mid) = mime_parser.get_header(HeaderDef::ChatEdit) {
-        if let Some(original_msg_id) = rfc724_mid_exists(context, rfc724_mid).await? {
-            if let Some(mut original_msg) =
-                Message::load_from_db_optional(context, original_msg_id).await?
-            {
-                if original_msg.from_id == from_id {
-                    if let Some(part) = mime_parser.parts.first() {
-                        let edit_msg_showpadlock = part
-                            .param
-                            .get_bool(Param::GuaranteeE2ee)
-                            .unwrap_or_default();
-                        if edit_msg_showpadlock || !original_msg.get_showpadlock() {
-                            let new_text =
-                                part.msg.strip_prefix(EDITED_PREFIX).unwrap_or(&part.msg);
-                            chat::save_text_edit_to_db(context, &mut original_msg, new_text)
-                                .await?;
-                        } else {
-                            warn!(context, "Edit message: Not encrypted.");
-                        }
-                    }
-                } else {
-                    warn!(context, "Edit message: Bad sender.");
-                }
-            } else {
-                warn!(context, "Edit message: Database entry does not exist.");
-            }
-        } else {
+        let Some(original_msg_id) = rfc724_mid_exists(context, rfc724_mid).await? else {
             warn!(
                 context,
                 "Edit message: rfc724_mid {rfc724_mid:?} not found."
             );
+            return Ok(());
+        };
+        let Some(mut original_msg) =
+            Message::load_from_db_optional(context, original_msg_id).await?
+        else {
+            warn!(context, "Edit message: Database entry does not exist.");
+            return Ok(());
+        };
+        if original_msg.from_id != from_id {
+            warn!(context, "Edit message: Bad sender.");
+            return Ok(());
         }
+        let Some(part) = mime_parser.parts.first() else {
+            return Ok(());
+        };
+
+        let edit_msg_showpadlock = part
+            .param
+            .get_bool(Param::GuaranteeE2ee)
+            .unwrap_or_default();
+        if !edit_msg_showpadlock && original_msg.get_showpadlock() {
+            warn!(context, "Edit message: Not encrypted.");
+            return Ok(());
+        }
+
+        let new_text = part.msg.strip_prefix(EDITED_PREFIX).unwrap_or(&part.msg);
+        chat::save_text_edit_to_db(context, &mut original_msg, new_text).await?;
     } else if let Some(rfc724_mid_list) = mime_parser.get_header(HeaderDef::ChatDelete)
         && let Some(part) = mime_parser.parts.first()
     {
         // See `message::delete_msgs_ex()`, unlike edit requests, DC doesn't send unencrypted
         // deletion requests, so there's no need to support them.
-        if part.param.get_bool(Param::GuaranteeE2ee).unwrap_or(false) {
-            let mut modified_chat_ids = BTreeSet::new();
-            let mut msg_ids = Vec::new();
-
-            let rfc724_mid_vec: Vec<&str> = rfc724_mid_list.split_whitespace().collect();
-            for rfc724_mid in rfc724_mid_vec {
-                if let Some(msg_id) = message::rfc724_mid_exists(context, rfc724_mid).await? {
-                    if let Some(msg) = Message::load_from_db_optional(context, msg_id).await? {
-                        if msg.from_id == from_id {
-                            message::delete_msg_locally(context, &msg).await?;
-                            msg_ids.push(msg.id);
-                            modified_chat_ids.insert(msg.chat_id);
-                        } else {
-                            warn!(context, "Delete message: Bad sender.");
-                        }
-                    } else {
-                        warn!(context, "Delete message: Database entry does not exist.");
-                    }
-                } else {
-                    warn!(context, "Delete message: {rfc724_mid:?} not found.");
-                }
-            }
-            message::delete_msgs_locally_done(context, &msg_ids, modified_chat_ids).await?;
-        } else {
+        if part.param.get_bool(Param::GuaranteeE2ee) != Some(true) {
             warn!(context, "Delete message: Not encrypted.");
+            return Ok(());
         }
+
+        let mut modified_chat_ids = BTreeSet::new();
+        let mut msg_ids = Vec::new();
+
+        let rfc724_mid_vec: Vec<&str> = rfc724_mid_list.split_whitespace().collect();
+        for rfc724_mid in rfc724_mid_vec {
+            let rfc724_mid = rfc724_mid.trim_start_matches('<').trim_end_matches('>');
+            let Some(msg_id) = message::rfc724_mid_exists(context, rfc724_mid).await? else {
+                warn!(context, "Delete message: {rfc724_mid:?} not found.");
+                // Insert a tombstone so that the message will be ignored if it arrives later within a period specified in prune_tombstones().
+                insert_tombstone(context, rfc724_mid).await?;
+                continue;
+            };
+
+            let Some(msg) = Message::load_from_db_optional(context, msg_id).await? else {
+                warn!(context, "Delete message: Database entry does not exist.");
+                continue;
+            };
+            if msg.from_id != from_id {
+                warn!(context, "Delete message: Bad sender.");
+                continue;
+            }
+
+            message::delete_msg_locally(context, &msg).await?;
+            msg_ids.push(msg.id);
+            modified_chat_ids.insert(msg.chat_id);
+        }
+        message::delete_msgs_locally_done(context, &msg_ids, modified_chat_ids).await?;
     }
     Ok(())
 }
@@ -3644,12 +3568,7 @@ async fn create_or_lookup_mailinglist_or_broadcast(
             mime_parser.timestamp_sent,
         )
         .await
-        .with_context(|| {
-            format!(
-                "failed to create mailinglist '{}' for grpid={}",
-                &name, &listid
-            )
-        })?;
+        .with_context(|| format!("failed to create mailinglist '{name}' for grpid={listid}",))?;
 
         if chattype == Chattype::InBroadcast {
             chat::add_to_chat_contacts_table(

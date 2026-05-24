@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Union
-from warnings import warn
 
 from ._utils import AttrDict, futuremethod
 from .chat import Chat
@@ -392,8 +391,7 @@ class Account:
         """Return the list of fresh messages, newest messages first.
 
         This call is intended for displaying notifications.
-        If you are writing a bot, use `get_fresh_messages_in_arrival_order()` instead,
-        to process oldest messages first.
+        If you are writing a bot, process "incoming message" events instead.
         """
         fresh_msg_ids = self._rpc.get_fresh_msgs(self.id)
         return [Message(self, msg_id) for msg_id in fresh_msg_ids]
@@ -463,16 +461,6 @@ class Account:
         """Wait for reaction change event."""
         return self.wait_for_event(EventType.REACTIONS_CHANGED)
 
-    def get_fresh_messages_in_arrival_order(self) -> list[Message]:
-        """Return fresh messages list sorted in the order of their arrival, with ascending IDs."""
-        warn(
-            "get_fresh_messages_in_arrival_order is deprecated, use get_next_messages instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        fresh_msg_ids = sorted(self._rpc.get_fresh_msgs(self.id))
-        return [Message(self, msg_id) for msg_id in fresh_msg_ids]
-
     def export_backup(self, path, passphrase: str = "") -> None:
         """Export backup."""
         self._rpc.export_backup(self.id, str(path), passphrase)
@@ -495,3 +483,7 @@ class Account:
         """Return ICE servers for WebRTC configuration."""
         ice_servers_json = self._rpc.ice_servers(self.id)
         return json.loads(ice_servers_json)
+
+    def is_sending_locations(self) -> bool:
+        """Return True if sending locations to any chat."""
+        return self._rpc.is_sending_locations(self.id)

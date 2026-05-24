@@ -264,15 +264,11 @@ impl Kml {
 
 /// Enables location streaming in chat identified by `chat_id` for `seconds` seconds.
 #[expect(clippy::arithmetic_side_effects)]
-pub async fn send_locations_to_chat(
-    context: &Context,
-    chat_id: ChatId,
-    seconds: i64,
-) -> Result<()> {
+pub async fn send_to_chat(context: &Context, chat_id: ChatId, seconds: i64) -> Result<()> {
     ensure!(seconds >= 0);
     ensure!(!chat_id.is_special());
     let now = time();
-    let is_sending_locations_before = is_sending_locations_to_chat(context, Some(chat_id)).await?;
+    let is_sending_locations_before = is_sending_to_chat(context, chat_id).await?;
     context
         .sql
         .execute(
@@ -305,35 +301,49 @@ pub async fn send_locations_to_chat(
     Ok(())
 }
 
-/// Returns whether `chat_id` or any chat is sending locations.
-///
-/// If `chat_id` is `Some` only that chat is checked, otherwise returns `true` if any chat
-/// is sending locations.
-pub async fn is_sending_locations_to_chat(
-    context: &Context,
-    chat_id: Option<ChatId>,
-) -> Result<bool> {
-    let exists = match chat_id {
-        Some(chat_id) => {
-            context
-                .sql
-                .exists(
-                    "SELECT COUNT(id) FROM chats  WHERE id=?  AND locations_send_until>?;",
-                    (chat_id, time()),
-                )
-                .await?
-        }
-        None => {
-            context
-                .sql
-                .exists(
-                    "SELECT COUNT(id) FROM chats  WHERE locations_send_until>?;",
-                    (time(),),
-                )
-                .await?
-        }
-    };
-    Ok(exists)
+/// Returns whether any chat is sending locations.
+pub async fn is_sending(context: &Context) -> Result<bool> {
+    context
+        .sql
+        .exists(
+            "SELECT COUNT(id) FROM chats WHERE locations_send_until>?",
+            (time(),),
+        )
+        .await
+}
+
+/// Returns whether `chat_id` is sending locations.
+pub async fn is_sending_to_chat(context: &Context, chat_id: ChatId) -> Result<bool> {
+    context
+        .sql
+        .exists(
+            "SELECT COUNT(id) FROM chats WHERE id=? AND locations_send_until>?",
+            (chat_id, time()),
+        )
+        .await
+}
+
+/// Returns a list of chats in which location streaming is enabled.
+async fn get_chats_with_location_streaming(context: &Context) -> Result<Vec<ChatId>> {
+    context
+        .sql
+        .query_map_vec(
+            "SELECT id FROM chats WHERE locations_send_until>?",
+            (time(),),
+            |row| {
+                let chat_id: ChatId = row.get(0)?;
+                Ok(chat_id)
+            },
+        )
+        .await
+}
+
+/// Stop sending locations in all chats.
+pub async fn stop_sending(context: &Context) -> Result<()> {
+    for chat_id in get_chats_with_location_streaming(context).await? {
+        send_to_chat(context, chat_id, 0).await?;
+    }
+    Ok(())
 }
 
 /// Sets current location of the user device.
@@ -459,13 +469,6 @@ fn is_marker(txt: &str) -> bool {
     }
 }
 
-/// Deletes all locations from the database.
-pub async fn delete_all(context: &Context) -> Result<()> {
-    context.sql.execute("DELETE FROM locations;", ()).await?;
-    context.emit_location_changed(None).await?;
-    Ok(())
-}
-
 /// Deletes expired locations.
 ///
 /// Only path locations are deleted.
@@ -495,7 +498,7 @@ pub(crate) async fn delete_expired(context: &Context, now: i64) -> Result<()> {
 ///
 /// This function is used when a message is deleted
 /// that has a corresponding `location_id`.
-pub(crate) async fn delete_poi_location(context: &Context, location_id: u32) -> Result<()> {
+pub(crate) async fn delete_poi(context: &Context, location_id: u32) -> Result<()> {
     context
         .sql
         .execute(
@@ -520,7 +523,7 @@ pub(crate) async fn get_poi_location(context: &Context, location_id: u32) -> Res
 }
 
 /// Deletes POI locations that don't have corresponding message anymore.
-pub(crate) async fn delete_orphaned_poi_locations(context: &Context) -> Result<()> {
+pub(crate) async fn delete_orphaned_poi(context: &Context) -> Result<()> {
     context.sql.execute("
     DELETE FROM locations
     WHERE independent=1 AND id NOT IN
@@ -729,9 +732,9 @@ pub(crate) async fn save(
 
 pub(crate) async fn location_loop(context: &Context, interrupt_receiver: Receiver<()>) {
     loop {
-        let next_event = match maybe_send_locations(context).await {
+        let next_event = match maybe_send(context).await {
             Err(err) => {
-                warn!(context, "maybe_send_locations failed: {:#}", err);
+                warn!(context, "location::maybe_send failed: {:#}", err);
                 Some(60) // Retry one minute later.
             }
             Ok(next_event) => next_event,
@@ -769,7 +772,7 @@ pub(crate) async fn location_loop(context: &Context, interrupt_receiver: Receive
 /// Returns number of seconds until the next time location streaming for some chat ends
 /// automatically.
 #[expect(clippy::arithmetic_side_effects)]
-async fn maybe_send_locations(context: &Context) -> Result<Option<u64>> {
+async fn maybe_send(context: &Context) -> Result<Option<u64>> {
     let mut next_event: Option<u64> = None;
 
     let now = time();
@@ -881,7 +884,8 @@ mod tests {
     use crate::config::Config;
     use crate::message::MessageState;
     use crate::receive_imf::receive_imf;
-    use crate::test_utils::{TestContext, TestContextManager};
+    use crate::test_utils;
+    use crate::test_utils::{ExpectedEvents, TestContext, TestContextManager};
     use crate::tools::SystemTime;
 
     #[test]
@@ -949,12 +953,15 @@ mod tests {
     /// Tests that location.kml is hidden.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn receive_location_kml() -> Result<()> {
-        let alice = TestContext::new_alice().await;
+        let mut tcm = TestContextManager::new();
+        let alice = &tcm.alice().await;
+        let bob = &tcm.bob().await;
 
-        receive_imf(
-            &alice,
+        let encrypted_message = test_utils::encrypt_raw_message(
+            bob,
+            &[alice],
             br#"Subject: Hello
-Message-ID: hello@example.net
+Message-ID: <hello@example.net>
 To: Alice <alice@example.org>
 From: Bob <bob@example.net>
 Date: Mon, 20 Dec 2021 00:00:00 +0000
@@ -962,14 +969,15 @@ Chat-Version: 1.0
 Content-Type: text/plain; charset=utf-8; format=flowed; delsp=no
 
 Text message."#,
-            false,
         )
         .await?;
+        receive_imf(alice, encrypted_message.as_bytes(), false).await?;
         let received_msg = alice.get_last_msg().await;
         assert_eq!(received_msg.text, "Text message.");
 
-        receive_imf(
-            &alice,
+        let encrypted_message = test_utils::encrypt_raw_message(
+            bob,
+            &[alice],
             br#"Subject: locations
 MIME-Version: 1.0
 To: <alice@example.org>
@@ -996,16 +1004,14 @@ Content-Disposition: attachment; filename="location.kml"
 </Document>
 </kml>
 
---U8BOG8qNXfB0GgLiQ3PKUjlvdIuLRF--"#,
-            false,
-        )
-        .await?;
+--U8BOG8qNXfB0GgLiQ3PKUjlvdIuLRF--"#).await?;
+        receive_imf(alice, encrypted_message.as_bytes(), false).await?;
 
         // Received location message is not visible, last message stays the same.
         let received_msg2 = alice.get_last_msg().await;
         assert_eq!(received_msg2.id, received_msg.id);
 
-        let locations = get_range(&alice, None, None, 0, 0).await?;
+        let locations = get_range(alice, None, None, 0, 0).await?;
         assert_eq!(locations.len(), 1);
         Ok(())
     }
@@ -1013,10 +1019,13 @@ Content-Disposition: attachment; filename="location.kml"
     /// Tests that `location.kml` is not hidden and not seen if it contains a message.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn receive_visible_location_kml() -> Result<()> {
-        let alice = TestContext::new_alice().await;
+        let mut tcm = TestContextManager::new();
+        let alice = &tcm.alice().await;
+        let bob = &tcm.bob().await;
 
-        receive_imf(
-            &alice,
+        let encrypted_message = test_utils::encrypt_raw_message(
+            bob,
+            &[alice],
             br#"Subject: locations
 MIME-Version: 1.0
 To: <alice@example.org>
@@ -1044,16 +1053,15 @@ Content-Disposition: attachment; filename="location.kml"
 </Document>
 </kml>
 
---U8BOG8qNXfB0GgLiQ3PKUjlvdIuLRF--"#,
-            false,
-        )
-        .await?;
+--U8BOG8qNXfB0GgLiQ3PKUjlvdIuLRF--"#).await?;
+
+        receive_imf(alice, encrypted_message.as_bytes(), false).await?;
 
         let received_msg = alice.get_last_msg().await;
         assert_eq!(received_msg.text, "Text message.");
         assert_eq!(received_msg.state, MessageState::InFresh);
 
-        let locations = get_range(&alice, None, None, 0, 0).await?;
+        let locations = get_range(alice, None, None, 0, 0).await?;
         assert_eq!(locations.len(), 1);
         Ok(())
     }
@@ -1064,7 +1072,7 @@ Content-Disposition: attachment; filename="location.kml"
         let bob = TestContext::new_bob().await;
 
         let alice_chat = alice.create_chat(&bob).await;
-        send_locations_to_chat(&alice, alice_chat.id, 1000).await?;
+        send_to_chat(&alice, alice_chat.id, 1000).await?;
         let sent = alice.pop_sent_msg().await;
         let msg = bob.recv_msg(&sent).await;
         assert_eq!(msg.text, "Location streaming enabled by alice@example.org.");
@@ -1113,10 +1121,13 @@ Content-Disposition: attachment; filename="location.kml"
             .await?;
 
         let alice_chat = alice.create_chat(bob).await;
+        // Bob needs the chat accepted so that "normal" messages from Alice trigger `IncomingMsg`.
+        // Location-only messages still must trigger `MsgsChanged`.
+        bob.create_chat(alice).await;
 
         // Alice enables location streaming.
         // Bob receives a message saying that Alice enabled location streaming.
-        send_locations_to_chat(alice, alice_chat.id, 60).await?;
+        send_to_chat(alice, alice_chat.id, 60).await?;
         bob.recv_msg(&alice.pop_sent_msg().await).await;
 
         // Alice gets new location from GPS.
@@ -1126,8 +1137,19 @@ Content-Disposition: attachment; filename="location.kml"
         // 10 seconds later location sending stream manages to send location.
         SystemTime::shift(Duration::from_secs(10));
         delete_expired(alice, time()).await?;
-        maybe_send_locations(alice).await?;
+        maybe_send(alice).await?;
+        bob.evtracker.clear_events();
         bob.recv_msg_opt(&alice.pop_sent_msg().await).await;
+        bob.evtracker
+            .get_matching_ex(
+                bob,
+                ExpectedEvents {
+                    expected: |e| matches!(e, EventType::MsgsChanged { .. }),
+                    unexpected: |e| matches!(e, EventType::IncomingMsg { .. }),
+                },
+            )
+            .await
+            .unwrap();
         assert_eq!(get_range(alice, None, None, 0, 0).await?.len(), 1);
         assert_eq!(get_range(bob, None, None, 0, 0).await?.len(), 1);
 

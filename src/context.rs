@@ -21,7 +21,6 @@ use crate::contact::{Contact, ContactId};
 use crate::debug_logging::DebugLogging;
 use crate::events::{Event, EventEmitter, EventType, Events};
 use crate::imap::{Imap, ServerMetadata};
-use crate::key::self_fingerprint;
 use crate::log::warn;
 use crate::logged_debug_assert;
 use crate::message::{self, MessageState, MsgId};
@@ -568,15 +567,6 @@ impl Context {
         }
     }
 
-    /// Requests deletion of all messages from chatmail relays.
-    ///
-    /// Non-chatmail relays are excluded
-    /// to avoid accidentally deleting emails
-    /// from shared inboxes.
-    pub async fn clear_all_relay_storage(&self) -> Result<()> {
-        self.scheduler.clear_all_relay_storage().await
-    }
-
     /// Restarts the IO scheduler if it was running before
     /// when it is not running this is an no-op
     pub async fn restart_io_if_running(&self) {
@@ -857,7 +847,6 @@ impl Context {
 
     /// Returns information about the context as key-value pairs.
     pub async fn get_info(&self) -> Result<BTreeMap<&'static str, String>> {
-        let secondary_addrs = self.get_secondary_self_addrs().await?.join(", ");
         let all_transports: Vec<String> = ConfiguredLoginParam::load_all(self)
             .await?
             .into_iter()
@@ -894,10 +883,6 @@ impl Context {
             .sql
             .count("SELECT COUNT(*) FROM public_keys;", ())
             .await?;
-        let fingerprint_str = match self_fingerprint(self).await {
-            Ok(fp) => fp.to_string(),
-            Err(err) => format!("<key failure: {err}>"),
-        };
 
         let mut res = get_info();
 
@@ -959,11 +944,6 @@ impl Context {
             }
         }
 
-        res.insert("secondary_addrs", secondary_addrs);
-        res.insert(
-            "show_emails",
-            self.get_config_int(Config::ShowEmails).await?.to_string(),
-        );
         res.insert(
             "who_can_call_me",
             self.get_config_int(Config::WhoCanCallMe).await?.to_string(),
@@ -980,7 +960,6 @@ impl Context {
         res.insert("disable_idle", disable_idle.to_string());
         res.insert("private_key_count", prv_key_cnt.to_string());
         res.insert("public_key_count", pub_key_cnt.to_string());
-        res.insert("fingerprint", fingerprint_str);
         res.insert(
             "media_quality",
             self.get_config_int(Config::MediaQuality).await?.to_string(),
@@ -988,12 +967,6 @@ impl Context {
         res.insert(
             "delete_device_after",
             self.get_config_int(Config::DeleteDeviceAfter)
-                .await?
-                .to_string(),
-        );
-        res.insert(
-            "delete_server_after",
-            self.get_config_int(Config::DeleteServerAfter)
                 .await?
                 .to_string(),
         );
@@ -1006,24 +979,6 @@ impl Context {
         res.insert(
             "last_cant_decrypt_outgoing_msgs",
             self.get_config_int(Config::LastCantDecryptOutgoingMsgs)
-                .await?
-                .to_string(),
-        );
-        res.insert(
-            "quota_exceeding",
-            self.get_config_int(Config::QuotaExceeding)
-                .await?
-                .to_string(),
-        );
-        res.insert(
-            "authserv_id_candidates",
-            self.get_config(Config::AuthservIdCandidates)
-                .await?
-                .unwrap_or_default(),
-        );
-        res.insert(
-            "sign_unencrypted",
-            self.get_config_int(Config::SignUnencrypted)
                 .await?
                 .to_string(),
         );
@@ -1091,6 +1046,12 @@ impl Context {
         res.insert(
             "team_profile",
             self.get_config_bool(Config::TeamProfile).await?.to_string(),
+        );
+        res.insert(
+            "force_encryption",
+            self.get_config_bool(Config::ForceEncryption)
+                .await?
+                .to_string(),
         );
 
         let elapsed = time_elapsed(&self.creation_time);

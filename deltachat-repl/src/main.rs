@@ -176,7 +176,7 @@ const DB_COMMANDS: [&str; 11] = [
     "housekeeping",
 ];
 
-const CHAT_COMMANDS: [&str; 40] = [
+const CHAT_COMMANDS: [&str; 39] = [
     "listchats",
     "listarchived",
     "start-realtime",
@@ -194,7 +194,6 @@ const CHAT_COMMANDS: [&str; 40] = [
     "chatinfo",
     "sendlocations",
     "setlocation",
-    "dellocations",
     "getlocations",
     "send",
     "send-sync",
@@ -433,7 +432,7 @@ async fn handle_cmd(
                 {
                     println!("Open the following url, set mail_pw to the generated token and server_flags to 2:\n{oauth2_url}");
                 } else {
-                    println!("OAuth2 not available for {}.", &addr);
+                    println!("OAuth2 not available for {addr}.");
                 }
             } else {
                 println!("oauth2: set addr first.");

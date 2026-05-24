@@ -91,7 +91,15 @@ def test_lowercase_address(acfactory) -> None:
     assert account.list_transports()[0]["addr"] == addr
 
     param = account.get_info()["used_transport_settings"]
-    assert addr in param
+
+    domain = addr.rsplit("@")[-1]
+    domain_upper = addr_upper.rsplit("@")[-1]
+    assert domain in param
+    assert domain_upper not in param
+
+    # Whole address should not appear in the info,
+    # does not matter if uppercase or lowercase.
+    assert addr not in param
     assert addr_upper not in param
 
 
@@ -1232,10 +1240,12 @@ def test_leave_and_delete_group(acfactory, log):
 
 
 def test_immediate_autodelete(acfactory, direct_imap, log):
+    """
+    `bcc_self` is off by default,
+    so that messages are supposed to be immediately autodeleted
+    """
     ac1, ac2 = acfactory.get_online_accounts(2)
-
-    # "1" means delete immediately, while "0" means do not delete
-    ac2.set_config("delete_server_after", "1")
+    assert ac1.get_config("bcc_self") == "0"
 
     log.section("ac1: create chat with ac2")
     chat1 = ac1.create_chat(ac2)

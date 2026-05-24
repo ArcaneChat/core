@@ -153,15 +153,6 @@ pub enum StockMessage {
     #[strum(props(fallback = "Forwarded"))]
     Forwarded = 97,
 
-    #[strum(props(
-        fallback = "⚠️ Your provider's storage is about to exceed, already %1$s%% are used.\n\n\
-                    You may not be able to receive message when the storage is 100%% used.\n\n\
-                    👉 Please check if you can delete old data in the provider's webinterface \
-                    and consider to enable \"Settings / Delete Old Messages\". \
-                    You can check your current storage usage anytime at \"Settings / Connectivity\"."
-    ))]
-    QuotaExceedingMsgBody = 98,
-
     #[strum(props(fallback = "Multi Device Synchronization"))]
     SyncMsgSubject = 101,
 
@@ -197,9 +188,6 @@ pub enum StockMessage {
 
     #[strum(props(fallback = "Error: %1$s"))]
     Error = 112,
-
-    #[strum(props(fallback = "Not supported by your provider."))]
-    NotSupportedByProvider = 113,
 
     #[strum(props(fallback = "Messages"))]
     Messages = 114,
@@ -1100,13 +1088,6 @@ pub(crate) fn forwarded(context: &Context) -> String {
     translated(context, StockMessage::Forwarded)
 }
 
-/// Stock string: `⚠️ Your provider's storage is about to exceed...`.
-pub(crate) fn quota_exceeding(context: &Context, highest_usage: u64) -> String {
-    translated(context, StockMessage::QuotaExceedingMsgBody)
-        .replace1(&format!("{highest_usage}"))
-        .replace("%%", "%")
-}
-
 /// Stock string: `Incoming Messages`.
 pub(crate) fn incoming_messages(context: &Context) -> String {
     translated(context, StockMessage::IncomingMessages)
@@ -1151,11 +1132,6 @@ pub(crate) fn last_msg_sent_successfully(context: &Context) -> String {
 /// `%1$s` will be replaced by a possibly more detailed, typically english, error description.
 pub(crate) fn error(context: &Context, error: &str) -> String {
     translated(context, StockMessage::Error).replace1(error)
-}
-
-/// Stock string: `Not supported by your provider.`.
-pub(crate) fn not_supported_by_provider(context: &Context) -> String {
-    translated(context, StockMessage::NotSupportedByProvider)
 }
 
 /// Stock string: `Messages`.

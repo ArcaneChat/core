@@ -21,9 +21,6 @@ use futures_lite::FutureExt;
 use ratelimit::Ratelimit;
 use url::Url;
 
-use crate::calls::{
-    UnresolvedIceServer, create_fallback_ice_servers, create_ice_servers_from_metadata,
-};
 use crate::chat::{self, ChatId, ChatIdBlocked, add_device_msg};
 use crate::chatlist_events;
 use crate::config::Config;
@@ -48,6 +45,10 @@ use crate::stock_str;
 use crate::tools::{self, create_id, duration_to_str, time};
 use crate::transport::{
     ConfiguredLoginParam, ConfiguredServerLoginParam, prioritize_server_login_params,
+};
+use crate::{
+    calls::{UnresolvedIceServer, create_fallback_ice_servers, create_ice_servers_from_metadata},
+    ephemeral::delete_expired_imap_messages,
 };
 
 pub(crate) mod capabilities;
@@ -525,6 +526,12 @@ impl Imap {
             context.scheduler.interrupt_ephemeral_task().await;
         }
 
+        // Mark expired messages for deletion. Note that `delete_expired_imap_messages` is
+        // not well optimized and should not be called before fetching.
+        delete_expired_imap_messages(context, session.transport_id(), session.is_chatmail())
+            .await
+            .context("delete_expired_imap_messages")?;
+
         session
             .move_delete_messages(context, watch_folder)
             .await
@@ -945,29 +952,6 @@ impl Session {
         Ok(())
     }
 
-    /// Deletes all messages from IMAP folder.
-    pub(crate) async fn delete_all_messages(
-        &mut self,
-        context: &Context,
-        folder: &str,
-    ) -> Result<()> {
-        let transport_id = self.transport_id();
-
-        if self.select_with_uidvalidity(context, folder).await? {
-            self.add_flag_finalized_with_set("1:*", "\\Deleted").await?;
-            self.selected_folder_needs_expunge = true;
-            context
-                .sql
-                .execute(
-                    "DELETE FROM imap WHERE transport_id=? AND folder=?",
-                    (transport_id, folder),
-                )
-                .await?;
-        }
-
-        Ok(())
-    }
-
     /// Moves batch of messages identified by their UID from the currently
     /// selected folder to the target folder.
     async fn move_message_batch(
@@ -1068,15 +1052,12 @@ impl Session {
             if target.is_empty() {
                 self.delete_message_batch(context, &uid_set, rowid_set)
                     .await
-                    .with_context(|| format!("cannot delete batch of messages {:?}", &uid_set))?;
+                    .with_context(|| format!("cannot delete batch of messages {uid_set:?}"))?;
             } else {
                 self.move_message_batch(context, &uid_set, rowid_set, &target)
                     .await
                     .with_context(|| {
-                        format!(
-                            "cannot move batch of messages {:?} to folder {:?}",
-                            &uid_set, target
-                        )
+                        format!("cannot move batch of messages {uid_set:?} to folder {target:?}",)
                     })?;
             }
         }
@@ -1310,9 +1291,10 @@ impl Session {
 
         for (request_uids, set) in build_sequence_sets(&request_uids)? {
             info!(context, "Starting UID FETCH of message set \"{}\".", set);
-            let mut fetch_responses = self.uid_fetch(&set, BODY_FULL).await.with_context(|| {
-                format!("fetching messages {} from folder \"{}\"", &set, folder)
-            })?;
+            let mut fetch_responses = self
+                .uid_fetch(&set, BODY_FULL)
+                .await
+                .with_context(|| format!("fetching messages {set} from folder {folder:?}"))?;
 
             // Map from UIDs to unprocessed FETCH results. We put unprocessed FETCH results here
             // when we want to process other messages first.
@@ -1404,6 +1386,8 @@ impl Session {
                     "Passing message UID {} to receive_imf().", request_uid
                 );
                 let res = receive_imf_inner(context, rfc724_mid, body, is_seen).await;
+
+                // If there was an error receiving the message, show a device message:
                 let received_msg = match res {
                     Err(err) => {
                         warn!(context, "receive_imf error: {err:#}.");
@@ -2019,12 +2003,26 @@ pub(crate) async fn prefetch_should_download(
     // prevent_rename=true as this might be a mailing list message and in this case it would be bad if we rename the contact.
     // (prevent_rename is the last argument of from_field_to_contact_id())
 
+    // New SecureJoin is fully encrypted,
+    // but for compatibility we still download legacy `Secure-Join: vc-request` messages.
+    let is_legacy_securejoin = headers.get_header_value(HeaderDef::SecureJoin).is_some();
+
+    let is_encrypted = headers
+        .get_header_value(HeaderDef::ContentType)
+        .is_some_and(|content_type| {
+            mailparse::parse_content_type(&content_type).mimetype == "multipart/encrypted"
+        });
+
     if flags.any(|f| f == Flag::Draft) {
         info!(context, "Ignoring draft message");
         return Ok(false);
     }
 
-    let should_download = (!blocked_contact) || maybe_ndn;
+    let should_download = maybe_ndn
+        || (!blocked_contact
+            && (is_legacy_securejoin
+                || is_encrypted
+                || !context.get_config_bool(Config::ForceEncryption).await?));
     Ok(should_download)
 }
 

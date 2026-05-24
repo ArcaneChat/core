@@ -42,12 +42,25 @@ impl EncryptHelper {
         compress: bool,
         seipd_version: SeipdVersion,
     ) -> Result<String> {
-        let sign_key = load_self_secret_key(context).await?;
-
         let mut raw_message = Vec::new();
         let cursor = Cursor::new(&mut raw_message);
         mail_to_encrypt.clone().write_part(cursor).ok();
 
+        let ctext = self
+            .encrypt_raw(context, keyring, raw_message, compress, seipd_version)
+            .await?;
+        Ok(ctext)
+    }
+
+    pub async fn encrypt_raw(
+        self,
+        context: &Context,
+        keyring: Vec<SignedPublicKey>,
+        raw_message: Vec<u8>,
+        compress: bool,
+        seipd_version: SeipdVersion,
+    ) -> Result<String> {
+        let sign_key = load_self_secret_key(context).await?;
         let ctext =
             pgp::pk_encrypt(raw_message, keyring, sign_key, compress, seipd_version).await?;
 
@@ -79,16 +92,6 @@ impl EncryptHelper {
 
         Ok(ctext)
     }
-
-    /// Signs the passed-in `mail` using the private key from `context`.
-    /// Returns the payload and the signature.
-    pub async fn sign(self, context: &Context, mail: &MimePart<'static>) -> Result<String> {
-        let sign_key = load_self_secret_key(context).await?;
-        let mut buffer = Vec::new();
-        mail.clone().write_part(&mut buffer)?;
-        let signature = pgp::pk_calc_signature(buffer, &sign_key)?;
-        Ok(signature)
-    }
 }
 
 /// Ensures a private key exists for the configured user.
@@ -106,9 +109,11 @@ pub async fn ensure_secret_key_exists(context: &Context) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chat;
     use crate::chat::send_text_msg;
     use crate::config::Config;
     use crate::message::Message;
+    use crate::mimeparser::SystemMessage;
     use crate::receive_imf::receive_imf;
     use crate::test_utils::{TestContext, TestContextManager};
 
@@ -153,10 +158,33 @@ Sent with my Delta Chat Messenger: https://delta.chat";
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cannot_send_unencrypted_by_default() -> Result<()> {
+        let mut tcm = TestContextManager::new();
+        let alice = &tcm.alice().await;
+        let bob = &tcm.bob().await;
+        let chat = alice.create_email_chat(bob).await;
+
+        let mut msg = Message::new_text("Hello!".to_string());
+        assert!(chat::send_msg(alice, chat.id, &mut msg).await.is_err());
+        assert_eq!(
+            msg.error().unwrap(),
+            "\u{26a0}\u{fe0f} Your email provider example.org requires end-to-end encryption which is not setup yet."
+        );
+        let info_msg = alice.get_last_msg().await;
+        assert_eq!(
+            info_msg.get_info_type(),
+            SystemMessage::InvalidUnencryptedMail
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_chatmail_can_send_unencrypted() -> Result<()> {
         let mut tcm = TestContextManager::new();
         let bob = &tcm.bob().await;
         bob.set_config_bool(Config::IsChatmail, true).await?;
+        bob.allow_unencrypted().await?;
         let bob_chat_id = receive_imf(
             bob,
             b"From: alice@example.org\n\

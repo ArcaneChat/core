@@ -8,6 +8,7 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result, bail, ensure};
 use async_channel::{self, Receiver, Sender};
 use futures::FutureExt as _;
+use futures::future;
 use futures_lite::FutureExt as _;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
@@ -22,6 +23,7 @@ use tokio::time::{Duration, sleep};
 
 use crate::context::{Context, ContextBuilder};
 use crate::events::{Event, EventEmitter, EventType, Events};
+use crate::location;
 use crate::log::warn;
 use crate::push::PushSubscriber;
 use crate::stock_str::StockStrings;
@@ -536,6 +538,38 @@ impl Accounts {
         self.push_subscriber.set_device_token(token).await;
         Ok(())
     }
+
+    /// Sets location for all accounts.
+    ///
+    /// Returns true if location should still be streamed.
+    pub async fn set_location(&self, latitude: f64, longitude: f64, accuracy: f64) -> Result<bool> {
+        let continue_streaming = future::try_join_all(self.accounts.iter().map(
+            |(account_id, account)| async move {
+                location::set(account, latitude, longitude, accuracy)
+                    .await
+                    .with_context(|| format!("Failed to set location for account {account_id}"))
+            },
+        ))
+        .await?
+        .into_iter()
+        .any(|continue_streaming| continue_streaming);
+        Ok(continue_streaming)
+    }
+
+    /// Stops sending locations to all chats.
+    pub async fn stop_sending_locations(&self) -> Result<()> {
+        future::try_join_all(
+            self.accounts
+                .iter()
+                .map(|(account_id, account)| async move {
+                    location::stop_sending(account).await.with_context(|| {
+                        format!("Failed to stop sending locations for account {account_id}")
+                    })
+                }),
+        )
+        .await?;
+        Ok(())
+    }
 }
 
 /// Configuration file name.
@@ -760,7 +794,7 @@ impl Config {
                 .with_push_subscriber(push_subscriber.clone())
                 .build()
                 .await
-                .with_context(|| format!("failed to create context from file {:?}", &dbfile))?;
+                .with_context(|| format!("failed to create context from file {dbfile:?}"))?;
             // Try to open without a passphrase,
             // but do not return an error if account is passphare-protected.
             ctx.open("".to_string()).await?;

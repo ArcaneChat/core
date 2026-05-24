@@ -19,6 +19,7 @@ use crate::headerdef::HeaderDef;
 use crate::message;
 use crate::mimeparser::MimeMessage;
 use crate::receive_imf::receive_imf;
+use crate::test_utils;
 use crate::test_utils::{TestContext, TestContextManager, get_chat_msg};
 use crate::tools::SystemTime;
 
@@ -114,6 +115,7 @@ fn test_header_encoding() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_manually_set_subject() -> Result<()> {
     let t = TestContext::new_alice().await;
+    t.allow_unencrypted().await?;
     let chat = t.create_chat_with_contact("bob", "bob@example.org").await;
 
     let mut msg = Message::new(Viewtype::Text);
@@ -132,14 +134,13 @@ async fn test_subject_from_mua() {
     // 1.: Receive a mail from an MUA
     assert_eq!(
         msg_to_subject_str(
-            b"Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
-                From: Bob <bob@example.com>\n\
-                To: alice@example.org\n\
-                Subject: Antw: Chat: hello\n\
-                Message-ID: <2222@example.com>\n\
-                Date: Sun, 22 Mar 2020 22:37:56 +0000\n\
-                \n\
-                hello\n"
+            b"From: Bob <bob@example.net>\r\n\
+              To: alice@example.org\r\n\
+              Subject: Antw: Chat: hello\r\n\
+              Message-ID: <2222@example.net>\r\n\
+              Date: Sun, 22 Mar 2020 22:37:56 +0000\r\n\
+              \r\n\
+              hello\r\n"
         )
         .await,
         "Re: Chat: hello"
@@ -147,14 +148,13 @@ async fn test_subject_from_mua() {
 
     assert_eq!(
         msg_to_subject_str(
-            b"Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
-                From: Bob <bob@example.com>\n\
-                To: alice@example.org\n\
-                Subject: Infos: 42\n\
-                Message-ID: <2222@example.com>\n\
-                Date: Sun, 22 Mar 2020 22:37:56 +0000\n\
-                \n\
-                hello\n"
+            b"From: Bob <bob@example.net>\r\n\
+              To: alice@example.org\r\n\
+              Subject: Infos: 42\r\n\
+              Message-ID: <2222@example.net>\r\n\
+              Date: Sun, 22 Mar 2020 22:37:56 +0000\r\n\
+              \r\n\
+              hello\r\n"
         )
         .await,
         "Re: Infos: 42"
@@ -166,15 +166,14 @@ async fn test_subject_from_dc() {
     // 2. Receive a message from Delta Chat
     assert_eq!(
         msg_to_subject_str(
-            b"Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
-                From: bob@example.com\n\
-                To: alice@example.org\n\
-                Subject: Chat: hello\n\
-                Chat-Version: 1.0\n\
-                Message-ID: <2223@example.com>\n\
-                Date: Sun, 22 Mar 2020 22:37:56 +0000\n\
-                \n\
-                hello\n"
+            b"From: bob@example.net\r\n\
+              To: alice@example.org\r\n\
+              Subject: Chat: hello\r\n\
+              Chat-Version: 1.0\r\n\
+              Message-ID: <2223@example.net>\r\n\
+              Date: Sun, 22 Mar 2020 22:37:56 +0000\r\n\
+              \r\n\
+              hello\r\n"
         )
         .await,
         "Re: Chat: hello"
@@ -185,10 +184,12 @@ async fn test_subject_from_dc() {
 async fn test_subject_outgoing() {
     // 3. Send the first message to a new contact
     let t = TestContext::new_alice().await;
+    t.allow_unencrypted().await.unwrap();
 
     assert_eq!(first_subject_str(t).await, "Message from alice@example.org");
 
     let t = TestContext::new_alice().await;
+    t.allow_unencrypted().await.unwrap();
     t.set_config(Config::Displayname, Some("Alice"))
         .await
         .unwrap();
@@ -199,29 +200,27 @@ async fn test_subject_outgoing() {
 async fn test_subject_unicode() {
     // 4. Receive messages with unicode characters and make sure that we do not panic (we do not care about the result)
     msg_to_subject_str(
-        "Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
-            From: bob@example.com\n\
-            To: alice@example.org\n\
-            Subject: äääää\n\
-            Chat-Version: 1.0\n\
-            Message-ID: <2893@example.com>\n\
-            Date: Sun, 22 Mar 2020 22:37:56 +0000\n\
-            \n\
-            hello\n"
+        "From: bob@example.net\r\n\
+         To: alice@example.org\r\n\
+         Subject: äääää\r\n\
+         Chat-Version: 1.0\r\n\
+         Message-ID: <2893@example.com>\r\n\
+         Date: Sun, 22 Mar 2020 22:37:56 +0000\r\n\
+         \r\n\
+         hello\r\n"
             .as_bytes(),
     )
     .await;
 
     msg_to_subject_str(
-        "Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
-            From: bob@example.com\n\
-            To: alice@example.org\n\
-            Subject: aäääää\n\
-            Chat-Version: 1.0\n\
-            Message-ID: <2893@example.com>\n\
-            Date: Sun, 22 Mar 2020 22:37:56 +0000\n\
-            \n\
-            hello\n"
+        "From: bob@example.net\r\n\
+         To: alice@example.org\r\n\
+         Subject: aäääää\r\n\
+         Chat-Version: 1.0\r\n\
+         Message-ID: <2893@example.com>\r\n\
+         Date: Sun, 22 Mar 2020 22:37:56 +0000\r\n\
+         \r\n\
+         hello\r\n"
             .as_bytes(),
     )
     .await;
@@ -230,73 +229,76 @@ async fn test_subject_unicode() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_subject_mdn() {
     // 5. Receive an mdn (read receipt) and make sure the mdn's subject is not used
-    let t = TestContext::new_alice().await;
+    let mut tcm = TestContextManager::new();
+    let t = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+    t.allow_unencrypted().await.unwrap();
     receive_imf(
-        &t,
-        b"Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
-            From: alice@example.org\n\
-            To: bob@example.com\n\
-            Subject: Hello, Bob\n\
-            Chat-Version: 1.0\n\
-            Message-ID: <2893@example.com>\n\
-            Date: Sun, 22 Mar 2020 22:37:56 +0000\n\
-            \n\
-            hello\n",
+        t,
+        b"From: alice@example.org\r\n\
+          To: bob@example.net\r\n\
+          Subject: Hello, Bob\r\n\
+          Chat-Version: 1.0\r\n\
+          Message-ID: <2893@example.com>\r\n\
+          Date: Sun, 22 Mar 2020 22:37:56 +0000\r\n\
+          \r\n\
+          hello\r\n",
         false,
     )
     .await
     .unwrap();
     let mut new_msg = incoming_msg_to_reply_msg(
-        b"Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
-                 From: bob@example.com\n\
-                 To: alice@example.org\n\
-                 Subject: message opened\n\
-                 Date: Sun, 22 Mar 2020 23:37:57 +0000\n\
-                 Chat-Version: 1.0\n\
-                 Message-ID: <Mr.12345678902@example.com>\n\
-                 Content-Type: multipart/report; report-type=disposition-notification; boundary=\"SNIPP\"\n\
-                 \n\
-                 \n\
-                 --SNIPP\n\
-                 Content-Type: text/plain; charset=utf-8\n\
-                 \n\
-                 Read receipts do not guarantee sth. was read.\n\
-                 \n\
-                 \n\
-                 --SNIPP\n\
-                 Content-Type: message/disposition-notification\n\
-                 \n\
-                 Reporting-UA: Delta Chat 1.28.0\n\
-                 Original-Recipient: rfc822;bob@example.com\n\
-                 Final-Recipient: rfc822;bob@example.com\n\
-                 Original-Message-ID: <2893@example.com>\n\
-                 Disposition: manual-action/MDN-sent-automatically; displayed\n\
-                 \n", &t).await;
-    chat::send_msg(&t, new_msg.chat_id, &mut new_msg)
+        b"From: bob@example.net\r\n\
+          To: alice@example.org\r\n\
+          Subject: message opened\r\n\
+          Date: Sun, 22 Mar 2020 23:37:57 +0000\r\n\
+          Chat-Version: 1.0\r\n\
+          Message-ID: <Mr.12345678902@example.com>\r\n\
+          Content-Type: multipart/report; report-type=disposition-notification; boundary=\"SNIPP\"\r\n\
+          \r\n\
+          \r\n\
+          --SNIPP\r\n\
+          Content-Type: text/plain; charset=utf-8\r\n\
+          \r\n\
+          Read receipts do not guarantee sth. was read.\r\n\
+          \r\n\
+          \r\n\
+          --SNIPP\r\n\
+          Content-Type: message/disposition-notification\r\n\
+          \r\n\
+          Reporting-UA: Delta Chat 1.28.0\r\n\
+          Original-Recipient: rfc822;bob@example.com\r\n\
+          Final-Recipient: rfc822;bob@example.com\r\n\
+          Original-Message-ID: <2893@example.com>\r\n\
+          Disposition: manual-action/MDN-sent-automatically; displayed\r\n\
+          \r\n", t, bob).await;
+    chat::send_msg(t, new_msg.chat_id, &mut new_msg)
         .await
         .unwrap();
-    let mf = MimeFactory::from_msg(&t, new_msg).await.unwrap();
+    let mf = MimeFactory::from_msg(t, new_msg).await.unwrap();
     // The subject string should not be "Re: message opened"
-    assert_eq!("Re: Hello, Bob", mf.subject_str(&t).await.unwrap());
+    assert_eq!("Re: Hello, Bob", mf.subject_str(t).await.unwrap());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_mdn_create_encrypted() -> Result<()> {
     let mut tcm = TestContextManager::new();
     let alice = tcm.alice().await;
+    alice.allow_unencrypted().await?;
     alice
         .set_config(Config::Displayname, Some("Alice Exampleorg"))
         .await?;
     let bob = tcm.bob().await;
+    bob.allow_unencrypted().await?;
     bob.set_config(Config::Displayname, Some("Bob Examplenet"))
         .await?;
     bob.set_config(Config::Selfstatus, Some("Bob Examplenet"))
         .await?;
     bob.set_config_bool(Config::MdnsEnabled, true).await?;
 
+    // MDN for unencrypted message is not encrypted.
     let mut msg = Message::new(Viewtype::Text);
-    msg.param.set_int(Param::SkipAutocrypt, 1);
-    let chat_alice = alice.create_chat(&bob).await.id;
+    let chat_alice = alice.create_email_chat(&bob).await.id;
     let sent = alice.send_msg(chat_alice, &mut msg).await;
 
     let rcvd = bob.recv_msg(&sent).await;
@@ -311,13 +313,13 @@ async fn test_mdn_create_encrypted() -> Result<()> {
     let bob_alice_contact = bob.add_or_lookup_contact(&alice).await;
     assert_eq!(bob_alice_contact.get_authname(), "Alice Exampleorg");
 
+    // MDN for encrypted message is encrypted.
     let rcvd = tcm.send_recv(&alice, &bob, "Heyho").await;
     message::markseen_msgs(&bob, vec![rcvd.id]).await?;
 
     let mimefactory = MimeFactory::from_mdn(&bob, rcvd.from_id, rcvd.rfc724_mid, vec![]).await?;
     let rendered_msg = mimefactory.render(&bob).await?;
 
-    // When encrypted, the MDN should be encrypted as well
     assert!(rendered_msg.is_encrypted);
     assert!(!rendered_msg.message.contains("Bob Examplenet"));
     assert!(!rendered_msg.message.contains("Alice Exampleorg"));
@@ -417,7 +419,7 @@ async fn first_subject_str(t: TestContext) -> String {
     mf.subject_str(&t).await.unwrap()
 }
 
-// In `imf_raw`, From has to be bob@example.com, To has to be alice@example.org
+// In `imf_raw`, From has to be bob@example.net, To has to be alice@example.org
 async fn msg_to_subject_str(imf_raw: &[u8]) -> String {
     let subject_str = msg_to_subject_str_inner(imf_raw, false, false, false).await;
 
@@ -465,53 +467,62 @@ async fn msg_to_subject_str_inner(
     reply: bool,
     message_arrives_inbetween: bool,
 ) -> String {
-    let t = TestContext::new_alice().await;
-    let mut new_msg = incoming_msg_to_reply_msg(imf_raw, &t).await;
-    let incoming_msg = get_chat_msg(&t, new_msg.chat_id, 0, 1).await;
+    let mut tcm = TestContextManager::new();
+    let t = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+    let mut new_msg = incoming_msg_to_reply_msg(imf_raw, t, bob).await;
+    let incoming_msg = get_chat_msg(t, new_msg.chat_id, 1, 2).await;
 
     if delete_original_msg {
-        incoming_msg.id.trash(&t, false).await.unwrap();
+        incoming_msg.id.trash(t, false).await.unwrap();
     }
 
     if message_arrives_inbetween {
-        receive_imf(
-            &t,
-            b"Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
-                    From: Bob <bob@example.com>\n\
-                    To: alice@example.org\n\
-                    Subject: Some other, completely unrelated subject\n\
-                    Message-ID: <3cl4@example.com>\n\
-                    Date: Sun, 22 Mar 2020 22:37:56 +0000\n\
-                    \n\
-                    Some other, completely unrelated content\n",
-            false,
+        let encrypted_msg = test_utils::encrypt_raw_message(
+            bob,
+            &[t],
+            b"From: Bob <bob@example.net>\r\n\
+              To: alice@example.org\r\n\
+              Subject: Some other, completely unrelated subject\r\n\
+              Message-ID: <3cl4@example.com>\r\n\
+              Date: Sun, 22 Mar 2020 22:37:56 +0000\r\n\
+              \r\n\
+              Some other, completely unrelated content\r\n",
         )
         .await
         .unwrap();
+        receive_imf(t, encrypted_msg.as_bytes(), false)
+            .await
+            .unwrap();
 
         let arrived_msg = t.get_last_msg().await;
         assert_eq!(arrived_msg.chat_id, incoming_msg.chat_id);
     }
 
     if reply {
-        new_msg.set_quote(&t, Some(&incoming_msg)).await.unwrap();
+        new_msg.set_quote(t, Some(&incoming_msg)).await.unwrap();
     }
 
-    chat::send_msg(&t, new_msg.chat_id, &mut new_msg)
+    chat::send_msg(t, new_msg.chat_id, &mut new_msg)
         .await
         .unwrap();
-    let mf = MimeFactory::from_msg(&t, new_msg).await.unwrap();
-    mf.subject_str(&t).await.unwrap()
+    let mf = MimeFactory::from_msg(t, new_msg).await.unwrap();
+    mf.subject_str(t).await.unwrap()
 }
 
 // Creates a `Message` that replies "Hi" to the incoming email in `imf_raw`.
-async fn incoming_msg_to_reply_msg(imf_raw: &[u8], context: &Context) -> Message {
-    context
-        .set_config(Config::ShowEmails, Some("2"))
+async fn incoming_msg_to_reply_msg(
+    imf_raw: &[u8],
+    context: &TestContext,
+    from: &TestContext,
+) -> Message {
+    let encrypted_msg = test_utils::encrypt_raw_message(from, &[context], imf_raw)
         .await
         .unwrap();
 
-    receive_imf(context, imf_raw, false).await.unwrap();
+    receive_imf(context, encrypted_msg.as_bytes(), false)
+        .await
+        .unwrap();
 
     let chats = Chatlist::try_load(context, 0, None, None).await.unwrap();
 
@@ -527,30 +538,31 @@ async fn incoming_msg_to_reply_msg(imf_raw: &[u8], context: &Context) -> Message
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 // This test could still be extended
 async fn test_render_reply() {
-    let t = TestContext::new_alice().await;
-    let context = &t;
+    let mut tcm = TestContextManager::new();
+    let t = &tcm.alice().await;
+    let charlie = &tcm.charlie().await;
 
     let mut msg = incoming_msg_to_reply_msg(
-        b"Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
-                From: Charlie <charlie@example.com>\n\
-                To: alice@example.org\n\
-                Subject: Chat: hello\n\
-                Chat-Version: 1.0\n\
-                Message-ID: <2223@example.com>\n\
-                Date: Sun, 22 Mar 2020 22:37:56 +0000\n\
-                \n\
-                hello\n",
-        context,
+        b"From: Charlie <charlie@example.net>\r\n\
+          To: alice@example.org\r\n\
+          Subject: Chat: hello\r\n\
+          Chat-Version: 1.0\r\n\
+          Message-ID: <2223@example.com>\r\n\
+          Date: Sun, 22 Mar 2020 22:37:56 +0000\r\n\
+          \r\n\
+          hello\r\n",
+        t,
+        charlie,
     )
     .await;
-    chat::send_msg(&t, msg.chat_id, &mut msg).await.unwrap();
+    chat::send_msg(t, msg.chat_id, &mut msg).await.unwrap();
 
-    let mimefactory = MimeFactory::from_msg(&t, msg).await.unwrap();
+    let mimefactory = MimeFactory::from_msg(t, msg).await.unwrap();
 
     let recipients = mimefactory.recipients();
-    assert_eq!(recipients, vec!["charlie@example.com"]);
+    assert_eq!(recipients, vec!["charlie@example.net"]);
 
-    let rendered_msg = mimefactory.render(context).await.unwrap();
+    let rendered_msg = mimefactory.render(t).await.unwrap();
 
     let mail = mailparse::parse_mail(rendered_msg.message.as_bytes()).unwrap();
     assert_eq!(
@@ -562,7 +574,7 @@ async fn test_render_reply() {
         "1.0"
     );
 
-    let _mime_msg = MimeMessage::from_bytes(context, rendered_msg.message.as_bytes())
+    let _mime_msg = MimeMessage::from_bytes(t, rendered_msg.message.as_bytes())
         .await
         .unwrap();
 }
@@ -571,6 +583,7 @@ async fn test_render_reply() {
 async fn test_selfavatar_unencrypted() -> anyhow::Result<()> {
     // create chat with bob, set selfavatar
     let t = TestContext::new_alice().await;
+    t.allow_unencrypted().await?;
     let chat = t.create_chat_with_contact("bob", "bob@example.org").await;
 
     let file = t.dir.path().join("avatar.png");
@@ -606,70 +619,6 @@ async fn test_selfavatar_unencrypted() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_selfavatar_unencrypted_signed() {
-    // create chat with bob, set selfavatar
-    let t = TestContext::new_alice().await;
-    t.set_config(Config::SignUnencrypted, Some("1"))
-        .await
-        .unwrap();
-    let chat = t.create_chat_with_contact("bob", "bob@example.org").await;
-
-    let file = t.dir.path().join("avatar.png");
-    let bytes = include_bytes!("../../test-data/image/avatar64x64.png");
-    tokio::fs::write(&file, bytes).await.unwrap();
-    t.set_config(Config::Selfavatar, Some(file.to_str().unwrap()))
-        .await
-        .unwrap();
-
-    // send message to bob: that should get multipart/signed.
-    // `Subject:` is protected by copying it.
-    // make sure, `Subject:` stays in the outer header (imf header)
-    let mut msg = Message::new_text("this is the text!".to_string());
-
-    let sent_msg = t.send_msg(chat.id, &mut msg).await;
-    let mut payload = sent_msg.payload().splitn(4, "\r\n\r\n");
-
-    let part = payload.next().unwrap();
-    assert_eq!(part.match_indices("multipart/signed").count(), 1);
-    assert_eq!(part.match_indices("From:").count(), 1);
-    assert_eq!(part.match_indices("Message-ID:").count(), 1);
-    assert_eq!(part.match_indices("Subject:").count(), 1);
-    assert_eq!(part.match_indices("Autocrypt:").count(), 1);
-    assert_eq!(part.match_indices("Chat-User-Avatar:").count(), 0);
-
-    let part = payload.next().unwrap();
-    assert_eq!(
-        part.match_indices("multipart/mixed; protected-headers=\"v1\"")
-            .count(),
-        1
-    );
-    assert_eq!(part.match_indices("From:").count(), 1);
-    assert_eq!(part.match_indices("Message-ID:").count(), 0);
-    assert_eq!(part.match_indices("Subject:").count(), 1);
-    assert_eq!(part.match_indices("Autocrypt:").count(), 1);
-    assert_eq!(part.match_indices("Chat-User-Avatar:").count(), 0);
-
-    let part = payload.next().unwrap();
-    assert_eq!(part.match_indices("text/plain").count(), 1);
-    assert_eq!(part.match_indices("From:").count(), 0);
-    assert_eq!(part.match_indices("Message-ID:").count(), 1);
-    assert_eq!(part.match_indices("Chat-User-Avatar:").count(), 0);
-    assert_eq!(part.match_indices("Subject:").count(), 0);
-
-    let body = payload.next().unwrap();
-    assert_eq!(body.match_indices("this is the text!").count(), 1);
-
-    let bob = TestContext::new_bob().await;
-    bob.recv_msg(&sent_msg).await;
-    let alice_id = Contact::lookup_id_by_addr(&bob.ctx, "alice@example.org", Origin::Unknown)
-        .await
-        .unwrap()
-        .unwrap();
-    let alice_contact = Contact::get_by_id(&bob.ctx, alice_id).await.unwrap();
-    assert_eq!(alice_contact.is_key_contact(), false);
-}
-
 /// Test that removed member address does not go into the `To:` field.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_remove_member_bcc() -> Result<()> {
@@ -680,6 +629,7 @@ async fn test_remove_member_bcc() -> Result<()> {
     let alice = &tcm.alice().await;
     let bob = &tcm.bob().await;
     let charlie = &tcm.charlie().await;
+    alice.allow_unencrypted().await?;
 
     let alice_addr = alice.get_config(Config::Addr).await?.unwrap();
     let bob_addr = bob.get_config(Config::Addr).await?.unwrap();
@@ -723,6 +673,7 @@ async fn test_remove_member_bcc() -> Result<()> {
 async fn test_from_before_autocrypt() -> Result<()> {
     // create chat with bob
     let t = TestContext::new_alice().await;
+    t.allow_unencrypted().await?;
     let chat = t.create_chat_with_contact("bob", "bob@example.org").await;
 
     // send message to bob: that should get multipart/mixed because of the avatar moved to inner header;
@@ -866,6 +817,7 @@ async fn test_new_member_is_first_recipient() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_no_empty_to_header() -> Result<()> {
     let alice = &TestContext::new_alice().await;
+    alice.allow_unencrypted().await?;
     let mut self_chat = alice.get_self_chat().await;
     self_chat.param.remove(Param::Selftalk);
     self_chat.update_param(alice).await?;

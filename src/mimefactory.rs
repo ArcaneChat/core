@@ -1227,53 +1227,18 @@ impl MimeFactory {
                     message.header(header, value)
                 });
             let message = MimePart::new("multipart/mixed", vec![message]);
-            let mut message = protected_headers
+            let message = protected_headers
                 .iter()
                 .fold(message, |message, (header, value)| {
                     message.header(*header, value.clone())
                 });
 
-            if skip_autocrypt || !context.get_config_bool(Config::SignUnencrypted).await? {
-                // Deduplicate unprotected headers that also are in the protected headers:
-                let protected: HashSet<&str> =
-                    HashSet::from_iter(protected_headers.iter().map(|(header, _value)| *header));
-                unprotected_headers.retain(|(header, _value)| !protected.contains(header));
+            // Deduplicate unprotected headers that also are in the protected headers:
+            let protected: HashSet<&str> =
+                HashSet::from_iter(protected_headers.iter().map(|(header, _value)| *header));
+            unprotected_headers.retain(|(header, _value)| !protected.contains(header));
 
-                message
-            } else {
-                for (h, v) in &mut message.headers {
-                    if h == "Content-Type"
-                        && let mail_builder::headers::HeaderType::ContentType(ct) = v
-                    {
-                        let mut ct_new = ct.clone();
-                        ct_new = ct_new.attribute("protected-headers", "v1");
-                        if use_std_header_protection {
-                            ct_new = ct_new.attribute("hp", "clear");
-                        }
-                        *ct = ct_new;
-                        break;
-                    }
-                }
-
-                let signature = encrypt_helper.sign(context, &message).await?;
-                MimePart::new(
-                    "multipart/signed; protocol=\"application/pgp-signature\"; protected",
-                    vec![
-                        message,
-                        MimePart::new(
-                            "application/pgp-signature; name=\"signature.asc\"",
-                            signature,
-                        )
-                        .header(
-                            "Content-Description",
-                            mail_builder::headers::raw::Raw::<'static>::new(
-                                "OpenPGP digital signature",
-                            ),
-                        )
-                        .attachment("signature"),
-                    ],
-                )
-            }
+            message
         };
 
         let MimeFactory {
@@ -1829,7 +1794,7 @@ impl MimeFactory {
             parts.push(msg_kml_part);
         }
 
-        if location::is_sending_locations_to_chat(context, Some(msg.chat_id)).await?
+        if location::is_sending_to_chat(context, msg.chat_id).await?
             && let Some(part) = self.get_location_kml_part(context).await?
         {
             parts.push(part);
@@ -1974,32 +1939,13 @@ pub(crate) fn render_outer_message(
 /// Takes the encrypted part, wraps it in a MimePart,
 /// and sets the appropriate Content-Type for the outer message
 pub(crate) fn wrap_encrypted_part(encrypted: String) -> MimePart<'static> {
-    // XXX: additional newline is needed
-    // to pass filtermail at
-    // <https://github.com/deltachat/chatmail/blob/4d915f9800435bf13057d41af8d708abd34dbfa8/chatmaild/src/chatmaild/filtermail.py#L84-L86>:
-    let encrypted = encrypted + "\n";
-
     MimePart::new(
         "multipart/encrypted; protocol=\"application/pgp-encrypted\"",
         vec![
             // Autocrypt part 1
-            MimePart::new("application/pgp-encrypted", "Version: 1\r\n").header(
-                "Content-Description",
-                mail_builder::headers::raw::Raw::new("PGP/MIME version identification"),
-            ),
+            MimePart::new("application/pgp-encrypted", "Version: 1\r\n"),
             // Autocrypt part 2
-            MimePart::new(
-                "application/octet-stream; name=\"encrypted.asc\"",
-                encrypted,
-            )
-            .header(
-                "Content-Description",
-                mail_builder::headers::raw::Raw::new("OpenPGP encrypted message"),
-            )
-            .header(
-                "Content-Disposition",
-                mail_builder::headers::raw::Raw::new("inline; filename=\"encrypted.asc\";"),
-            ),
+            MimePart::new("application/octet-stream", encrypted),
         ],
     )
 }
@@ -2192,10 +2138,6 @@ fn group_headers_by_confidentiality(
                 }
             }
         } else {
-            // Copy the header to the protected headers
-            // in case of signed-only message.
-            // If the message is not signed, this value will not be used.
-            protected_headers.push(header.clone());
             unprotected_headers.push(header.clone())
         }
     }

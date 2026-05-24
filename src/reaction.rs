@@ -36,10 +36,7 @@ pub struct Reaction {
     reaction: String,
 }
 
-// We implement From<&str> instead of std::str::FromStr, because
-// FromStr requires error type and reaction parsing never returns an
-// error.
-impl From<&str> for Reaction {
+impl Reaction {
     /// Convert a `&str` into a `Reaction`.
     /// Everything after the first whitespace is ignored.
     ///
@@ -51,7 +48,7 @@ impl From<&str> for Reaction {
     /// reactions is not different from other kinds of spam attacks
     /// such as sending large numbers of large messages, and should be
     /// dealt with the same way, e.g. by blocking the user.
-    fn from(reaction: &str) -> Self {
+    pub fn new(reaction: &str) -> Self {
         let reaction: &str = reaction
             .split_ascii_whitespace()
             .next()
@@ -61,9 +58,7 @@ impl From<&str> for Reaction {
             reaction: reaction.to_string(),
         }
     }
-}
 
-impl Reaction {
     /// Returns true if reaction contains no emoji.
     pub fn is_empty(&self) -> bool {
         self.reaction.is_empty()
@@ -212,7 +207,7 @@ pub async fn send_reaction(context: &Context, msg_id: MsgId, reaction: &str) -> 
     let msg = Message::load_from_db(context, msg_id).await?;
     let chat_id = msg.chat_id;
 
-    let reaction: Reaction = reaction.into();
+    let reaction = Reaction::new(reaction);
     let mut reaction_msg = Message::new_text(reaction.as_str().to_string());
     reaction_msg.set_reaction();
     reaction_msg.in_reply_to = Some(msg.rfc724_mid);
@@ -282,7 +277,7 @@ pub async fn get_msg_reactions(context: &Context, msg_id: MsgId) -> Result<React
             |row| {
                 let contact_id: ContactId = row.get(0)?;
                 let reaction: String = row.get(1)?;
-                Ok((contact_id, Reaction::from(reaction.as_str())))
+                Ok((contact_id, Reaction::new(reaction.as_str())))
             },
         )
         .await?;
@@ -340,18 +335,17 @@ impl Chat {
 
 #[cfg(test)]
 mod tests {
-    use deltachat_contact_tools::ContactAddress;
-
     use super::*;
     use crate::chat::{forward_msgs, get_chat_msgs, marknoticed_chat, send_text_msg};
     use crate::chatlist::Chatlist;
     use crate::config::Config;
-    use crate::contact::{Contact, Origin};
+    use crate::contact::Contact;
     use crate::key::{load_self_public_key, load_self_secret_key};
     use crate::message::{MessageState, Viewtype, delete_msgs, markseen_msgs};
     use crate::pgp::{SeipdVersion, pk_encrypt};
     use crate::receive_imf::receive_imf;
     use crate::sql::housekeeping;
+    use crate::test_utils;
     use crate::test_utils::E2EE_INFO_MSGS;
     use crate::test_utils::TestContext;
     use crate::test_utils::TestContextManager;
@@ -361,89 +355,84 @@ mod tests {
     #[test]
     fn test_parse_reaction() {
         // Check that basic set of emojis from RFC 9078 is supported.
-        assert_eq!(Reaction::from("👍").as_str(), "👍");
-        assert_eq!(Reaction::from("👎").as_str(), "👎");
-        assert_eq!(Reaction::from("😀").as_str(), "😀");
-        assert_eq!(Reaction::from("☹").as_str(), "☹");
-        assert_eq!(Reaction::from("😢").as_str(), "😢");
+        assert_eq!(Reaction::new("👍").as_str(), "👍");
+        assert_eq!(Reaction::new("👎").as_str(), "👎");
+        assert_eq!(Reaction::new("😀").as_str(), "😀");
+        assert_eq!(Reaction::new("☹").as_str(), "☹");
+        assert_eq!(Reaction::new("😢").as_str(), "😢");
 
         // Empty string can be used to remove all reactions.
-        assert!(Reaction::from("").is_empty());
+        assert!(Reaction::new("").is_empty());
 
         // Short strings can be used as emojis, could be used to add
         // support for custom emojis via emoji shortcodes.
-        assert_eq!(Reaction::from(":deltacat:").as_str(), ":deltacat:");
+        assert_eq!(Reaction::new(":deltacat:").as_str(), ":deltacat:");
 
         // Check that long strings are not valid emojis.
         assert!(
-            Reaction::from(":foobarbazquuxaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:").is_empty()
+            Reaction::new(":foobarbazquuxaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:").is_empty()
         );
 
         // Multiple reactions separated by spaces or tabs are not supported.
-        assert_eq!(Reaction::from("👍 ❤").as_str(), "👍");
-        assert_eq!(Reaction::from("👍\t❤").as_str(), "👍");
+        assert_eq!(Reaction::new("👍 ❤").as_str(), "👍");
+        assert_eq!(Reaction::new("👍\t❤").as_str(), "👍");
 
-        assert_eq!(Reaction::from("👍\t:foo: ❤").as_str(), "👍");
-        assert_eq!(Reaction::from("👍\t:foo: ❤").as_str(), "👍");
+        assert_eq!(Reaction::new("👍\t:foo: ❤").as_str(), "👍");
+        assert_eq!(Reaction::new("👍\t:foo: ❤").as_str(), "👍");
 
-        assert_eq!(Reaction::from("👍 👍").as_str(), "👍");
+        assert_eq!(Reaction::new("👍 👍").as_str(), "👍");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_receive_reaction() -> Result<()> {
-        let alice = TestContext::new_alice().await;
+        let mut tcm = TestContextManager::new();
+        let alice = &tcm.alice().await;
+        let bob = &tcm.bob().await;
 
         // Alice receives BCC-self copy of a message sent to Bob.
-        receive_imf(
-            &alice,
-            "To: bob@example.net\n\
-From: alice@example.org\n\
-Date: Today, 29 February 2021 00:00:00 -800\n\
-Message-ID: 12345@example.org\n\
-Subject: Meeting\n\
-\n\
-Can we chat at 1pm pacific, today?"
-                .as_bytes(),
-            false,
+        let encrypted_message = test_utils::encrypt_raw_message(
+            alice,
+            &[alice, bob],
+            b"To: bob@example.net\r\n\
+From: alice@example.org\r\n\
+Date: Today, 29 February 2021 00:00:00 -800\r\n\
+Message-ID: 12345@example.org\r\n\
+Subject: Meeting\r\n\
+\r\n\
+Can we chat at 1pm pacific, today?",
         )
         .await?;
+        receive_imf(alice, encrypted_message.as_bytes(), false).await?;
         let msg = alice.get_last_msg().await;
         assert_eq!(msg.state, MessageState::OutDelivered);
-        let reactions = get_msg_reactions(&alice, msg.id).await?;
+        let reactions = get_msg_reactions(alice, msg.id).await?;
         let contacts = reactions.contacts();
         assert_eq!(contacts.len(), 0);
 
-        let bob_id = Contact::add_or_lookup(
-            &alice,
-            "",
-            &ContactAddress::new("bob@example.net")?,
-            Origin::ManuallyCreated,
-        )
-        .await?
-        .0;
+        let bob_id = alice.add_or_lookup_contact_id(bob).await;
         let bob_reaction = reactions.get(bob_id);
         assert!(bob_reaction.is_empty()); // Bob has not reacted to message yet.
 
         // Alice receives reaction to her message from Bob.
-        receive_imf(
-            &alice,
-            "To: alice@example.org\n\
-From: bob@example.net\n\
-Date: Today, 29 February 2021 00:00:10 -800\n\
-Message-ID: 56789@example.net\n\
-In-Reply-To: 12345@example.org\n\
-Subject: Meeting\n\
-Mime-Version: 1.0 (1.0)\n\
-Content-Type: text/plain; charset=utf-8\n\
-Content-Disposition: reaction\n\
-\n\
+        test_utils::receive_encrypted_imf(
+            alice,
+            bob,
+            "To: alice@example.org\r\n\
+From: bob@example.net\r\n\
+Date: Today, 29 February 2021 00:00:10 -800\r\n\
+Message-ID: 56789@example.net\r\n\
+In-Reply-To: 12345@example.org\r\n\
+Subject: Meeting\r\n\
+Mime-Version: 1.0 (1.0)\r\n\
+Content-Type: text/plain; charset=utf-8\r\n\
+Content-Disposition: reaction\r\n\
+\r\n\
 \u{1F44D}"
                 .as_bytes(),
-            false,
         )
         .await?;
 
-        let reactions = get_msg_reactions(&alice, msg.id).await?;
+        let reactions = get_msg_reactions(alice, msg.id).await?;
         assert_eq!(reactions.to_string(), "👍1");
 
         let contacts = reactions.contacts();
@@ -456,8 +445,9 @@ Content-Disposition: reaction\n\
         assert_eq!(bob_reaction.as_str(), "👍");
 
         // Alice receives reaction to her message from Bob with a footer.
-        receive_imf(
-            &alice,
+        test_utils::receive_encrypted_imf(
+            alice,
+            bob,
             "To: alice@example.org\n\
 From: bob@example.net\n\
 Date: Today, 29 February 2021 00:00:10 -800\n\
@@ -474,16 +464,16 @@ Content-Disposition: reaction\n\
 _______________________________________________\n\
 Here's my footer -- bob@example.net"
                 .as_bytes(),
-            false,
         )
         .await?;
 
-        let reactions = get_msg_reactions(&alice, msg.id).await?;
+        let reactions = get_msg_reactions(alice, msg.id).await?;
         assert_eq!(reactions.to_string(), "😀1");
 
         // Alice receives a message with reaction to her message from Bob.
-        let msg_bob = receive_imf(
-            &alice,
+        let msg_bob = test_utils::receive_encrypted_imf(
+            alice,
+            bob,
             "To: alice@example.org\n\
 From: bob@example.net\n\
 Date: Today, 29 February 2021 00:00:10 -800\n\
@@ -507,18 +497,16 @@ Content-Disposition: reaction\n\
 \n\
 --YiEDa0DAkWCtVeE4--"
                 .as_bytes(),
-            false,
         )
-        .await?
-        .unwrap();
-        let msg_bob = Message::load_from_db(&alice, msg_bob.msg_ids[0]).await?;
+        .await?;
+        let msg_bob = Message::load_from_db(alice, msg_bob.msg_ids[0]).await?;
         assert_eq!(msg_bob.from_id, bob_id);
         assert_eq!(msg_bob.chat_id, msg.chat_id);
         assert_eq!(msg_bob.viewtype, Viewtype::Text);
         assert_eq!(msg_bob.state, MessageState::InFresh);
         assert_eq!(msg_bob.hidden, false);
         assert_eq!(msg_bob.text, "Reply + reaction");
-        let reactions = get_msg_reactions(&alice, msg.id).await?;
+        let reactions = get_msg_reactions(alice, msg.id).await?;
         assert_eq!(reactions.to_string(), "👍1");
 
         Ok(())
@@ -582,7 +570,7 @@ Content-Disposition: reaction\n\
                 assert_eq!(chat_id, expected_chat_id);
                 assert_eq!(msg_id, expected_msg_id);
                 assert_eq!(contact_id, expected_contact_id);
-                assert_eq!(reaction, Reaction::from(expected_reaction));
+                assert_eq!(reaction, Reaction::new(expected_reaction));
             }
             _ => panic!("Unexpected event {event:?}."),
         }
@@ -823,6 +811,7 @@ Content-Disposition: reaction\n\
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_reaction_forwarded_summary() -> Result<()> {
         let alice = TestContext::new_alice().await;
+        alice.allow_unencrypted().await?;
 
         // Alice adds a message to "Saved Messages"
         let self_chat = alice.get_self_chat().await;

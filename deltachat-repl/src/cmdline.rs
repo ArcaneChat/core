@@ -122,7 +122,7 @@ async fn poke_spec(context: &Context, spec: Option<&str>) -> bool {
                 let name_f = entry.file_name();
                 let name = name_f.to_string_lossy();
                 if name.ends_with(".eml") {
-                    let path_plus_name = format!("{}/{}", &real_spec, name);
+                    let path_plus_name = format!("{real_spec}/{name}");
                     println!("Import: {path_plus_name}");
                     if poke_eml_file(context, Path::new(&path_plus_name))
                         .await
@@ -133,11 +133,11 @@ async fn poke_spec(context: &Context, spec: Option<&str>) -> bool {
                 }
             }
         } else {
-            eprintln!("Import: Cannot open directory \"{}\".", &real_spec);
+            eprintln!("Import: Cannot open directory {real_spec:?}.");
             return false;
         }
     }
-    println!("Import: {} items read from \"{}\".", read_cnt, &real_spec);
+    println!("Import: {read_cnt} items read from {real_spec:?}.");
     if read_cnt > 0 {
         context.emit_msgs_changed_without_ids();
     }
@@ -179,7 +179,7 @@ async fn log_msg(context: &Context, prefix: impl AsRef<str>, msg: &Message) {
         msg.get_id(),
         if msg.get_showpadlock() { "🔒" } else { "" },
         if msg.has_location() { "📍" } else { "" },
-        &contact_name,
+        contact_name,
         contact_id,
         msgtext,
         if msg.has_html() { "[HAS-HTML]️" } else { "" },
@@ -221,7 +221,7 @@ async fn log_msg(context: &Context, prefix: impl AsRef<str>, msg: &Message) {
         },
         statestr,
         downloadstate,
-        &temp2,
+        temp2,
     );
 }
 
@@ -345,7 +345,6 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
                  chatinfo\n\
                  sendlocations <seconds>\n\
                  setlocation <lat> <lng>\n\
-                 dellocations\n\
                  getlocations [<contact-id>]\n\
                  send <text>\n\
                  send-sync <text>\n\
@@ -562,7 +561,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
                             .map_or_else(String::new, |prefix| format!("{prefix}: ")),
                         summary.text,
                         statestr,
-                        &timestr,
+                        timestr,
                         if chat.is_sending_locations() {
                             "📍"
                         } else {
@@ -574,7 +573,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
                     );
                 }
             }
-            if location::is_sending_locations_to_chat(&context, None).await? {
+            if location::is_sending(&context).await? {
                 println!("Location streaming enabled.");
             }
             println!("{cnt} chats");
@@ -623,7 +622,6 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
                 &context,
                 sel_chat.get_id(),
                 chat::MessageListOptions {
-                    info_only: false,
                     add_daymarker: true,
                 },
             )
@@ -782,11 +780,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
 
             println!(
                 "Location streaming: {}",
-                location::is_sending_locations_to_chat(
-                    &context,
-                    Some(sel_chat.as_ref().unwrap().get_id())
-                )
-                .await?,
+                location::is_sending_to_chat(&context, sel_chat.as_ref().unwrap().get_id()).await?,
             );
         }
         "getlocations" => {
@@ -826,12 +820,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             ensure!(!arg1.is_empty(), "No timeout given.");
 
             let seconds = arg1.parse()?;
-            location::send_locations_to_chat(
-                &context,
-                sel_chat.as_ref().unwrap().get_id(),
-                seconds,
-            )
-            .await?;
+            location::send_to_chat(&context, sel_chat.as_ref().unwrap().get_id(), seconds).await?;
             println!(
                 "Locations will be sent to Chat#{} for {} seconds. Use 'setlocation <lat> <lng>' to play around.",
                 sel_chat.as_ref().unwrap().get_id(),
@@ -852,9 +841,6 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             } else {
                 println!("Success, streaming can be stopped.");
             }
-        }
-        "dellocations" => {
-            location::delete_all(&context).await?;
         }
         "send" => {
             ensure!(sel_chat.is_some(), "No chat selected.");
@@ -1250,11 +1236,9 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
         "estimatedeletion" => {
             ensure!(!arg1.is_empty(), "Argument <seconds> missing");
             let seconds = arg1.parse()?;
-            let device_cnt = message::estimate_deletion_cnt(&context, false, seconds).await?;
-            let server_cnt = message::estimate_deletion_cnt(&context, true, seconds).await?;
-            println!(
-                "estimated count of messages older than {seconds} seconds:\non device: {device_cnt}\non server: {server_cnt}"
-            );
+            let from_server = false;
+            let device_cnt = message::estimate_deletion_cnt(&context, from_server, seconds).await?;
+            println!("estimated count of messages older than {seconds} seconds: {device_cnt}");
         }
         "" => (),
         _ => bail!("Unknown command: \"{arg0}\" type ? for help."),

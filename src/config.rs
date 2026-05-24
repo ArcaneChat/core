@@ -190,24 +190,9 @@ pub enum Config {
     #[strum(props(default = "1"))]
     MdnsEnabled,
 
-    /// Whether to show classic emails or only chat messages.
-    #[strum(props(default = "2"))] // also change ShowEmails.default() on changes
-    ShowEmails,
-
     /// Quality of the media files to send.
     #[strum(props(default = "0"))] // also change MediaQuality.default() on changes
     MediaQuality,
-
-    /// Timer in seconds after which the message is deleted from the
-    /// server.
-    ///
-    /// 0 means messages are never deleted by Delta Chat.
-    ///
-    /// Value 1 is treated as "delete at once": messages are deleted
-    /// immediately, without moving to DeltaChat folder.
-    ///
-    /// Default is 1 for chatmail accounts without `BccSelf`, 0 otherwise.
-    DeleteServerAfter,
 
     /// Timer in seconds after which the message is deleted from the
     /// device.
@@ -371,11 +356,6 @@ pub enum Config {
     #[strum(props(default = "0"))]
     NotifyAboutWrongPw,
 
-    /// If a warning about exceeding quota was shown recently,
-    /// this is the percentage of quota at the time the warning was given.
-    /// Unset, when quota falls below minimal warning threshold again.
-    QuotaExceeding,
-
     /// Timestamp of the last time housekeeping was run
     LastHousekeeping,
 
@@ -415,15 +395,6 @@ pub enum Config {
     /// In tests, this is usually disabled.
     #[strum(props(default = "1"))]
     SyncMsgs,
-
-    /// Space-separated list of all the authserv-ids which we believe
-    /// may be the one of our email server.
-    ///
-    /// See `crate::authres::update_authservid_candidates`.
-    AuthservIdCandidates,
-
-    /// Make all outgoing messages with Autocrypt header "multipart/signed".
-    SignUnencrypted,
 
     /// Let the core save all events to the database.
     /// This value is used internally to remember the MsgId of the logging xdc
@@ -504,6 +475,13 @@ pub enum Config {
     /// Experimental option denoting that the current profile is shared between multiple team members.
     /// For now, the only effect of this option is that seen flags are not synchronized.
     TeamProfile,
+
+    /// Force encryption.
+    ///
+    /// When enabled, unencrypted messages cannot be sent
+    /// and incoming unencrypted messages are not fetched and not processed.
+    #[strum(props(default = "1"))]
+    ForceEncryption,
 }
 
 impl Config {
@@ -521,9 +499,9 @@ impl Config {
             self,
             Self::Displayname
                 | Self::MdnsEnabled
-                | Self::ShowEmails
                 | Self::Selfavatar
-                | Self::Selfstatus,
+                | Self::Selfstatus
+                | Self::ForceEncryption,
         )
     }
 
@@ -576,14 +554,6 @@ impl Context {
         // Default values
         let val = match key {
             Config::ConfiguredInboxFolder => Some("INBOX".to_string()),
-            Config::DeleteServerAfter => {
-                match !Box::pin(self.get_config_bool(Config::BccSelf)).await?
-                    && Box::pin(self.is_chatmail()).await?
-                {
-                    true => Some("1".to_string()),
-                    false => Some("0".to_string()),
-                }
-            }
             Config::Addr => self.get_config_opt(Config::ConfiguredAddr).await?,
             _ => key.get_str("default").map(|s| s.to_string()),
         };
@@ -664,23 +634,6 @@ impl Context {
         self.get_config_bool(Config::MdnsEnabled).await
     }
 
-    /// Gets configured "delete_server_after" value.
-    ///
-    /// `None` means never delete the message, `Some(0)` means delete
-    /// at once, `Some(x)` means delete after `x` seconds.
-    pub async fn get_config_delete_server_after(&self) -> Result<Option<i64>> {
-        let val = match self
-            .get_config_parsed::<i64>(Config::DeleteServerAfter)
-            .await?
-            .unwrap_or(0)
-        {
-            0 => None,
-            1 => Some(0),
-            x => Some(x),
-        };
-        Ok(val)
-    }
-
     /// Gets the configured provider.
     ///
     /// The provider is determined by the current primary transport.
@@ -729,7 +682,6 @@ impl Context {
             | Config::Bot
             | Config::NotifyAboutWrongPw
             | Config::SyncMsgs
-            | Config::SignUnencrypted
             | Config::DisableIdle => {
                 ensure!(
                     matches!(value, None | Some("0") | Some("1")),
@@ -963,16 +915,23 @@ impl Context {
     /// Determine whether the specified addr maps to the/a self addr.
     /// Returns `false` if no addresses are configured.
     pub(crate) async fn is_self_addr(&self, addr: &str) -> Result<bool> {
+        // Employ the config cache to optimize for `ConfiguredAddr` passed.
+        if !addr.is_empty()
+            && addr_cmp(
+                addr,
+                &self
+                    .get_config(Config::ConfiguredAddr)
+                    .await?
+                    .unwrap_or_default(),
+            )
+        {
+            return Ok(true);
+        }
         Ok(self
-            .get_config(Config::ConfiguredAddr)
+            .get_all_self_addrs()
             .await?
             .iter()
-            .any(|a| addr_cmp(addr, a))
-            || self
-                .get_secondary_self_addrs()
-                .await?
-                .iter()
-                .any(|a| addr_cmp(addr, a)))
+            .any(|a| addr_cmp(addr, a)))
     }
 
     /// Sets `primary_new` as the new primary self address and saves the old
@@ -1017,14 +976,6 @@ impl Context {
                 },
             )
             .await
-    }
-
-    /// Returns all secondary self addresses.
-    pub(crate) async fn get_secondary_self_addrs(&self) -> Result<Vec<String>> {
-        self.sql.query_map_vec("SELECT addr FROM transports WHERE addr NOT IN (SELECT value FROM config WHERE keyname='configured_addr')", (), |row| {
-            let addr: String = row.get(0)?;
-            Ok(addr)
-        }).await
     }
 
     /// Returns all published secondary self addresses.

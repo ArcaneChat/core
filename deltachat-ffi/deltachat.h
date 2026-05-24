@@ -408,22 +408,10 @@ char*           dc_get_blobdir               (const dc_context_t* context);
  *                    1=send a copy of outgoing messages to self (default).
  *                    Sending messages to self is needed for a proper multi-account setup,
  *                    however, on the other hand, may lead to unwanted notifications in non-delta clients.
- * - `show_emails`  = DC_SHOW_EMAILS_OFF (0)=
- *                    show direct replies to chats only,
- *                    DC_SHOW_EMAILS_ACCEPTED_CONTACTS (1)=
- *                    also show all mails of confirmed contacts,
- *                    DC_SHOW_EMAILS_ALL (2)=
- *                    also show mails of unconfirmed contacts (default).
  * - `delete_device_after` = 0=do not delete messages from device automatically (default),
  *                    >=1=seconds, after which messages are deleted automatically from the device.
  *                    Messages in the "saved messages" chat (see dc_chat_is_self_talk()) are skipped.
  *                    Messages are deleted whether they were seen or not, the UI should clearly point that out.
- *                    See also dc_estimate_deletion_cnt().
- * - `delete_server_after` = 0=do not delete messages from server automatically (default),
- *                    1=delete messages directly after receiving from server, mvbox is skipped.
- *                    >1=seconds, after which messages are deleted automatically from the server, mvbox is used as defined.
- *                    "Saved messages" are deleted from the server as well as
- *                    e-mails matching the `show_emails` settings above, the UI should clearly point that out.
  *                    See also dc_estimate_deletion_cnt().
  * - `media_quality` = DC_MEDIA_QUALITY_BALANCED (0) =
  *                    good outgoing images/videos/voice quality at reasonable sizes (default)
@@ -494,6 +482,7 @@ char*           dc_get_blobdir               (const dc_context_t* context);
  *                       0 = Everybody (except explicitly blocked contacts),
  *                       1 = Contacts (default, does not include contact requests),
  *                       2 = Nobody (calls never result in a notification).
+ * - `force_encryption` = 1 (default) to force encryption, 0 to allow unencrypted messages.
  *
  * Also, there are configs that are only needed
  * if you want to use the deprecated dc_configure() API, such as:
@@ -541,9 +530,6 @@ int             dc_set_config                (dc_context_t* context, const char*
  *                    an error (no warning as it should be shown to the user) is logged but the attachment is sent anyway.
  * - `sys.config_keys` = get a space-separated list of all config-keys available.
  *                    The config-keys are the keys that can be passed to the parameter `key` of this function.
- * - `quota_exceeding` = 0: quota is unknown or in normal range;
- *                    >=80: quota is about to exceed, the value is the concrete percentage,
- *                    a device message is added when that happens, however, that value may still be interesting for bots.
  *
  * @memberof dc_context_t
  * @param context The context object. For querying system values, this can be NULL.
@@ -1397,7 +1383,6 @@ dc_msg_t*       dc_get_draft                 (dc_context_t* context, uint32_t ch
 
 
 #define         DC_GCM_ADDDAYMARKER          0x01
-#define         DC_GCM_INFO_ONLY             0x02
 
 
 /**
@@ -1418,7 +1403,6 @@ dc_msg_t*       dc_get_draft                 (dc_context_t* context, uint32_t ch
  * @param flags If set to DC_GCM_ADDDAYMARKER, the marker DC_MSG_ID_DAYMARKER will
  *     be added before each day (regarding the local timezone). Set this to 0 if you do not want this behaviour.
  *     The day marker timestamp is the midnight one for the corresponding (following) day in the local timezone.
- *     If set to DC_GCM_INFO_ONLY, only system messages will be returned, can be combined with DC_GCM_ADDDAYMARKER.
  * @param marker1before Deprecated, set this to 0.
  * @return Array of message IDs, must be dc_array_unref()'d when no longer used.
  */
@@ -1473,17 +1457,16 @@ dc_chatlist_t*     dc_get_similar_chatlist   (dc_context_t* context, uint32_t ch
 
 /**
  * Estimate the number of messages that will be deleted
- * by the dc_set_config()-options `delete_device_after` or `delete_server_after`.
+ * by the dc_set_config()-option `delete_device_after`.
  * This is typically used to show the estimated impact to the user
  * before actually enabling deletion of old messages.
  *
  * @memberof dc_context_t
  * @param context The context object as returned from dc_context_new().
- * @param from_server 1=Estimate deletion count for server, 0=Estimate deletion count for device
+ * @param from_server Deprecated, pass 0 here
  * @param seconds Count messages older than the given number of seconds.
  * @return Number of messages that are older than the given number of seconds.
- *     This includes e-mails downloaded due to the `show_emails` option.
- *     Messages in the "saved messages" folder are not counted as they will not be deleted automatically.
+ *     Messages in the "Saved Messages" chat are not counted as they will not be deleted automatically.
  */
 int             dc_estimate_deletion_cnt    (dc_context_t* context, int from_server, int64_t seconds);
 
@@ -2828,19 +2811,6 @@ int         dc_set_location                 (dc_context_t* context, double latit
 dc_array_t* dc_get_locations                (dc_context_t* context, uint32_t chat_id, uint32_t contact_id, int64_t timestamp_begin, int64_t timestamp_end);
 
 
-/**
- * Delete all locations on the current device.
- * Locations already sent cannot be deleted.
- *
- * Typically results in the event #DC_EVENT_LOCATION_CHANGED
- * with contact_id set to 0.
- *
- * @memberof dc_context_t
- * @param context The context object.
- */
-void        dc_delete_all_locations         (dc_context_t* context);
-
-
 // misc
 
 /**
@@ -4029,8 +3999,6 @@ int             dc_msg_get_viewtype           (const dc_msg_t* msg);
  *   Marked as read on IMAP and MDN may be sent. Use dc_markseen_msgs() to mark messages as being seen.
  *
  * Outgoing message states:
- * - @ref DC_STATE_OUT_PREPARING - For files which need time to be prepared before they can be sent,
- *   the message enters this state before @ref DC_STATE_OUT_PENDING. Deprecated.
  * - @ref DC_STATE_OUT_DRAFT - Message saved as draft using dc_set_draft()
  * - @ref DC_STATE_OUT_PENDING - The user has pressed the "send" button but the
  *   message is not yet sent and is pending in some way. Maybe we're offline (no checkmark).
@@ -5619,13 +5587,6 @@ int64_t         dc_lot_get_timestamp     (const dc_lot_t* lot);
 #define         DC_STATE_IN_SEEN             16
 
 /**
- * Outgoing message being prepared. See dc_msg_get_state() for details.
- *
- * @deprecated 2024-12-07
- */
-#define         DC_STATE_OUT_PREPARING       18
-
-/**
  * Outgoing message drafted. See dc_msg_get_state() for details.
  */
 #define         DC_STATE_OUT_DRAFT           19
@@ -6429,8 +6390,7 @@ void dc_event_unref(dc_event_t* event);
  * Location of one or more contact has changed.
  *
  * @param data1 (int) contact_id of the contact for which the location has changed.
- *     If the locations of several contacts have been changed,
- *     e.g. after calling dc_delete_all_locations(), this parameter is set to 0.
+ *     If the locations of several contacts have been changed, this parameter is set to 0.
  * @param data2 0
  */
 #define DC_EVENT_LOCATION_CHANGED         2035
@@ -6699,14 +6659,6 @@ void dc_event_unref(dc_event_t* event);
 
 #define DC_EVENT_DATA1_IS_STRING(e)  0    // not used anymore 
 #define DC_EVENT_DATA2_IS_STRING(e)  ((e)==DC_EVENT_CONFIGURE_PROGRESS || (e)==DC_EVENT_IMEX_FILE_WRITTEN || ((e)>=100 && (e)<=499))
-
-
-/*
- * Values for dc_get|set_config("show_emails")
- */
-#define DC_SHOW_EMAILS_OFF               0
-#define DC_SHOW_EMAILS_ACCEPTED_CONTACTS 1
-#define DC_SHOW_EMAILS_ALL               2
 
 
 /*
@@ -7043,11 +6995,7 @@ void dc_event_unref(dc_event_t* event);
 /// Used in message summary text for notifications and chatlist.
 #define DC_STR_FORWARDED                  97
 
-/// "Quota exceeding, already %1$s%% used."
-///
-/// Used as device message text.
-///
-/// `%1$s` will be replaced by the percentage used
+/// @deprecated 2026-04-25
 #define DC_STR_QUOTA_EXCEEDING_MSG_BODY   98
 
 /// "Multi Device Synchronization"
@@ -7106,11 +7054,6 @@ void dc_event_unref(dc_event_t* event);
 ///
 /// `%1$s` will be replaced by a possibly more detailed, typically english, error description.
 #define DC_STR_ERROR                      112
-
-/// "Not supported by your provider."
-///
-/// Used in the connectivity view.
-#define DC_STR_NOT_SUPPORTED_BY_PROVIDER  113
 
 /// "Messages"
 ///

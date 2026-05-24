@@ -8,7 +8,7 @@ use crate::chatlist::Chatlist;
 use crate::constants::Chattype;
 use crate::message::Message;
 use crate::receive_imf::receive_imf;
-use crate::test_utils::{E2EE_INFO_MSGS, TestContext};
+use crate::test_utils::{E2EE_INFO_MSGS, TestContext, TestContextManager};
 use crate::tools::{SystemTime, create_outgoing_rfc724_mid};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -54,6 +54,7 @@ async fn receive_msg(t: &TestContext, chat: &Chat) {
 async fn test_get_fresh_msgs_and_muted_chats() {
     // receive various mails in 3 chats
     let t = TestContext::new_alice().await;
+    t.allow_unencrypted().await.unwrap();
     let bob = t.create_chat_with_contact("", "bob@g.it").await;
     let claire = t.create_chat_with_contact("", "claire@g.it").await;
     let dave = t.create_chat_with_contact("", "dave@g.it").await;
@@ -103,6 +104,7 @@ async fn test_get_fresh_msgs_and_muted_chats() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_get_fresh_msgs_and_muted_until() {
     let t = TestContext::new_alice().await;
+    t.allow_unencrypted().await.unwrap();
     let bob = t.create_chat_with_contact("", "bob@g.it").await;
     receive_msg(&t, &bob).await;
     assert_eq!(get_chat_msgs(&t, bob.id).await.unwrap().len(), 1);
@@ -158,6 +160,7 @@ async fn test_get_fresh_msgs_and_muted_until() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_muted_context() -> Result<()> {
     let t = TestContext::new_alice().await;
+    t.allow_unencrypted().await?;
     assert_eq!(t.get_fresh_msgs().await.unwrap().len(), 0);
     t.set_config(Config::IsMuted, Some("1")).await?;
     let chat = t.create_chat_with_contact("", "bob@g.it").await;
@@ -324,6 +327,7 @@ async fn test_get_info_completeness() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_search_msgs() -> Result<()> {
     let alice = TestContext::new_alice().await;
+    alice.allow_unencrypted().await?;
     let self_talk = ChatId::create_for_contact(&alice, ContactId::SELF).await?;
     let chat = alice
         .create_chat_with_contact("Bob", "bob@example.org")
@@ -385,49 +389,40 @@ async fn test_search_msgs() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_search_unaccepted_requests() -> Result<()> {
-    let t = TestContext::new_alice().await;
-    receive_imf(
-        &t,
-        b"From: BobBar <bob@example.org>\n\
-                 To: alice@example.org\n\
-                 Subject: foo\n\
-                 Message-ID: <msg1234@example.org>\n\
-                 Chat-Version: 1.0\n\
-                 Date: Tue, 25 Oct 2022 13:37:00 +0000\n\
-                 \n\
-                 hello bob, foobar test!\n",
-        false,
-    )
-    .await?;
-    let chat_id = t.get_last_msg().await.get_chat_id();
-    let chat = Chat::load_from_db(&t, chat_id).await?;
+    let mut tcm = TestContextManager::new();
+    let t = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+    bob.set_config(Config::Displayname, Some("BobBar")).await?;
+    let msg = tcm.send_recv(bob, t, "hello bob, foobar test!").await;
+    let chat_id = msg.get_chat_id();
+    let chat = Chat::load_from_db(t, chat_id).await?;
     assert_eq!(chat.get_type(), Chattype::Single);
     assert!(chat.is_contact_request());
+    assert_eq!(Chatlist::try_load(t, 0, None, None).await?.len(), 1);
 
-    assert_eq!(Chatlist::try_load(&t, 0, None, None).await?.len(), 1);
     assert_eq!(
-        Chatlist::try_load(&t, 0, Some("BobBar"), None).await?.len(),
+        Chatlist::try_load(t, 0, Some("BobBar"), None).await?.len(),
         1
     );
     assert_eq!(t.search_msgs(None, "foobar").await?.len(), 1);
     assert_eq!(t.search_msgs(Some(chat_id), "foobar").await?.len(), 1);
 
-    chat_id.block(&t).await?;
+    chat_id.block(t).await?;
 
-    assert_eq!(Chatlist::try_load(&t, 0, None, None).await?.len(), 0);
+    assert_eq!(Chatlist::try_load(t, 0, None, None).await?.len(), 0);
     assert_eq!(
-        Chatlist::try_load(&t, 0, Some("BobBar"), None).await?.len(),
+        Chatlist::try_load(t, 0, Some("BobBar"), None).await?.len(),
         0
     );
     assert_eq!(t.search_msgs(None, "foobar").await?.len(), 0);
     assert_eq!(t.search_msgs(Some(chat_id), "foobar").await?.len(), 0);
 
-    let contact_ids = get_chat_contacts(&t, chat_id).await?;
-    Contact::unblock(&t, *contact_ids.first().unwrap()).await?;
+    let contact_ids = get_chat_contacts(t, chat_id).await?;
+    Contact::unblock(t, *contact_ids.first().unwrap()).await?;
 
-    assert_eq!(Chatlist::try_load(&t, 0, None, None).await?.len(), 1);
+    assert_eq!(Chatlist::try_load(t, 0, None, None).await?.len(), 1);
     assert_eq!(
-        Chatlist::try_load(&t, 0, Some("BobBar"), None).await?.len(),
+        Chatlist::try_load(t, 0, Some("BobBar"), None).await?.len(),
         1
     );
     assert_eq!(t.search_msgs(None, "foobar").await?.len(), 1);
@@ -439,6 +434,7 @@ async fn test_search_unaccepted_requests() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_limit_search_msgs() -> Result<()> {
     let alice = TestContext::new_alice().await;
+    alice.allow_unencrypted().await?;
     let chat = alice
         .create_chat_with_contact("Bob", "bob@example.org")
         .await;
@@ -602,10 +598,7 @@ async fn test_get_next_msgs() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_cache_is_cleared_when_io_is_started() -> Result<()> {
     let alice = TestContext::new_alice().await;
-    assert_eq!(
-        alice.get_config(Config::ShowEmails).await?,
-        Some("2".to_string())
-    );
+    assert_eq!(alice.get_config(Config::Displayname).await?, None);
 
     // Change the config circumventing the cache
     // This simulates what the notification plugin on iOS might do
@@ -613,24 +606,21 @@ async fn test_cache_is_cleared_when_io_is_started() -> Result<()> {
     alice
         .sql
         .execute(
-            "INSERT OR REPLACE INTO config (keyname, value) VALUES ('show_emails', '0')",
+            "INSERT OR REPLACE INTO config (keyname, value) VALUES ('displayname', 'Alice 2')",
             (),
         )
         .await?;
 
     // Alice's Delta Chat doesn't know about it yet:
-    assert_eq!(
-        alice.get_config(Config::ShowEmails).await?,
-        Some("2".to_string())
-    );
+    assert_eq!(alice.get_config(Config::Displayname).await?, None);
 
     // Starting IO will fail of course because no server settings are configured,
     // but it should invalidate the caches:
     alice.start_io().await;
 
     assert_eq!(
-        alice.get_config(Config::ShowEmails).await?,
-        Some("0".to_string())
+        alice.get_config(Config::Displayname).await?,
+        Some("Alice 2".to_string())
     );
 
     Ok(())

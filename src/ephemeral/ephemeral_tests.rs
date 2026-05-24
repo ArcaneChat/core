@@ -9,6 +9,7 @@ use crate::download::DownloadState;
 use crate::location;
 use crate::message::markseen_msgs;
 use crate::receive_imf::receive_imf;
+use crate::test_utils;
 use crate::test_utils::{TestContext, TestContextManager};
 use crate::timesmearing::MAX_SECONDS_TO_LEND_FROM_FUTURE;
 use crate::{
@@ -310,20 +311,22 @@ async fn test_ephemeral_timer_rollback() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_ephemeral_delete_msgs() -> Result<()> {
-    let t = TestContext::new_alice().await;
+    let mut tcm = TestContextManager::new();
+    let t = &tcm.alice().await;
+    let bob = &tcm.bob().await;
     let self_chat = t.get_self_chat().await;
 
-    assert_eq!(next_expiration_timestamp(&t).await, None);
+    assert_eq!(next_expiration_timestamp(t).await, None);
 
     t.send_text(self_chat.id, "Saved message, which we delete manually")
         .await;
     let msg = t.get_last_msg_in(self_chat.id).await;
-    msg.id.trash(&t, false).await?;
-    check_msg_is_deleted(&t, &self_chat, msg.id).await;
+    msg.id.trash(t, false).await?;
+    check_msg_is_deleted(t, &self_chat, msg.id).await;
 
     self_chat
         .id
-        .set_ephemeral_timer(&t, Timer::Enabled { duration: 3600 })
+        .set_ephemeral_timer(t, Timer::Enabled { duration: 3600 })
         .await
         .unwrap();
 
@@ -331,7 +334,7 @@ async fn test_ephemeral_delete_msgs() -> Result<()> {
     let now = time();
     let msg = t.send_text(self_chat.id, "Message text").await;
 
-    check_msg_will_be_deleted(&t, msg.sender_msg_id, &self_chat, now + 3599, time() + 3601)
+    check_msg_will_be_deleted(t, msg.sender_msg_id, &self_chat, now + 3599, time() + 3601)
         .await
         .unwrap();
 
@@ -343,17 +346,17 @@ async fn test_ephemeral_delete_msgs() -> Result<()> {
     let now = time();
     let msg = t.send_text(self_chat.id, "Message text").await;
 
-    check_msg_will_be_deleted(&t, msg.sender_msg_id, &self_chat, now + 3559, time() + 3601)
+    check_msg_will_be_deleted(t, msg.sender_msg_id, &self_chat, now + 3559, time() + 3601)
         .await
         .unwrap();
 
     // Send a message to Bob which will be deleted after 1800s because of DeleteDeviceAfter.
-    let bob_chat = t.create_chat_with_contact("", "bob@example.net").await;
+    let bob_chat = t.create_chat(bob).await;
     let now = time();
     let msg = t.send_text(bob_chat.id, "Message text").await;
 
     check_msg_will_be_deleted(
-        &t,
+        t,
         msg.sender_msg_id,
         &bob_chat,
         now + 1799,
@@ -368,13 +371,13 @@ async fn test_ephemeral_delete_msgs() -> Result<()> {
     // This tests that the message is deleted at min(ephemeral deletion time, DeleteDeviceAfter deletion time).
     bob_chat
         .id
-        .set_ephemeral_timer(&t, Timer::Enabled { duration: 60 })
+        .set_ephemeral_timer(t, Timer::Enabled { duration: 60 })
         .await?;
 
     let now = time();
     let msg = t.send_text(bob_chat.id, "Message text").await;
 
-    check_msg_will_be_deleted(&t, msg.sender_msg_id, &bob_chat, now + 59, time() + 61)
+    check_msg_will_be_deleted(t, msg.sender_msg_id, &bob_chat, now + 59, time() + 61)
         .await
         .unwrap();
 
@@ -449,107 +452,159 @@ async fn check_msg_is_deleted(t: &TestContext, chat: &Chat, msg_id: MsgId) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_delete_expired_imap_messages() -> Result<()> {
     let t = TestContext::new_alice().await;
-    const HOUR: i64 = 60 * 60;
     let now = time();
-    let transport_id = 1;
-    let uidvalidity = 12345;
-    for (id, timestamp, ephemeral_timestamp) in &[
-        (900, now - 2 * HOUR, 0),
-        (1000, now - 23 * HOUR - MIN_DELETE_SERVER_AFTER, 0),
-        (1010, now - 23 * HOUR, 0),
-        (1020, now - 21 * HOUR, 0),
-        (1030, now - 19 * HOUR, 0),
-        (2000, now - 18 * HOUR, now - HOUR),
-        (2020, now - 17 * HOUR, now + HOUR),
-        (3000, now + HOUR, 0),
-    ] {
-        let message_id = id.to_string();
-        t.sql
-               .execute(
-                   "INSERT INTO msgs (id, rfc724_mid, timestamp, ephemeral_timestamp) VALUES (?,?,?,?);",
-                   (id, &message_id, timestamp, ephemeral_timestamp),
-               )
-               .await?;
+    let transport_id: u32 = 1;
+    let uidvalidity = 12345u32;
+    t.set_config_bool(Config::BccSelf, false).await?;
+
+    async fn is_deleted(context: &Context, mid: &str) -> Result<bool> {
+        Ok(context
+            .sql
+            .count(
+                "SELECT COUNT(*) FROM imap WHERE target='' AND rfc724_mid=?",
+                (mid,),
+            )
+            .await?
+            == 1)
+    }
+
+    async fn reset_targets(context: &Context) {
+        context
+            .sql
+            .execute("UPDATE imap SET target='INBOX'", ())
+            .await
+            .unwrap();
+    }
+
+    // Test messages:
+    //
+    // Three messages that were not split into pre- and post- message:
+    //  "expired@localhost"     - expired ephemeral message
+    //  "no_expire@localhost"   - non-ephemeral message
+    //  "future@localhost"      - will expire in the future, but not yet
+    //
+    // And four messages that were split into pre- and post-message.
+    //  "expired_*@localhost"   - has pre-msg, expired ephemeral message, not downloaded yet
+    //  "no_expire_*@localhost" - has pre-msg, non-ephemeral, not downloaded yet
+    //  "future_*@localhost"    - has pre-msg, not expired yet, not downloaded yet
+    //  "done_*@localhost"      - Fully downloaded -> post- message can be deleted
+    //
+    // The tuple is (rfc724_mid, ephemeral_timestamp, download_state, pre_rfc724_mid)
+    let msgs: [(&str, i64, DownloadState, &str); 7] = [
+        ("expired@localhost", now - 1, DownloadState::Done, ""),
+        ("no_expire@localhost", 0, DownloadState::Done, ""),
+        // Use "now + 3600" rather than "now + 1", otherwise the test may be flaky
+        // if it is slow and the message expires in a second
+        ("future@localhost", now + 3600, DownloadState::Done, ""),
+        (
+            "expired_post@localhost",
+            now - 1,
+            DownloadState::Available,
+            "expired_pre@localhost",
+        ),
+        (
+            "no_expire_post@localhost",
+            0,
+            DownloadState::Available,
+            "no_expire_pre@localhost",
+        ),
+        (
+            "future_post@localhost",
+            now + 3600,
+            DownloadState::Available,
+            "future_pre@localhost",
+        ),
+        (
+            "done_post@localhost",
+            0,
+            DownloadState::Done,
+            "done_pre@localhost",
+        ),
+    ];
+    for (rfc724_mid, ephemeral_timestamp, download_state, pre_rfc724_mid) in msgs {
         t.sql
             .execute(
-                "INSERT INTO imap (transport_id, rfc724_mid, folder, uid, target, uidvalidity) VALUES (?, ?,'INBOX',?, 'INBOX', ?);",
-                (transport_id, &message_id, id, uidvalidity),
+                "INSERT INTO msgs \
+                 (rfc724_mid, timestamp, ephemeral_timestamp, download_state, pre_rfc724_mid) \
+                 VALUES (?,?,?,?,?)",
+                (
+                    rfc724_mid,
+                    now,
+                    ephemeral_timestamp,
+                    download_state,
+                    pre_rfc724_mid,
+                ),
+            )
+            .await?;
+    }
+    let rfc724_mids: Vec<&str> = msgs
+        .iter()
+        .flat_map(|(rfc724_mid, _, _, pre_rfc724_mid)| [*rfc724_mid, *pre_rfc724_mid])
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    for (i, rfc724_mid) in rfc724_mids.iter().enumerate() {
+        t.sql
+            .execute(
+                "INSERT INTO imap \
+                 (transport_id, rfc724_mid, folder, uid, target, uidvalidity) \
+                 VALUES (?,?,'INBOX',?,'INBOX',?)",
+                (transport_id, *rfc724_mid, (i + 1) as u32, uidvalidity),
             )
             .await?;
     }
 
-    async fn test_marked_for_deletion(context: &Context, id: u32) -> Result<()> {
-        assert_eq!(
-            context
-                .sql
-                .count(
-                    "SELECT COUNT(*) FROM imap WHERE target='' AND rfc724_mid=?",
-                    (id.to_string(),),
-                )
-                .await?,
-            1
+    for (is_chatmail, other_transport) in
+        [(false, false), (false, true), (true, false), (true, true)]
+    {
+        println!(
+            "Testing combination is_chatmail={is_chatmail}, other_transport={other_transport}"
         );
-        Ok(())
+
+        delete_expired_imap_messages(
+            &t,
+            if other_transport {
+                transport_id + 1
+            } else {
+                transport_id
+            },
+            is_chatmail,
+        )
+        .await?;
+
+        if other_transport {
+            // Nothing should be deleted on another transport
+            for rfc724_mid in &rfc724_mids {
+                assert_eq!(is_deleted(&t, rfc724_mid).await?, false);
+            }
+            continue;
+        }
+
+        assert_eq!(is_deleted(&t, "expired@localhost").await?, true);
+        assert_eq!(is_deleted(&t, "no_expire@localhost").await?, is_chatmail);
+        assert_eq!(is_deleted(&t, "future@localhost").await?, is_chatmail);
+        assert_eq!(is_deleted(&t, "expired_post@localhost").await?, true);
+        assert_eq!(is_deleted(&t, "expired_pre@localhost").await?, true);
+        assert_eq!(is_deleted(&t, "no_expire_post@localhost").await?, false);
+        assert_eq!(
+            is_deleted(&t, "no_expire_pre@localhost").await?,
+            is_chatmail
+        );
+        assert_eq!(is_deleted(&t, "future_post@localhost").await?, false);
+        assert_eq!(is_deleted(&t, "future_pre@localhost").await?, is_chatmail);
+        assert_eq!(is_deleted(&t, "done_pre@localhost").await?, is_chatmail);
+        assert_eq!(is_deleted(&t, "done_post@localhost").await?, is_chatmail);
+
+        reset_targets(&t).await;
     }
 
-    async fn remove_uid(context: &Context, id: u32) -> Result<()> {
-        context
-            .sql
-            .execute("DELETE FROM imap WHERE rfc724_mid=?", (id.to_string(),))
-            .await?;
-        Ok(())
-    }
-
-    // This should mark message 2000 for deletion.
-    delete_expired_imap_messages(&t).await?;
-    test_marked_for_deletion(&t, 2000).await?;
-    remove_uid(&t, 2000).await?;
-    // No other messages are marked for deletion.
-    assert_eq!(
-        t.sql
-            .count("SELECT COUNT(*) FROM imap WHERE target=''", ())
-            .await?,
-        0
-    );
-
-    t.set_config(Config::DeleteServerAfter, Some(&*(25 * HOUR).to_string()))
-        .await?;
-    delete_expired_imap_messages(&t).await?;
-    test_marked_for_deletion(&t, 1000).await?;
-
-    MsgId::new(1000)
-        .update_download_state(&t, DownloadState::Available)
-        .await?;
-    t.sql
-        .execute("UPDATE imap SET target=folder WHERE rfc724_mid='1000'", ())
-        .await?;
-    delete_expired_imap_messages(&t).await?;
-    test_marked_for_deletion(&t, 1000).await?; // Delete downloadable anyway.
-    remove_uid(&t, 1000).await?;
-
-    t.set_config(Config::DeleteServerAfter, Some(&*(22 * HOUR).to_string()))
-        .await?;
-    delete_expired_imap_messages(&t).await?;
-    test_marked_for_deletion(&t, 1010).await?;
-    t.sql
-        .execute("UPDATE imap SET target=folder WHERE rfc724_mid='1010'", ())
-        .await?;
-
-    MsgId::new(1010)
-        .update_download_state(&t, DownloadState::Available)
-        .await?;
-    delete_expired_imap_messages(&t).await?;
-    // Keep downloadable for now.
-    assert_eq!(
-        t.sql
-            .count("SELECT COUNT(*) FROM imap WHERE target=''", ())
-            .await?,
-        0
-    );
-
-    t.set_config(Config::DeleteServerAfter, Some("1")).await?;
-    delete_expired_imap_messages(&t).await?;
-    test_marked_for_deletion(&t, 3000).await?;
+    // With BccSelf=true, non-expired messages are kept even if `is_chatmail` is true
+    t.set_config_bool(Config::BccSelf, true).await?;
+    delete_expired_imap_messages(&t, transport_id, true).await?;
+    assert_eq!(is_deleted(&t, "expired@localhost").await?, true);
+    assert_eq!(is_deleted(&t, "no_expire@localhost").await?, false);
+    assert_eq!(is_deleted(&t, "done_pre@localhost").await?, false);
+    assert_eq!(is_deleted(&t, "done_post@localhost").await?, false);
 
     Ok(())
 }
@@ -557,50 +612,54 @@ async fn test_delete_expired_imap_messages() -> Result<()> {
 // Regression test for a bug in the timer rollback protection.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_ephemeral_timer_references() -> Result<()> {
-    let alice = TestContext::new_alice().await;
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
 
     // Message with Message-ID <first@example.com> and no timer is received.
-    receive_imf(
-        &alice,
-        b"From: Bob <bob@example.com>\n\
-                    To: Alice <alice@example.org>\n\
-                    Chat-Version: 1.0\n\
-                    Subject: Subject\n\
-                    Message-ID: <first@example.com>\n\
-                    Date: Sun, 22 Mar 2020 00:10:00 +0000\n\
-                    \n\
-                    hello\n",
-        false,
+    let encrypted_msg = test_utils::encrypt_raw_message(
+        bob,
+        &[alice],
+        b"From: Bob <bob@example.net>\r\n\
+          To: Alice <alice@example.org>\r\n\
+          Chat-Version: 1.0\r\n\
+          Subject: Subject\r\n\
+          Message-ID: <first@example.com>\r\n\
+          Date: Sun, 22 Mar 2020 00:10:00 +0000\r\n\
+          \r\n\
+          hello\r\n",
     )
     .await?;
+    receive_imf(alice, encrypted_msg.as_bytes(), false).await?;
 
     let msg = alice.get_last_msg().await;
     let chat_id = msg.chat_id;
-    assert_eq!(chat_id.get_ephemeral_timer(&alice).await?, Timer::Disabled);
+    assert_eq!(chat_id.get_ephemeral_timer(alice).await?, Timer::Disabled);
 
     // Message with Message-ID <second@example.com> is received.
-    receive_imf(
-        &alice,
-        b"From: Bob <bob@example.com>\n\
-                    To: Alice <alice@example.org>\n\
-                    Chat-Version: 1.0\n\
-                    Subject: Subject\n\
-                    Message-ID: <second@example.com>\n\
-                    Date: Sun, 22 Mar 2020 00:11:00 +0000\n\
-                    Ephemeral-Timer: 60\n\
-                    \n\
-                    second message\n",
-        false,
+    let encrypted_msg = test_utils::encrypt_raw_message(
+        bob,
+        &[alice],
+        b"From: Bob <bob@example.net>\r\n\
+          To: Alice <alice@example.org>\r\n\
+          Chat-Version: 1.0\r\n\
+          Subject: Subject\r\n\
+          Message-ID: <second@example.com>\r\n\
+          Date: Sun, 22 Mar 2020 00:11:00 +0000\r\n\
+          Ephemeral-Timer: 60\r\n\
+          \r\n\
+          second message\r\n",
     )
     .await?;
+    receive_imf(alice, encrypted_msg.as_bytes(), false).await?;
     assert_eq!(
-        chat_id.get_ephemeral_timer(&alice).await?,
+        chat_id.get_ephemeral_timer(alice).await?,
         Timer::Enabled { duration: 60 }
     );
     let msg = alice.get_last_msg().await;
 
     // Message is deleted when its timer expires.
-    msg.id.trash(&alice, false).await?;
+    msg.id.trash(alice, false).await?;
 
     // Message with Message-ID <third@example.com>, referencing <first@example.com> and
     // <second@example.com>, is received.  The message <second@example.come> is not in the
@@ -614,25 +673,26 @@ async fn test_ephemeral_timer_references() -> Result<()> {
     //
     // The message also contains a quote of the first message to test that only References:
     // header and not In-Reply-To: is consulted by the rollback protection.
-    receive_imf(
-        &alice,
-        b"From: Bob <bob@example.com>\n\
-                    To: Alice <alice@example.org>\n\
-                    Chat-Version: 1.0\n\
-                    Subject: Subject\n\
-                    Message-ID: <third@example.com>\n\
-                    Date: Sun, 22 Mar 2020 00:12:00 +0000\n\
-                    References: <first@example.com> <second@example.com>\n\
-                    In-Reply-To: <first@example.com>\n\
-                    \n\
-                    > hello\n",
-        false,
+    let encrypted_msg = test_utils::encrypt_raw_message(
+        bob,
+        &[alice],
+        b"From: Bob <bob@example.net>\r\n\
+          To: Alice <alice@example.org>\r\n\
+          Chat-Version: 1.0\r\n\
+          Subject: Subject\r\n\
+          Message-ID: <third@example.com>\r\n\
+          Date: Sun, 22 Mar 2020 00:12:00 +0000\r\n\
+          References: <first@example.com> <second@example.com>\r\n\
+          In-Reply-To: <first@example.com>\r\n\
+          \r\n\
+          > hello\r\n",
     )
     .await?;
+    receive_imf(alice, encrypted_msg.as_bytes(), false).await?;
 
     let msg = alice.get_last_msg().await;
     assert_eq!(
-        msg.chat_id.get_ephemeral_timer(&alice).await?,
+        msg.chat_id.get_ephemeral_timer(alice).await?,
         Timer::Disabled
     );
 
@@ -644,24 +704,20 @@ async fn test_ephemeral_timer_references() -> Result<()> {
 // successful reconnection.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_ephemeral_msg_offline() -> Result<()> {
-    let alice = TestContext::new_alice().await;
-    let chat = alice
-        .create_chat_with_contact("Bob", "bob@example.org")
-        .await;
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+    let chat = alice.create_chat(bob).await;
     let duration = 60;
     chat.id
-        .set_ephemeral_timer(&alice, Timer::Enabled { duration })
+        .set_ephemeral_timer(alice, Timer::Enabled { duration })
         .await?;
     let mut msg = Message::new_text("hi".to_string());
-    assert!(
-        chat::send_msg_sync(&alice, chat.id, &mut msg)
-            .await
-            .is_err()
-    );
+    assert!(chat::send_msg_sync(alice, chat.id, &mut msg).await.is_err());
     let stmt = "SELECT COUNT(*) FROM smtp WHERE msg_id=?";
     assert!(alice.sql.exists(stmt, (msg.id,)).await?);
     let now = time();
-    check_msg_will_be_deleted(&alice, msg.id, &chat, now, now + i64::from(duration) + 1).await?;
+    check_msg_will_be_deleted(alice, msg.id, &chat, now, now + i64::from(duration) + 1).await?;
     assert!(alice.sql.exists(stmt, (msg.id,)).await?);
 
     Ok(())

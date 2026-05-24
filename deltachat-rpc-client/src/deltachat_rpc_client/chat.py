@@ -164,7 +164,7 @@ class Chat:
         return Message(self.account, msg_id)
 
     def send_sticker(self, path: str) -> Message:
-        """Send an sticker and return the resulting Message instance."""
+        """Deprecated as of 2026-04; use `send_message` with `Viewtype.STICKER` instead."""
         msg_id = self._rpc.send_sticker(self.account.id, self.id, path)
         return Message(self.account, msg_id)
 
@@ -206,9 +206,9 @@ class Chat:
         snapshot["message"] = Message(self.account, snapshot.id)
         return snapshot
 
-    def get_messages(self, info_only: bool = False, add_daymarker: bool = False) -> list[Message]:
+    def get_messages(self, add_daymarker: bool = False) -> list[Message]:
         """Get the list of messages in this chat."""
-        msgs = self._rpc.get_message_ids(self.account.id, self.id, info_only, add_daymarker)
+        msgs = self._rpc.get_message_ids(self.account.id, self.id, False, add_daymarker)
         return [Message(self.account, msg_id) for msg_id in msgs]
 
     def get_fresh_message_count(self) -> int:
@@ -276,6 +276,16 @@ class Chat:
     def remove_image(self) -> None:
         """Remove profile image of this chat."""
         self._rpc.set_chat_profile_image(self.account.id, self.id, None)
+
+    def send_locations(self, seconds) -> None:
+        """Enable location streaming in the chat for the given number of seconds.
+
+        Pass 0 to disable location streaming."""
+        self._rpc.send_locations_to_chat(self.account.id, self.id, seconds)
+
+    def is_sending_locations(self) -> bool:
+        """Return True if sending locations to this chat."""
+        return self._rpc.is_sending_locations_to_chat(self.account.id, self.id)
 
     def get_locations(
         self,

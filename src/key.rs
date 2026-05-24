@@ -1,7 +1,7 @@
 //! Cryptographic key module.
 
 use std::collections::BTreeMap;
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::io::Cursor;
 
 use anyhow::{Context as _, Result, bail, ensure};
@@ -570,9 +570,11 @@ pub async fn preconfigure_keypair(context: &Context, secret_data: &str) -> Resul
 pub struct Fingerprint(Vec<u8>);
 
 impl Fingerprint {
-    /// Creates new 160-bit (20 bytes) fingerprint.
+    /// Creates new fingerprint.
+    ///
+    /// It is 160-bit (20 bytes) for v4 keys and 32 bytes for v6 keys.
     pub fn new(v: Vec<u8>) -> Fingerprint {
-        debug_assert_eq!(v.len(), 20);
+        debug_assert!(v.len() == 20 || v.len() == 32);
         Fingerprint(v)
     }
 
@@ -582,6 +584,21 @@ impl Fingerprint {
     /// human-readable formatted string.
     pub fn hex(&self) -> String {
         hex::encode_upper(&self.0)
+    }
+
+    /// Make a human-readable fingerprint.
+    pub fn human_readable(&self) -> String {
+        let mut f = String::new();
+        // Split key into chunks of 4 with space and newline at 20 chars
+        for (i, c) in self.hex().chars().enumerate() {
+            if i > 0 && i % 20 == 0 {
+                writeln!(&mut f).ok();
+            } else if i > 0 && i % 4 == 0 {
+                write!(&mut f, " ").ok();
+            }
+            write!(&mut f, "{c}").ok();
+        }
+        f
     }
 }
 
@@ -599,22 +616,6 @@ impl fmt::Debug for Fingerprint {
     }
 }
 
-/// Make a human-readable fingerprint.
-impl fmt::Display for Fingerprint {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Split key into chunks of 4 with space and newline at 20 chars
-        for (i, c) in self.hex().chars().enumerate() {
-            if i > 0 && i % 20 == 0 {
-                writeln!(f)?;
-            } else if i > 0 && i % 4 == 0 {
-                write!(f, " ")?;
-            }
-            write!(f, "{c}")?;
-        }
-        Ok(())
-    }
-}
-
 /// Parse a human-readable or otherwise formatted fingerprint.
 impl std::str::FromStr for Fingerprint {
     type Err = anyhow::Error;
@@ -626,7 +627,10 @@ impl std::str::FromStr for Fingerprint {
             .filter(|&c| c.is_ascii_hexdigit())
             .collect();
         let v: Vec<u8> = hex::decode(&hex_repr)?;
-        ensure!(v.len() == 20, "wrong fingerprint length: {hex_repr}");
+        ensure!(
+            v.len() == 20 || v.len() == 32,
+            "wrong fingerprint length: {hex_repr}"
+        );
         let fp = Fingerprint::new(v);
         Ok(fp)
     }
@@ -890,7 +894,7 @@ i8pcjGO+IZffvyZJVRWfVooBJmWWbPB1pueo3tx8w3+fcuzpxz+RLFKaPyqXO+dD
             1, 2, 4, 8, 16, 32, 64, 128, 255, 1, 2, 4, 8, 16, 32, 64, 128, 255, 19, 20,
         ]);
         assert_eq!(
-            fp.to_string(),
+            fp.human_readable(),
             "0102 0408 1020 4080 FF01\n0204 0810 2040 80FF 1314"
         );
     }

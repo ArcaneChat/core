@@ -14,9 +14,8 @@ use mailparse::{DispositionType, MailHeader, MailHeaderMap, SingleInfo, addrpars
 use mime::Mime;
 
 use crate::aheader::Aheader;
-use crate::authres::handle_authres;
 use crate::blob::BlobObject;
-use crate::chat::ChatId;
+use crate::chat::{Chat, ChatId};
 use crate::config::Config;
 use crate::constants;
 use crate::contact::{ContactId, import_public_key};
@@ -275,7 +274,7 @@ impl MimeMessage {
         let timestamp_rcvd = smeared_time(context);
         let mut timestamp_sent =
             Self::get_timestamp_sent(&mail.headers, timestamp_rcvd, timestamp_rcvd);
-        let mut hop_info = parse_receive_headers(&mail.get_headers());
+        let hop_info = parse_receive_headers(&mail.get_headers());
 
         let mut headers = Default::default();
         let mut headers_removed = HashSet::<String>::new();
@@ -305,37 +304,9 @@ impl MimeMessage {
 
         // Parse hidden headers.
         let mimetype = mail.ctype.mimetype.parse::<Mime>()?;
-        let (part, mimetype) =
-            if mimetype.type_() == mime::MULTIPART && mimetype.subtype().as_str() == "signed" {
-                if let Some(part) = mail.subparts.first() {
-                    // We don't remove "subject" from `headers` because currently just signed
-                    // messages are shown as unencrypted anyway.
-
-                    timestamp_sent =
-                        Self::get_timestamp_sent(&part.headers, timestamp_sent, timestamp_rcvd);
-                    MimeMessage::merge_headers(
-                        context,
-                        &mut headers,
-                        &mut headers_removed,
-                        &mut recipients,
-                        &mut past_members,
-                        &mut from,
-                        &mut list_post,
-                        &mut chat_disposition_notification_to,
-                        part,
-                    );
-                    (part, part.ctype.mimetype.parse::<Mime>()?)
-                } else {
-                    // Not a valid signed message, handle it as plaintext.
-                    (&mail, mimetype)
-                }
-            } else {
-                // Currently we do not sign unencrypted messages by default.
-                (&mail, mimetype)
-            };
         if mimetype.type_() == mime::MULTIPART
             && mimetype.subtype().as_str() == "mixed"
-            && let Some(part) = part.subparts.first()
+            && let Some(part) = mail.subparts.first()
         {
             for field in &part.headers {
                 let key = field.get_key().to_lowercase();
@@ -359,18 +330,13 @@ impl MimeMessage {
             );
         }
 
-        // Remove headers that are allowed _only_ in the encrypted+signed part. It's ok to leave
-        // them in signed-only emails, but has no value currently.
+        // Remove headers that are allowed _only_ in the encrypted+signed part
         let encrypted = false;
         Self::remove_secured_headers(&mut headers, &mut headers_removed, encrypted);
 
         let mut from = from.context("No from in message")?;
 
-        let dkim_results = handle_authres(context, &mail, &from.addr).await?;
-
         let mut gossiped_keys = Default::default();
-        hop_info += "\n\n";
-        hop_info += &dkim_results.to_string();
 
         let from_is_not_self_addr = !context.is_self_addr(&from.addr).await?;
 
@@ -390,7 +356,7 @@ impl MimeMessage {
         let decrypted_msg; // Decrypted signed OpenPGP message.
         let expected_sender_fingerprint: Option<String>;
 
-        let (mail, is_encrypted) = match decrypt::decrypt(context, &mail).await {
+        let (mail, is_encrypted) = match Box::pin(decrypt::decrypt(context, &mail)).await {
             Ok(Some((mut msg, expected_sender_fp))) => {
                 mail_raw = msg.as_data_vec().unwrap_or_default();
 
@@ -524,11 +490,13 @@ impl MimeMessage {
         let mail = mail.as_ref().map(|mail| {
             let (content, signatures_detached) = validate_detached_signature(mail, &public_keyring)
                 .unwrap_or((mail, Default::default()));
-            let signatures_detached = signatures_detached
-                .into_iter()
-                .map(|fp| (fp, Vec::new()))
-                .collect::<HashMap<_, _>>();
-            signatures.extend(signatures_detached);
+            if is_encrypted {
+                let signatures_detached = signatures_detached
+                    .into_iter()
+                    .map(|fp| (fp, Vec::new()))
+                    .collect::<HashMap<_, _>>();
+                signatures.extend(signatures_detached);
+            }
             content
         });
 
@@ -2131,7 +2099,7 @@ async fn parse_gossip_headers(
     let mut gossiped_keys: BTreeMap<String, GossipedKey> = Default::default();
 
     for value in &gossip_headers {
-        let header = match value.parse::<Aheader>() {
+        let header = match Aheader::from_str(value) {
             Ok(header) => header,
             Err(err) => {
                 warn!(context, "Failed parsing Autocrypt-Gossip header: {}", err);
@@ -2221,9 +2189,6 @@ pub(crate) fn parse_message_id(ids: &str) -> Result<String> {
 /// Returns whether the outer header value must be ignored if the message contains a signed (and
 /// optionally encrypted) part. This is independent from the modern Header Protection defined in
 /// <https://www.rfc-editor.org/rfc/rfc9788.html>.
-///
-/// NB: There are known cases when Subject and List-ID only appear in the outer headers of
-/// signed-only messages. Such messages are shown as unencrypted anyway.
 fn is_protected(key: &str) -> bool {
     key.starts_with("chat-")
         || matches!(
@@ -2580,6 +2545,10 @@ async fn handle_ndn(
 
     for msg_id in msg_ids {
         let mut message = Message::load_from_db(context, msg_id).await?;
+        let chat = Chat::load_from_db(context, message.chat_id).await?;
+        if chat.typ == constants::Chattype::OutBroadcast {
+            continue;
+        }
         let aggregated_error = message
             .error
             .as_ref()

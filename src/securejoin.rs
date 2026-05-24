@@ -73,8 +73,7 @@ fn shorten_name(name: &str, length: usize) -> String {
         // We use _ rather than ... to avoid dots at the end of the URL, which would confuse linkifiers
         format!(
             "{}_",
-            &name
-                .chars()
+            name.chars()
                 .take(length.saturating_sub(1))
                 .collect::<String>()
         )
@@ -142,7 +141,7 @@ pub async fn get_securejoin_qr(context: &Context, chat: Option<ChatId>) -> Resul
     let auth = create_id();
     token::save(context, Namespace::Auth, grpid, &auth, time()).await?;
 
-    let fingerprint = get_self_fingerprint(context).await?.hex();
+    let fingerprint = self_fingerprint(context).await?;
 
     let self_addr = context.get_primary_self_addr().await?;
     let self_addr_urlencoded = utf8_percent_encode(&self_addr, DISALLOWED_CHARACTERS).to_string();
@@ -861,7 +860,8 @@ fn encrypted_and_signed(
         } else {
             warn!(
                 context,
-                "Message does not match expected fingerprint {expected_fingerprint}.",
+                "Message does not match expected fingerprint {}.",
+                expected_fingerprint.human_readable()
             );
             false
         }

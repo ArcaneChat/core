@@ -25,7 +25,7 @@ use crate::download::DownloadState;
 use crate::ephemeral::{Timer as EphemeralTimer, start_ephemeral_timers_msgids};
 use crate::events::EventType;
 use crate::imap::markseen_on_imap_table;
-use crate::location::delete_poi_location;
+use crate::location;
 use crate::location::get_poi_location;
 use crate::log::warn;
 use crate::mimeparser::{SystemMessage, parse_message_id};
@@ -223,7 +223,7 @@ SELECT ?1, rfc724_mid, pre_rfc724_mid, timestamp, ?, ? FROM msgs WHERE id=?1
             } else {
                 msg.timestamp_sort
             });
-            ret += &format!("Received: {}", &s);
+            ret += &format!("Received: {s}");
             ret += "\n";
         }
 
@@ -302,7 +302,7 @@ SELECT ?1, rfc724_mid, pre_rfc724_mid, timestamp, ?, ? FROM msgs WHERE id=?1
             ret += "Type: ";
             ret += &format!("{}", msg.viewtype);
             ret += "\n";
-            ret += &format!("Mimetype: {}\n", &msg.get_filemime().unwrap_or_default());
+            ret += &format!("Mimetype: {}\n", msg.get_filemime().unwrap_or_default());
         }
         let w = msg.param.get_int(Param::Width).unwrap_or_default();
         let h = msg.param.get_int(Param::Height).unwrap_or_default();
@@ -530,7 +530,7 @@ impl Message {
                  FROM msgs m
                  LEFT JOIN chats c ON c.id=m.chat_id
                  LEFT JOIN msgs_mdns mdns ON mdns.msg_id=m.id
-                 WHERE m.id=? AND chat_id!=3
+                 WHERE m.id=? AND chat_id!=3 -- DC_CHAT_ID_TRASH
                  LIMIT 1",
                 (id,),
                 |row| {
@@ -751,7 +751,7 @@ impl Message {
     /// at a position different from the self-location.
     /// You should not call this function
     /// if you want to bind the current self-location to a message;
-    /// this is done by [`location::set()`] and [`send_locations_to_chat()`].
+    /// this is done by [`location::set()`] and [`location::send_to_chat()`].
     ///
     /// Typically results in the event [`LocationChanged`] with
     /// `contact_id` set to [`ContactId::SELF`].
@@ -760,7 +760,7 @@ impl Message {
     /// `longitude` is the East-west position of the location.
     ///
     /// [`location::set()`]: crate::location::set
-    /// [`send_locations_to_chat()`]: crate::location::send_locations_to_chat
+    /// [`location::send_to_chat()`]: crate::location::send_to_chat
     /// [`LocationChanged`]: crate::events::EventType::LocationChanged
     pub fn set_location(&mut self, latitude: f64, longitude: f64) {
         if latitude == 0.0 && longitude == 0.0 {
@@ -805,12 +805,6 @@ impl Message {
     /// Returns the type of the message.
     pub fn get_viewtype(&self) -> Viewtype {
         self.viewtype
-    }
-
-    /// Forces the message to **keep** [Viewtype::Sticker]
-    /// e.g the message will not be converted to a [Viewtype::Image].
-    pub fn force_sticker(&mut self) {
-        self.param.set_int(Param::ForceSticker, 1);
     }
 
     /// Returns the state of the message.
@@ -1399,13 +1393,8 @@ pub enum MessageState {
     /// IMAP and MDN may be sent.
     InSeen = 16,
 
-    /// For files which need time to be prepared before they can be
-    /// sent, the message enters this state before
-    /// OutPending.
-    ///
-    /// Deprecated 2024-12-07.
-    OutPreparing = 18,
-
+    // Deprecated 2024-12-07. Removed 2026-04.
+    // OutPreparing = 18,
     /// Message saved as draft.
     OutDraft = 19,
 
@@ -1438,7 +1427,6 @@ impl std::fmt::Display for MessageState {
                 Self::InFresh => "Fresh",
                 Self::InNoticed => "Noticed",
                 Self::InSeen => "Seen",
-                Self::OutPreparing => "Preparing",
                 Self::OutDraft => "Draft",
                 Self::OutPending => "Pending",
                 Self::OutFailed => "Failed",
@@ -1455,7 +1443,7 @@ impl MessageState {
         use MessageState::*;
         matches!(
             self,
-            OutPreparing | OutPending | OutDelivered | OutMdnRcvd // OutMdnRcvd can still fail because it could be a group message and only some recipients failed.
+            OutPending | OutDelivered | OutMdnRcvd // OutMdnRcvd can still fail because it could be a group message and only some recipients failed.
         )
     }
 
@@ -1464,7 +1452,7 @@ impl MessageState {
         use MessageState::*;
         matches!(
             self,
-            OutPreparing | OutDraft | OutPending | OutFailed | OutDelivered | OutMdnRcvd
+            OutDraft | OutPending | OutFailed | OutDelivered | OutMdnRcvd
         )
     }
 
@@ -1667,7 +1655,7 @@ pub(crate) async fn get_mime_headers(context: &Context, msg_id: MsgId) -> Result
 /// This may be called in batches; the final events are emitted in delete_msgs_locally_done() then.
 pub(crate) async fn delete_msg_locally(context: &Context, msg: &Message) -> Result<()> {
     if msg.location_id > 0 {
-        delete_poi_location(context, msg.location_id).await?;
+        location::delete_poi(context, msg.location_id).await?;
     }
     let on_server = true;
     msg.id
@@ -2123,64 +2111,52 @@ pub async fn get_request_msg_cnt(context: &Context) -> usize {
 }
 
 /// Estimates the number of messages that will be deleted
-/// by the options `delete_device_after` or `delete_server_after`.
+/// by the `set_config()`-option `delete_device_after`.
 ///
 /// This is typically used to show the estimated impact to the user
 /// before actually enabling deletion of old messages.
 ///
-/// If `from_server` is true,
-/// estimate deletion count for server,
-/// otherwise estimate deletion count for device.
+/// Messages in the "Saved Messages" chat are not counted as they will not be deleted automatically.
 ///
-/// Count messages older than the given number of `seconds`.
+/// Parameters:
+/// - `from_server`: Deprecated, pass `false` here
+/// - `seconds`: Count messages older than the given number of seconds.
 ///
 /// Returns the number of messages that are older than the given number of seconds.
-/// This includes e-mails downloaded due to the `show_emails` option.
-/// Messages in the "saved messages" folder are not counted as they will not be deleted automatically.
 #[expect(clippy::arithmetic_side_effects)]
 pub async fn estimate_deletion_cnt(
     context: &Context,
     from_server: bool,
     seconds: i64,
 ) -> Result<usize> {
+    ensure!(
+        !from_server,
+        "The `delete_server_after` config option was removed. You need to pass `false` for `from_server`"
+    );
+
     let self_chat_id = ChatIdBlocked::lookup_by_contact(context, ContactId::SELF)
         .await?
         .map(|c| c.id)
         .unwrap_or_default();
     let threshold_timestamp = time() - seconds;
 
-    let cnt = if from_server {
-        context
-            .sql
-            .count(
-                "SELECT COUNT(*)
-             FROM msgs m
-             WHERE m.id > ?
-               AND timestamp < ?
-               AND chat_id != ?
-               AND EXISTS (SELECT * FROM imap WHERE rfc724_mid=m.rfc724_mid);",
-                (DC_MSG_ID_LAST_SPECIAL, threshold_timestamp, self_chat_id),
-            )
-            .await?
-    } else {
-        context
-            .sql
-            .count(
-                "SELECT COUNT(*)
+    let cnt = context
+        .sql
+        .count(
+            "SELECT COUNT(*)
              FROM msgs m
              WHERE m.id > ?
                AND timestamp < ?
                AND chat_id != ?
                AND chat_id != ? AND hidden = 0;",
-                (
-                    DC_MSG_ID_LAST_SPECIAL,
-                    threshold_timestamp,
-                    self_chat_id,
-                    DC_CHAT_ID_TRASH,
-                ),
-            )
-            .await?
-    };
+            (
+                DC_MSG_ID_LAST_SPECIAL,
+                threshold_timestamp,
+                self_chat_id,
+                DC_CHAT_ID_TRASH,
+            ),
+        )
+        .await?;
     Ok(cnt)
 }
 
@@ -2334,8 +2310,6 @@ pub enum Viewtype {
     Gif = 21,
 
     /// Message containing a sticker, similar to image.
-    /// NB: When sending, the message viewtype may be changed to `Image` by some heuristics like
-    /// checking for transparent pixels. Use `Message::force_sticker()` to disable them.
     ///
     /// If possible, the ui should display the image without borders in a transparent way.
     /// A click on a sticker will offer to install the sticker set in some future.

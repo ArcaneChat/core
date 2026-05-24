@@ -1,9 +1,9 @@
 [package]
 name = "deltachat"
-version = "2.50.0-dev"
+version = "2.50.0"
 edition = "2024"
 license = "MPL-2.0"
-rust-version = "1.88"
+rust-version = "1.89"
 repository = "https://github.com/chatmail/core"
 
 [profile.dev]
@@ -53,7 +53,7 @@ blake3 = "1.8.2"
 brotli = { version = "8", default-features=false, features = ["std"] }
 bytes = "1"
 chrono = { workspace = true, features = ["alloc", "clock", "std"] }
-colorutils-rs = { version = "0.7.5", default-features = false }
+colorutils-rs = { version = "0.8.0", default-features = false }
 data-encoding = "2.9.0"
 escaper = "0.1"
 fast-socks5 = "1"
@@ -78,7 +78,7 @@ num-derive = "0.4"
 num-traits = { workspace = true }
 parking_lot = "0.12.4"
 percent-encoding = "2.3"
-pgp = { version = "0.19.0", default-features = false }
+pgp = { version = "0.19.0", features = ["draft-pqc"], default-features = false }
 pin-project = "1"
 qrcodegen = "1.7.0"
 quick-xml = { version = "0.39", features = ["escape-html"] }
@@ -103,7 +103,7 @@ thiserror = { workspace = true }
 tokio-io-timeout = "1.2.1"
 tokio-rustls = { version = "0.26.2", default-features = false }
 tokio-stream = { version = "0.1.17", features = ["fs"] }
-astral-tokio-tar = { version = "0.6", default-features = false }
+astral-tokio-tar = { version = "0.6.2", default-features = false }
 tokio-util = { workspace = true }
 tokio = { workspace = true, features = ["fs", "rt-multi-thread", "macros"] }
 toml = "0.9"

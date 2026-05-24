@@ -218,7 +218,7 @@ pub(crate) fn maybe_network_lost(context: &Context, stores: Vec<ConnectivityStor
 impl fmt::Debug for ConnectivityStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(guard) = self.0.try_lock() {
-            write!(f, "ConnectivityStore {:?}", &*guard)
+            write!(f, "ConnectivityStore {:?}", *guard)
         } else {
             write!(f, "ConnectivityStore [LOCKED]")
         }
@@ -418,7 +418,11 @@ impl Context {
             };
             match &quota.recent {
                 Err(e) => {
-                    ret += &escaper::encode_minimal(&e.to_string());
+                    // If not supported by the provider,
+                    // just skip the "quota" section.
+                    if !matches!(e, crate::quota::Error::NotSupportedByProvider) {
+                        ret += &escaper::encode_minimal(&e.to_string());
+                    }
                 }
                 Ok(quota) => {
                     if quota.is_empty() {

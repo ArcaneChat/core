@@ -6,15 +6,15 @@ use std::io::Cursor;
 use anyhow::{Context as _, Result, ensure};
 use deltachat_contact_tools::{EmailAddress, may_be_valid_addr};
 use pgp::composed::{
-    ArmorOptions, Deserializable, DetachedSignature, EncryptionCaps, KeyType as PgpKeyType,
-    MessageBuilder, SecretKeyParamsBuilder, SignedKeyDetails, SignedPublicKey, SignedPublicSubKey,
-    SignedSecretKey, SubkeyParamsBuilder, SubpacketConfig,
+    Deserializable, DetachedSignature, EncryptionCaps, KeyType as PgpKeyType, MessageBuilder,
+    SecretKeyParamsBuilder, SignedKeyDetails, SignedPublicKey, SignedPublicSubKey, SignedSecretKey,
+    SubkeyParamsBuilder, SubpacketConfig,
 };
 use pgp::crypto::aead::{AeadAlgorithm, ChunkSize};
 use pgp::crypto::ecc_curve::ECCCurve;
 use pgp::crypto::hash::HashAlgorithm;
 use pgp::crypto::sym::SymmetricKeyAlgorithm;
-use pgp::packet::{Signature, SignatureConfig, SignatureType, Subpacket, SubpacketData};
+use pgp::packet::{Signature, Subpacket, SubpacketData};
 use pgp::types::{
     CompressionAlgorithm, Imprint, KeyDetails, KeyVersion, Password, SignedUser, SigningKey as _,
     StringToKey,
@@ -200,47 +200,6 @@ pub async fn pk_encrypt(
             Ok(encoded_msg)
         })
         .await?
-}
-
-/// Produces a detached signature for `plain` text using `private_key_for_signing`.
-pub fn pk_calc_signature(
-    plain: Vec<u8>,
-    private_key_for_signing: &SignedSecretKey,
-) -> Result<String> {
-    let rng = thread_rng();
-
-    let mut config = SignatureConfig::from_key(
-        rng,
-        &private_key_for_signing.primary_key,
-        SignatureType::Binary,
-    )?;
-
-    config.hashed_subpackets = vec![
-        Subpacket::regular(SubpacketData::IssuerFingerprint(
-            private_key_for_signing.fingerprint(),
-        ))?,
-        Subpacket::critical(SubpacketData::SignatureCreationTime(
-            pgp::types::Timestamp::now(),
-        ))?,
-    ];
-    config.unhashed_subpackets = vec![];
-    if private_key_for_signing.version() <= KeyVersion::V4 {
-        config
-            .unhashed_subpackets
-            .push(Subpacket::regular(SubpacketData::IssuerKeyId(
-                private_key_for_signing.legacy_key_id(),
-            ))?);
-    }
-
-    let signature = config.sign(
-        &private_key_for_signing.primary_key,
-        &Password::empty(),
-        plain.as_slice(),
-    )?;
-
-    let sig = DetachedSignature::new(signature);
-
-    Ok(sig.to_armored_string(ArmorOptions::default())?)
 }
 
 /// Returns fingerprints
@@ -887,5 +846,42 @@ mod tests {
         // Cannot merge certificates with different primary key.
         assert!(merge_openpgp_certificates(alice.clone(), bob.clone()).is_err());
         assert!(merge_openpgp_certificates(bob.clone(), alice.clone()).is_err());
+    }
+
+    /// Test PQC support.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_pqc() -> Result<()> {
+        let mut tcm = TestContextManager::new();
+        let alice = &tcm.alice().await;
+        let pqc = &tcm.pqc().await;
+
+        let pqc_received_message = tcm.send_recv_accept(alice, pqc, "Hi!").await;
+        let pqc_chat_id = pqc_received_message.chat_id;
+        let pqc_sent = pqc.send_text(pqc_chat_id, "Hello back!").await;
+
+        let alice_rcvd = alice.recv_msg(&pqc_sent).await;
+        assert_eq!(alice_rcvd.text, "Hello back!");
+
+        Ok(())
+    }
+
+    /// Tests securejoin with inviter using PQC key.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_securejoin_pqc_inviter() {
+        let mut tcm = TestContextManager::new();
+        let alice = &tcm.alice().await;
+        let pqc = &tcm.pqc().await;
+
+        tcm.execute_securejoin(pqc, alice).await;
+    }
+
+    /// Tests securejoin with joiner using PQC key.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_securejoin_pqc_joiner() {
+        let mut tcm = TestContextManager::new();
+        let pqc = &tcm.pqc().await;
+        let bob = &tcm.bob().await;
+
+        tcm.execute_securejoin(bob, pqc).await;
     }
 }

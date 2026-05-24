@@ -335,6 +335,7 @@ async fn test_add_or_lookup() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_contact_name_changes() -> Result<()> {
     let t = TestContext::new_alice().await;
+    t.allow_unencrypted().await?;
 
     // first message creates contact and one-to-one-chat without name set
     receive_imf(
@@ -927,9 +928,12 @@ async fn test_synchronize_status() -> Result<()> {
     // Alice has two devices.
     let alice1 = &tcm.alice().await;
     let alice2 = &tcm.alice().await;
+    alice1.allow_unencrypted().await?;
+    alice2.allow_unencrypted().await?;
 
     // Bob has one device.
     let bob = &tcm.bob().await;
+    bob.allow_unencrypted().await?;
 
     let default_status = alice1.get_config(Config::Selfstatus).await?;
 
@@ -998,33 +1002,18 @@ async fn test_selfavatar_changed_event() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_last_seen() -> Result<()> {
-    let alice = TestContext::new_alice().await;
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
 
-    let (contact_id, _) = Contact::add_or_lookup(
-        &alice,
-        "Bob",
-        &ContactAddress::new("bob@example.net")?,
-        Origin::ManuallyCreated,
-    )
-    .await?;
-    let contact = Contact::get_by_id(&alice, contact_id).await?;
+    let contact = alice.add_or_lookup_contact(bob).await;
     assert_eq!(contact.last_seen(), 0);
 
-    let mime = br#"Subject: Hello
-Message-ID: message@example.net
-To: Alice <alice@example.org>
-From: Bob <bob@example.net>
-Content-Type: text/plain; charset=utf-8; format=flowed; delsp=no
-Chat-Version: 1.0
-Date: Sun, 22 Mar 2020 22:37:55 +0000
-
-Hi."#;
-    receive_imf(&alice, mime, false).await?;
-    let msg = alice.get_last_msg().await;
+    let msg = tcm.send_recv(bob, alice, "Hi.").await;
 
     let timestamp = msg.get_timestamp();
     assert!(timestamp > 0);
-    let contact = Contact::get_by_id(&alice, contact_id).await?;
+    let contact = Contact::get_by_id(alice, contact.id).await?;
     assert_eq!(contact.last_seen(), timestamp);
 
     Ok(())
@@ -1098,6 +1087,7 @@ async fn test_was_seen_recently_event() -> Result<()> {
 async fn test_lookup_id_by_addr_recent_ex(accept_unencrypted_chat: bool) -> Result<()> {
     let mut tcm = TestContextManager::new();
     let bob = &tcm.bob().await;
+    bob.allow_unencrypted().await?;
 
     let raw = include_bytes!("../../test-data/message/thunderbird_with_autocrypt.eml");
     assert!(std::str::from_utf8(raw)?.contains("Date: Thu, 24 Nov 2022 20:05:57 +0100"));

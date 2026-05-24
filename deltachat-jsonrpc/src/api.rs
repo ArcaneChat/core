@@ -318,15 +318,6 @@ impl CommandApi {
         Ok(())
     }
 
-    /// Requests to clear storage on all chatmail relays.
-    ///
-    /// I/O must be started for this request to take effect.
-    async fn clear_all_relay_storage(&self, account_id: u32) -> Result<()> {
-        let ctx = self.get_context(account_id).await?;
-        ctx.clear_all_relay_storage().await?;
-        Ok(())
-    }
-
     /// Get top-level info for an account.
     async fn get_account_info(&self, account_id: u32) -> Result<Account> {
         let context_option = self.accounts.read().await.get_account(account_id);
@@ -744,10 +735,19 @@ impl CommandApi {
         Ok(msg_ids)
     }
 
-    /// Estimate the number of messages that will be deleted
-    /// by the set_config()-options `delete_device_after` or `delete_server_after`.
+    /// Estimates the number of messages that will be deleted
+    /// by the `set_config()`-option `delete_device_after`.
+    ///
     /// This is typically used to show the estimated impact to the user
     /// before actually enabling deletion of old messages.
+    ///
+    /// Messages in the "Saved Messages" chat are not counted as they will not be deleted automatically.
+    ///
+    /// Parameters:
+    /// - `from_server`: Deprecated, pass `false` here
+    /// - `seconds`: Count messages older than the given number of seconds.
+    ///
+    /// Returns the number of messages that are older than the given number of seconds.
     async fn estimate_auto_deletion_count(
         &self,
         account_id: u32,
@@ -1375,8 +1375,22 @@ impl CommandApi {
         markseen_msgs(&ctx, msg_ids.into_iter().map(MsgId::new).collect()).await
     }
 
-    /// Returns all messages of a particular chat.
+    /// Get all message IDs belonging to a chat.
     ///
+    /// The list is already sorted and starts with the oldest message.
+    /// Clients should not try to re-sort the list as this would be an expensive action
+    /// and would result in inconsistencies between clients.
+    /// Note that the messages are not necessarily sorted by their ID or by their displayed timestamp;
+    /// UIs need to handle both the case of descending message IDs
+    /// and of decreasing timestamps.
+    ///
+    /// Optionally, 'daymarkers' added to the ID array may help to
+    /// implement virtual lists.
+    ///
+    /// Parameters:
+    ///
+    /// * chat_id The chat ID of which the messages IDs should be queried.
+    /// * _info_only: Deprecated, pass `false` here.
     /// * `add_daymarker` - If `true`, add day markers as `DC_MSG_ID_DAYMARKER` to the result,
     ///   e.g. [1234, 1237, 9, 1239]. The day marker timestamp is the midnight one for the
     ///   corresponding (following) day in the local timezone.
@@ -1384,17 +1398,14 @@ impl CommandApi {
         &self,
         account_id: u32,
         chat_id: u32,
-        info_only: bool,
+        _info_only: bool,
         add_daymarker: bool,
     ) -> Result<Vec<u32>> {
         let ctx = self.get_context(account_id).await?;
         let msg = get_chat_msgs_ex(
             &ctx,
             ChatId::new(chat_id),
-            MessageListOptions {
-                info_only,
-                add_daymarker,
-            },
+            MessageListOptions { add_daymarker },
         )
         .await?;
         Ok(msg
@@ -1426,21 +1437,24 @@ impl CommandApi {
         }
     }
 
+    /// Get all messages belonging to a chat.
+    ///
+    /// Similar to `get_message_ids` / `getMessageIds`,
+    /// see that function for details.
+    /// The difference is that this function here returns a list of `MessageListItem`,
+    /// which is an enum of a message or a daymarker.
     async fn get_message_list_items(
         &self,
         account_id: u32,
         chat_id: u32,
-        info_only: bool,
+        _info_only: bool,
         add_daymarker: bool,
     ) -> Result<Vec<JsonrpcMessageListItem>> {
         let ctx = self.get_context(account_id).await?;
         let msg = get_chat_msgs_ex(
             &ctx,
             ChatId::new(chat_id),
-            MessageListOptions {
-                info_only,
-                add_daymarker,
-            },
+            MessageListOptions { add_daymarker },
         )
         .await?;
         Ok(msg
@@ -1877,20 +1891,6 @@ impl CommandApi {
         deltachat::contact::make_vcard(&ctx, &contacts).await
     }
 
-    /// Sets vCard containing the given contacts to the message draft.
-    async fn set_draft_vcard(
-        &self,
-        account_id: u32,
-        msg_id: u32,
-        contacts: Vec<u32>,
-    ) -> Result<()> {
-        let ctx = self.get_context(account_id).await?;
-        let contacts: Vec<_> = contacts.iter().map(|&c| ContactId::new(c)).collect();
-        let mut msg = Message::load_from_db(&ctx, MsgId::new(msg_id)).await?;
-        msg.make_vcard(&ctx, &contacts).await?;
-        msg.get_chat_id().set_draft(&ctx, Some(&mut msg)).await
-    }
-
     // ---------------------------------------------
     //                   chat
     // ---------------------------------------------
@@ -2115,6 +2115,21 @@ impl CommandApi {
     //                  locations
     // ---------------------------------------------
 
+    /// Sets current location.
+    ///
+    /// Returns true if location streaming is currently
+    /// enabled and locations should be updated.
+    ///
+    /// Location is represented as latitude and longitude in degrees
+    /// and horizontal accuracy in meters.
+    async fn set_location(&self, latitude: f64, longitude: f64, accuracy: f64) -> Result<bool> {
+        self.accounts
+            .read()
+            .await
+            .set_location(latitude, longitude, accuracy)
+            .await
+    }
+
     async fn get_locations(
         &self,
         account_id: u32,
@@ -2135,6 +2150,39 @@ impl CommandApi {
         .await?;
 
         Ok(locations.into_iter().map(|l| l.into()).collect())
+    }
+
+    /// Enables location streaming in chat identified by `chat_id` for `seconds` seconds.
+    ///
+    /// Pass 0 as the number of seconds to disable location streaming in the chat.
+    async fn send_locations_to_chat(
+        &self,
+        account_id: u32,
+        chat_id: u32,
+        seconds: i64,
+    ) -> Result<()> {
+        let ctx = self.get_context(account_id).await?;
+        let chat_id = ChatId::new(chat_id);
+        location::send_to_chat(&ctx, chat_id, seconds).await?;
+        Ok(())
+    }
+
+    /// Returns whether any chat is sending locations.
+    async fn is_sending_locations(&self, account_id: u32) -> Result<bool> {
+        let ctx = self.get_context(account_id).await?;
+        location::is_sending(&ctx).await
+    }
+
+    /// Returns whether `chat_id` is sending locations.
+    async fn is_sending_locations_to_chat(&self, account_id: u32, chat_id: u32) -> Result<bool> {
+        let ctx = self.get_context(account_id).await?;
+        let chat_id = ChatId::new(chat_id);
+        location::is_sending_to_chat(&ctx, chat_id).await
+    }
+
+    /// Stops sending locations to all chats.
+    async fn stop_sending_locations(&self) -> Result<()> {
+        self.accounts.read().await.stop_sending_locations().await
     }
 
     // ---------------------------------------------
@@ -2368,6 +2416,7 @@ impl CommandApi {
         chat::resend_msgs(&ctx, &message_ids).await
     }
 
+    /// @deprecated as of 2026-04; use `send_msg` with `Viewtype::Sticker` instead.
     async fn send_sticker(
         &self,
         account_id: u32,
@@ -2378,9 +2427,6 @@ impl CommandApi {
 
         let mut msg = Message::new(Viewtype::Sticker);
         msg.set_file_and_deduplicate(&ctx, Path::new(&sticker_path), None, None)?;
-
-        // JSON-rpc does not need heuristics to turn [Viewtype::Sticker] into [Viewtype::Image]
-        msg.force_sticker();
 
         let message_id = deltachat::chat::send_msg(&ctx, ChatId::new(chat_id), &mut msg).await?;
         Ok(message_id.to_u32())
