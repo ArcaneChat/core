@@ -4944,7 +4944,6 @@ uint32_t        dc_msg_get_original_msg_id    (const dc_msg_t* msg);
  */
 uint32_t        dc_msg_get_saved_msg_id     (const dc_msg_t* msg);
 
-void            dc_msg_force_sticker          (dc_msg_t* msg);
 char*           dc_msg_get_poi_location       (dc_msg_t* msg);
 
 /**

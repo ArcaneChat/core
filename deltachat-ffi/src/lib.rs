@@ -4039,16 +4039,6 @@ pub unsafe extern "C" fn dc_msg_get_saved_msg_id(msg: *const dc_msg_t) -> u32 {
     })
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn dc_msg_force_sticker(msg: *mut dc_msg_t) {
-    if msg.is_null() {
-        eprintln!("ignoring careless call to dc_msg_force_sticker()");
-        return;
-    }
-    let ffi_msg = &mut *msg;
-    ffi_msg.message.force_sticker();
-}
-
 // dc_contact_t
 
 /// FFI struct for [dc_contact_t]
