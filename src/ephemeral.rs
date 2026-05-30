@@ -654,7 +654,7 @@ pub(crate) async fn ephemeral_loop(context: &Context, interrupt_receiver: Receiv
 
 /// Schedules expired IMAP messages for deletion on the server.
 ///
-/// Also see [`delete_expired_imap_messages`],
+/// Also see [`delete_expired_messages`],
 /// which locally deletes expired messages.
 pub(crate) async fn delete_expired_imap_messages(
     context: &Context,
@@ -663,7 +663,8 @@ pub(crate) async fn delete_expired_imap_messages(
 ) -> Result<()> {
     let now = time();
 
-    if should_delete_all_downloaded_messages(context, is_chatmail).await? {
+    let bcc_self = context.get_config_bool(Config::BccSelf).await?;
+    if should_delete_all_downloaded_messages(bcc_self, is_chatmail) {
         // This is the only device using this relay.
         // Mark all downloaded messages for deletion, because they are not needed anymore.
         //
@@ -690,7 +691,7 @@ pub(crate) async fn delete_expired_imap_messages(
                 (transport_id, now, DownloadState::Done),
             )
             .await?;
-    } else {
+    } else if bcc_self {
         // There may be other devices using this relay,
         // either because there is multi-device or because this is a classical email server.
         // Only delete expired ephemeral messages.
@@ -711,16 +712,37 @@ pub(crate) async fn delete_expired_imap_messages(
                 (transport_id, now),
             )
             .await?;
+    } else {
+        // Single device.
+        // Delete all expired and encrypted messages.
+        context
+            .sql
+            .execute(
+                "UPDATE imap
+                 SET target=''
+                 WHERE transport_id=?1
+                 AND rfc724_mid IN (
+                    SELECT rfc724_mid FROM msgs
+                    WHERE id>9
+                      AND ((ephemeral_timestamp!=0 AND ephemeral_timestamp<=?2) OR
+                           ((param GLOB '*\nc=1*' OR param GLOB 'c=1*') AND download_state=?3))
+                    UNION
+                    SELECT pre_rfc724_mid FROM msgs
+                    WHERE pre_rfc724_mid!=''
+                      AND id>9
+                      AND ((ephemeral_timestamp!=0 AND ephemeral_timestamp<=?2) OR
+                           (param GLOB '*\nc=1*' OR param GLOB 'c=1*'))
+                )",
+                (transport_id, now, DownloadState::Done),
+            )
+            .await?;
     }
 
     Ok(())
 }
 
-pub(crate) async fn should_delete_all_downloaded_messages(
-    context: &Context,
-    is_chatmail: bool,
-) -> Result<bool> {
-    Ok(!context.get_config_bool(Config::BccSelf).await? && is_chatmail)
+pub(crate) fn should_delete_all_downloaded_messages(bcc_self: bool, is_chatmail: bool) -> bool {
+    !bcc_self && is_chatmail
 }
 
 /// Start ephemeral timers for seen messages if they are not started

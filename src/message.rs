@@ -141,8 +141,20 @@ SELECT ?1, rfc724_mid, pre_rfc724_mid, timestamp, ?, ? FROM msgs WHERE id=?1
         Ok(())
     }
 
-    pub(crate) async fn set_delivered(self, context: &Context) -> Result<()> {
-        update_msg_state(context, self, MessageState::OutDelivered).await?;
+    /// Returns whether the message state is updated to `OutDelivered`.
+    pub(crate) async fn set_delivered(self, context: &Context) -> Result<bool> {
+        if context
+            .sql
+            .execute(
+                // Only update `OutPending` i.e. if the message is (re-)sent to all chat members.
+                "UPDATE msgs SET state=?, error='' WHERE id=? AND state=?",
+                (MessageState::OutDelivered, self, MessageState::OutPending),
+            )
+            .await?
+            == 0
+        {
+            return Ok(false);
+        }
         let chat_id: Option<ChatId> = context
             .sql
             .query_get_value("SELECT chat_id FROM msgs WHERE id=?", (self,))
@@ -154,7 +166,7 @@ SELECT ?1, rfc724_mid, pre_rfc724_mid, timestamp, ?, ? FROM msgs WHERE id=?1
         if let Some(chat_id) = chat_id {
             chatlist_events::emit_chatlist_item_changed(context, chat_id);
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Bad evil escape hatch.
@@ -313,6 +325,7 @@ SELECT ?1, rfc724_mid, pre_rfc724_mid, timestamp, ?, ? FROM msgs WHERE id=?1
         if duration != 0 {
             ret += &format!("Duration: {duration} ms\n",);
         }
+        ret += &format!("\nDatabase ID: {}", msg.id);
         if !msg.rfc724_mid.is_empty() {
             ret += &format!("\nMessage-ID: {}", msg.rfc724_mid);
 
@@ -601,6 +614,31 @@ impl Message {
         }
 
         Ok(msg)
+    }
+
+    /// Loads the message with given Message-ID from the database.
+    ///
+    /// Cannot return a trashed message.
+    pub async fn load_by_rfc724_mid_optional(
+        context: &Context,
+        rfc724_mid: &str,
+    ) -> Result<Option<Message>> {
+        if let Some(msg_id) = context
+            .sql
+            .query_row_optional(
+                "SELECT id FROM msgs WHERE rfc724_mid=? AND chat_id != ?",
+                (rfc724_mid, DC_CHAT_ID_TRASH),
+                |row| {
+                    let msg_id: MsgId = row.get(0)?;
+                    Ok(msg_id)
+                },
+            )
+            .await?
+        {
+            Self::load_from_db_optional(context, msg_id).await
+        } else {
+            Ok(None)
+        }
     }
 
     /// Returns additional text which is appended to the message's text field
@@ -1401,6 +1439,9 @@ pub enum MessageState {
     /// The user has pressed the "send" button but the message is not
     /// yet sent and is pending in some way. Maybe we're offline (no
     /// checkmark).
+    ///
+    /// This state means that the message is being (re-)sent to all chat members. It shalln't be
+    /// used e.g. for resending only to a new broadcast member.
     OutPending = 20,
 
     /// *Unrecoverable* error (*recoverable* errors result in pending
