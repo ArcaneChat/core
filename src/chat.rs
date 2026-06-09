@@ -32,6 +32,7 @@ use crate::debug_logging::maybe_set_logging_xdc;
 use crate::download::{
     DownloadState, PRE_MSG_ATTACHMENT_SIZE_THRESHOLD, PRE_MSG_SIZE_WARNING_THRESHOLD,
 };
+use crate::ensure_and_debug_assert_eq;
 use crate::ephemeral::{Timer as EphemeralTimer, start_chat_ephemeral_timers};
 use crate::events::EventType;
 use crate::key::{Fingerprint, self_fingerprint};
@@ -1782,9 +1783,8 @@ impl Chat {
                 );
                 bail!("Cannot set message, contact for {} not found.", self.id);
             }
-        } else if matches!(self.typ, Chattype::Group | Chattype::OutBroadcast)
-            && self.param.get_int(Param::Unpromoted).unwrap_or_default() == 1
-        {
+        } else if self.param.get_int(Param::Unpromoted).unwrap_or_default() == 1 {
+            ensure_and_debug_assert_eq!(self.typ, Chattype::Group,);
             msg.param.set_int(Param::AttachChatAvatarAndDescription, 1);
             self.param
                 .remove(Param::Unpromoted)
@@ -3626,9 +3626,6 @@ pub(crate) async fn create_group_ex(
 /// because the word "channel" already appears a lot in the code,
 /// which would make it hard to grep for it.
 ///
-/// After creation, the chat contains no recipients and is in _unpromoted_ state;
-/// see [`create_group`] for more information on the unpromoted state.
-///
 /// Returns the created chat's id.
 pub async fn create_broadcast(context: &Context, chat_name: String) -> Result<ChatId> {
     let grpid = create_id();
@@ -3660,17 +3657,20 @@ pub(crate) async fn create_out_broadcast_ex(
             |row| row.get(0),
         )?;
         ensure!(cnt == 0, "{cnt} chats exist with grpid {grpid}");
+        let mut params: Params = Params::new();
+        params.update_timestamp(Param::GroupNameTimestamp, time())?;
 
         t.execute(
             "INSERT INTO chats
-            (type, name, name_normalized, grpid, created_timestamp)
-            VALUES(?, ?, ?, ?, ?)",
+            (type, name, name_normalized, grpid, created_timestamp, param)
+            VALUES(?, ?, ?, ?, ?, ?)",
             (
                 Chattype::OutBroadcast,
                 &chat_name,
                 normalize_text(&chat_name),
                 &grpid,
                 timestamp,
+                params.to_string(),
             ),
         )?;
         let chat_id = ChatId::new(t.last_insert_rowid().try_into()?);
@@ -3800,13 +3800,15 @@ pub(crate) async fn add_to_chat_contacts_table(
 
 /// Removes a contact from the chat
 /// by updating the `remove_timestamp`.
+/// Returns whether the contact has been a chat member recently. If so, a removal message should be
+/// sent.
 pub(crate) async fn remove_from_chat_contacts_table(
     context: &Context,
     chat_id: ChatId,
     contact_id: ContactId,
-) -> Result<()> {
+) -> Result<bool> {
     let now = time();
-    context
+    let is_past_member = context
         .sql
         .execute(
             "UPDATE chats_contacts
@@ -3814,12 +3816,15 @@ pub(crate) async fn remove_from_chat_contacts_table(
              WHERE chat_id=? AND contact_id=?",
             (now, chat_id, contact_id),
         )
-        .await?;
-    Ok(())
+        .await?
+        > 0;
+    Ok(is_past_member)
 }
 
 /// Removes a contact from the chat
-/// without leaving a trace.
+/// without leaving a trace in the db.
+/// Returns whether the contact was removed, even if it was a past contact. If so, a removal message
+/// should be sent if the removal is issued by this device.
 ///
 /// Note that if we call this function,
 /// and then receive a message from another device
@@ -3829,17 +3834,17 @@ pub(crate) async fn remove_from_chat_contacts_table_without_trace(
     context: &Context,
     chat_id: ChatId,
     contact_id: ContactId,
-) -> Result<()> {
-    context
+) -> Result<bool> {
+    let removed = context
         .sql
         .execute(
             "DELETE FROM chats_contacts
             WHERE chat_id=? AND contact_id=?",
             (chat_id, contact_id),
         )
-        .await?;
-
-    Ok(())
+        .await?
+        > 0;
+    Ok(removed)
 }
 
 /// Adds a contact to the chat.
@@ -4159,10 +4164,13 @@ pub async fn remove_contact_from_chat(
 
     let mut sync = Nosync;
 
-    if chat.is_promoted() && chat.typ != Chattype::OutBroadcast {
-        remove_from_chat_contacts_table(context, chat_id, contact_id).await?;
+    let removed = if chat.is_promoted() && chat.typ != Chattype::OutBroadcast {
+        remove_from_chat_contacts_table(context, chat_id, contact_id).await?
     } else {
-        remove_from_chat_contacts_table_without_trace(context, chat_id, contact_id).await?;
+        remove_from_chat_contacts_table_without_trace(context, chat_id, contact_id).await?
+    };
+    if !removed {
+        return Ok(());
     }
 
     // We do not return an error if the contact does not exist in the database.

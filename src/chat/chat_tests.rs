@@ -9,6 +9,7 @@ use crate::headerdef::HeaderDef;
 use crate::imex::{ImexMode, has_backup, imex};
 use crate::message::{Message, MessengerMessage, delete_msgs};
 use crate::mimeparser::{self, MimeMessage};
+use crate::qr::{Qr, check_qr};
 use crate::receive_imf::receive_imf;
 use crate::securejoin::{get_securejoin_qr, join_securejoin};
 use crate::test_utils;
@@ -2799,6 +2800,30 @@ async fn test_can_send_group() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_cant_remove_nonmember() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+    let charlie = &tcm.charlie().await;
+
+    let alice_broadcast_id = create_broadcast(alice, "Channel".to_string()).await?;
+    let qr = get_securejoin_qr(alice, Some(alice_broadcast_id))
+        .await
+        .unwrap();
+    tcm.exec_securejoin_qr(bob, alice, &qr).await;
+
+    let alice_charlie_id = alice.add_or_lookup_contact_id(charlie).await;
+    remove_contact_from_chat(alice, alice_broadcast_id, alice_charlie_id).await?;
+    assert!(alice.pop_sent_msg_opt(Duration::ZERO).await.is_none());
+    assert!(!remove_from_chat_contacts_table(alice, alice_broadcast_id, alice_charlie_id).await?);
+    assert!(
+        !remove_from_chat_contacts_table_without_trace(alice, alice_broadcast_id, alice_charlie_id)
+            .await?
+    );
+    Ok(())
+}
+
 /// Tests that in a broadcast channel,
 /// the recipients can't see the identity of their fellow recipients.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2922,10 +2947,24 @@ async fn test_broadcast_change_name() -> Result<()> {
     let fiona = &tcm.fiona().await;
 
     let broadcast_id = create_broadcast(alice, "Channel".to_string()).await?;
-    let qr = get_securejoin_qr(alice, Some(broadcast_id)).await.unwrap();
+    let mut qr = get_securejoin_qr(alice, Some(broadcast_id)).await.unwrap();
+    // Something goes wrong with the title, e.g. maybe it gets ellipsized
+    // Note that the title always comes at the end for human readability
+    qr += "+modified+title";
 
-    tcm.section("Alice invites Bob to her channel");
-    tcm.exec_securejoin_qr(bob, alice, &qr).await;
+    {
+        tcm.section("Alice invites Bob to her channel");
+        let Qr::AskJoinBroadcast { name, .. } = check_qr(bob, &qr).await? else {
+            panic!();
+        };
+        assert_eq!(name, "Channel modified title");
+
+        // The channel's name gets fixed after actually joining the channel:
+        let bob_chat_id = tcm.exec_securejoin_qr(bob, alice, &qr).await;
+        let bob_chat = Chat::load_from_db(bob, bob_chat_id).await?;
+        assert_eq!(bob_chat.name, "Channel");
+    }
+
     tcm.section("Alice invites Fiona to her channel");
     tcm.exec_securejoin_qr(fiona, alice, &qr).await;
 

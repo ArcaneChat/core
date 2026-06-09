@@ -147,6 +147,7 @@
 
             CARGO_BUILD_TARGET = rustTarget;
             TARGET_CC = "${pkgsWin64.stdenv.cc}/bin/${pkgsWin64.stdenv.cc.targetPrefix}cc";
+            CFLAGS_x86_64_pc_windows_gnu = "-I${pkgsWin64.windows.pthreads}/include";
             CARGO_BUILD_RUSTFLAGS = [
               "-C"
               "linker=${TARGET_CC}"
@@ -203,6 +204,7 @@
             src = pkgs.lib.cleanSource ./.;
             nativeBuildInputs = [
               pkgs.perl # Needed to build vendored OpenSSL.
+              pkgs.nasm # aws-lc-sys requires it
             ];
             depsBuildBuild = [
               winCC
@@ -215,6 +217,7 @@
 
             CARGO_BUILD_TARGET = rustTarget;
             TARGET_CC = "${winCC}/bin/${winCC.targetPrefix}cc";
+            CFLAGS_i686_pc_windows_gnu = "-I${pkgsWin32.windows.pthreads}/include";
             CARGO_BUILD_RUSTFLAGS = [
               "-C"
               "linker=${TARGET_CC}"
@@ -516,22 +519,6 @@
                   substituteInPlace $out/include/deltachat.h \
                     --replace __FILE__ '"${placeholder "out"}/include/deltachat.h"'
                 '';
-              };
-
-            # Source package for deltachat-rpc-server.
-            # Fake package that downloads Linux version,
-            # needed to install deltachat-rpc-server on Android with `pip`.
-            deltachat-rpc-server-source =
-              pkgs.stdenv.mkDerivation {
-                pname = "deltachat-rpc-server-source";
-                version = manifest.version;
-                src = pkgs.lib.cleanSource ./.;
-                nativeBuildInputs = [
-                  pkgs.python3
-                  pkgs.python3Packages.wheel
-                ];
-                buildPhase = ''python3 scripts/wheel-rpc-server.py source deltachat_rpc_server-${manifest.version}.tar.gz'';
-                installPhase = ''mkdir -p $out; cp -av deltachat_rpc_server-${manifest.version}.tar.gz $out'';
               };
 
             deltachat-rpc-client =
