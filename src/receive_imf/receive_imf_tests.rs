@@ -1663,8 +1663,8 @@ async fn test_save_mime_headers_off() -> anyhow::Result<()> {
 
     let msg = bob.recv_msg(&alice.pop_sent_msg().await).await;
     assert_eq!(msg.get_text(), "hi!");
-    let mime = message::get_mime_headers(&bob, msg.id).await?;
-    assert!(mime.is_empty());
+    let html = msg.id.get_html(&bob).await?;
+    assert!(html.is_none());
     Ok(())
 }
 
@@ -2030,12 +2030,12 @@ async fn test_no_smtp_job_for_self_chat() -> Result<()> {
     let chat_id = bob.get_self_chat().await.id;
     let mut msg = Message::new_text("Happy birthday to me".to_string());
     chat::send_msg(bob, chat_id, &mut msg).await?;
-    assert!(bob.pop_sent_msg_opt(Duration::ZERO).await.is_none());
+    assert!(bob.pop_sent_msg_opt().await.is_none());
 
     bob.set_config_bool(Config::BccSelf, true).await?;
     let mut msg = Message::new_text("Happy birthday to me".to_string());
     chat::send_msg(bob, chat_id, &mut msg).await?;
-    assert!(bob.pop_sent_msg_opt(Duration::ZERO).await.is_some());
+    assert!(bob.pop_sent_msg_opt().await.is_some());
 
     Ok(())
 }
@@ -4059,6 +4059,8 @@ async fn test_delayed_removal_is_ignored() -> Result<()> {
     remove_contact_from_chat(bob, bob_chat_id, bob_contact_fiona).await?;
     let remove_msg = bob.pop_sent_msg().await;
 
+    SystemTime::shift(Duration::from_secs(1));
+
     // Bob adds new members Dom and Elena, but first addition message is lost.
     let dom = &tcm.dom().await;
     let elena = &tcm.elena().await;
@@ -4074,6 +4076,8 @@ async fn test_delayed_removal_is_ignored() -> Result<()> {
     // and removal of Fiona.
     alice.recv_msg(&add_msg).await;
     assert_eq!(get_chat_contacts(alice, chat_id).await?.len(), 4);
+
+    SystemTime::shift(Duration::from_secs(1));
 
     // Alice re-adds Fiona.
     add_contact_to_chat(alice, chat_id, alice_fiona).await?;

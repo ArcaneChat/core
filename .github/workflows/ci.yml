@@ -62,7 +62,7 @@ jobs:
         with:
           show-progress: false
           persist-credentials: false
-      - uses: EmbarkStudios/cargo-deny-action@a531616d8ce3b9177443e48a1159bc945a099823
+      - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe
         with:
           arguments: --workspace --all-features --locked
           command: check
@@ -146,7 +146,7 @@ jobs:
           cache-bin: false
 
       - name: Install nextest
-        uses: taiki-e/install-action@60ae4ce63c7aeb6e96d7f572c1ec7fafbb17ca80
+        uses: taiki-e/install-action@e49978b799e49ff429d162b7a30601a569ab6538
         with:
           tool: nextest
 

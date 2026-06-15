@@ -402,9 +402,9 @@ async fn test_receive_pre_message_image() -> Result<()> {
     // test that metadata is correctly returned by methods
     assert_eq!(msg.get_post_message_viewtype(), Some(Viewtype::Image));
     // recoded image dimensions
-    assert_eq!(msg.get_filebytes(bob).await?, Some(149632));
-    assert_eq!(msg.get_height(), 1280);
-    assert_eq!(msg.get_width(), 720);
+    assert_eq!(msg.get_filebytes(bob).await?, Some(233935));
+    assert_eq!(msg.get_height(), 1704);
+    assert_eq!(msg.get_width(), 959);
 
     Ok(())
 }
@@ -534,6 +534,17 @@ async fn test_webxdc_updates_in_post_message_after_pre_message() -> Result<()> {
 
     let alice_chat_id = alice.create_chat_id(bob).await;
 
+    // regression test where updates get assigned to an unrelated prior webxdc message
+    let mut unrelated_xdc = Message::new(Viewtype::Webxdc);
+    unrelated_xdc.set_file_from_bytes(
+        alice,
+        "first.xdc",
+        include_bytes!("../../../test-data/webxdc/minimal.xdc"),
+        None,
+    )?;
+    send_msg(alice, alice_chat_id, &mut unrelated_xdc).await?;
+    let bob_unrelated_webxdc = bob.recv_msg(&alice.pop_sent_msg().await).await;
+
     let big_webxdc_app = big_webxdc_app().await?;
 
     let mut alice_instance = Message::new(Viewtype::Webxdc);
@@ -552,12 +563,65 @@ async fn test_webxdc_updates_in_post_message_after_pre_message() -> Result<()> {
 
     let bob_instance = bob.recv_msg(&pre_message).await;
     assert_eq!(bob_instance.download_state, DownloadState::Available);
+
+    // don't accidentally assign updates from a pre-message to parent message
+    assert_eq!(
+        bob.get_webxdc_status_updates(bob_unrelated_webxdc.id, StatusUpdateSerial::new(0))
+            .await?,
+        "[]"
+    );
+
     bob.recv_msg_trash(&post_message).await;
     let bob_instance = Message::load_from_db(bob, bob_instance.id).await?;
     assert_eq!(bob_instance.download_state, DownloadState::Done);
 
     assert_eq!(
         bob.get_webxdc_status_updates(bob_instance.id, StatusUpdateSerial::new(0))
+            .await?,
+        r#"[{"payload":42,"info":"i","serial":1,"max_serial":1}]"#
+    );
+
+    Ok(())
+}
+
+/// Tests sending large webxdc without text.
+///
+/// This is a regression test, previously pre-message
+/// was trashed when it had no text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_large_webxdc_without_text() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+
+    tcm.section("Bob sends large webxdc without attached text message.");
+    let bob_chat_id = bob.create_chat_id(alice).await;
+    let big_webxdc_app = big_webxdc_app().await?;
+    let mut bob_instance = Message::new(Viewtype::Webxdc);
+    bob_instance.set_file_from_bytes(bob, "test.xdc", &big_webxdc_app, None)?;
+    bob_chat_id.set_draft(bob, Some(&mut bob_instance)).await?;
+    bob.send_webxdc_status_update(bob_instance.id, r#"{"payload":42, "info":"i"}"#)
+        .await?;
+
+    send_msg(bob, bob_chat_id, &mut bob_instance).await?;
+    let post_message = bob.pop_sent_msg().await;
+    let pre_message = bob.pop_sent_msg().await;
+
+    tcm.section("Alice receives a pre-message");
+    let alice_instance = alice.recv_msg(&pre_message).await;
+    assert_eq!(alice_instance.download_state, DownloadState::Available);
+
+    tcm.section("Alice receives a post-message");
+    alice.recv_msg_trash(&post_message).await;
+    let alice_instance = Message::load_from_db(alice, alice_instance.id).await?;
+    assert_eq!(alice_instance.download_state, DownloadState::Done);
+
+    let alice_file_path = alice_instance.get_file(alice).expect("No file");
+    tokio::fs::try_exists(alice_file_path).await?;
+
+    assert_eq!(
+        alice
+            .get_webxdc_status_updates(alice_instance.id, StatusUpdateSerial::new(0))
             .await?,
         r#"[{"payload":42,"info":"i","serial":1,"max_serial":1}]"#
     );

@@ -826,7 +826,9 @@ UPDATE config SET value=? WHERE keyname='configured_addr' AND value!=?1
         }
     }
 
-    if let Some(ref status_update) = mime_parser.webxdc_status_update {
+    if let Some(ref status_update) = mime_parser.webxdc_status_update
+        && !matches!(mime_parser.pre_message, PreMessageMode::Pre { .. })
+    {
         let can_info_msg;
         let instance = if mime_parser
             .parts
@@ -1215,6 +1217,8 @@ async fn decide_chat_assignment(
         // Most mailboxes have a "Drafts" folder where constantly new emails appear but we don't actually want to show them
         info!(context, "Email is probably just a draft (TRASH).");
         true
+    } else if matches!(mime_parser.pre_message, PreMessageMode::Pre { .. }) {
+        false
     } else if mime_parser.webxdc_status_update.is_some() && mime_parser.parts.len() == 1 {
         if let Some(part) = mime_parser.parts.first() {
             if part.typ == Viewtype::Text && part.msg.is_empty() {
