@@ -3,7 +3,9 @@ use std::sync::Arc;
 use super::*;
 use crate::Event;
 use crate::chatlist::get_archived_cnt;
-use crate::constants::{DC_GCL_ARCHIVED_ONLY, DC_GCL_NO_SPECIALS, N_MSGS_TO_NEW_BROADCAST_MEMBER};
+use crate::constants::{
+    self, DC_GCL_ARCHIVED_ONLY, DC_GCL_NO_SPECIALS, N_MSGS_TO_NEW_BROADCAST_MEMBER,
+};
 use crate::ephemeral::Timer;
 use crate::headerdef::HeaderDef;
 use crate::imex::{ImexMode, has_backup, imex};
@@ -748,7 +750,7 @@ async fn test_leave_group() -> Result<()> {
 
     assert_eq!(get_chat_contacts(&alice, alice_chat_id).await?.len(), 1);
 
-    assert_eq!(rcvd_leave_msg.state, MessageState::InSeen);
+    assert_eq!(rcvd_leave_msg.state, MessageState::InNoticed);
 
     alice.emit_event(EventType::Test);
     alice
@@ -1371,6 +1373,18 @@ async fn test_markfresh_chat() -> Result<()> {
     assert_ne!(bob_msg2.state, MessageState::InFresh);
     assert_eq!(bob_chat_id.get_fresh_msg_cnt(bob).await?, 0);
     assert_eq!(bob.get_fresh_msgs().await?.len(), 0);
+
+    // Marking a message as seen results to sending an MDN to the contact and self.
+    message::markseen_msgs(bob, vec![bob_msg2.id]).await?;
+    assert_eq!(
+        bob.sql
+            .count(
+                "SELECT COUNT(*) FROM smtp_mdns WHERE from_id=?",
+                (bob_msg2.from_id,)
+            )
+            .await?,
+        1
+    );
 
     // bob marks the chat as fresh again, fresh count is 1 again
     markfresh_chat(bob, bob_chat_id).await?;
@@ -3071,6 +3085,7 @@ async fn test_broadcast_resend_to_new_member() -> Result<()> {
         let fiona_msg = fiona.recv_msg(&resent_msg).await;
         assert_eq!(fiona_msg.chat_id, fiona_bc_id);
         assert_eq!(fiona_msg.text, (i + 1).to_string());
+        assert_eq!(fiona_msg.param.get_bool(Param::WantsMdn).unwrap(), true);
         assert!(resent_msg.recipients.contains("fiona@example.net"));
         assert!(!resent_msg.recipients.contains("bob@"));
         // The message is undecryptable for Bob, he mustn't be able to know yet that somebody joined
@@ -5163,6 +5178,52 @@ async fn test_blocked_bob_cant_create_11_chat_via_securejoin() -> Result<()> {
     Ok(())
 }
 
+/// Regression test:
+///
+/// Pinning a chat that didn't complete securejoin on one device
+/// should not cause a blank chat to be displayed on other device.
+/// Such chat should be marked as blocked until the first message is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_sync_no_blank_chat() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice1 = &tcm.alice().await;
+    let alice2 = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+
+    for a in [alice1, alice2] {
+        a.set_config_bool(Config::SyncMsgs, true).await?;
+        a.set_config_bool(Config::BccSelf, true).await?;
+    }
+
+    let qr = get_securejoin_qr(bob, None).await?;
+
+    // Scan QR on alice1 and pin the resulting chat.
+    let chat_id = tcm.exec_securejoin_qr(alice1, bob, &qr).await;
+    chat_id
+        .set_visibility(&alice1.ctx, ChatVisibility::Pinned)
+        .await?;
+
+    // alice2 should receive a sync item about changing visibility of a chat it doesn't know about.
+    sync(alice1, alice2).await;
+
+    // Chat created on alice2 should be blocked (hidden)
+    let chat = Chat::load_from_db(&alice2.ctx, chat_id).await?;
+    assert_eq!(chat.blocked, Blocked::Yes);
+    assert_eq!(chat.get_name(), "");
+    assert_eq!(chat.visibility, ChatVisibility::Pinned);
+
+    // First message should unblock and fill missing data on other device.
+    let msg = alice1.send_text(chat_id, "meow").await;
+
+    alice2.recv_msg(&msg).await;
+    let chat = Chat::load_from_db(&alice2.ctx, chat_id).await?;
+    assert_eq!(chat.blocked, Blocked::Not);
+    assert_eq!(chat.get_name(), "bob@example.net");
+    assert_eq!(chat.visibility, ChatVisibility::Pinned);
+
+    Ok(())
+}
+
 /// Tests sending JPEG image with .png extension.
 ///
 /// This is a regression test, previously sending failed
@@ -5822,6 +5883,35 @@ async fn test_send_edit_request() -> Result<()> {
     forward_msgs(&alice2, &[test.id], test.chat_id).await?;
     let forwarded = alice2.get_last_msg().await;
     assert!(!forwarded.is_edited());
+
+    // If a message is too long after editing, it becomes an HTML message on the receiver side. On
+    // the sender side it's still text so that it can be edited again.
+    static REPEAT_TXT: &str = "this text with 42 chars is just repeated.\n";
+    static REPEAT_CNT: usize = constants::DC_DESIRED_TEXT_LEN / REPEAT_TXT.len() + 2;
+    let long_txt = REPEAT_TXT.repeat(REPEAT_CNT);
+    send_edit_request(alice, alice_msg.id, long_txt.clone()).await?;
+    let sent = alice.pop_sent_msg().await;
+    let test = Message::load_from_db(alice, alice_msg.id).await?;
+    assert!(!test.has_html());
+    assert_eq!(test.text, long_txt);
+    bob.recv_msg_opt(&sent).await;
+    let test = Message::load_from_db(bob, bob_msg.id).await?;
+    assert!(test.is_edited());
+    assert!(test.has_html());
+    let html = test.id.get_html(bob).await?.unwrap();
+    assert_eq!(html.matches("just repeated.<br/>").count(), REPEAT_CNT);
+    assert!(test.text.matches("just repeated.").count() > 0);
+
+    // Alice shortens the message back so it's not HTML for Bob anymore.
+    send_edit_request(alice, alice_msg.id, "Text me on Delta.Chat".to_string()).await?;
+    let sent = alice.pop_sent_msg().await;
+    let test = Message::load_from_db(alice, alice_msg.id).await?;
+    assert_eq!(test.text, "Text me on Delta.Chat");
+    bob.recv_msg_opt(&sent).await;
+    let test = Message::load_from_db(bob, bob_msg.id).await?;
+    assert!(test.is_edited());
+    assert!(!test.has_html());
+    assert_eq!(test.text, "Text me on Delta.Chat");
 
     Ok(())
 }

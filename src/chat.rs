@@ -3046,7 +3046,7 @@ pub async fn send_edit_request(context: &Context, msg_id: MsgId, new_text: Strin
         return Ok(());
     }
 
-    save_text_edit_to_db(context, &mut original_msg, &new_text).await?;
+    save_text_edit_to_db(context, &mut original_msg, &new_text, &[]).await?;
 
     let mut edit_msg = Message::new_text(EDITED_PREFIX.to_owned() + &new_text); // prefix only set for nicer display in Non-Delta-MUAs
     edit_msg.set_quote(context, Some(&original_msg)).await?; // quote only set for nicer display in Non-Delta-MUAs
@@ -3065,16 +3065,20 @@ pub(crate) async fn save_text_edit_to_db(
     context: &Context,
     original_msg: &mut Message,
     new_text: &str,
+    mime_headers: &[u8],
 ) -> Result<()> {
     original_msg.param.set_int(Param::IsEdited, 1);
     context
         .sql
         .execute(
-            "UPDATE msgs SET txt=?, txt_normalized=?, param=? WHERE id=?",
+            "
+UPDATE msgs SET txt=?, txt_normalized=?, param=?, mime_headers=?, mime_modified=? WHERE id=?",
             (
                 new_text,
                 normalize_text(new_text),
                 original_msg.param.to_string(),
+                mime_headers,
+                !mime_headers.is_empty(),
                 original_msg.id,
             ),
         )
@@ -3552,6 +3556,10 @@ pub async fn create_group_unencrypted(context: &Context, name: &str) -> Result<C
 ///   unencrypted chats currently.
 /// * `grpid` - Group ID. Iff nonempty, the chat is encrypted (with key-contacts).
 /// * `name` - Chat name.
+///
+/// NB: Unencrypted chats with similar names and the same members are merged on other devices, but
+/// usually users don't create such chats and look up the existing one instead, so chat split on the
+/// first device is acceptable.
 pub(crate) async fn create_group_ex(
     context: &Context,
     sync: sync::Sync,
@@ -5226,9 +5234,11 @@ impl Context {
                     }
                     _ => (),
                 }
-                // Use `Request` so that even if the program crashes, the user doesn't have to look
-                // into the blocked contacts.
-                ChatIdBlocked::get_for_contact(self, contact_id, Blocked::Request)
+                // Newly created chat will be soon unblocked, `Blocked::Yes` here is just
+                // to hide it from chatlist, as at this point it is completely blank (no name etc.).
+                // Even if app crashes at this point, the chat will re-appear on e.g. any new
+                // message sent from other device.
+                ChatIdBlocked::get_for_contact(self, contact_id, Blocked::Yes)
                     .await?
                     .id
             }
@@ -5252,7 +5262,13 @@ impl Context {
                     }
                     _ => (),
                 }
-                ChatIdBlocked::get_for_contact(self, contact_id, Blocked::Request)
+                // Don't show a chat on other devices until securejoin completes.
+                // E.g. pinning a not-synced chat on device A shouldn't display it on device B yet.
+                //
+                // A pinned chat will appear on other devices only when the first
+                // message is sent from the device that read the invitation - which is the same
+                // behavior as with un-pinned chats.
+                ChatIdBlocked::get_for_contact(self, contact_id, Blocked::Yes)
                     .await?
                     .id
             }

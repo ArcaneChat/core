@@ -102,10 +102,6 @@ impl Session {
         self.capabilities.can_check_quota
     }
 
-    pub fn can_condstore(&self) -> bool {
-        self.capabilities.can_condstore
-    }
-
     pub fn can_metadata(&self) -> bool {
         self.capabilities.can_metadata
     }
@@ -115,7 +111,7 @@ impl Session {
     }
 
     // Returns true if IMAP server has `XCHATMAIL` capability.
-    pub fn is_chatmail(&self) -> bool {
+    pub(crate) fn is_chatmail(&self) -> bool {
         self.capabilities.is_chatmail
     }
 

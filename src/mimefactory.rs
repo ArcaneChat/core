@@ -164,7 +164,6 @@ pub struct MimeFactory {
 #[derive(Debug, Clone)]
 pub struct RenderedEmail {
     pub message: String,
-    // pub envelope: Envelope,
     pub is_encrypted: bool,
     pub last_added_location_id: Option<u32>,
 
@@ -221,7 +220,10 @@ impl MimeFactory {
         let mut member_fingerprints = Vec::new();
         let mut member_timestamps = Vec::new();
         let mut recipient_ids = HashSet::new();
-        let mut req_mdn = false;
+        let req_mdn = !chat.is_self_talk()
+            && !msg.is_system_message()
+            && msg.param.get_int(Param::Reaction).unwrap_or_default() == 0
+            && context.should_request_mdns().await?;
 
         let encryption_pubkeys;
 
@@ -478,13 +480,6 @@ impl MimeFactory {
                 ContactId::scaleup_origin(context, &recipient_ids, origin).await?;
             }
 
-            if !msg.is_system_message()
-                && msg.param.get_int(Param::Reaction).unwrap_or_default() == 0
-                && context.should_request_mdns().await?
-            {
-                req_mdn = true;
-            }
-
             encryption_pubkeys = if !is_encrypted {
                 None
             } else if should_encrypt_symmetrically(&msg, &chat) {
@@ -623,9 +618,7 @@ impl MimeFactory {
 
     fn should_skip_autocrypt(&self) -> bool {
         match &self.loaded {
-            Loaded::Message { msg, .. } => {
-                msg.param.get_bool(Param::SkipAutocrypt).unwrap_or_default()
-            }
+            Loaded::Message { .. } => false,
             Loaded::Mdn { .. } => true,
         }
     }
@@ -1035,16 +1028,12 @@ impl MimeFactory {
             is_securejoin_message,
         );
 
-        let use_std_header_protection = context
-            .get_config_bool(Config::StdHeaderProtectionComposing)
-            .await?;
         let outer_message = if let Some(encryption_pubkeys) = self.encryption_pubkeys {
             let mut message = add_headers_to_encrypted_part(
                 message,
                 &unprotected_headers,
                 hidden_headers,
                 protected_headers,
-                use_std_header_protection,
             );
 
             // Add gossip headers in chats with multiple recipients
@@ -1241,7 +1230,6 @@ impl MimeFactory {
 
         Ok(RenderedEmail {
             message,
-            // envelope: Envelope::new,
             is_encrypted,
             last_added_location_id,
             sync_ids_to_delete: self.sync_ids_to_delete,
@@ -1947,7 +1935,6 @@ fn add_headers_to_encrypted_part(
     unprotected_headers: &[(&'static str, HeaderType<'static>)],
     hidden_headers: Vec<(&'static str, HeaderType<'static>)>,
     protected_headers: Vec<(&'static str, HeaderType<'static>)>,
-    use_std_header_protection: bool,
 ) -> MimePart<'static> {
     // Store protected headers in the inner message.
     let message = protected_headers
@@ -1963,21 +1950,19 @@ fn add_headers_to_encrypted_part(
             message.header(header, value)
         });
 
-    if use_std_header_protection {
-        message = unprotected_headers
-            .iter()
-            // Structural headers shouldn't be added as "HP-Outer". They are defined in
-            // <https://www.rfc-editor.org/rfc/rfc9787.html#structural-header-fields>.
-            .filter(|(name, _)| {
-                !(name.eq_ignore_ascii_case("mime-version")
-                    || name.eq_ignore_ascii_case("content-type")
-                    || name.eq_ignore_ascii_case("content-transfer-encoding")
-                    || name.eq_ignore_ascii_case("content-disposition"))
-            })
-            .fold(message, |message, (name, value)| {
-                message.header(format!("HP-Outer: {name}"), value.clone())
-            });
-    }
+    message = unprotected_headers
+        .iter()
+        // Structural headers shouldn't be added as "HP-Outer". They are defined in
+        // <https://www.rfc-editor.org/rfc/rfc9787.html#structural-header-fields>.
+        .filter(|(name, _)| {
+            !(name.eq_ignore_ascii_case("mime-version")
+                || name.eq_ignore_ascii_case("content-type")
+                || name.eq_ignore_ascii_case("content-transfer-encoding")
+                || name.eq_ignore_ascii_case("content-disposition"))
+        })
+        .fold(message, |message, (name, value)| {
+            message.header(format!("HP-Outer: {name}"), value.clone())
+        });
 
     // Set the appropriate Content-Type for the inner message
     for (h, v) in &mut message.headers {
@@ -1986,9 +1971,7 @@ fn add_headers_to_encrypted_part(
         {
             let mut ct_new = ct.clone();
             ct_new = ct_new.attribute("protected-headers", "v1");
-            if use_std_header_protection {
-                ct_new = ct_new.attribute("hp", "cipher");
-            }
+            ct_new = ct_new.attribute("hp", "cipher");
             *ct = ct_new;
             break;
         }
@@ -2330,13 +2313,11 @@ pub(crate) async fn render_symm_encrypted_securejoin_message(
     );
 
     let outer_message = {
-        let use_std_header_protection = true;
         let message = add_headers_to_encrypted_part(
             message,
             &unprotected_headers,
             hidden_headers,
             protected_headers,
-            use_std_header_protection,
         );
 
         // Disable compression for SecureJoin to ensure

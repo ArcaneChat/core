@@ -462,7 +462,10 @@ char*           dc_get_blobdir               (const dc_context_t* context);
  * - `gossip_period` = How often to gossip Autocrypt keys in chats with multiple recipients, in
  *                    seconds. 2 days by default.
  *                    This is not supposed to be changed by UIs and only used for testing.
- * - `is_chatmail` = 1 if the the server is a chatmail server, 0 otherwise.
+ * - `is_chatmail`  = (deprecated) 1 if the the server is a chatmail server, 0 otherwise.
+ *                    This is deprecated, UIs should not behave differently
+ *                    for chatmail relays and classical email servers.
+ *                    Most usages in UIs can be replaced by `force_encryption`.
  * - `is_muted`     = Whether a context is muted by the user.
  *                    Muted contexts should not sound, vibrate or show notifications.
  *                    In contrast to `dc_set_chat_mute_duration()`,
@@ -6342,6 +6345,15 @@ void dc_event_unref(dc_event_t* event);
  * @param data2 (int) msg_id
  */
 #define DC_EVENT_MSG_DELETED              2016
+
+/**
+ * Like @ref DC_EVENT_MSG_READ, but also fires on subsequent MDNs,
+ * if there are multiple receivers, i.e. in groups and channels.
+ *
+ * @param data1 (int) chat_id
+ * @param data2 (int) msg_id
+ */
+#define DC_EVENT_MSG_READ_COUNT_CHANGED   2018
 
 
 /**

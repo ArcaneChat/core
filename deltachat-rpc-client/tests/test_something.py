@@ -221,6 +221,30 @@ def test_account(acfactory) -> None:
     alice.stop_io()
 
 
+def test_mark_fresh_vs_self_mdn(acfactory) -> None:
+    alice, bob = acfactory.get_online_accounts(2)
+    bob.set_config("bcc_self", "1")
+
+    alice_contact_bob = alice.create_contact(bob)
+    alice_chat = alice_contact_bob.create_chat()
+    alice_chat.send_text("Hello!")
+
+    event = bob.wait_for_incoming_msg_event()
+    chat_id = event.chat_id
+    msg_id = event.msg_id
+
+    bob_chat = bob.get_chat_by_id(chat_id)
+    message = bob.get_message_by_id(msg_id)
+    bob_chat.accept()
+    bob.mark_seen_messages([message])
+    bob_chat.mark_fresh()
+    assert bob_chat.get_fresh_message_count() == 1
+    alice.wait_for_event(EventType.MSG_READ)
+    alice_chat.send_text("You've read 'Hello!'")
+    bob.wait_for_incoming_msg_event()
+    assert bob_chat.get_fresh_message_count() == 2
+
+
 def test_chat(acfactory) -> None:
     alice, bob = acfactory.get_online_accounts(2)
 
@@ -448,6 +472,35 @@ def test_reaction_seen_on_another_dev(acfactory) -> None:
     chat_id = alice2.wait_for_event(EventType.MSGS_NOTICED).chat_id
     alice2_chat_bob = alice2.create_chat(bob)
     assert chat_id == alice2_chat_bob.id
+
+
+def test_2nd_device_events_when_msgs_are_seen(acfactory) -> None:
+    alice, bob = acfactory.get_online_accounts(2)
+    alice2 = alice.clone()
+    alice2.start_io()
+
+    # Get an accepted chat, otherwise alice2 won't be notified about the 2nd message.
+    chat_alice2 = alice2.create_chat(bob)
+    chat_id_alice2 = chat_alice2.get_basic_snapshot().id
+
+    chat_bob_alice = bob.create_chat(alice)
+    chat_bob_alice.send_text("Hello!")
+    msg_alice = alice.wait_for_incoming_msg()
+    assert alice2.wait_for_incoming_msg_event().chat_id == chat_id_alice2
+    chat_bob_alice.send_text("What's new?")
+    assert alice2.wait_for_incoming_msg_event().chat_id == chat_id_alice2
+    chat_alice2 = alice2.get_chat_by_id(chat_id_alice2)
+    assert chat_alice2.get_fresh_message_count() == 2
+
+    msg_alice.mark_seen()
+    assert alice2.wait_for_msgs_changed_event().chat_id == chat_id_alice2
+    assert chat_alice2.get_fresh_message_count() == 1
+
+    msg_id = alice.wait_for_msgs_changed_event().msg_id
+    msg = alice.get_message_by_id(msg_id)
+    msg.mark_seen()
+    assert alice2.wait_for_event(EventType.MSGS_NOTICED).chat_id == chat_id_alice2
+    assert chat_alice2.get_fresh_message_count() == 0
 
 
 def test_is_bot(acfactory) -> None:

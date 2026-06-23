@@ -319,6 +319,12 @@ pub enum Config {
     /// True if account is configured.
     Configured,
 
+    /// Deprecated, we are trying to get rid of this global setting.
+    /// It is possible to configure a profile with both chatmail relays
+    /// and classical email servers.
+    ///
+    /// Most usages in UIs can be replaced by `force_encryption`.
+    ///
     /// True if account is a chatmail account.
     IsChatmail,
 
@@ -454,12 +460,6 @@ pub enum Config {
 
     /// Return an error from `receive_imf_inner()`. For tests.
     SimulateReceiveImfError,
-
-    /// Enable composing emails with Header Protection as defined in
-    /// <https://www.rfc-editor.org/rfc/rfc9788.html> "Header Protection for Cryptographically
-    /// Protected Email".
-    #[strum(props(default = "1"))]
-    StdHeaderProtectionComposing,
 
     /// Who can call me.
     ///
