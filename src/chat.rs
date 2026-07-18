@@ -4804,7 +4804,7 @@ pub async fn resend_msgs(context: &Context, msg_ids: &[MsgId]) -> Result<()> {
             chat_id: msg.chat_id,
             msg_id: msg.id,
         });
-        // note(treefit): only matters if it is the last message in chat (but probably to expensive to check, debounce also solves it)
+        // note(treefit): only matters if it is the last message in chat (but probably too expensive to check, debounce also solves it)
         chatlist_events::emit_chatlist_item_changed(context, msg.chat_id);
 
         if msg.viewtype == Viewtype::Webxdc {
