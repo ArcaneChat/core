@@ -61,7 +61,7 @@ use crate::{logged_debug_assert, mimeparser};
 ///
 /// One email with multiple attachments can end up as multiple chat messages, but they
 /// all have the same chat_id, state and sort_timestamp.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct ReceivedMsg {
     /// Chat the message is assigned to.
     pub chat_id: ChatId,
@@ -545,8 +545,15 @@ pub(crate) async fn receive_imf_inner(
         if mime_parser.incoming {
             return Ok(None);
         }
-        // For the case if we missed a successful SMTP response. Be optimistic that the message is
-        // delivered also.
+
+        // It sometimes happens that a slow server (usually a classical email server)
+        // receives a message via SMTP,
+        // but then the connection to the server dies before it sends the OK response.
+        // In order to handle this case, we delete the SMTP send jobs if we receive our own message via IMAP.
+        //
+        // Now, messages with long recipient lists are split into multiple SMTP jobs.
+        // In this case, we only want to delete the SMTP job that was sent to self
+        // because this is the only chunk we can be sure was sent out.
         let self_addr = context.get_primary_self_addr().await?;
         context
             .sql
@@ -2067,8 +2074,15 @@ async fn add_parts(
                 None => {
                     warn!(
                         context,
-                        "Cannot add iroh peer because WebXDC instance does not exist."
+                        "Cannot add iroh peer because WebXDC instance {in_reply_to} does not exist."
                     );
+                    return Ok(ReceivedMsg {
+                        chat_id,
+                        state,
+                        hidden: true,
+                        sort_timestamp,
+                        ..Default::default()
+                    });
                 }
             },
             None => {

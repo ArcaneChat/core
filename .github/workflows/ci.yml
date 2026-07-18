@@ -20,7 +20,7 @@ permissions: {}
 
 env:
   RUSTFLAGS: -Dwarnings
-  RUST_VERSION: 1.95.0
+  RUST_VERSION: 1.97.1
 
   # Minimum Supported Rust Version
   MSRV: 1.89.0
@@ -31,7 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           show-progress: false
           persist-credentials: false
@@ -58,7 +58,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           show-progress: false
           persist-credentials: false
@@ -73,7 +73,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           show-progress: false
           persist-credentials: false
@@ -89,7 +89,7 @@ jobs:
     env:
       RUSTDOCFLAGS: -Dwarnings
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           show-progress: false
           persist-credentials: false
@@ -128,7 +128,7 @@ jobs:
         shell: bash
         if: matrix.rust == 'latest'
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           show-progress: false
           persist-credentials: false
@@ -146,7 +146,7 @@ jobs:
           cache-bin: false
 
       - name: Install nextest
-        uses: taiki-e/install-action@15449e3094499af05d8d964a1c884208e4b8b595
+        uses: taiki-e/install-action@50414676f9f5d50a65992c6dd2ed02641263226c
         with:
           tool: nextest
 
@@ -171,7 +171,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           show-progress: false
           persist-credentials: false
@@ -200,7 +200,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           show-progress: false
           persist-credentials: false
@@ -226,7 +226,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           show-progress: false
           persist-credentials: false
@@ -252,7 +252,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           show-progress: false
           persist-credentials: false
@@ -302,7 +302,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           show-progress: false
           persist-credentials: false
@@ -356,7 +356,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           show-progress: false
           persist-credentials: false

@@ -350,8 +350,8 @@ impl Imap {
 
         let login_params = prioritize_server_login_params(&context.sql, &self.lp, "imap").await?;
         let mut first_error = None;
-        for lp in login_params {
-            info!(context, "IMAP trying to connect to {}.", &lp.connection);
+        'candidate: for lp in login_params {
+            info!(context, "IMAP trying to connect to {}.", lp.connection);
             let connection_candidate = lp.connection.clone();
             let client = match Client::connect(
                 context,
@@ -366,7 +366,7 @@ impl Imap {
                 Err(err) => {
                     warn!(context, "{err:#}.");
                     first_error.get_or_insert(err);
-                    continue;
+                    continue 'candidate;
                 }
             };
 
@@ -387,26 +387,47 @@ impl Imap {
                     user: imap_user.into(),
                     access_token: token,
                 };
-                client.authenticate("XOAUTH2", auth).await
+                client
+                    .authenticate("XOAUTH2", auth)
+                    .await
+                    .map(|session| (session, None))
             } else {
                 info!(context, "Logging into IMAP server with LOGIN.");
                 client.login(imap_user, imap_pw).await
             };
 
             match login_res {
-                Ok(mut session) => {
-                    let capabilities = determine_capabilities(&mut session).await?;
+                Ok((mut session, login_capabilities_opt)) => {
+                    let capabilities = if let Some(login_capabilities) = login_capabilities_opt {
+                        login_capabilities
+                    } else {
+                        // OK response did not contain the CAPABILITY response code.
+                        // Request capabilities explicitly.
+                        match determine_capabilities(&mut session).await {
+                            Ok(capabilities) => capabilities,
+                            Err(err) => {
+                                warn!(context, "Failed to determine capabilities: {err:#}.");
+                                continue 'candidate;
+                            }
+                        }
+                    };
                     let resync_request_sender = self.resync_request_sender.clone();
 
                     let session = if capabilities.can_compress {
                         info!(context, "Enabling IMAP compression.");
-                        let compressed_session = session
+                        let compressed_session = match session
                             .compress(|s| {
                                 let session_stream: Box<dyn SessionStream> = Box::new(s);
                                 session_stream
                             })
                             .await
-                            .context("Failed to enable IMAP compression")?;
+                        {
+                            Ok(compressed_session) => compressed_session,
+                            Err(err) => {
+                                warn!(context, "Failed to enable IMAP compression: {err:#}.");
+                                continue 'candidate;
+                            }
+                        };
                         Session::new(
                             compressed_session,
                             capabilities,
@@ -1182,6 +1203,7 @@ impl Session {
 
         for (request_uids, set) in build_sequence_sets(&request_uids)? {
             info!(context, "Starting UID FETCH of message set \"{}\".", set);
+            let transport_id = self.transport_id();
             let mut fetch_responses = self
                 .uid_fetch(&set, BODY_FULL)
                 .await
@@ -1277,6 +1299,12 @@ impl Session {
                     "Passing message UID {} to receive_imf().", request_uid
                 );
                 let res = receive_imf_inner(context, rfc724_mid, body, is_seen).await;
+                crate::sql::update_transport_last_rcvd_timestamp(context, transport_id)
+                    .await
+                    .context(format!(
+                        "Failed to update last_rcvd_timestamp of transport {}",
+                        transport_id
+                    ))?;
 
                 // If there was an error receiving the message, show a device message:
                 let received_msg = match res {
@@ -1284,7 +1312,9 @@ impl Session {
                         warn!(context, "receive_imf error: {err:#}.");
 
                         let text = format!(
-                            "❌ Failed to receive a message: {err:#}. Core version v{DC_VERSION_STR}. Please report this bug to delta@merlinux.eu or https://support.delta.chat/.",
+                            // No trailing '.' to avoid from the Android UI treating it as a part of
+                            // URL.
+                            "❌ Failed to receive a message: {err:#}. Core version v{DC_VERSION_STR}. Please report this bug to delta@merlinux.eu or https://support.delta.chat/",
                         );
                         let mut msg = Message::new_text(text);
                         add_device_msg(context, None, Some(&mut msg)).await?;
@@ -1995,23 +2025,6 @@ async fn get_uidvalidity(context: &Context, transport_id: u32, folder: &str) -> 
         )
         .await?
         .unwrap_or(0))
-}
-
-pub(crate) async fn set_modseq(
-    context: &Context,
-    transport_id: u32,
-    folder: &str,
-    modseq: u64,
-) -> Result<()> {
-    context
-        .sql
-        .execute(
-            "INSERT INTO imap_sync (transport_id, folder, modseq) VALUES (?,?,?)
-                ON CONFLICT(transport_id, folder) DO UPDATE SET modseq=excluded.modseq",
-            (transport_id, folder, modseq),
-        )
-        .await?;
-    Ok(())
 }
 
 /// Builds a list of sequence/uid sets. The returned sets have each no more than around 1000

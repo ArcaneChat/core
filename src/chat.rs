@@ -1794,8 +1794,7 @@ impl Chat {
         }
 
         let is_bot = context.get_config_bool(Config::Bot).await?;
-        msg.param
-            .set_optional(Param::Bot, Some("1").filter(|_| is_bot));
+        msg.param.set_optional(Param::Bot, is_bot.then_some("1"));
 
         // Set "In-Reply-To:" to identify the message to which the composed message is a reply.
         // Set "References:" to identify the "thread" of the conversation.
@@ -2926,10 +2925,9 @@ pub(crate) async fn create_send_msg_jobs(context: &Context, msg: &mut Message) -
 
     let now = time();
 
-    if rendered_msg.last_added_location_id.is_some()
-        && let Err(err) = location::set_kml_sent_timestamp(context, msg.chat_id, now).await
-    {
-        error!(context, "Failed to set kml sent_timestamp: {err:#}.");
+    if let Some(last_added_location_timestamp) = rendered_msg.last_added_location_timestamp {
+        location::set_kml_sent_timestamp(context, msg.chat_id, last_added_location_timestamp)
+            .await?;
     }
 
     if attach_selfavatar && let Err(err) = msg.chat_id.set_selfavatar_timestamp(context, now).await

@@ -45,9 +45,11 @@ use crate::transport::{
 use crate::{EventType, stock_str};
 use crate::{chat, provider};
 
-/// Maximum number of relays
-/// see <https://github.com/chatmail/core/issues/7608>
-pub(crate) const MAX_TRANSPORT_RELAYS: usize = 5;
+/// Maximum number of published relays.
+///
+/// See <https://github.com/chatmail/core/issues/7608>
+/// and <https://github.com/chatmail/core/issues/8421>.
+pub(crate) const MAX_PUBLISHED_RELAYS: usize = 5;
 
 /// Hard-coded candidates for default relays.
 /// In the future, we want to use it during onboarding;
@@ -230,8 +232,9 @@ impl Context {
         self.sql.count("SELECT COUNT(*) FROM transports", ()).await
     }
 
-    /// Removes the transport with the specified email address
-    /// (i.e. [EnteredLoginParam::addr]).
+    /// Immediately deletes a transport, potentially causing messages not to arrive.
+    /// This must ONLY be used by the automated tests.
+    /// UI implementations must use [`Self::set_transport_unpublished`] instead.
     pub async fn delete_transport(&self, addr: &str) -> Result<()> {
         let now = time();
         let removed_transport_id = self
@@ -282,15 +285,17 @@ impl Context {
     }
 
     /// Change whether the transport is unpublished.
+    /// UIs should call this function when the user clicks on "Remove".
+    /// Core will keep listening on this transport for some time,
+    /// and automatically remove it once it is no longer needed.
     ///
     /// Unpublished transports are not advertised to contacts,
     /// and self-sent messages are not sent there,
     /// so that we don't cause extra messages to the corresponding inbox,
     /// but can still receive messages from contacts who don't know our new transport addresses yet.
     ///
-    /// The default is false, but when the user updates from a version that didn't have this flag,
-    /// existing secondary transports are set to unpublished,
-    /// so that an existing transport address doesn't suddenly get spammed with a lot of messages.
+    /// Unpublished transports that are not used to receive any new messages for a time defined by
+    /// `UNPUBLISHED_TRANSPORT_KEEP_TIME` are automatically removed.
     pub async fn set_transport_unpublished(&self, addr: &str, unpublished: bool) -> Result<()> {
         self.sql
             .transaction(|trans| {
@@ -333,14 +338,11 @@ impl Context {
                 .await?
             && self
                 .sql
-                .count("SELECT COUNT(*) FROM transports", ())
+                .count("SELECT COUNT(*) FROM transports WHERE is_published", ())
                 .await?
-                >= MAX_TRANSPORT_RELAYS
+                >= MAX_PUBLISHED_RELAYS
         {
-            bail!(
-                "You have reached the maximum number of relays ({}).",
-                MAX_TRANSPORT_RELAYS
-            )
+            bail!("You have reached the maximum number of relays ({MAX_PUBLISHED_RELAYS}).")
         }
 
         let provider = match configure(self, param).await {
@@ -721,12 +723,12 @@ async fn get_autoconfig(
     }
     progress!(ctx, 300);
 
+    // `?emailaddress=` query string is excluded on purpose.
+    // It is not part of the URL according to <https://datatracker.ietf.org/doc/draft-ietf-mailmaint-autoconfig/06/>.
+    // Related discussion confirming this is at <https://github.com/benbucksch/autoconfig-spec/issues/17>.
     if let Ok(res) = moz_autoconfigure(
         ctx,
-        // the doc does not mention `emailaddress=`, however, Thunderbird adds it, see <https://releases.mozilla.org/pub/thunderbird/>,  which makes some sense
-        &format!(
-            "https://{param_domain}/.well-known/autoconfig/mail/config-v1.1.xml?emailaddress={param_addr_urlencoded}"
-        ),
+        &format!("https://{param_domain}/.well-known/autoconfig/mail/config-v1.1.xml"),
         &param.addr,
         accept_invalid_certificates,
     )
