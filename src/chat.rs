@@ -64,7 +64,9 @@ pub(crate) const ADMIN_GROUP_ID_SEPARATOR: char = '.';
 
 /// Returns the admin fingerprint if this is an admin group (grpid contains `FINGERPRINT.GRPID`).
 pub(crate) fn admin_group_fingerprint(grpid: &str) -> Option<&str> {
-    grpid.split_once(ADMIN_GROUP_ID_SEPARATOR).map(|(fpr, _)| fpr)
+    grpid
+        .split_once(ADMIN_GROUP_ID_SEPARATOR)
+        .map(|(fpr, _)| fpr)
 }
 
 /// Returns the base group ID (the random part after the fingerprint), for use in QR codes.
@@ -3474,7 +3476,8 @@ pub async fn get_chat_media(
     msg_type2: Viewtype,
     msg_type3: Viewtype,
 ) -> Result<Vec<MsgId>> {
-    let list = if false && msg_type == Viewtype::Webxdc
+    let list = if false
+        && msg_type == Viewtype::Webxdc
         && msg_type2 == Viewtype::Unknown
         && msg_type3 == Viewtype::Unknown
     {
@@ -3614,10 +3617,7 @@ pub async fn create_group_with_admin(context: &Context, name: &str) -> Result<Ch
 /// For admin groups (where `grpid` is `FINGERPRINT.GRPID`), this looks up the contact
 /// whose key fingerprint matches the fingerprint in the group ID.
 /// Returns [`ContactId::SELF`] if the admin is the current user.
-pub async fn get_admin_contact_id(
-    context: &Context,
-    grpid: &str,
-) -> Result<Option<ContactId>> {
+pub async fn get_admin_contact_id(context: &Context, grpid: &str) -> Result<Option<ContactId>> {
     let Some(admin_fpr) = admin_group_fingerprint(grpid) else {
         return Ok(None);
     };

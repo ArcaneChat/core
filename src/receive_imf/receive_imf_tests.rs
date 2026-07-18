@@ -5722,8 +5722,7 @@ async fn test_admin_group_not_created_from_non_admin_message() -> Result<()> {
     // Fiona receives Bob's message.  Since Bob's fingerprint does NOT match the
     // admin fingerprint embedded in the grpid, the group must NOT be created on
     // Fiona's side.
-    let received = receive_imf(fiona, bob_sent.payload().as_bytes(), false)
-        .await?;
+    let received = receive_imf(fiona, bob_sent.payload().as_bytes(), false).await?;
     // Either the message was discarded entirely or it went to trash / 1:1 chat.
     // Either way, no new *admin group* chat should have appeared.
     if let Some(ref r) = received {
@@ -5778,7 +5777,11 @@ async fn test_admin_group_rejects_member_gossip_from_non_admin() -> Result<()> {
 
     // Confirm Alice's group has only SELF + Bob.
     let alice_members_before = get_chat_contacts(alice, alice_group).await?;
-    assert_eq!(alice_members_before.len(), 2, "Alice's group should have 2 members before Bob's message");
+    assert_eq!(
+        alice_members_before.len(),
+        2,
+        "Alice's group should have 2 members before Bob's message"
+    );
     let fiona_contact_on_alice = alice.add_or_lookup_contact_id(fiona).await;
     assert!(
         !alice_members_before.contains(&fiona_contact_on_alice),

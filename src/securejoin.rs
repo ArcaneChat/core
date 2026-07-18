@@ -667,8 +667,7 @@ pub(crate) async fn handle_securejoin_handshake(
                     if my_fpr != admin_fpr {
                         warn!(
                             context,
-                            "Aborting secure-join: we are not the admin of group {}.",
-                            chat.id
+                            "Aborting secure-join: we are not the admin of group {}.", chat.id
                         );
                         return Ok(HandshakeMessage::Ignore);
                     }

@@ -246,7 +246,9 @@ fn test_validate_group_id() {
     // Too-short fingerprint part.
     assert!(!validate_group_id("ABCDEF.aaaaaaaaaaaa"));
     // Invalid base_id (too short).
-    assert!(!validate_group_id("A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2.short"));
+    assert!(!validate_group_id(
+        "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2.short"
+    ));
     // No separator.
     assert!(!validate_group_id(
         "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2aaaaaaaaaaaa"

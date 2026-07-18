@@ -1,7 +1,9 @@
 use std::time::{Duration, SystemTime};
 
 use anyhow::{bail, Context as _, Result};
-use deltachat::chat::{self, get_admin_contact_id, get_chat_contacts, get_past_chat_contacts, ChatVisibility};
+use deltachat::chat::{
+    self, get_admin_contact_id, get_chat_contacts, get_past_chat_contacts, ChatVisibility,
+};
 use deltachat::chat::{Chat, ChatId};
 use deltachat::constants::Chattype;
 use deltachat::contact::{Contact, ContactId};

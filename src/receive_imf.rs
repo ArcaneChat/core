@@ -15,8 +15,8 @@ use num_traits::FromPrimitive;
 use regex::Regex;
 
 use crate::chat::{
-    self, Chat, ChatId, ChatIdBlocked, ChatVisibility, admin_group_fingerprint,
-    is_contact_in_chat, save_broadcast_secret,
+    self, Chat, ChatId, ChatIdBlocked, ChatVisibility, admin_group_fingerprint, is_contact_in_chat,
+    save_broadcast_secret,
 };
 use crate::config::Config;
 use crate::constants::{self, Blocked, Chattype, DC_CHAT_ID_TRASH, EDITED_PREFIX, ShowEmails};
@@ -1932,6 +1932,8 @@ async fn add_parts(
         let is_from_in_chat =
             !chat_contacts.contains(&ContactId::SELF) || chat_contacts.contains(&from_id);
 
+        let is_sender_admin = is_group_admin_contact(context, &chat.grpid, from_id).await?;
+
         info!(
             context,
             "Received new ephemeral timer value {ephemeral_timer:?} for chat {chat_id}, checking if it should be applied."
@@ -1940,6 +1942,11 @@ async fn add_parts(
             warn!(
                 context,
                 "Ignoring ephemeral timer change to {ephemeral_timer:?} for chat {chat_id} because sender {from_id} is not a member.",
+            );
+        } else if !is_sender_admin {
+            warn!(
+                context,
+                "Ignoring ephemeral timer change to {ephemeral_timer:?} for chat {chat_id} because sender {from_id} is not the admin.",
             );
         } else if is_dc_message == MessengerMessage::Yes
             && get_previous_message(context, mime_parser)
@@ -3117,12 +3124,7 @@ async fn apply_group_changes(
 
     // For admin groups, determine if the sender is the admin.
     // The admin fingerprint is encoded in the grpid as FINGERPRINT.GRPID.
-    let sender_is_admin = if let Some(admin_fpr) = admin_group_fingerprint(&chat.grpid) {
-        let from_fpr = get_contact_fingerprint(context, from_id).await?;
-        from_fpr.as_deref() == Some(admin_fpr)
-    } else {
-        true // Not an admin group; all members can modify.
-    };
+    let sender_is_admin = is_group_admin_contact(context, &chat.grpid, from_id).await?;
 
     if let Some(removed_addr) = mime_parser.get_header(HeaderDef::ChatGroupMemberRemoved) {
         if !is_from_in_chat {
@@ -3387,12 +3389,7 @@ async fn apply_chat_name_avatar_and_description_changes(
     // ========== Apply chat name changes ==========
 
     // For admin groups, only the admin can change name, description, and avatar.
-    let is_sender_admin = if let Some(admin_fpr) = admin_group_fingerprint(&chat.grpid) {
-        let from_fpr = get_contact_fingerprint(context, from_id).await?;
-        from_fpr.as_deref() == Some(admin_fpr)
-    } else {
-        true // Not an admin group; all members can modify.
-    };
+    let is_sender_admin = is_group_admin_contact(context, &chat.grpid, from_id).await?;
     // For group state changes (name/description/avatar), treat non-admins as non-members.
     let can_modify_group_state = is_from_in_chat && is_sender_admin;
 
@@ -4388,7 +4385,10 @@ async fn lookup_key_contact_by_address(
 /// Returns the fingerprint of the given contact as a hex string.
 ///
 /// For [`ContactId::SELF`], uses the local device's own fingerprint.
-async fn get_contact_fingerprint(context: &Context, contact_id: ContactId) -> Result<Option<String>> {
+async fn get_contact_fingerprint(
+    context: &Context,
+    contact_id: ContactId,
+) -> Result<Option<String>> {
     if contact_id == ContactId::SELF {
         Ok(self_fingerprint_opt(context).await?.map(|s| s.to_string()))
     } else {
@@ -4396,6 +4396,19 @@ async fn get_contact_fingerprint(context: &Context, contact_id: ContactId) -> Re
             .await?
             .fingerprint()
             .map(|f| f.hex()))
+    }
+}
+
+async fn is_group_admin_contact(
+    context: &Context,
+    grpid: &str,
+    contact_id: ContactId,
+) -> Result<bool> {
+    if let Some(admin_fpr) = admin_group_fingerprint(grpid) {
+        let contact_fpr = get_contact_fingerprint(context, contact_id).await?;
+        Ok(contact_fpr.as_deref() == Some(admin_fpr))
+    } else {
+        Ok(true)
     }
 }
 

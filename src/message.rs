@@ -741,7 +741,8 @@ impl Message {
     pub async fn get_poi_location(&self, context: &Context) -> String {
         if !self.has_location() {
             "".to_string()
-        } else if let Ok((latitude, longitude)) = get_poi_location(context, self.location_id).await {
+        } else if let Ok((latitude, longitude)) = get_poi_location(context, self.location_id).await
+        {
             format!("{latitude},{longitude}")
         } else {
             "".to_string()

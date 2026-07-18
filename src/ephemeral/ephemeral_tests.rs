@@ -12,7 +12,7 @@ use crate::receive_imf::receive_imf;
 use crate::test_utils::{TestContext, TestContextManager};
 use crate::timesmearing::MAX_SECONDS_TO_LEND_FROM_FUTURE;
 use crate::{
-    chat::{self, Chat, ChatItem, create_group, send_text_msg},
+    chat::{self, Chat, ChatItem, create_group, create_group_with_admin, send_text_msg},
     tools::IsNoneOrEmpty,
 };
 
@@ -820,6 +820,62 @@ async fn test_ephemeral_timer_non_member() -> Result<()> {
     alice.recv_msg(&sent_ephemeral_timer_change).await;
 
     // Timer is not changed because Bob is not a member.
+    assert_eq!(
+        alice_chat_id.get_ephemeral_timer(alice).await?,
+        Timer::Disabled
+    );
+
+    Ok(())
+}
+
+/// Tests that non-admin members cannot change admin-group ephemeral timer locally.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_ephemeral_timer_admin_group_non_admin_local_change_fails() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+
+    let alice_bob_contact_id = alice.add_or_lookup_contact_id(bob).await;
+    let alice_chat_id = create_group_with_admin(alice, "Admin Group").await?;
+    add_contact_to_chat(alice, alice_chat_id, alice_bob_contact_id).await?;
+    let sent = alice.send_text(alice_chat_id, "Hi!").await;
+    let bob_chat_id = bob.recv_msg(&sent).await.chat_id;
+    bob_chat_id.accept(bob).await?;
+
+    let err = bob_chat_id
+        .set_ephemeral_timer(bob, Timer::Enabled { duration: 60 })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "Only the group admin can change the ephemeral timer of this group"
+    );
+    assert_eq!(bob_chat_id.get_ephemeral_timer(bob).await?, Timer::Disabled);
+    assert!(bob.pop_sent_msg_opt(Duration::from_secs(1)).await.is_none());
+
+    Ok(())
+}
+
+/// Tests that incoming admin-group timer changes from non-admins are ignored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_ephemeral_timer_admin_group_non_admin_remote_change_ignored() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+
+    let alice_bob_contact_id = alice.add_or_lookup_contact_id(bob).await;
+    let alice_chat_id = create_group_with_admin(alice, "Admin Group").await?;
+    add_contact_to_chat(alice, alice_chat_id, alice_bob_contact_id).await?;
+    let sent = alice.send_text(alice_chat_id, "Hi!").await;
+    let bob_chat_id = bob.recv_msg(&sent).await.chat_id;
+    bob_chat_id.accept(bob).await?;
+
+    bob_chat_id
+        .inner_set_ephemeral_timer(bob, Timer::Enabled { duration: 60 })
+        .await?;
+    let sent = bob.send_text(bob_chat_id, "Rogue timer change").await;
+    alice.recv_msg(&sent).await;
+
     assert_eq!(
         alice_chat_id.get_ephemeral_timer(alice).await?,
         Timer::Disabled

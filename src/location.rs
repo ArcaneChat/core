@@ -512,9 +512,7 @@ pub(crate) async fn get_poi_location(context: &Context, location_id: u32) -> Res
         .query_row(
             "SELECT latitude, longitude FROM locations WHERE independent=1 AND id=?",
             (location_id as i32,),
-            |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            },
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .await
 }

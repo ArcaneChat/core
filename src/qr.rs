@@ -13,6 +13,7 @@ use rand::TryRngCore as _;
 use rand::distr::{Alphanumeric, SampleString};
 use serde::Deserialize;
 
+use crate::chat::ADMIN_GROUP_ID_SEPARATOR;
 use crate::config::Config;
 use crate::contact::{Contact, ContactId, Origin};
 use crate::context::Context;
@@ -22,7 +23,6 @@ use crate::net::http::post_empty;
 use crate::net::proxy::{DEFAULT_SOCKS_PORT, ProxyConfig};
 use crate::token;
 use crate::tools::{time, validate_id};
-use crate::chat::{ADMIN_GROUP_ID_SEPARATOR};
 
 const OPENPGP4FPR_SCHEME: &str = "OPENPGP4FPR:"; // yes: uppercase
 const IDELTACHAT_SCHEME: &str = "https://i.delta.chat/#";
