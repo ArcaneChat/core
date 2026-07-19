@@ -2564,7 +2564,7 @@ async fn prepare_msg_blob(context: &Context, msg: &mut Message) -> Result<()> {
         // running numbers, etc.
         let filename: String = match viewtype_orig {
             Viewtype::Voice => format!(
-                "voice-messsage_{}.{}",
+                "voice-message_{}.{}",
                 chrono::Utc
                     .timestamp_opt(msg.timestamp_sort, 0)
                     .single()
