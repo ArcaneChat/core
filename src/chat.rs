@@ -3609,7 +3609,14 @@ pub async fn create_group_with_admin(context: &Context, name: &str) -> Result<Ch
     let fingerprint = self_fingerprint(context).await?;
     let base_grpid = create_id();
     let grpid = format!("{fingerprint}{ADMIN_GROUP_ID_SEPARATOR}{base_grpid}");
-    create_group_ex(context, Sync, grpid, name).await
+    let result = create_group_ex(context, Sync, grpid, name).await;
+    if let Ok(chat_id) = result {
+        let secret = create_broadcast_secret();
+        save_broadcast_secret(context, chat_id, &secret).await?;
+        Ok(chat_id)
+    } else {
+        result
+    }
 }
 
 /// Returns the contact ID of the group admin for an admin group, or `None` for regular groups.
@@ -4054,7 +4061,7 @@ pub(crate) async fn add_contact_to_chat_ex(
         msg.param.set_optional(Param::Arg4, fingerprint);
         msg.param
             .set_int(Param::ContactAddedRemoved, contact.id.to_u32() as i32);
-        if chat.typ == Chattype::OutBroadcast {
+        if chat.typ == Chattype::OutBroadcast || admin_group_fingerprint(&chat.grpid).is_some() {
             let secret = load_broadcast_secret(context, chat_id)
                 .await?
                 .context("Failed to find broadcast shared secret")?;

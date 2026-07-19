@@ -3361,6 +3361,19 @@ async fn apply_group_changes(
         context.emit_event(EventType::ChatModified(chat.id));
         chatlist_events::emit_chatlist_item_changed(context, chat.id);
     }
+
+    // For admin groups, save the broadcast secret when the admin sends it
+    // (e.g., in a member-added message directed to the new member).
+    if admin_group_fingerprint(&chat.grpid).is_some() && sender_is_admin {
+        if let Some(secret) = mime_parser.get_header(HeaderDef::ChatBroadcastSecret) {
+            if validate_broadcast_secret(secret) {
+                save_broadcast_secret(context, chat.id, secret).await?;
+            } else {
+                warn!(context, "Not saving invalid broadcast secret for admin group");
+            }
+        }
+    }
+
     Ok(GroupChangesInfo {
         better_msg,
         added_removed_id: if added_id.is_some() {

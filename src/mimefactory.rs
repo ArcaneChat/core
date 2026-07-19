@@ -15,7 +15,7 @@ use tokio::fs;
 
 use crate::aheader::{Aheader, EncryptPreference};
 use crate::blob::BlobObject;
-use crate::chat::{self, Chat, PARAM_BROADCAST_SECRET, load_broadcast_secret};
+use crate::chat::{self, Chat, PARAM_BROADCAST_SECRET, admin_group_fingerprint, load_broadcast_secret};
 use crate::config::Config;
 use crate::constants::{BROADCAST_INCOMPATIBILITY_MSG, Chattype, DC_FROM_HANDSHAKE};
 use crate::contact::{Contact, ContactId, Origin};
@@ -894,7 +894,7 @@ impl MimeFactory {
             ));
         }
 
-        if let Loaded::Message { msg, chat } = &self.loaded
+        if let Loaded::Message { msg: _, chat } = &self.loaded
             && (chat.typ == Chattype::OutBroadcast || chat.typ == Chattype::InBroadcast)
         {
             headers.push((
@@ -902,15 +902,16 @@ impl MimeFactory {
                 mail_builder::headers::text::Text::new(format!("{} <{}>", chat.name, chat.grpid))
                     .into(),
             ));
+        }
 
-            if msg.param.get_cmd() == SystemMessage::MemberAddedToGroup
-                && let Some(secret) = msg.param.get(PARAM_BROADCAST_SECRET)
-            {
-                headers.push((
-                    "Chat-Broadcast-Secret",
-                    mail_builder::headers::text::Text::new(secret.to_string()).into(),
-                ));
-            }
+        if let Loaded::Message { msg, .. } = &self.loaded
+            && msg.param.get_cmd() == SystemMessage::MemberAddedToGroup
+            && let Some(secret) = msg.param.get(PARAM_BROADCAST_SECRET)
+        {
+            headers.push((
+                "Chat-Broadcast-Secret",
+                mail_builder::headers::text::Text::new(secret.to_string()).into(),
+            ));
         }
 
         if let Loaded::Message { msg, .. } = &self.loaded {
@@ -2207,11 +2208,12 @@ fn hidden_recipients() -> Address<'static> {
 }
 
 fn should_encrypt_with_broadcast_secret(msg: &Message, chat: &Chat) -> bool {
-    chat.typ == Chattype::OutBroadcast && must_have_only_one_recipient(msg, chat).is_none()
+    (chat.typ == Chattype::OutBroadcast || admin_group_fingerprint(&chat.grpid).is_some())
+        && must_have_only_one_recipient(msg, chat).is_none()
 }
 
 fn should_hide_recipients(msg: &Message, chat: &Chat) -> bool {
-    should_encrypt_with_broadcast_secret(msg, chat)
+    chat.typ == Chattype::OutBroadcast && must_have_only_one_recipient(msg, chat).is_none()
 }
 
 fn should_encrypt_symmetrically(msg: &Message, chat: &Chat) -> bool {
@@ -2223,7 +2225,7 @@ fn should_encrypt_symmetrically(msg: &Message, chat: &Chat) -> bool {
 /// rather than all recipients.
 /// This function returns the fingerprint of the recipient the message should be sent to.
 fn must_have_only_one_recipient<'a>(msg: &'a Message, chat: &Chat) -> Option<Result<&'a str>> {
-    if chat.typ == Chattype::OutBroadcast
+    if (chat.typ == Chattype::OutBroadcast || admin_group_fingerprint(&chat.grpid).is_some())
         && matches!(
             msg.param.get_cmd(),
             SystemMessage::MemberRemovedFromGroup | SystemMessage::MemberAddedToGroup
