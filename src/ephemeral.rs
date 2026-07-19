@@ -72,7 +72,7 @@ use async_channel::Receiver;
 use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
 
-use crate::chat::{ChatId, ChatIdBlocked, send_msg};
+use crate::chat::{Chat, ChatId, ChatIdBlocked, admin_group_fingerprint, send_msg};
 use crate::config::Config;
 use crate::constants::{DC_CHAT_ID_LAST_SPECIAL, DC_CHAT_ID_TRASH};
 use crate::contact::ContactId;
@@ -210,6 +210,17 @@ impl ChatId {
     ///
     /// If timer value is 0, disable ephemeral message timer.
     pub async fn set_ephemeral_timer(self, context: &Context, timer: Timer) -> Result<()> {
+        ensure!(!self.is_special(), "Invalid chat ID");
+
+        let chat = Chat::load_from_db(context, self).await?;
+        if admin_group_fingerprint(&chat.grpid).is_some() {
+            ensure!(
+                crate::chat::get_admin_contact_id(context, &chat.grpid).await?
+                    == Some(ContactId::SELF),
+                "Only the group admin can change the ephemeral timer of this group"
+            );
+        }
+
         if timer == self.get_ephemeral_timer(context).await? {
             return Ok(());
         }

@@ -57,6 +57,26 @@ use crate::webxdc::StatusUpdateSerial;
 
 pub(crate) const PARAM_BROADCAST_SECRET: Param = Param::Arg3;
 
+/// Separator between the admin's fingerprint and the random group ID in admin groups.
+///
+/// Must not be a URL-safe base64 character (`A-Za-z0-9-_`)
+pub(crate) const ADMIN_GROUP_ID_SEPARATOR: char = ':';
+
+/// Returns the admin fingerprint if this is an admin group.
+pub(crate) fn admin_group_fingerprint(grpid: &str) -> Option<&str> {
+    grpid.split_once(ADMIN_GROUP_ID_SEPARATOR).map(|(fpr, _)| fpr)
+}
+
+/// Returns the base group ID (the random part after the fingerprint), for use in QR codes.
+///
+/// For regular groups, returns the full grpid unchanged.
+pub(crate) fn admin_group_base_id(grpid: &str) -> &str {
+    grpid
+        .split_once(ADMIN_GROUP_ID_SEPARATOR)
+        .map(|(_, id)| id)
+        .unwrap_or(grpid)
+}
+
 /// An chat item, such as a message or a marker.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum ChatItem {
@@ -3543,6 +3563,56 @@ pub async fn create_group(context: &Context, name: &str) -> Result<ChatId> {
     create_group_ex(context, Sync, create_id(), name).await
 }
 
+/// Creates an encrypted group chat with an admin.
+///
+/// The group ID is composed of the creator's fingerprint and a random ID separated by
+/// [`ADMIN_GROUP_ID_SEPARATOR`].
+/// Only the admin (creator) can add/remove members or change the group name, description,
+/// or avatar. Other members can send messages and leave the group.
+pub async fn create_group_with_admin(context: &Context, name: &str) -> Result<ChatId> {
+    let fingerprint = self_fingerprint(context).await?;
+    let base_grpid = create_id();
+    let grpid = format!("{fingerprint}{ADMIN_GROUP_ID_SEPARATOR}{base_grpid}");
+    let result = create_group_ex(context, Sync, grpid, name).await;
+    if let Ok(chat_id) = result {
+        let secret = create_broadcast_secret();
+        save_broadcast_secret(context, chat_id, &secret).await?;
+        Ok(chat_id)
+    } else {
+        result
+    }
+}
+
+/// Returns the contact ID of the group admin for an admin group, or `None` for regular groups.
+///
+/// For admin groups (where `grpid` is `FINGERPRINT.GRPID`), this looks up the contact
+/// whose key fingerprint matches the fingerprint in the group ID.
+/// Returns [`ContactId::SELF`] if the admin is the current user.
+pub async fn get_admin_contact_id(context: &Context, grpid: &str) -> Result<Option<ContactId>> {
+    let Some(admin_fpr) = admin_group_fingerprint(grpid) else {
+        return Ok(None);
+    };
+
+    // Check self first (cheaper and handles the case where the contact is not yet in the DB).
+    use crate::key::self_fingerprint_opt;
+    if let Some(self_fpr) = self_fingerprint_opt(context).await? {
+        if self_fpr == admin_fpr {
+            return Ok(Some(ContactId::SELF));
+        }
+    }
+
+    // `admin_group_fingerprint` guarantees admin_fpr is non-empty.
+    let contact_id = context
+        .sql
+        .query_row_optional(
+            "SELECT id FROM contacts WHERE fingerprint=?",
+            (admin_fpr,),
+            |row| row.get::<_, ContactId>(0),
+        )
+        .await?;
+    Ok(contact_id)
+}
+
 /// Creates an unencrypted group chat.
 pub async fn create_group_unencrypted(context: &Context, name: &str) -> Result<ChatId> {
     create_group_ex(context, Sync, String::new(), name).await
@@ -3912,6 +3982,15 @@ pub(crate) async fn add_contact_to_chat_ex(
         );
         return Ok(false);
     }
+
+    if let Some(admin_fpr) = admin_group_fingerprint(&chat.grpid) {
+        let self_fpr = self_fingerprint(context).await?;
+        ensure!(
+            self_fpr == admin_fpr,
+            "Only the group admin can add other members to this group"
+        );
+    }
+
     if from_handshake && chat.param.get_int(Param::Unpromoted).unwrap_or_default() == 1 {
         let now = time();
         chat.param
@@ -4168,6 +4247,16 @@ pub async fn remove_contact_from_chat(
         bail!("{err_msg}");
     }
 
+    if contact_id != ContactId::SELF {
+        if let Some(admin_fpr) = admin_group_fingerprint(&chat.grpid) {
+            let self_fpr = self_fingerprint(context).await?;
+            ensure!(
+                self_fpr == admin_fpr,
+                "Only the group admin can remove other members from this group"
+            );
+        }
+    }
+
     let mut sync = Nosync;
 
     let removed = if chat.is_promoted() && chat.typ != Chattype::OutBroadcast {
@@ -4282,6 +4371,14 @@ async fn set_chat_description_ex(
         bail!("Cannot set chat description; self not in group");
     }
 
+    if let Some(admin_fpr) = admin_group_fingerprint(&chat.grpid) {
+        let self_fpr = self_fingerprint(context).await?;
+        ensure!(
+            self_fpr == admin_fpr,
+            "Only the group admin can change the description of this group"
+        );
+    }
+
     let old_description = get_chat_description(context, chat_id).await?;
     if old_description == new_description {
         return Ok(());
@@ -4370,6 +4467,13 @@ async fn rename_ex(
                 "Cannot set chat name; self not in group".into(),
             ));
         } else {
+            if let Some(admin_fpr) = admin_group_fingerprint(&chat.grpid) {
+                let self_fpr = self_fingerprint(context).await?;
+                ensure!(
+                    self_fpr == admin_fpr,
+                    "Only the group admin can rename this group"
+                );
+            }
             context
                 .sql
                 .execute(
@@ -4440,6 +4544,13 @@ pub async fn set_chat_profile_image(
             "Cannot set chat profile image; self not in group.".into(),
         ));
         bail!("Failed to set profile image");
+    }
+    if let Some(admin_fpr) = admin_group_fingerprint(&chat.grpid) {
+        let self_fpr = self_fingerprint(context).await?;
+        ensure!(
+            self_fpr == admin_fpr,
+            "Only the group admin can change the profile image of this group"
+        );
     }
     let mut msg = Message::new(Viewtype::Text);
     msg.param

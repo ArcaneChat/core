@@ -1091,6 +1091,19 @@ impl CommandApi {
         chat::create_group(&ctx, &name).await.map(|id| id.to_u32())
     }
 
+    /// Create a new encrypted group chat with an admin.
+    ///
+    /// Similar to [`Self::create_group_chat`], but only the creator (admin) can add/remove
+    /// members or change the group name, description, avatar, etc.
+    /// Other members can send messages and leave the group.
+    /// The `group_admin_id` field in [`FullChat`] will be set to the admin's contact ID.
+    async fn create_group_with_admin(&self, account_id: u32, name: String) -> Result<u32> {
+        let ctx = self.get_context(account_id).await?;
+        chat::create_group_with_admin(&ctx, &name)
+            .await
+            .map(|id| id.to_u32())
+    }
+
     /// Create a new unencrypted group chat.
     ///
     /// Same as [`Self::create_group_chat`], but the chat is unencrypted and can only have
