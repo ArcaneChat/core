@@ -1712,10 +1712,12 @@ pub async fn delete_msgs_ex(
 
     for &msg_id in msg_ids {
         let msg = Message::load_from_db(context, msg_id).await?;
+        /*
         ensure!(
             !delete_for_all || msg.from_id == ContactId::SELF,
             "Can delete only own messages for others"
         );
+        */
         ensure!(
             !delete_for_all || msg.get_showpadlock(),
             "Cannot request deletion of unencrypted message for others"

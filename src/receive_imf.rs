@@ -1871,6 +1871,8 @@ async fn add_parts(
     };
     let in_fresh = state == MessageState::InFresh;
 
+    let grpid = chat.grpid.clone();
+
     let sort_timestamp = chat_id
         .calc_sort_timestamp(context, mime_parser.timestamp_sent, sort_to_bottom)
         .await?;
@@ -1888,7 +1890,7 @@ async fn add_parts(
             BTreeSet::<ContactId>::from_iter(chat::get_chat_contacts(context, chat_id).await?);
         let is_from_in_chat =
             !chat_contacts.contains(&ContactId::SELF) || chat_contacts.contains(&from_id);
-        let sender_is_admin = is_group_admin_contact(context, &chat.grpid, from_id).await?;
+        let sender_is_admin = is_group_admin_contact(context, &grpid, from_id).await?;
 
         info!(
             context,
@@ -2101,7 +2103,7 @@ async fn add_parts(
         }
     }
 
-    handle_edit_delete(context, mime_parser, from_id, &mime_headers).await?;
+    handle_edit_delete(context, mime_parser, from_id, &mime_headers, &grpid).await?;
     handle_post_message(context, mime_parser, from_id, state).await?;
 
     if mime_parser.is_system_message == SystemMessage::CallAccepted
@@ -2372,6 +2374,7 @@ async fn handle_edit_delete(
     mime_parser: &MimeMessage,
     from_id: ContactId,
     mime_headers: &[u8],
+    grpid: &str,
 ) -> Result<()> {
     if let Some(rfc724_mid) = mime_parser.get_header(HeaderDef::ChatEdit) {
         let Some(original_msg_id) = rfc724_mid_exists(context, rfc724_mid).await? else {
@@ -2433,7 +2436,7 @@ async fn handle_edit_delete(
                 warn!(context, "Delete message: Database entry does not exist.");
                 continue;
             };
-            if msg.from_id != from_id {
+            if msg.from_id != from_id && !is_group_admin_contact(context, grpid, from_id).await? {
                 warn!(context, "Delete message: Bad sender.");
                 continue;
             }
