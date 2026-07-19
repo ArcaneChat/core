@@ -13,6 +13,7 @@ use rand::TryRngCore as _;
 use rand::distr::{Alphanumeric, SampleString};
 use serde::Deserialize;
 
+use crate::chat::ADMIN_GROUP_ID_SEPARATOR;
 use crate::config::Config;
 use crate::contact::{Contact, ContactId, Origin};
 use crate::context::Context;
@@ -511,13 +512,24 @@ async fn decode_openpgp(context: &Context, qr: &str) -> Result<Qr> {
         .get("s")
         .filter(|&s| validate_id(s))
         .map(|s| s.to_string());
-    let grpid = param
-        .get("x")
-        .filter(|&s| validate_id(s))
-        .map(|s| s.to_string());
 
     let grpname = decode_name(&param, "g")?;
+    let admin_grpname = decode_name(&param, "z")?;
     let broadcast_name = decode_name(&param, "b")?;
+
+    // For admin groups, reconstruct the full grpid as FINGERPRINT<SEP>base_grpid.
+    let grpid = if admin_grpname.is_some() {
+        param
+            .get("x")
+            .filter(|&s| validate_id(s))
+            .map(|base_id| format!("{}{ADMIN_GROUP_ID_SEPARATOR}{base_id}", fingerprint.hex()))
+    } else {
+        param
+            .get("x")
+            .filter(|&s| validate_id(s))
+            .map(|s| s.to_string())
+    };
+    let grpname = grpname.or(admin_grpname);
 
     let mut is_v3 = param.get("v") == Some(&"3");
 
