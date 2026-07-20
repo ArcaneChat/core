@@ -725,7 +725,7 @@ pub(crate) async fn receive_imf_inner(
         is_old_contact_request = chat_id_blocked == Blocked::Request && !is_created;
 
         // Add parts
-        add_parts(
+        let msg = add_parts(
             context,
             &mut mime_parser,
             imf_raw,
@@ -741,7 +741,13 @@ pub(crate) async fn receive_imf_inner(
             is_created,
         )
         .await
-        .context("add_parts error")?
+        .context("add_parts error")?;
+
+        crate::reaction::apply_pending_reactions(context, rfc724_mid, chat_id)
+            .await
+            .context("Failed to apply pending reactions")?;
+
+        msg
     };
 
     if !from_id.is_special() {

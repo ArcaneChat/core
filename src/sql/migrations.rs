@@ -2459,8 +2459,8 @@ UPDATE msgs SET state=24 WHERE state=18; -- Change OutPreparing to OutFailed.
     inc_and_check(&mut migration_version, 155)?;
     if dbversion < migration_version {
         // last_rcvd_timestamp tracks timestamp of the last received message
-        // on the transport. This is used to remove hidden transports that
-        // were not used to receive messages for some predefined time.
+        // on the transport. This is used to automatically remove hidden transports
+        // that were not used to receive messages for some time.
         //
         // NOTE: ideally we would use `DEFAULT (unixepoch())`,
         // but sqlite forbids non-constant default in ALTER TABLE.
@@ -2482,6 +2482,41 @@ UPDATE msgs SET state=24 WHERE state=18; -- Change OutPreparing to OutFailed.
         sql.execute_migration(
             "DROP INDEX IF EXISTS msgs_index7;
             CREATE INDEX msgs_index7 ON msgs (state, hidden, chat_id, timestamp);",
+            migration_version,
+        )
+        .await?;
+    }
+
+    inc_and_check(&mut migration_version, 157)?;
+    if dbversion < migration_version {
+        // Ensure that existing transports
+        // don't start out with last_rcvd_timestamp=0,
+        // so that they are not immediately deleted
+        sql.execute_migration_transaction(
+            |transaction| {
+                transaction.execute(
+                    "UPDATE transports SET last_rcvd_timestamp=?1 WHERE last_rcvd_timestamp=0",
+                    (tools::time(),),
+                )?;
+                Ok(())
+            },
+            migration_version,
+        )
+        .await?;
+    }
+
+    inc_and_check(&mut migration_version, 158)?;
+    if dbversion < migration_version {
+        // Stores reactions to not-yet-received messages.
+        sql.execute_migration(
+            "CREATE TABLE pending_reactions (
+                rfc724_mid TEXT NOT NULL,
+                contact_id INTEGER NOT NULL,
+                reaction TEXT NOT NULL,
+                timestamp INTEGER NOT NULL,
+                PRIMARY KEY(rfc724_mid, contact_id),
+                FOREIGN KEY(contact_id) REFERENCES contacts(id) ON DELETE CASCADE
+            ) STRICT",
             migration_version,
         )
         .await?;
