@@ -1,6 +1,6 @@
 [package]
 name = "deltachat"
-version = "2.55.0"
+version = "2.56.0"
 edition = "2024"
 license = "MPL-2.0"
 rust-version = "1.89"
@@ -89,7 +89,6 @@ rusqlite = { workspace = true, features = ["sqlcipher"] }
 sanitize-filename = { workspace = true }
 sdp = "0.17.1"
 serde_json = { workspace = true }
-serde_urlencoded = "0.7.1"
 serde = { workspace = true, features = ["derive"] }
 sha-1 = "0.10"
 sha2 = "0.10"
@@ -101,7 +100,7 @@ tagger = "4.3.4"
 textwrap = "0.16.2"
 thiserror = { workspace = true }
 tokio-io-timeout = "1.2.1"
-tokio-rustls = { version = "0.26.2", default-features = false, features = ["aws-lc-rs", "tls12"] }
+tokio-rustls = { version = "0.26.2", default-features = false }
 tokio-stream = { version = "0.1.17", features = ["fs"] }
 astral-tokio-tar = { version = "0.6.3", default-features = false }
 tokio-util = { workspace = true }
