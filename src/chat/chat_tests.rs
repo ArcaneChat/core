@@ -2242,6 +2242,30 @@ async fn test_sticker_forward() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_tgs_file_is_promoted_to_sticker() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+    let alice_chat = alice.create_chat(bob).await;
+
+    let file = alice.get_blobdir().join("sticker.tgs");
+    tokio::fs::write(&file, b"dummy tgs data").await?;
+
+    let mut msg = Message::new(Viewtype::File);
+    msg.set_file_and_deduplicate(alice, &file, Some("sticker.tgs"), None)?;
+    alice_chat.id.set_draft(alice, Some(&mut msg)).await?;
+
+    let mut draft = alice_chat.id.get_draft(alice).await?.unwrap();
+    assert_eq!(draft.get_viewtype(), Viewtype::Sticker);
+
+    let sent_msg = alice.send_msg(alice_chat.id, &mut draft).await;
+    let received = bob.recv_msg(&sent_msg).await;
+    assert_eq!(received.get_viewtype(), Viewtype::Sticker);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_forward_basic() -> Result<()> {
     let alice = TestContext::new_alice().await;
     let bob = TestContext::new_bob().await;

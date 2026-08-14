@@ -823,7 +823,11 @@ SELECT id, rfc724_mid, pre_rfc724_mid, timestamp, ?, 1 FROM msgs WHERE chat_id=?
                         // users can send images as "files" to preserve the original quality
                         // (usually we compress images). The remaining conversions are done by
                         // `prepare_msg_blob()` later.
-                        .filter(|&(vt, _)| vt == Viewtype::Webxdc || vt == Viewtype::Vcard)
+                        .filter(|&(vt, _)| {
+                            vt == Viewtype::Sticker
+                                || vt == Viewtype::Webxdc
+                                || vt == Viewtype::Vcard
+                        })
                 {
                     msg.viewtype = better_type;
                 }
