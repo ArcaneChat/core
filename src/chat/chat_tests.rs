@@ -2259,6 +2259,8 @@ async fn test_tgs_file_is_promoted_to_sticker() -> Result<()> {
     assert_eq!(draft.get_viewtype(), Viewtype::Sticker);
 
     let sent_msg = alice.send_msg(alice_chat.id, &mut draft).await;
+    alice.assert_warn("Failed to get width and height").await;
+    assert_eq!(alice.get_last_msg().await.get_viewtype(), Viewtype::Sticker);
     let received = bob.recv_msg(&sent_msg).await;
     assert_eq!(received.get_viewtype(), Viewtype::Sticker);
 
