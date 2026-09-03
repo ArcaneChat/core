@@ -74,9 +74,6 @@ pub struct WebxdcManifest {
     /// Optional URL of webxdc source code.
     pub source_code_url: Option<String>,
 
-    /// prefered screen orientation (landscape or portrait).
-    pub orientation: Option<String>,
-
     /// Set to "map" to request integration.
     pub request_integration: Option<String>,
 }
@@ -110,9 +107,6 @@ pub struct WebxdcInfo {
     /// It should request access, be encrypted
     /// and sent to self for this.
     pub internet_access: bool,
-
-    /// prefered screen orientation (landscape or portrait).
-    pub orientation: String,
 
     /// Address to be used for `window.webxdc.selfAddr` in JS land.
     pub self_addr: String,
@@ -977,11 +971,6 @@ impl Message {
             },
             request_integration,
             internet_access,
-            orientation: if let Some(orientation) = manifest.orientation {
-                orientation
-            } else {
-                "".to_string()
-            },
             self_addr,
             is_app_sender,
             is_broadcast,

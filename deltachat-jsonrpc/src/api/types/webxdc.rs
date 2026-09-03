@@ -35,10 +35,6 @@ pub struct WebxdcMessageInfo {
     source_code_url: Option<String>,
     /// True if full internet access should be granted to the app.
     internet_access: bool,
-
-    /// prefered screen orientation (landscape or portrait).
-    orientation: Option<String>,
-
     /// Address to be used for `window.webxdc.selfAddr` in JS land.
     self_addr: String,
     /// Define if the local user is the one who initially shared the webxdc application in the chat.
@@ -67,7 +63,6 @@ impl WebxdcMessageInfo {
             source_code_url,
             request_integration: _,
             internet_access,
-            orientation,
             self_addr,
             is_app_sender,
             is_broadcast,
@@ -82,7 +77,6 @@ impl WebxdcMessageInfo {
             summary: maybe_empty_string_to_option(summary),
             source_code_url: maybe_empty_string_to_option(source_code_url),
             internet_access,
-            orientation: maybe_empty_string_to_option(orientation),
             self_addr,
             is_app_sender,
             is_broadcast,
