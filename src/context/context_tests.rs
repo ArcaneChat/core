@@ -278,7 +278,6 @@ async fn test_get_info_completeness() {
         "mail_pw",
         "mail_port",
         "mail_security",
-        "notify_about_wrong_pw",
         "selfstatus",
         "send_server",
         "send_user",
@@ -299,6 +298,7 @@ async fn test_get_info_completeness() {
         "stats_last_update",
         "stats_last_old_contact_id",
         "simulate_receive_imf_error", // only used in tests
+        "keyupdate_baseline",         // Our own addresses, don't leak them to the logs.
     ];
     let t = TestContext::new().await;
     let info = t.get_info().await.unwrap();

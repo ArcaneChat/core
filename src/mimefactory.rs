@@ -10,6 +10,8 @@ use deltachat_contact_tools::sanitize_bidi_characters;
 use iroh_gossip::proto::TopicId;
 use mail_builder::headers::HeaderType;
 use mail_builder::headers::address::Address;
+use mail_builder::headers::raw::Raw;
+use mail_builder::headers::text::Text;
 use mail_builder::mime::MimePart;
 use tokio::fs;
 
@@ -32,7 +34,7 @@ use crate::message::{Message, MsgId, Viewtype};
 use crate::mimeparser::SystemMessage;
 use crate::param::Param;
 use crate::peer_channels::{create_iroh_header, get_iroh_topic_for_msg};
-use crate::pgp::{SeipdVersion, addresses_from_public_key, pubkey_supports_seipdv2};
+use crate::pgp::{SeipdVersion, addresses_from_public_key, pubkey_supports_seipdv2, relay_addrs};
 use crate::simplify::escape_message_footer_marks;
 use crate::stock_str;
 use crate::tools::{IsNoneOrEmpty, create_outgoing_rfc724_mid, remove_subject_prefix, time};
@@ -405,6 +407,8 @@ pub(crate) fn render_queued_mail(
         }
     }
 
+    let sign_key = if should_sign { Some(secret_key) } else { None };
+
     let message = match encryption {
         Encryption::No => raw_message,
         Encryption::Asymmetric { encryption_pubkeys } => {
@@ -432,7 +436,7 @@ pub(crate) fn render_queued_mail(
             let encrypted = crate::pgp::pk_encrypt(
                 full_raw_message,
                 encryption_keyring,
-                secret_key.clone(),
+                sign_key,
                 should_compress,
                 seipd_version,
             )?;
@@ -443,12 +447,6 @@ pub(crate) fn render_queued_mail(
         Encryption::Symmetric { shared_secret } => {
             let mut full_raw_message = inner_headers.clone();
             full_raw_message.extend(raw_message);
-
-            let sign_key = if should_sign {
-                Some(secret_key.clone())
-            } else {
-                None
-            };
 
             let encrypted = crate::pgp::symm_encrypt_message(
                 full_raw_message,
@@ -578,9 +576,7 @@ impl MimeFactory {
 
             let public_key = SignedPublicKey::from_slice(&public_key_bytes)?;
 
-            let relays =
-                addresses_from_public_key(&public_key).unwrap_or_else(|| vec![addr.clone()]);
-            recipients.extend(relays);
+            recipients.extend(relay_addrs(&public_key, &addr));
             to.push((authname, addr.clone()));
 
             Encryption::Asymmetric {
@@ -897,7 +893,7 @@ impl MimeFactory {
             }
         } else if contact.is_key_contact() {
             let encryption_pubkeys = if let Some(key) = contact.public_key(context).await? {
-                recipients = addresses_from_public_key(&key).unwrap_or_else(|| vec![addr.clone()]);
+                recipients = relay_addrs(&key, &addr);
                 vec![(addr.clone(), key)]
             } else {
                 Vec::new()
@@ -1560,6 +1556,23 @@ impl MimeFactory {
             // that normally only allows encrypted mails.
             message
         } else {
+            // Unencrypted message.
+            let message = if let Loaded::Message { msg, .. } = &self.loaded
+                && msg.param.get_cmd() == SystemMessage::SecurejoinMessage
+                && matches!(
+                    msg.param.get(Param::Arg),
+                    Some("vc-request") | Some("vg-request")
+                ) {
+                // Workaround for legacy SecureJoin {vc,vg}-request messages.
+                // They must be sent as multipart/mixed
+                // for compatibility with chatmail relays
+                // that allow to send these messages unencrypted,
+                // but only as long as they have this MIME structure.
+                MimePart::new("multipart/mixed", vec![message])
+            } else {
+                message
+            };
+
             headers.iter().fold(message, |message, (header, value)| {
                 debug_assert_ne!(*header, "from");
                 debug_assert_ne!(*header, "message-id");
@@ -2224,12 +2237,14 @@ impl MimeFactory {
         );
 
         // second body part: machine-readable, always REQUIRED by RFC 6522
+        //
+        // We do not include the Final-Recipient field.
+        // According to <https://datatracker.ietf.org/doc/html/rfc8098#section-3.2.4>
+        // it MUST be present and be the address on which original message was received,
+        // but practically it is not going to be used.
         let message_text2 = format!(
-            "Original-Recipient: rfc822;{}\r\n\
-             Final-Recipient: rfc822;{}\r\n\
-             Original-Message-ID: <{}>\r\n\
+            "Original-Message-ID: <{rfc724_mid}>\r\n\
              Disposition: manual-action/MDN-sent-automatically; displayed\r\n",
-            self.from_addr, self.from_addr, rfc724_mid
         );
 
         let extension_fields = if additional_msg_ids.is_empty() {
@@ -2422,6 +2437,42 @@ fn b_encode(value: &str) -> String {
     )
 }
 
+/// Returns the headers to place into the encrypted part
+/// of messages that are not part of a chat.
+async fn non_chat_headers(
+    context: &Context,
+    subject: &str,
+) -> Result<Vec<(&'static str, HeaderType<'static>)>> {
+    let date = chrono::DateTime::<chrono::Utc>::from_timestamp(time(), 0)
+        .unwrap()
+        .to_rfc2822();
+    let mut headers = vec![
+        ("To", Address::new_list(vec![hidden_recipients()]).into()),
+        ("Date", Raw::new(date).into()),
+        ("Subject", Text::new(subject.to_string()).into()),
+    ];
+    // Automatic Response headers <https://www.rfc-editor.org/rfc/rfc3834>
+    if context.get_config_bool(Config::Bot).await? {
+        headers.push(("Auto-Submitted", Raw::new("auto-generated").into()));
+    }
+    Ok(headers)
+}
+
+/// Renders `queued_mail` for SMTP with the own key pair and primary address.
+async fn render_with_self_key(context: &Context, queued_mail: QueuedMail) -> Result<String> {
+    let public_key = key::load_self_public_key(context).await?;
+    let secret_key = key::load_self_secret_key(context).await?;
+    let from_addr = context.get_primary_self_addr().await?;
+    let rendered_mail = render_queued_mail(
+        queued_mail,
+        &public_key,
+        &secret_key,
+        from_addr,
+        RenderSideEffects::default(),
+    )?;
+    Ok(rendered_mail.message)
+}
+
 pub(crate) async fn render_symm_encrypted_securejoin_message(
     context: &Context,
     step: &str,
@@ -2434,81 +2485,97 @@ pub(crate) async fn render_symm_encrypted_securejoin_message(
 
     let message: MimePart<'static> = MimePart::new("text/plain", "Secure-Join");
 
-    let mut headers = Vec::<(&'static str, HeaderType<'static>)>::new();
-
-    let to: Vec<Address<'static>> = vec![hidden_recipients()];
-    headers.push((
-        "To",
-        mail_builder::headers::address::Address::new_list(to.clone()).into(),
-    ));
-
-    let timestamp = time();
-    let date = chrono::DateTime::<chrono::Utc>::from_timestamp(timestamp, 0)
-        .unwrap()
-        .to_rfc2822();
-    headers.push(("Date", mail_builder::headers::raw::Raw::new(date).into()));
-
-    headers.push((
-        "Subject",
-        mail_builder::headers::text::Text::new("Secure-Join".to_string()).into(),
-    ));
-
-    // Automatic Response headers <https://www.rfc-editor.org/rfc/rfc3834>
-    if context.get_config_bool(Config::Bot).await? {
-        headers.push((
-            "Auto-Submitted",
-            mail_builder::headers::raw::Raw::new("auto-generated".to_string()).into(),
-        ));
-    }
-
-    headers.push((
-        "Secure-Join",
-        mail_builder::headers::raw::Raw::new(step.to_string()).into(),
-    ));
-
-    headers.push((
-        "Secure-Join-Auth",
-        mail_builder::headers::text::Text::new(auth.to_string()).into(),
-    ));
+    let mut headers = non_chat_headers(context, "Secure-Join").await?;
+    headers.push(("Secure-Join", Raw::new(step.to_string()).into()));
+    headers.push(("Secure-Join-Auth", Text::new(auth.to_string()).into()));
 
     let message = add_headers_to_encrypted_part(message, headers);
 
-    // Disable compression for SecureJoin to ensure
-    // there are no compression side channels
-    // leaking information about the tokens.
-    let should_compress = false;
-
-    // Only sign the message if we attach the pubkey.
-    let should_sign = should_attach_pubkey;
-
-    let raw_message = part_to_bytes(message);
-
     let queued_mail = QueuedMail {
-        raw_message,
+        raw_message: part_to_bytes(message),
         display_name: String::new(),
         rfc724_mid: rfc724_mid.to_string(),
         encryption: Encryption::Symmetric {
             shared_secret: shared_secret.to_string(),
         },
         should_attach_pubkey,
-        should_sign,
-        should_compress,
+        // Only sign the message if we attach the pubkey.
+        should_sign: should_attach_pubkey,
+        // Disable compression for SecureJoin to ensure
+        // there are no compression side channels
+        // leaking information about the tokens.
+        should_compress: false,
     };
 
-    let public_key = key::load_self_public_key(context).await?;
-    let secret_key = key::load_self_secret_key(context).await?;
-    let side_effects = RenderSideEffects::default();
+    render_with_self_key(context, queued_mail).await
+}
 
-    let from_addr = context.get_primary_self_addr().await?;
-    let rendered_mail = render_queued_mail(
-        queued_mail,
-        &public_key,
-        &secret_key,
-        from_addr,
-        side_effects,
-    )?;
+/// Returns the body of a keyupdate message, shaped like a receipt notification.
+///
+/// The shape is what every core goes by, as a keyupdate carries no marker:
+/// a `multipart/report` is trashed as an MDN even where unencrypted mail is accepted,
+/// while a plain text body would end up in a contact request.
+/// The report deliberately names no original message, see [`crate::keyupdate`].
+fn keyupdate_body() -> MimePart<'static> {
+    // Human-readable first part as RFC 6522 requires, untranslated like in `render_mdn`.
+    let text_part = MimePart::new(
+        "text/plain",
+        "This message updates the sender's encryption key and relay list.",
+    );
+    // We do not include the Final-Recipient field.
+    // Technically it is required for MDNs, but keyupdates
+    // are sent not in response to any message,
+    // so we don't have the address on which we received the message either.
+    let machine_part = MimePart::new(
+        "message/disposition-notification",
+        "Disposition: automatic-action/MDN-sent-automatically; processed\r\n",
+    );
+    MimePart::new(
+        "multipart/report; report-type=disposition-notification",
+        vec![text_part, machine_part],
+    )
+}
 
-    Ok(rendered_mail.message)
+/// Renders a keyupdate message informing the owners of `recipient_keys`
+/// about the current key and relay list, see [`crate::keyupdate`].
+pub(crate) async fn render_keyupdate_message(
+    context: &Context,
+    rfc724_mid: &str,
+    recipient_keys: Vec<SignedPublicKey>,
+) -> Result<String> {
+    info!(
+        context,
+        "Sending keyupdate message to {} recipients.",
+        recipient_keys.len()
+    );
+    let message = keyupdate_body();
+
+    let headers = non_chat_headers(context, "Keyupdate").await?;
+    let message = add_headers_to_encrypted_part(message, headers);
+
+    let queued_mail = QueuedMail {
+        raw_message: part_to_bytes(message),
+        display_name: String::new(),
+        rfc724_mid: rfc724_mid.to_string(),
+        encryption: Encryption::Asymmetric {
+            encryption_pubkeys: recipient_keys
+                .into_iter()
+                .map(|key| (String::new(), key))
+                .collect(),
+        },
+
+        // Attached key with its relay list notation is the actual payload.
+        should_attach_pubkey: true,
+
+        // Unsigned, so that no intended recipient fingerprint subpacket
+        // reveals the chunk's recipients to each other.
+        should_sign: false,
+
+        // Disable compression to avoid side channels, message body is small anyway.
+        should_compress: false,
+    };
+
+    render_with_self_key(context, queued_mail).await
 }
 
 /// Renders MIME part into a vector of bytes.

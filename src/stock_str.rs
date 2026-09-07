@@ -75,11 +75,6 @@ pub enum StockMessage {
     #[strum(props(fallback = "Archived chats"))]
     ArchivedChats = 40,
 
-    #[strum(props(
-        fallback = "Cannot login as \"%1$s\". Please check if the email address and the password are correct."
-    ))]
-    CannotLogin = 60,
-
     #[strum(props(fallback = "Location streaming enabled."))]
     MsgLocationEnabled = 64,
 
@@ -439,9 +434,6 @@ https://delta.chat/donate"))]
 
     #[strum(props(fallback = "Message pinned by %1$s."))]
     MsgMessagePinnedBy = 244,
-
-    #[strum(props(fallback = "Phasing out"))]
-    PhasingOut = 245,
 }
 
 impl StockMessage {
@@ -903,11 +895,6 @@ pub(crate) fn sync_msg_body(context: &Context) -> String {
     translated(context, StockMessage::SyncMsgBody)
 }
 
-/// Stock string: `Cannot login as \"%1$s\". Please check...`.
-pub(crate) fn cannot_login(context: &Context, user: &str) -> String {
-    translated(context, StockMessage::CannotLogin).replace1(user)
-}
-
 /// Stock string: `Location streaming enabled.`.
 pub(crate) fn msg_location_enabled(context: &Context) -> String {
     translated(context, StockMessage::MsgLocationEnabled)
@@ -1176,11 +1163,6 @@ pub(crate) fn sending(context: &Context) -> String {
 /// Stock string: `Your last message was sent successfully.`.
 pub(crate) fn last_msg_sent_successfully(context: &Context) -> String {
     translated(context, StockMessage::LastMsgSentSuccessfully)
-}
-
-/// Stock string: `Phasing out`.
-pub(crate) fn phasing_out(context: &Context) -> String {
-    translated(context, StockMessage::PhasingOut)
 }
 
 /// Stock string: `Error: %1$s…`.

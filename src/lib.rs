@@ -55,7 +55,7 @@ pub use events::*;
 
 mod aheader;
 pub mod appversions;
-mod automatic_relay_management;
+mod autorelay;
 pub mod blob;
 pub mod calls;
 pub mod chat;
@@ -72,6 +72,7 @@ pub mod ephemeral;
 mod imap;
 pub mod imex;
 pub mod key;
+mod keyupdate;
 pub mod location;
 pub mod login_param;
 pub mod message;

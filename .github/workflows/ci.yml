@@ -20,7 +20,7 @@ permissions: {}
 
 env:
   RUSTFLAGS: -Dwarnings
-  RUST_VERSION: 1.97.1
+  RUST_VERSION: 1.98.0
 
   # Minimum Supported Rust Version
   MSRV: 1.89.0
@@ -40,7 +40,7 @@ jobs:
       - run: rustup override set $RUST_VERSION
         shell: bash
       - name: Cache rust cargo artifacts
-        uses: swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-bin: false
@@ -80,7 +80,7 @@ jobs:
           show-progress: false
           persist-credentials: false
       - name: Cache rust cargo artifacts
-        uses: swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-bin: false
@@ -126,13 +126,13 @@ jobs:
         shell: bash
 
       - name: Cache rust cargo artifacts
-        uses: swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-bin: false
 
       - name: Install nextest
-        uses: taiki-e/install-action@3d7d7cd5ac7f994c1892ae0c06165095b9139094
+        uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc
         with:
           tool: nextest
 
@@ -163,7 +163,7 @@ jobs:
           persist-credentials: false
 
       - name: Cache rust cargo artifacts
-        uses: swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-bin: false
@@ -192,7 +192,7 @@ jobs:
           persist-credentials: false
 
       - name: Cache rust cargo artifacts
-        uses: swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-bin: false

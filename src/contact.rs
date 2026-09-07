@@ -38,7 +38,9 @@ use crate::param::{Param, Params};
 use crate::pgp::{addresses_from_public_key, merge_openpgp_certificates};
 use crate::sync::{self, Sync::*};
 use crate::tools::{SystemTime, duration_to_str, get_abs_path, normalize_text, time, to_lowercase};
-use crate::{chat, chatlist_events, ensure_and_debug_assert_ne, stock_str};
+use crate::{
+    chat, chatlist_events, ensure_and_debug_assert, ensure_and_debug_assert_ne, stock_str,
+};
 
 /// Time during which a contact is considered as seen recently.
 const SEEN_RECENTLY_SECONDS: i64 = 600;
@@ -892,7 +894,7 @@ impl Contact {
                     blocked.is_none(),
                     blocked.unwrap_or(Blocked::Not),
                     Chattype::Single,
-                    constants::DC_CHAT_ID_LAST_SPECIAL,
+                    ChatId::LAST_SPECIAL,
                     blocked.unwrap_or(Blocked::Not),
                 ),
             )
@@ -1174,7 +1176,7 @@ VALUES (?, ?, ?, ?, ?, ?)
         query: Option<&str>,
     ) -> Result<Vec<ContactId>> {
         let self_addrs = context
-            .get_all_self_addrs()
+            .get_self_addrs()
             .await?
             .into_iter()
             .collect::<HashSet<_>>();
@@ -1633,20 +1635,24 @@ WHERE addr=?
     ) -> Result<Option<PathBuf>> {
         if self.id == ContactId::SELF {
             if let Some(p) = context.get_config(Config::Selfavatar).await? {
-                return Ok(Some(PathBuf::from(p))); // get_config() calls get_abs_path() internally already
+                Ok(Some(PathBuf::from(p))) // get_config() calls get_abs_path() internally already
+            } else {
+                Ok(None)
             }
         } else if self.id == ContactId::DEVICE {
-            return Ok(Some(chat::get_device_icon(context).await?));
-        }
-        if show_fallback_icon && !self.id.is_special() && !self.is_key_contact() {
-            return Ok(Some(chat::get_unencrypted_icon(context).await?));
-        }
-        if let Some(image_rel) = self.param.get(Param::ProfileImage)
+            Ok(Some(chat::get_device_icon(context).await?))
+        } else if self.id.is_special() {
+            // All special contacts are handled above.
+            Ok(None)
+        } else if show_fallback_icon && !self.is_key_contact() {
+            Ok(Some(chat::get_unencrypted_icon(context).await?))
+        } else if let Some(image_rel) = self.param.get(Param::ProfileImage)
             && !image_rel.is_empty()
         {
-            return Ok(Some(get_abs_path(context, Path::new(image_rel))));
+            Ok(Some(get_abs_path(context, Path::new(image_rel))))
+        } else {
+            Ok(None)
         }
-        Ok(None)
     }
 
     /// Returns a color for the contact.
@@ -1908,36 +1914,27 @@ WHERE type=? AND id IN (
 /// The given profile image is expected to be already in the blob directory
 /// as profile images can be set only by receiving messages, this should be always the case, however.
 ///
-/// For contact SELF, the image is not saved in the contact-database but as Config::Selfavatar.
+/// Cannot be used to set own profile picture, set [`Config::Selfavatar`] instead.
 pub(crate) async fn set_profile_image(
     context: &Context,
     contact_id: ContactId,
     profile_image: &AvatarAction,
 ) -> Result<()> {
+    ensure_and_debug_assert!(
+        !contact_id.is_special(),
+        "Cannot set avatar for special contacts"
+    );
+
     let mut contact = Contact::get_by_id(context, contact_id).await?;
-    let changed = match profile_image {
-        AvatarAction::Change(profile_image) => {
-            if contact_id == ContactId::SELF {
-                context
-                    .set_config_ext(Nosync, Config::Selfavatar, Some(profile_image))
-                    .await?;
-            } else {
-                contact.param.set(Param::ProfileImage, profile_image);
-            }
-            true
-        }
-        AvatarAction::Delete => {
-            if contact_id == ContactId::SELF {
-                context
-                    .set_config_ext(Nosync, Config::Selfavatar, None)
-                    .await?;
-            } else {
-                contact.param.remove(Param::ProfileImage);
-            }
-            true
-        }
+    let profile_image_opt = match profile_image {
+        AvatarAction::Change(profile_image) => Some(profile_image),
+        AvatarAction::Delete => None,
     };
+    let changed = contact.param.get(Param::ProfileImage) != profile_image_opt.map(|s| s.as_str());
     if changed {
+        contact
+            .param
+            .set_optional(Param::ProfileImage, profile_image_opt);
         contact.update_param(context).await?;
         context.emit_event(EventType::ContactsChanged(Some(contact_id)));
         chatlist_events::emit_chatlist_item_changed_for_contact_chat(context, contact_id).await;

@@ -17,11 +17,12 @@ use crate::key;
 use crate::key::{DcKey, Fingerprint, load_self_public_key, self_fingerprint};
 use crate::log::LogExt as _;
 use crate::log::warn;
-use crate::message::{self, Message, MsgId, Viewtype};
+use crate::message::{Message, Viewtype};
 use crate::mimeparser::{MimeMessage, SystemMessage};
 use crate::param::Param;
 use crate::qr::check_qr;
 use crate::securejoin::bob::JoinerProgress;
+use crate::smtp::insert_into_smtp;
 use crate::sync::Sync::*;
 use crate::tools::{create_id, create_outgoing_rfc724_mid, time};
 use crate::{SecurejoinSource, mimefactory, stats};
@@ -140,6 +141,19 @@ pub async fn get_securejoin_qr(context: &Context, chat: Option<ChatId>) -> Resul
     let self_addr = context.get_primary_self_addr().await?;
     let self_addr_urlencoded = utf8_percent_encode(&self_addr, DISALLOWED_CHARACTERS).to_string();
 
+    let r_param = context
+        .get_self_addrs()
+        .await?
+        .into_iter()
+        .filter(|addr| *addr != self_addr)
+        .reduce(|acc, addr| {
+            format!(
+                "{acc},{}",
+                utf8_percent_encode(&addr, DISALLOWED_CHARACTERS)
+            )
+        })
+        .map_or(String::default(), |addrs| format!("&r={addrs}"));
+
     let self_name = context
         .get_config(Config::Displayname)
         .await?
@@ -166,7 +180,7 @@ pub async fn get_securejoin_qr(context: &Context, chat: Option<ChatId>) -> Resul
         if chat.typ == Chattype::OutBroadcast {
             // For historic reansons, broadcasts currently use j instead of i for the invitenumber.
             format!(
-                "https://i.delta.chat/#{fingerprint}&v=3&x={grpid}&j={invitenumber}&s={auth}&a={self_addr_urlencoded}&n={self_name_urlencoded}&b={chat_name_urlencoded}",
+                "https://i.delta.chat/#{fingerprint}&v=3&x={grpid}&j={invitenumber}&s={auth}&a={self_addr_urlencoded}{r_param}&n={self_name_urlencoded}&b={chat_name_urlencoded}",
             )
         } else if admin_group_fingerprint(grpid).is_some() {
             // Admin group: put only the base (random) grpid in x=, use z= for the group name
@@ -176,7 +190,7 @@ pub async fn get_securejoin_qr(context: &Context, chat: Option<ChatId>) -> Resul
             )
         } else {
             format!(
-                "https://i.delta.chat/#{fingerprint}&v=3&x={grpid}&i={invitenumber}&s={auth}&a={self_addr_urlencoded}&n={self_name_urlencoded}&g={chat_name_urlencoded}",
+                "https://i.delta.chat/#{fingerprint}&v=3&x={grpid}&i={invitenumber}&s={auth}&a={self_addr_urlencoded}{r_param}&n={self_name_urlencoded}&g={chat_name_urlencoded}",
             )
         }
     } else {
@@ -189,7 +203,7 @@ pub async fn get_securejoin_qr(context: &Context, chat: Option<ChatId>) -> Resul
         context.scheduler.interrupt_smtp().await;
 
         format!(
-            "https://i.delta.chat/#{fingerprint}&v=3&i={invitenumber}&s={auth}&a={self_addr_urlencoded}&n={self_name_urlencoded}",
+            "https://i.delta.chat/#{fingerprint}&v=3&i={invitenumber}&s={auth}&a={self_addr_urlencoded}{r_param}&n={self_name_urlencoded}",
         )
     };
 
@@ -561,8 +575,7 @@ pub(crate) async fn handle_securejoin_handshake(
             )
             .await?;
 
-            let msg_id = message::insert_tombstone(context, &rfc724_mid).await?;
-            insert_into_smtp(context, &rfc724_mid, &addr, rendered_message, msg_id).await?;
+            insert_into_smtp(context, &rfc724_mid, &addr, rendered_message).await?;
             context.scheduler.interrupt_smtp().await;
 
             Ok(HandshakeMessage::Done)
@@ -750,24 +763,6 @@ pub(crate) async fn handle_securejoin_handshake(
             Ok(HandshakeMessage::Ignore)
         }
     }
-}
-
-async fn insert_into_smtp(
-    context: &Context,
-    rfc724_mid: &str,
-    recipients: &str,
-    rendered_message: String,
-    msg_id: MsgId,
-) -> Result<(), Error> {
-    context
-        .sql
-        .execute(
-            "INSERT INTO smtp (rfc724_mid, recipients, mime, msg_id)
-            VALUES            (?1,         ?2,         ?3,   ?4)",
-            (&rfc724_mid, &recipients, &rendered_message, msg_id),
-        )
-        .await?;
-    Ok(())
 }
 
 /// Observe self-sent Securejoin message.

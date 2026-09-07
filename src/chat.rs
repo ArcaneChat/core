@@ -22,9 +22,7 @@ use crate::chatlist_events;
 use crate::color::str_to_color;
 use crate::config::Config;
 use crate::constants::{
-    self, Blocked, Chattype, DC_CHAT_ID_ALLDONE_HINT, DC_CHAT_ID_ARCHIVED_LINK,
-    DC_CHAT_ID_LAST_SPECIAL, DC_CHAT_ID_TRASH, DC_RESEND_USER_AVATAR_DAYS, EDITED_PREFIX,
-    TIMESTAMP_SENT_TOLERANCE,
+    self, Blocked, Chattype, DC_RESEND_USER_AVATAR_DAYS, EDITED_PREFIX, TIMESTAMP_SENT_TOLERANCE,
 };
 use crate::contact::{self, Contact, ContactId, Origin};
 use crate::context::Context;
@@ -155,6 +153,15 @@ impl fmt::Display for CantSendReason {
 pub struct ChatId(u32);
 
 impl ChatId {
+    /// messages that should be deleted get this chat_id; the messages are deleted from the working thread later then. This is also needed as rfc724_mid should be preset as long as the message is not deleted on the server (otherwise it is downloaded again)
+    pub const TRASH: ChatId = ChatId::new(3);
+    /// only an indicator in a chatlist
+    pub const ARCHIVED_LINK: ChatId = ChatId::new(6);
+    /// only an indicator in a chatlist
+    pub const ALLDONE_HINT: ChatId = ChatId::new(7);
+    /// larger chat IDs are "real" chats, their messages are "real" messages.
+    pub const LAST_SPECIAL: ChatId = ChatId::new(9);
+
     /// Create a new [ChatId].
     pub const fn new(id: u32) -> ChatId {
         ChatId(id)
@@ -171,7 +178,7 @@ impl ChatId {
     ///
     /// This kind of chat ID can not be used for real chats.
     pub fn is_special(self) -> bool {
-        (0..=DC_CHAT_ID_LAST_SPECIAL.0).contains(&self.0)
+        (0..=Self::LAST_SPECIAL.0).contains(&self.0)
     }
 
     /// Chat ID for messages which need to be deleted.
@@ -181,7 +188,7 @@ impl ChatId {
     /// as they are not deleted on the server so that their rfc724_mid
     /// remains known and downloading them again can be avoided.
     pub fn is_trash(self) -> bool {
-        self == DC_CHAT_ID_TRASH
+        self == Self::TRASH
     }
 
     /// Chat ID signifying there are **any** number of archived chats.
@@ -191,7 +198,7 @@ impl ChatId {
     ///
     /// [`Chatlist`]: crate::chatlist::Chatlist
     pub fn is_archived_link(self) -> bool {
-        self == DC_CHAT_ID_ARCHIVED_LINK
+        self == Self::ARCHIVED_LINK
     }
 
     /// Virtual chat ID signalling there are **only** archived chats.
@@ -203,12 +210,12 @@ impl ChatId {
     /// [`DC_GCL_ADD_ALLDONE_HINT`]: crate::constants::DC_GCL_ADD_ALLDONE_HINT
     /// [`Chatlist`]: crate::chatlist::Chatlist
     pub fn is_alldone_hint(self) -> bool {
-        self == DC_CHAT_ID_ALLDONE_HINT
+        self == Self::ALLDONE_HINT
     }
 
     /// Returns [`ChatId`] of a chat that `msg` belongs to.
     pub(crate) fn lookup_by_message(msg: &Message) -> Option<Self> {
-        if msg.chat_id == DC_CHAT_ID_TRASH {
+        if msg.chat_id == Self::TRASH {
             return None;
         }
         if msg.download_state == DownloadState::Undecipherable {
@@ -598,7 +605,7 @@ impl ChatId {
     /// `msg_state` is the state of the message. Matters only for incoming messages currently. For
     /// multiple outgoing messages the function may be called once with MessageState::Undefined.
     /// Sending an appropriate event is up to the caller.
-    /// Also emits DC_EVENT_MSGS_CHANGED for DC_CHAT_ID_ARCHIVED_LINK when the number of archived
+    /// Also emits DC_EVENT_MSGS_CHANGED for ChatId::ARCHIVED_LINK when the number of archived
     /// chats with unread messages increases (which is possible if the chat is muted).
     pub async fn unarchive_if_not_muted(
         self,
@@ -634,7 +641,7 @@ impl ChatId {
                 .await?;
             if unread_cnt == 1 {
                 // Added the first unread message in the chat.
-                context.emit_msgs_changed_without_msg_id(DC_CHAT_ID_ARCHIVED_LINK);
+                context.emit_msgs_changed_without_msg_id(ChatId::ARCHIVED_LINK);
             }
             return Ok(());
         }
@@ -700,7 +707,7 @@ impl ChatId {
 INSERT OR REPLACE INTO msgs (id, rfc724_mid, pre_rfc724_mid, timestamp, chat_id, deleted)
 SELECT id, rfc724_mid, pre_rfc724_mid, timestamp, ?, 1 FROM msgs WHERE chat_id=?
                     ",
-                    (DC_CHAT_ID_TRASH, self),
+                    (ChatId::TRASH, self),
                 )?;
                 transaction.execute("DELETE FROM chats_contacts WHERE chat_id=?", (self,))?;
                 transaction.execute("DELETE FROM chats WHERE id=?", (self,))?;
@@ -1031,7 +1038,7 @@ SELECT id, rfc724_mid, pre_rfc724_mid, timestamp, ?, 1 FROM msgs WHERE chat_id=?
                    AND y.chat_id<>x.chat_id
                    AND y.chat_id>?
                  GROUP BY y.chat_id",
-                (self, DC_CHAT_ID_LAST_SPECIAL),
+                (self, ChatId::LAST_SPECIAL),
                 |row| {
                     let chat_id: ChatId = row.get(0)?;
                     let intersection: f64 = row.get(1)?;
@@ -1049,7 +1056,7 @@ SELECT id, rfc724_mid, pre_rfc724_mid, timestamp, ?, 1 FROM msgs WHERE chat_id=?
                  WHERE contact_id > ? AND chat_id > ?
                  AND add_timestamp >= remove_timestamp
                  GROUP BY chat_id",
-                (ContactId::LAST_SPECIAL, DC_CHAT_ID_LAST_SPECIAL),
+                (ContactId::LAST_SPECIAL, ChatId::LAST_SPECIAL),
                 |row| {
                     let chat_id: ChatId = row.get(0)?;
                     let size: f64 = row.get(1)?;
@@ -1233,7 +1240,7 @@ SELECT id, rfc724_mid, pre_rfc724_mid, timestamp, ?, 1 FROM msgs WHERE chat_id=?
             .filter(|&contact_id| !contact_id.is_special())
         {
             let contact = Contact::get_by_id(context, contact_id).await?;
-            let addr = contact.get_addr();
+            let name = contact.get_display_name();
             logged_debug_assert!(
                 context,
                 contact.is_key_contact(),
@@ -1246,12 +1253,12 @@ SELECT id, rfc724_mid, pre_rfc724_mid, timestamp, ?, 1 FROM msgs WHERE chat_id=?
             if let Some(public_key) = contact.public_key(context).await? {
                 if let Some(relay_addrs) = addresses_from_public_key(&public_key) {
                     let relays = relay_addrs.join(",");
-                    ret += &format!("\n{addr}({relays})\n{fingerprint}\n");
+                    ret += &format!("\n{name}({relays})\n{fingerprint}\n");
                 } else {
-                    ret += &format!("\n{addr}\n{fingerprint}\n");
+                    ret += &format!("\n{name}\n{fingerprint}\n");
                 }
             } else {
-                ret += &format!("\n{addr}\n(key missing)\n{fingerprint}\n");
+                ret += &format!("\n{name}\n(key missing)\n{fingerprint}\n");
             }
         }
 
@@ -2389,7 +2396,7 @@ impl ChatIdBlocked {
                   INNER JOIN chats_contacts j
                           ON c.id=j.chat_id
                   WHERE c.type=100  -- 100 = Chattype::Single
-                    AND c.id>9      -- 9 = DC_CHAT_ID_LAST_SPECIAL
+                    AND c.id>9      -- 9 = ChatId::LAST_SPECIAL
                     AND j.contact_id=?;",
                 (contact_id,),
                 |row| {
@@ -2869,7 +2876,7 @@ async fn render_mime_message_and_pre_message(
 /// Returns row ids if `smtp` table jobs were created or an empty `Vec` otherwise.
 ///
 /// The caller has to interrupt SMTP loop or otherwise process new rows.
-pub(crate) async fn create_send_msg_jobs(context: &Context, msg: &mut Message) -> Result<Vec<i64>> {
+async fn create_send_msg_jobs(context: &Context, msg: &mut Message) -> Result<Vec<i64>> {
     let cmd = msg.param.get_cmd();
     if cmd == SystemMessage::GroupNameChanged || cmd == SystemMessage::GroupDescriptionChanged {
         msg.chat_id
@@ -3050,21 +3057,21 @@ WHERE id=?
             )?;
             let all_recipients = recipients.join(" ");
             if let Some(pre_msg) = &rendered_pre_msg {
-                let row_id = stmt.execute((
+                let row_id = stmt.insert((
                     &pre_msg.rfc724_mid,
                     &all_recipients,
                     &pre_msg.message,
                     msg.id,
                 ))?;
-                row_ids.push(row_id.try_into()?);
+                row_ids.push(row_id);
             }
-            let row_id = stmt.execute((
+            let row_id = stmt.insert((
                 &rendered_msg.rfc724_mid,
                 &all_recipients,
                 &rendered_msg.message,
                 msg.id,
             ))?;
-            row_ids.push(row_id.try_into()?);
+            row_ids.push(row_id);
         }
         Ok(row_ids)
     };
@@ -3509,7 +3516,7 @@ pub async fn get_chat_media(
                 (
                     chat_id.is_none(),
                     chat_id.unwrap_or_else(|| ChatId::new(0)),
-                    DC_CHAT_ID_TRASH,
+                    ChatId::TRASH,
                     Viewtype::Webxdc,
                 ),
                 |row| {
@@ -3532,7 +3539,7 @@ pub async fn get_chat_media(
                 (
                     chat_id.is_none(),
                     chat_id.unwrap_or_else(|| ChatId::new(0)),
-                    DC_CHAT_ID_TRASH,
+                    ChatId::TRASH,
                     msg_type,
                     if msg_type2 != Viewtype::Unknown {
                         msg_type2
@@ -5495,7 +5502,7 @@ impl Context {
     /// a noticed chat is archived. Emitting events should be cheap, a false-positive `MsgsChanged`
     /// is ok.
     pub(crate) fn on_archived_chats_maybe_noticed(&self) {
-        self.emit_msgs_changed_without_msg_id(DC_CHAT_ID_ARCHIVED_LINK);
+        self.emit_msgs_changed_without_msg_id(ChatId::ARCHIVED_LINK);
     }
 }
 

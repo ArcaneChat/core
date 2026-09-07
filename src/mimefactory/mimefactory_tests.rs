@@ -52,7 +52,7 @@ fn test_render_email_address() {
 
     println!("{s}");
 
-    assert_eq!(s, r#""=?utf-8?B?w6Qgc3BhY2U=?=" <x@y.org>"#);
+    assert_eq!(s, "=?utf-8?B?w6Qgc3BhY2U=?= <x@y.org>");
 }
 
 #[test]
@@ -269,8 +269,6 @@ async fn test_subject_mdn() {
           --SNIPP\r\n\
           Content-Type: message/disposition-notification\r\n\
           \r\n\
-          Reporting-UA: Delta Chat 1.28.0\r\n\
-          Original-Recipient: rfc822;bob@example.com\r\n\
           Final-Recipient: rfc822;bob@example.com\r\n\
           Original-Message-ID: <2893@example.com>\r\n\
           Disposition: manual-action/MDN-sent-automatically; displayed\r\n\

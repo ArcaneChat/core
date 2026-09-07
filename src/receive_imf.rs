@@ -19,7 +19,7 @@ use crate::chat::{
     admin_group_fingerprint,
 };
 use crate::config::Config;
-use crate::constants::{self, Blocked, Chattype, DC_CHAT_ID_TRASH, EDITED_PREFIX};
+use crate::constants::{Blocked, Chattype, EDITED_PREFIX};
 use crate::contact::{self, Contact, ContactId, Origin, mark_contact_id_as_verified};
 use crate::context::Context;
 use crate::debug_logging::maybe_set_logging_xdc_inner;
@@ -461,7 +461,7 @@ async fn get_to_and_past_contact_ids(
 /// e.g. has nonstandard MIME structure.
 ///
 /// If possible, creates a database entry to prevent the message from being
-/// downloaded again, sets `chat_id=DC_CHAT_ID_TRASH` and returns `Ok(Some(…))`.
+/// downloaded again, sets `chat_id=ChatId::TRASH` and returns `Ok(Some(…))`.
 /// If the message is so wrong that we didn't even create a database entry,
 /// returns `Ok(None)`.
 pub(crate) async fn receive_imf_inner(
@@ -486,7 +486,7 @@ pub(crate) async fn receive_imf_inner(
     let trash = || async {
         let msg_ids = vec![insert_tombstone(context, rfc724_mid).await?];
         Ok(Some(ReceivedMsg {
-            chat_id: DC_CHAT_ID_TRASH,
+            chat_id: ChatId::TRASH,
             state: MessageState::Undefined,
             hidden: false,
             sort_timestamp: 0,
@@ -506,6 +506,19 @@ pub(crate) async fn receive_imf_inner(
         }
         Ok(mime_parser) => mime_parser,
     };
+
+    if !mime_parser.mdn_reports.is_empty()
+        && mime_parser.mdn_reports.iter().all(|report| {
+            report.original_message_id.is_none() && report.additional_message_ids.is_empty()
+        })
+    {
+        // A report naming no message can never be applied to one,
+        // and nothing else should come out of it: no contact, no chat,
+        // and no `last_seen` update lighting up an online dot.
+        // This is also how keyupdates are trashed, see `crate::keyupdate`.
+        info!(context, "Report without message reference (TRASH).");
+        return trash().await;
+    }
 
     if !mime_parser.was_encrypted()
         && mime_parser.get_header(HeaderDef::SecureJoin).is_none()
@@ -663,7 +676,7 @@ pub(crate) async fn receive_imf_inner(
             securejoin::HandshakeMessage::Done | securejoin::HandshakeMessage::Ignore => {
                 let msg_id = insert_tombstone(context, rfc724_mid).await?;
                 received_msg = Some(ReceivedMsg {
-                    chat_id: DC_CHAT_ID_TRASH,
+                    chat_id: ChatId::TRASH,
                     state: MessageState::InSeen,
                     hidden: false,
                     sort_timestamp: mime_parser.timestamp_sent,
@@ -1442,7 +1455,7 @@ async fn do_chat_assignment(
 
         match &chat_assignment {
             ChatAssignment::Trash => {
-                chat_id = Some(DC_CHAT_ID_TRASH);
+                chat_id = Some(ChatId::TRASH);
             }
             ChatAssignment::GroupChat { grpid } => {
                 // Try to assign to a chat based on Chat-Group-ID.
@@ -1572,7 +1585,7 @@ async fn do_chat_assignment(
 
         match &chat_assignment {
             ChatAssignment::Trash => {
-                chat_id = Some(DC_CHAT_ID_TRASH);
+                chat_id = Some(ChatId::TRASH);
             }
             ChatAssignment::GroupChat { grpid } => {
                 if let Some((id, blocked)) = chat::get_chat_id_by_grpid(context, grpid).await? {
@@ -1707,7 +1720,7 @@ async fn do_chat_assignment(
     }
     let chat_id = chat_id.unwrap_or_else(|| {
         info!(context, "No chat id for message (TRASH).");
-        DC_CHAT_ID_TRASH
+        ChatId::TRASH
     });
     Ok((chat_id, chat_id_blocked, chat_created))
 }
@@ -2019,7 +2032,7 @@ async fn add_parts(
         .as_ref()
         .is_some_and(|better_msg| better_msg.is_empty())
     {
-        DC_CHAT_ID_TRASH
+        ChatId::TRASH
     } else {
         chat_id
     };
@@ -2209,7 +2222,7 @@ INSERT INTO msgs
                     } else {
                         ""
                     },
-                    if trash { DC_CHAT_ID_TRASH } else { chat_id },
+                    if trash { ChatId::TRASH } else { chat_id },
                     if trash { ContactId::UNDEFINED } else { from_id },
                     if trash { ContactId::UNDEFINED } else { to_id },
                     sort_timestamp,
@@ -2598,24 +2611,11 @@ async fn save_locations(
     }
 
     if let Some(location_kml) = &mime_parser.location_kml
-        && let Some(addr) = &location_kml.addr
+        && location::save(context, chat_id, from_id, &location_kml.locations, false)
+            .await?
+            .is_some()
     {
-        let contact = Contact::get_by_id(context, from_id).await?;
-        if contact.get_addr().to_lowercase() == addr.to_lowercase() {
-            if location::save(context, chat_id, from_id, &location_kml.locations, false)
-                .await?
-                .is_some()
-            {
-                send_event = true;
-            }
-        } else {
-            warn!(
-                context,
-                "Address in location.kml {:?} is not the same as the sender address {:?}.",
-                addr,
-                contact.get_addr()
-            );
-        }
+        send_event = true;
     }
     if send_event {
         context.emit_location_changed(Some(from_id)).await?;
@@ -2921,7 +2921,7 @@ async fn create_group(
         // The message was decrypted successfully, but contains a late "quit" or otherwise
         // unwanted message.
         info!(context, "Message belongs to unwanted group (TRASH).");
-        Ok(Some((DC_CHAT_ID_TRASH, Blocked::Not)))
+        Ok(Some((ChatId::TRASH, Blocked::Not)))
     }
 }
 
@@ -3978,7 +3978,7 @@ async fn create_adhoc_group(
             context,
             "Message removes member from unknown ad-hoc group (TRASH)."
         );
-        return Ok(Some((DC_CHAT_ID_TRASH, Blocked::Not)));
+        return Ok(Some((ChatId::TRASH, Blocked::Not)));
     }
 
     let new_chat_id: ChatId = ChatId::create_multiuser_record(
@@ -4270,12 +4270,7 @@ async fn lookup_key_contact_by_address(
                          ) DESC,
                          last_seen DESC, id DESC
                      ",
-                    (
-                        addr,
-                        Chattype::Single,
-                        constants::DC_CHAT_ID_LAST_SPECIAL,
-                        Blocked::Not,
-                    ),
+                    (addr, Chattype::Single, ChatId::LAST_SPECIAL, Blocked::Not),
                     |row| {
                         let contact_id: ContactId = row.get(0)?;
                         Ok(contact_id)

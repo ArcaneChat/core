@@ -370,6 +370,14 @@ jobs:
       - name: List artifacts
         run: ls -l dist/
 
+      - name: Check that the wheel metadata reads back
+        run: |
+          echo 'You can check a local `nix build` on non-Mac machines against the following checksums.'
+          sha256sum dist/*.whl
+          mkdir tagcheck
+          cp dist/*.whl tagcheck/
+          nix run --inputs-from . nixpkgs#python3Packages.wheel -- tags tagcheck/*.whl
+
       - name: Upload binaries to the GitHub release
         if: github.event_name == 'release'
         env:
@@ -382,7 +390,7 @@ jobs:
 
       - name: Publish deltachat-rpc-server to PyPI
         if: github.event_name == 'release'
-        uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33
 
   publish_npm_package:
     name: Build & Publish npm prebuilds and deltachat-rpc-server

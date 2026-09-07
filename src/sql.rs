@@ -9,8 +9,8 @@ use rusqlite::{Connection, OpenFlags, Row, config::DbConfig, types::ValueRef};
 use tokio::sync::RwLock;
 
 use crate::blob::BlobObject;
+use crate::chat::ChatId;
 use crate::config::Config;
-use crate::constants::DC_CHAT_ID_TRASH;
 use crate::context::Context;
 use crate::debug_logging::set_debug_logging_xdc;
 use crate::ephemeral::start_ephemeral_timers;
@@ -46,9 +46,6 @@ mod migrations;
 mod pool;
 
 use pool::{Pool, WalCheckpointStats};
-
-/// How long a hidden and unused transport should be kept in the database before being deleted.
-pub const UNPUBLISHED_TRANSPORT_KEEP_TIME: i64 = 90 * 24 * 60 * 60;
 
 /// A wrapper around the underlying Sqlite3 object.
 #[derive(Debug)]
@@ -842,7 +839,7 @@ pub async fn housekeeping(context: &Context) -> Result<()> {
         .execute(
             "DELETE FROM msgs_mdns WHERE msg_id NOT IN \
             (SELECT id FROM msgs WHERE chat_id!=?)",
-            (DC_CHAT_ID_TRASH,),
+            (ChatId::TRASH,),
         )
         .await
         .context("failed to remove old MDNs")
@@ -854,7 +851,7 @@ pub async fn housekeeping(context: &Context) -> Result<()> {
         .execute(
             "DELETE FROM msgs_status_updates WHERE msg_id NOT IN \
             (SELECT id FROM msgs WHERE chat_id!=?)",
-            (DC_CHAT_ID_TRASH,),
+            (ChatId::TRASH,),
         )
         .await
         .context("failed to remove old webxdc status updates")
@@ -906,12 +903,6 @@ pub async fn housekeeping(context: &Context) -> Result<()> {
         .log_err(context)
         .ok();
 
-    remove_unused_hidden_transports(context)
-        .await
-        .context("Failed to remove unused hidden transports")
-        .log_err(context)
-        .ok();
-
     remove_old_pending_reactions(context)
         .await
         .context("Failed to remove old pending reactions")
@@ -934,28 +925,7 @@ async fn remove_old_pending_reactions(context: &Context) -> Result<usize> {
         .await
 }
 
-/// Removes transports that are hidden (`is_published=0`),
-/// and haven't been used to receive new messages for [`UNPUBLISHED_TRANSPORT_KEEP_TIME`] seconds.
-pub(crate) async fn remove_unused_hidden_transports(context: &Context) -> Result<usize> {
-    let now = time();
-    let cutoff = now.saturating_sub(UNPUBLISHED_TRANSPORT_KEEP_TIME);
-    context
-        .sql
-        .execute(
-            "DELETE FROM transports
-            WHERE is_published=0
-            AND last_rcvd_timestamp<?1
-            AND add_timestamp<?1", // important, prevents immediate deletion in case of `last_rcvd_timestamp=0`
-            (cutoff,),
-        )
-        .await
-}
-
-/// Updates transport's `last_rcvd_timestamp`
-/// with the current time.
-///
-/// This is used to postpone deletion of hidden transport by [`remove_unused_hidden_transports`],
-/// if it is still used to receive messages.
+/// Updates the transport's `last_rcvd_timestamp` with the current time.
 pub(crate) async fn update_transport_last_rcvd_timestamp(
     context: &Context,
     transport_id: u32,
@@ -1002,10 +972,17 @@ pub async fn remove_unused_files(context: &Context) -> Result<()> {
         Param::ProfileImage,
     )
     .await?;
+
+    // Only non-special contacts are selected
+    // because special contacts don't store profile image in parameters.
+    // ContactId::DEVICE has a hardcoded profile image
+    // and ContactId::SELF has the avatar stored in Config::Selfavatar.
+    // If some special contact has a profile image set
+    // e.g due to a bug, the file can be safely deleted.
     maybe_add_from_param(
         &context.sql,
         &mut files_in_use,
-        "SELECT param FROM contacts;",
+        "SELECT param FROM contacts WHERE id > 9;",
         Param::ProfileImage,
     )
     .await?;
@@ -1209,7 +1186,7 @@ async fn prune_tombstones(sql: &Sql) -> Result<()> {
          AND NOT EXISTS (
          SELECT * FROM imap WHERE msgs.rfc724_mid=rfc724_mid AND target!=''
          )",
-        (DC_CHAT_ID_TRASH, timestamp_max),
+        (ChatId::TRASH, timestamp_max),
     )
     .await?;
     Ok(())

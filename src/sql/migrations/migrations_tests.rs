@@ -8,6 +8,7 @@ use crate::contact::ContactId;
 use crate::contact::Origin;
 use crate::test_utils::TestContext;
 use crate::tools;
+use crate::transport::add_pseudo_transport;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_clear_config_cache() -> anyhow::Result<()> {
@@ -26,6 +27,60 @@ async fn test_clear_config_cache() -> anyhow::Result<()> {
     assert_eq!(t.get_config_bool(Config::IsChatmail).await?, true);
     assert_eq!(t.sql.get_raw_config_int(VERSION_CFG).await?.unwrap(), 1000);
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_keyupdate_baseline_migration() -> Result<()> {
+    let configured = STOP_MIGRATIONS_AT
+        .scope(163, async move { TestContext::new_alice().await })
+        .await;
+    // An address sorting before the existing one pins the seed's ORDER BY.
+    add_pseudo_transport(&configured, "aa@example.org").await?;
+    configured.sql.run_migrations(&configured).await?;
+    let relays = configured.get_config(Config::KeyupdateBaseline).await?;
+    assert_eq!(relays.as_deref(), Some("aa@example.org alice@example.org"));
+
+    Ok(())
+}
+
+/// Tests that upgrading removes unpublished transports.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_unpublished_transport_migration_165() -> Result<()> {
+    let t = STOP_MIGRATIONS_AT
+        .scope(163, async move { TestContext::new_alice().await })
+        .await;
+    let skewed = tools::time() + 3600;
+    t.sql
+        .execute(
+            "INSERT INTO transports (addr, entered_param, configured_param, is_published, add_timestamp)
+             VALUES ('unpublished@example.org', '', '', 0, ?)",
+            (skewed,),
+        )
+        .await?;
+
+    STOP_MIGRATIONS_AT
+        .scope(165, async { t.sql.run_migrations(&t).await })
+        .await?;
+
+    assert!(
+        !t.sql
+            .exists(
+                "SELECT COUNT(*) FROM transports WHERE addr='unpublished@example.org'",
+                (),
+            )
+            .await?
+    );
+    assert_eq!(
+        t.sql
+            .query_get_value(
+                "SELECT remove_timestamp FROM removed_transports WHERE addr='unpublished@example.org'",
+                (),
+            )
+            .await?,
+        Some(skewed)
+    );
+    assert_eq!(t.get_config(Config::KeyupdateBaseline).await?, None);
     Ok(())
 }
 

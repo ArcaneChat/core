@@ -1,3 +1,5 @@
+import urllib.parse
+
 import pytest
 
 from deltachat_rpc_client import EventType
@@ -5,11 +7,11 @@ from deltachat_rpc_client.const import ChatType, DownloadState
 from deltachat_rpc_client.rpc import JsonRpcError
 
 
-def test_add_second_address(acfactory) -> None:
-    account = acfactory.new_configured_account()
+def test_add_second_address(acf) -> None:
+    account = acf.new_configured_account()
     assert len(account.list_transports()) == 1
 
-    qr = acfactory.get_account_qr()
+    qr = acf.get_account_qr()
     account.add_transport_from_qr(qr)
     assert len(account.list_transports()) == 2
 
@@ -18,18 +20,23 @@ def test_add_second_address(acfactory) -> None:
 
     first_addr = account.list_transports()[0]["addr"]
     second_addr = account.list_transports()[1]["addr"]
+    third_addr = account.list_transports()[2]["addr"]
 
-    # Cannot delete the first address.
-    with pytest.raises(JsonRpcError):
-        account.delete_transport(first_addr)
+    assert account.get_config("configured_addr") == first_addr
+    account.delete_transport(first_addr)
+    assert len(account.list_transports()) == 2
+    assert account.get_config("configured_addr") != first_addr
 
     account.delete_transport(second_addr)
-    assert len(account.list_transports()) == 2
+    assert len(account.list_transports()) == 1
+
+    with pytest.raises(JsonRpcError):
+        account.delete_transport(third_addr)
 
 
-def test_change_address(acfactory) -> None:
+def test_change_address(acf) -> None:
     """Test Alice configuring a second transport and setting it as a primary one."""
-    alice, bob = acfactory.get_online_accounts(2)
+    alice, bob = acf.get_online_accounts(2)
 
     bob_addr = bob.get_config("configured_addr")
     bob.create_chat(alice)
@@ -44,7 +51,7 @@ def test_change_address(acfactory) -> None:
     old_alice_addr = alice.get_config("configured_addr")
     alice_vcard = alice.self_contact.make_vcard()
     assert old_alice_addr in alice_vcard
-    qr = acfactory.get_account_qr()
+    qr = acf.get_account_qr()
     alice.add_transport_from_qr(qr)
     new_alice_addr = alice.list_transports()[1]["addr"]
     with pytest.raises(JsonRpcError):
@@ -61,8 +68,6 @@ def test_change_address(acfactory) -> None:
     alice_vcard = alice.self_contact.make_vcard()
     assert old_alice_addr not in alice_vcard
     assert new_alice_addr in alice_vcard
-    with pytest.raises(JsonRpcError):
-        alice.delete_transport(new_alice_addr)
     alice.start_io()
 
     alice_chat_bob.send_text("Hello again!")
@@ -76,18 +81,18 @@ def test_change_address(acfactory) -> None:
     assert sender_addr2 == new_alice_addr
 
 
-def test_download_on_demand(acfactory, data) -> None:
-    alice, bob = acfactory.get_online_accounts(2)
+def test_download_on_demand(acf, rpcdata) -> None:
+    alice, bob = acf.get_online_accounts(2)
     alice.set_config("download_limit", "1")
 
     alice.stop_io()
-    qr = acfactory.get_account_qr()
+    qr = acf.get_account_qr()
     alice.add_transport_from_qr(qr)
     alice.start_io()
 
     alice.create_chat(bob)
     chat_bob_alice = bob.create_chat(alice)
-    chat_bob_alice.send_message(file=data.get_path("image/screenshot.jpg"))
+    chat_bob_alice.send_message(file=rpcdata.get_path("image/screenshot.jpg"))
     msg = alice.wait_for_incoming_msg()
     snapshot = msg.get_snapshot()
     assert snapshot.download_state == DownloadState.AVAILABLE
@@ -103,15 +108,15 @@ def test_download_on_demand(acfactory, data) -> None:
         assert msg.get_snapshot().download_state == dstate
 
 
-def test_reconfigure_transport(acfactory) -> None:
+def test_reconfigure_transport(acf) -> None:
     """Test that reconfiguring the transport works."""
-    account = acfactory.get_online_account()
+    account = acf.get_online_account()
 
     [transport] = account.list_transports()
     account.add_or_update_transport(transport)
 
 
-def test_transport_synchronization(acfactory, log) -> None:
+def test_transport_synchronization(acf, log) -> None:
     """Test synchronization of transports between devices."""
 
     def wait_for_io_started(ac):
@@ -120,22 +125,24 @@ def test_transport_synchronization(acfactory, log) -> None:
             if "scheduler is running" in ev.msg:
                 return
 
-    ac1, ac2 = acfactory.get_online_accounts(2)
+    def wait_transports(ac, n):
+        while len(ac.list_transports()) != n:
+            ac.wait_for_event(EventType.TRANSPORTS_MODIFIED)
+
+    ac1, ac2 = acf.get_online_accounts(2)
     ac1_clone = ac1.clone()
     ac1_clone.bring_online()
 
-    qr = acfactory.get_account_qr()
+    qr = acf.get_account_qr()
 
     ac1.add_transport_from_qr(qr)
-    ac1_clone.wait_for_event(EventType.TRANSPORTS_MODIFIED)
+    wait_transports(ac1_clone, 2)
     wait_for_io_started(ac1_clone)
     assert len(ac1.list_transports()) == 2
-    assert len(ac1_clone.list_transports()) == 2
 
     ac1_clone.add_transport_from_qr(qr)
-    ac1.wait_for_event(EventType.TRANSPORTS_MODIFIED)
+    wait_transports(ac1, 3)
     wait_for_io_started(ac1)
-    assert len(ac1.list_transports()) == 3
     assert len(ac1_clone.list_transports()) == 3
 
     log.section("ac1 clone removes second transport")
@@ -143,21 +150,17 @@ def test_transport_synchronization(acfactory, log) -> None:
     addr3 = transport3["addr"]
     ac1_clone.delete_transport(transport2["addr"])
 
-    ac1.wait_for_event(EventType.TRANSPORTS_MODIFIED)
+    wait_transports(ac1, 2)
     wait_for_io_started(ac1)
     [transport1, transport3] = ac1.list_transports()
 
-    log.section("ac1 changes the primary transport")
+    log.section("ac1 changes the sending transport")
     ac1.set_config("configured_addr", transport3["addr"])
-
-    ac1_clone.wait_for_event(EventType.TRANSPORTS_MODIFIED)
-    [transport1, transport3] = ac1_clone.list_transports()
-    assert ac1_clone.get_config("configured_addr") == transport1["addr"]
 
     log.section("ac1 removes the first transport")
     ac1.delete_transport(transport1["addr"])
 
-    ac1_clone.wait_for_event(EventType.TRANSPORTS_MODIFIED)
+    wait_transports(ac1_clone, 1)
     wait_for_io_started(ac1_clone)
     [transport3] = ac1_clone.list_transports()
     assert transport3["addr"] == addr3
@@ -170,15 +173,16 @@ def test_transport_synchronization(acfactory, log) -> None:
     assert ac1_clone.wait_for_incoming_msg().get_snapshot().text == "Hello!"
 
 
-def test_transport_sync_new_as_primary(acfactory, log) -> None:
+def test_transport_sync_new_as_primary(acf, log) -> None:
     """Test that a transport promoted on one device is usable on other devices."""
-    ac1, bob = acfactory.get_online_accounts(2)
+    ac1, bob = acf.get_online_accounts(2)
     ac1_clone = ac1.clone()
     ac1_clone.bring_online()
 
-    qr = acfactory.get_account_qr()
+    qr = acf.get_account_qr()
 
     ac1.add_transport_from_qr(qr)
+    ac1.wait_for_event(EventType.TRANSPORTS_MODIFIED)
     ac1_transports = ac1.list_transports()
     assert len(ac1_transports) == 2
     [transport1, transport2] = ac1_transports
@@ -188,6 +192,7 @@ def test_transport_sync_new_as_primary(acfactory, log) -> None:
 
     log.section("ac1 changes the primary transport")
     ac1.set_config("configured_addr", transport2["addr"])
+    ac1.wait_for_event(EventType.TRANSPORTS_MODIFIED)
 
     ac1_clone.wait_for_event(EventType.TRANSPORTS_MODIFIED)
     assert ac1_clone.get_config("configured_addr") == transport1["addr"]
@@ -202,12 +207,12 @@ def test_transport_sync_new_as_primary(acfactory, log) -> None:
     assert ac1_clone.wait_for_incoming_msg().get_snapshot().text == "hello back"
 
 
-def test_recognize_self_address(acfactory) -> None:
-    alice, bob = acfactory.get_online_accounts(2)
+def test_recognize_self_address(acf) -> None:
+    alice, bob = acf.get_online_accounts(2)
 
     bob_chat = bob.create_chat(alice)
 
-    qr = acfactory.get_account_qr()
+    qr = acf.get_account_qr()
     alice.add_transport_from_qr(qr)
 
     new_alice_addr = alice.list_transports()[1]["addr"]
@@ -218,10 +223,10 @@ def test_recognize_self_address(acfactory) -> None:
     assert msg.chat == alice.create_chat(bob)
 
 
-def test_transport_limit(acfactory) -> None:
+def test_transport_limit(acf) -> None:
     """Test transports limit."""
-    account = acfactory.get_online_account()
-    qr = acfactory.get_account_qr()
+    account = acf.get_online_account()
+    qr = acf.get_account_qr()
 
     limit = 5
 
@@ -234,28 +239,18 @@ def test_transport_limit(acfactory) -> None:
         account.add_transport_from_qr(qr)
 
     second_addr = account.list_transports()[1]["addr"]
-    third_addr = account.list_transports()[2]["addr"]
 
-    # test that adding a transport after unpublishing one works again
-    account.set_transport_unpublished(second_addr)
-    account.add_transport_from_qr(qr)
-    with pytest.raises(JsonRpcError):
-        account.add_transport_from_qr(qr)
-
-    # UIs are not expected to delete transports directly,
-    # but we still test that adding a transport
-    # after deleting one instead of unpublishing works.
-    account.delete_transport(third_addr)
+    account.delete_transport(second_addr)
     account.add_transport_from_qr(qr)
     with pytest.raises(JsonRpcError):
         account.add_transport_from_qr(qr)
 
 
-def test_message_info_imap_urls(acfactory) -> None:
+def test_message_info_imap_urls(acf) -> None:
     """Test that message info contains IMAP URLs of where the message was received."""
-    alice, bob = acfactory.get_online_accounts(2)
+    alice, bob = acf.get_online_accounts(2)
 
-    qr = acfactory.get_account_qr()
+    qr = acf.get_account_qr()
     for i in range(3):
         alice.add_transport_from_qr(qr)
         # Wait for all transports to go IDLE after adding each one.
@@ -290,10 +285,10 @@ def test_message_info_imap_urls(acfactory) -> None:
     assert f"{new_alice_addr}/INBOX" in msg_info
 
 
-def test_remove_primary_transport(acfactory, log) -> None:
+def test_remove_primary_transport(acf, log) -> None:
     """Test that after removing the primary relay, Alice can still receive messages."""
-    alice, bob = acfactory.get_online_accounts(2)
-    qr = acfactory.get_account_qr()
+    alice, bob = acf.get_online_accounts(2)
+    qr = acf.get_account_qr()
 
     alice.add_transport_from_qr(qr)
     alice.bring_online()
@@ -303,7 +298,6 @@ def test_remove_primary_transport(acfactory, log) -> None:
 
     log.section("Alice sets up second transport")
     [transport1, transport2] = alice.list_transports()
-    alice.set_config("configured_addr", transport2["addr"])
 
     bob_chat.send_text("Hello!")
     msg1 = alice.wait_for_incoming_msg().get_snapshot()
@@ -311,6 +305,7 @@ def test_remove_primary_transport(acfactory, log) -> None:
 
     log.section("Alice removes the primary relay")
     alice.delete_transport(transport1["addr"])
+    assert alice.get_config("configured_addr") == transport2["addr"]
     alice.stop_io()
     alice.start_io()
 
@@ -319,3 +314,33 @@ def test_remove_primary_transport(acfactory, log) -> None:
     assert msg2.text == "Hello again!"
     assert msg2.chat.get_basic_snapshot().chat_type == ChatType.SINGLE
     assert msg2.chat == alice.create_chat(bob)
+
+
+def test_qr_works_after_removing_primary_transport(acf, log) -> None:
+    log.section("Alice setups an account and adds two additional relays")
+    alice = acf.new_configured_account()
+    relay_qr = acf.get_account_qr()
+    alice.add_transport_from_qr(relay_qr)
+    alice.add_transport_from_qr(relay_qr)
+
+    first_addr = alice.list_transports()[0]["addr"]
+    second_addr = alice.list_transports()[1]["addr"]
+    third_addr = alice.list_transports()[2]["addr"]
+
+    log.section("Alice creates a QR code")
+    chat_qr = alice.get_qr_code()
+    chat_qr_unquoted = urllib.parse.unquote(chat_qr)
+    assert f"&a={first_addr}" in chat_qr_unquoted
+    assert f"&r={third_addr},{second_addr}" in chat_qr_unquoted
+
+    log.section("Alice removes first and second transport")
+    alice.set_config("configured_addr", third_addr)
+    alice.delete_transport(first_addr)
+    alice.delete_transport(second_addr)
+
+    log.section("Bob scans the QR code, which still works")
+    alice.bring_online()
+    bob = acf.get_online_account()
+    bob.secure_join(chat_qr)
+    alice.wait_for_securejoin_inviter_success()
+    bob.wait_for_securejoin_joiner_success()

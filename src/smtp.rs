@@ -327,6 +327,26 @@ pub(crate) async fn smtp_send(
     status
 }
 
+/// Inserts a tombstone for `rfc724_mid`
+/// and queues the rendered message for SMTP sending.
+pub(crate) async fn insert_into_smtp(
+    context: &Context,
+    rfc724_mid: &str,
+    recipients: &str,
+    rendered_message: String,
+) -> Result<()> {
+    let msg_id = message::insert_tombstone(context, rfc724_mid).await?;
+    context
+        .sql
+        .execute(
+            "INSERT INTO smtp (rfc724_mid, recipients, mime, msg_id)
+            VALUES            (?1,         ?2,         ?3,   ?4)",
+            (&rfc724_mid, &recipients, &rendered_message, msg_id),
+        )
+        .await?;
+    Ok(())
+}
+
 /// Sends message identified by `smtp` table rowid over SMTP connection.
 ///
 /// Removes row if the message should not be retried, otherwise increments retry count.
@@ -713,9 +733,12 @@ pub(crate) async fn add_self_recipients(
     // Avoid sending unencrypted messages to all transports, chatmail relays won't accept
     // them. Normally the user should have a non-chatmail primary transport to send unencrypted
     // messages.
+    let from = context.get_primary_self_addr().await?;
     if encrypted {
-        for addr in context.get_published_secondary_self_addrs().await? {
-            recipients.push(addr);
+        for addr in context.get_self_addrs().await? {
+            if addr != from {
+                recipients.push(addr);
+            }
         }
     }
     // `from` must be the last addr
@@ -724,7 +747,6 @@ pub(crate) async fn add_self_recipients(
     // This helps with marking messages as delivered
     // if the server is slow and we never get an `OK` response
     // before the connection times out.
-    let from = context.get_primary_self_addr().await?;
     recipients.push(from);
 
     Ok(())

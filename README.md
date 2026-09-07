@@ -21,8 +21,8 @@ The following protocols are handled without requiring API users to know much abo
 
 - secure TLS setup with DNS caching and shadowsocks/proxy support 
 
-- robust [SMTP](https://github.com/chatmail/async-imap) 
-  and [IMAP](https://github.com/chatmail/async-smtp) handling
+- robust [SMTP](https://github.com/chatmail/async-smtp) 
+  and [IMAP](https://github.com/chatmail/async-imap) handling
 
 - safe and interoperable [MIME parsing](https://github.com/staktrace/mailparse) 
   and [MIME building](https://github.com/stalwartlabs/mail-builder). 
@@ -167,7 +167,7 @@ $ cargo test -- --ignored
 
 Install [`cargo-bolero`](https://github.com/camshaft/bolero) with
 ```sh
-$ cargo install cargo-bolero
+$ cargo install --locked cargo-bolero
 ```
 
 Run fuzzing tests with

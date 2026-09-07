@@ -29,15 +29,13 @@ use crate::chat::{
 };
 use crate::chatlist::Chatlist;
 use crate::config::Config;
-use crate::constants::{Blocked, Chattype};
-use crate::constants::{DC_CHAT_ID_TRASH, DC_GCL_NO_SPECIALS};
+use crate::constants::{Blocked, Chattype, DC_GCL_NO_SPECIALS};
 use crate::contact::{
     Contact, ContactId, Modifier, Origin, import_vcard, make_vcard, mark_contact_id_as_verified,
 };
 use crate::context::Context;
 use crate::events::{Event, EventEmitter, EventType, Events};
 use crate::key::{self, DcKey, self_fingerprint};
-use crate::login_param::EnteredLoginParam;
 use crate::message::{Message, MessageState, MsgId};
 use crate::mimeparser::{MimeMessage, SystemMessage};
 use crate::pgp::SeipdVersion;
@@ -46,6 +44,7 @@ use crate::securejoin::{get_securejoin_qr, join_securejoin};
 use crate::smtp::msg_has_pending_smtp_job;
 use crate::stock_str::StockStrings;
 use crate::tools::time;
+use crate::transport::add_pseudo_transport;
 
 /// The number of info messages added to new e2ee chats.
 /// Currently this is "Messages are end-to-end encrypted.", string `ChatProtectionEnabled`.
@@ -200,17 +199,7 @@ impl TestContextManager {
             test_context.name()
         ));
 
-        // Insert a transport for the new address.
-        test_context.sql
-          .execute(
-            "INSERT OR IGNORE INTO transports (addr, entered_param, configured_param) VALUES (?, ?, ?)",
-               (
-                   new_addr,
-                   serde_json::to_string(&EnteredLoginParam{addr: new_addr.to_string(), ..Default::default()}).unwrap(),
-                   format!(r#"{{"addr":"{new_addr}","imap":[],"imap_user":"","imap_password":"","smtp":[],"smtp_user":"","smtp_password":"","certificate_checks":"Automatic"}}"#)
-              ),
-          ).await.unwrap();
-
+        test_context.add_transport(new_addr).await;
         test_context.set_primary_self_addr(new_addr).await.unwrap();
         // ensure_secret_key_exists() is called during configure
         key::ensure_secret_key_exists(test_context).await.unwrap();
@@ -578,6 +567,22 @@ impl TestContext {
         }
     }
 
+    /// Adds a transport for `addr` without any network activity.
+    pub async fn add_transport(&self, addr: &str) {
+        add_pseudo_transport(self, addr).await.unwrap();
+        // A fresh `add_timestamp` makes the re-signed self key newer than the copies
+        // contacts hold, so that certificate merging prefers the new relay list.
+        self.sql
+            .execute(
+                "UPDATE transports SET add_timestamp=? WHERE addr=?",
+                (time(), addr),
+            )
+            .await
+            .unwrap();
+        // Invalidate the cached self key so that it is regenerated with the new list.
+        self.self_public_key.lock().await.take();
+    }
+
     /// Retrieves a sent message from the jobs table.
     ///
     /// This retrieves and removes a message which has been scheduled to send from the jobs
@@ -774,7 +779,7 @@ ORDER BY id"
         receive_imf(self, msg.payload().as_bytes(), false)
             .await
             .unwrap()
-            .filter(|msg| msg.chat_id != DC_CHAT_ID_TRASH)
+            .filter(|msg| msg.chat_id != ChatId::TRASH)
     }
 
     /// Receives a message and asserts that it goes to trash chat.
@@ -783,7 +788,7 @@ ORDER BY id"
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(received.chat_id, DC_CHAT_ID_TRASH);
+        assert_eq!(received.chat_id, ChatId::TRASH);
     }
 
     /// Gets the most recent message ID of a chat.
@@ -1225,11 +1230,11 @@ pub async fn encrypt_raw_message(
     let mut cleartext = format!("Autocrypt: {aheader}").into_bytes();
     cleartext.extend_from_slice(b"\r\n");
     cleartext.extend_from_slice(payload);
-    let sign_key = key::load_self_secret_key(context).await?;
+    let sign_key = Some(key::load_self_secret_key(context).await?);
     let encrypted_payload = crate::pgp::pk_encrypt(
         cleartext,
         encryption_keyring,
-        sign_key,
+        sign_key.as_ref(),
         compress,
         SeipdVersion::V2,
     )?;

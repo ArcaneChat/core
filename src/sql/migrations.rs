@@ -2610,6 +2610,38 @@ UPDATE msgs SET state=24 WHERE state=18; -- Change OutPreparing to OutFailed.
         .await?;
     }
 
+    inc_and_check(&mut migration_version, 164)?;
+    if dbversion < migration_version {
+        // Seed the keyupdate baseline so that upgrading alone sends nothing,
+        // see `keyupdate.rs`.
+        sql.execute_migration(
+            "INSERT OR REPLACE INTO config (keyname, value)
+             SELECT 'keyupdate_baseline', IFNULL(group_concat(addr, ' ' ORDER BY addr), '')
+             FROM transports WHERE is_published=1",
+            migration_version,
+        )
+        .await?;
+    }
+
+    inc_and_check(&mut migration_version, 165)?;
+    if dbversion < migration_version {
+        // Remove any unpublished relays and cause keyupdates.
+        sql.execute_migration(
+            "INSERT INTO removed_transports (addr, remove_timestamp)
+                 SELECT addr, MAX(add_timestamp, unixepoch()) FROM transports
+                 WHERE is_published=0
+                     AND addr!=(SELECT value FROM config WHERE keyname='configured_addr')
+                 ON CONFLICT (addr) DO UPDATE SET
+                     remove_timestamp=MAX(excluded.remove_timestamp, remove_timestamp);
+             DELETE FROM transports
+                 WHERE is_published=0
+                     AND addr!=(SELECT value FROM config WHERE keyname='configured_addr');
+             DELETE FROM config WHERE keyname='keyupdate_baseline' AND changes()>0",
+            migration_version,
+        )
+        .await?;
+    }
+
     let new_version = sql
         .get_raw_config_int(VERSION_CFG)
         .await?
