@@ -804,9 +804,9 @@ dependencies = [
 
 [[package]]
 name = "chacha20"
-version = "0.10.1"
+version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d524456ba66e72eb8b115ff89e01e497f8e6d11d78b70b1aa13c0fbd97540a81"
+checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.3.0",
@@ -1327,7 +1327,7 @@ dependencies = [
 
 [[package]]
 name = "deltachat"
-version = "2.60.0-dev"
+version = "2.60.0"
 dependencies = [
  "anyhow",
  "astral-tokio-tar",
@@ -1435,7 +1435,7 @@ dependencies = [
 
 [[package]]
 name = "deltachat-jsonrpc"
-version = "2.60.0-dev"
+version = "2.60.0"
 dependencies = [
  "anyhow",
  "async-channel 2.5.0",
@@ -1455,8 +1455,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "deltachat-jsonrpc-bindings"
+version = "2.60.0"
+dependencies = [
+ "deltachat-jsonrpc",
+]
+
+[[package]]
 name = "deltachat-repl"
-version = "2.60.0-dev"
+version = "2.60.0"
 dependencies = [
  "anyhow",
  "deltachat",
@@ -1472,7 +1479,7 @@ dependencies = [
 
 [[package]]
 name = "deltachat-rpc-server"
-version = "2.60.0-dev"
+version = "2.60.0"
 dependencies = [
  "anyhow",
  "deltachat",
@@ -1501,7 +1508,7 @@ dependencies = [
 
 [[package]]
 name = "deltachat_ffi"
-version = "2.60.0-dev"
+version = "2.60.0"
 dependencies = [
  "anyhow",
  "deltachat",
@@ -4894,7 +4901,7 @@ version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c7f5fa3a058cd35567ef9bfa5e75732bee0f9e4c55fa90477bef2dfcdbc4be80"
 dependencies = [
- "chacha20 0.10.1",
+ "chacha20 0.10.2",
  "getrandom 0.4.3",
  "rand_core 0.10.1",
 ]
@@ -7528,9 +7535,9 @@ dependencies = [
 
 [[package]]
 name = "yerpc"
-version = "0.6.4"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1dc24983fbe850227bfc1de89bf8cbfb3e2463afc322e0de2f155c4c23d06445"
+checksum = "6924db1f1011f1d22566c45c7090aa66c3107c3c463ca32beaa8b2327127040a"
 dependencies = [
  "anyhow",
  "async-channel 1.9.0",
@@ -7548,9 +7555,9 @@ dependencies = [
 
 [[package]]
 name = "yerpc_derive"
-version = "0.6.3"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d8560d021437420316370db865e44c000bf86380b47cf05e49be9d652042bf5"
+checksum = "42c374248c189b15a7f0660db3984e9dcc790ec15f4b44e932e92be49de829f9"
 dependencies = [
  "convert_case",
  "darling",
