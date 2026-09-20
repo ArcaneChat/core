@@ -253,7 +253,6 @@ async fn test_add_or_lookup() {
     assert_eq!(contact.get_authname(), "bla foo");
     assert_eq!(contact.get_display_name(), "Name one");
     assert_eq!(contact.get_addr(), "one@eins.org");
-    assert_eq!(contact.get_name_n_addr(), "Name one (one@eins.org)");
 
     // modify first added contact
     let (contact_id_test, sth_modified) = Contact::add_or_lookup(
@@ -286,7 +285,6 @@ async fn test_add_or_lookup() {
     assert_eq!(contact.get_name(), "");
     assert_eq!(contact.get_display_name(), "three@drei.sam");
     assert_eq!(contact.get_addr(), "three@drei.sam");
-    assert_eq!(contact.get_name_n_addr(), "three@drei.sam");
 
     // add name to third contact from incoming message (this becomes authorized name)
     let (contact_id_test, sth_modified) = Contact::add_or_lookup(
@@ -300,7 +298,6 @@ async fn test_add_or_lookup() {
     assert_eq!(contact_id, contact_id_test);
     assert_eq!(sth_modified, Modifier::Modified);
     let contact = Contact::get_by_id(&t, contact_id).await.unwrap();
-    assert_eq!(contact.get_name_n_addr(), "m. serious (three@drei.sam)");
     assert!(!contact.is_blocked());
 
     // manually edit name of third contact (does not changed authorized name)
@@ -316,7 +313,6 @@ async fn test_add_or_lookup() {
     assert_eq!(sth_modified, Modifier::Modified);
     let contact = Contact::get_by_id(&t, contact_id).await.unwrap();
     assert_eq!(contact.get_authname(), "m. serious");
-    assert_eq!(contact.get_name_n_addr(), "schnucki (three@drei.sam)");
     assert!(!contact.is_blocked());
 
     // Fourth contact:
@@ -334,7 +330,6 @@ async fn test_add_or_lookup() {
     assert_eq!(contact.get_name(), "Wonderland, Alice");
     assert_eq!(contact.get_display_name(), "Wonderland, Alice");
     assert_eq!(contact.get_addr(), "alice@w.de");
-    assert_eq!(contact.get_name_n_addr(), "Wonderland, Alice (alice@w.de)");
 
     // check SELF
     let contact = Contact::get_by_id(&t, ContactId::SELF).await.unwrap();
@@ -373,7 +368,6 @@ async fn test_contact_name_changes() -> Result<()> {
     assert_eq!(contact.get_authname(), "");
     assert_eq!(contact.get_name(), "");
     assert_eq!(contact.get_display_name(), "f@example.org");
-    assert_eq!(contact.get_name_n_addr(), "f@example.org");
     let contacts = Contact::get_all(&t, 0, Some("f@example.org")).await?;
     assert_eq!(contacts.len(), 0);
 
@@ -399,7 +393,6 @@ async fn test_contact_name_changes() -> Result<()> {
     assert_eq!(contact.get_authname(), "Flobbyfoo");
     assert_eq!(contact.get_name(), "");
     assert_eq!(contact.get_display_name(), "Flobbyfoo");
-    assert_eq!(contact.get_name_n_addr(), "Flobbyfoo (f@example.org)");
     let contacts = Contact::get_all(&t, 0, Some("f@example.org")).await?;
     assert_eq!(contacts.len(), 0);
     let contacts = Contact::get_all(&t, 0, Some("flobbyfoo")).await?;
@@ -429,7 +422,6 @@ async fn test_contact_name_changes() -> Result<()> {
     assert_eq!(contact.get_authname(), "Foo Flobby");
     assert_eq!(contact.get_name(), "");
     assert_eq!(contact.get_display_name(), "Foo Flobby");
-    assert_eq!(contact.get_name_n_addr(), "Foo Flobby (f@example.org)");
     let contacts = Contact::get_all(&t, 0, Some("f@example.org")).await?;
     assert_eq!(contacts.len(), 0);
     let contacts = Contact::get_all(&t, 0, Some("flobbyfoo")).await?;
@@ -447,7 +439,6 @@ async fn test_contact_name_changes() -> Result<()> {
     assert_eq!(contact.get_authname(), "Foo Flobby");
     assert_eq!(contact.get_name(), "Falk");
     assert_eq!(contact.get_display_name(), "Falk");
-    assert_eq!(contact.get_name_n_addr(), "Falk (f@example.org)");
     let contacts = Contact::get_all(&t, 0, Some("f@example.org")).await?;
     assert_eq!(contacts.len(), 0);
     let contacts = Contact::get_all(&t, 0, Some("falk")).await?;
@@ -1172,27 +1163,6 @@ async fn test_lookup_id_by_addr_recent_accepted() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_verified_by_none() -> Result<()> {
-    let mut tcm = TestContextManager::new();
-    let alice = tcm.alice().await;
-    let bob = tcm.bob().await;
-
-    let contact_id = Contact::create(&alice, "Bob", "bob@example.net").await?;
-    let contact = Contact::get_by_id(&alice, contact_id).await?;
-    assert!(contact.get_verifier_id(&alice).await?.is_none());
-
-    // Receive a message from Bob to save the public key.
-    let chat = bob.create_chat(&alice).await;
-    let sent_msg = bob.send_text(chat.id, "moin").await;
-    alice.recv_msg(&sent_msg).await;
-
-    let contact = Contact::get_by_id(&alice, contact_id).await?;
-    assert!(contact.get_verifier_id(&alice).await?.is_none());
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_sync_create() -> Result<()> {
     let alice0 = &TestContext::new_alice().await;
     let alice1 = &TestContext::new_alice().await;
@@ -1240,7 +1210,7 @@ async fn test_make_n_import_vcard() -> Result<()> {
     tokio::fs::write(&avatar_path, avatar_bytes).await?;
     bob.set_config(Config::Selfavatar, Some(avatar_path.to_str().unwrap()))
         .await?;
-    let bob_addr = bob.get_config(Config::Addr).await?.unwrap();
+    let bob_addr = bob.get_config(Config::ConfiguredAddr).await?.unwrap();
     let bob_biography = bob.get_config(Config::Selfstatus).await?.unwrap();
     let chat = bob.create_chat(alice).await;
     let sent_msg = bob.send_text(chat.id, "moin").await;
@@ -1336,7 +1306,7 @@ async fn test_make_n_import_vcard() -> Result<()> {
 async fn test_import_vcard_key_change() -> Result<()> {
     let alice = &TestContext::new_alice().await;
     let bob = &TestContext::new_bob().await;
-    let bob_addr = &bob.get_config(Config::Addr).await?.unwrap();
+    let bob_addr = &bob.get_config(Config::ConfiguredAddr).await?.unwrap();
     bob.set_config(Config::Displayname, Some("Bob")).await?;
     let vcard = make_vcard(bob, &[ContactId::SELF]).await?;
     alice.evtracker.clear_events();
@@ -1391,13 +1361,11 @@ async fn test_import_vcard_key_change() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_self_is_verified() -> Result<()> {
+async fn test_self_is_key_contact() -> Result<()> {
     let mut tcm = TestContextManager::new();
     let alice = tcm.alice().await;
 
     let contact = Contact::get_by_id(&alice, ContactId::SELF).await?;
-    assert_eq!(contact.is_verified(&alice).await?, true);
-    assert!(contact.get_verifier_id(&alice).await?.is_none());
     assert!(contact.is_key_contact());
 
     Ok(())

@@ -6,7 +6,6 @@ use anyhow::{Result, anyhow, bail, ensure};
 use deltachat_derive::{FromSql, ToSql};
 use serde::{Deserialize, Serialize};
 
-use crate::config::Config;
 use crate::context::Context;
 use crate::imap::session::Session;
 use crate::log::warn;
@@ -22,9 +21,6 @@ pub(crate) use post_msg_metadata::PostMsgMetadata;
 /// Current value is a bit less than the minimum auto-download setting from the UIs (which is 160
 /// KiB).
 pub(crate) const PRE_MSG_ATTACHMENT_SIZE_THRESHOLD: u64 = 140_000;
-
-/// Max size for pre messages. A warning is emitted when this is exceeded.
-pub(crate) const PRE_MSG_SIZE_WARNING_THRESHOLD: usize = 150_000;
 
 /// Download state of the message.
 #[derive(
@@ -167,8 +163,7 @@ pub(crate) async fn download_msg(
         .fetch_single_msg(context, &server_folder, server_uid, rfc724_mid)
         .await?;
 
-    let bcc_self = context.get_config_bool(Config::BccSelf).await?;
-    if ephemeral::should_delete_all_downloaded_messages(bcc_self, session.is_chatmail()) {
+    if ephemeral::should_delete_all_downloaded_messages(context).await? {
         // Now that the message was downloaded, it likely needs to be deleted;
         // trigger a re-check by interrupting the inbox folder.
         // This is mainly needed to make the tests pass;

@@ -11,7 +11,7 @@
 use std::fmt;
 use std::sync::atomic::Ordering;
 
-use anyhow::{Context as _, Result, bail, format_err};
+use anyhow::{Context as _, Result, format_err};
 use deltachat_contact_tools::{EmailAddress, addr_normalize};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
@@ -260,34 +260,6 @@ impl fmt::Display for ConfiguredLoginParam {
 }
 
 impl ConfiguredLoginParam {
-    /// Load configured account settings from the database.
-    ///
-    /// Returns transport ID and configured parameters
-    /// of the current primary transport.
-    /// Returns `None` if account is not configured.
-    pub(crate) async fn load(context: &Context) -> Result<Option<(u32, Self)>> {
-        let Some(self_addr) = context.get_config(Config::ConfiguredAddr).await? else {
-            return Ok(None);
-        };
-
-        let Some((id, json)) = context
-            .sql
-            .query_row_optional(
-                "SELECT id, configured_param FROM transports WHERE addr=?",
-                (&self_addr,),
-                |row| {
-                    let id: u32 = row.get(0)?;
-                    let json: String = row.get(1)?;
-                    Ok((id, json))
-                },
-            )
-            .await?
-        else {
-            bail!("Self address {self_addr} doesn't have a corresponding transport");
-        };
-        Ok(Some((id, Self::from_json(&json)?)))
-    }
-
     /// Loads configured login parameters for all transports.
     ///
     /// Returns a vector of all transport IDs
@@ -532,7 +504,7 @@ pub(crate) async fn save_transport(
         > 0;
 
     if configured_addr.is_none() {
-        // If there is no transport yet, set the new transport as the primary one
+        // If there is no transport yet, use the new transport for sending
         context
             .sql
             .set_raw_config(Config::ConfiguredAddr.as_ref(), Some(&addr))
@@ -676,7 +648,7 @@ pub(crate) async fn sync_transports(
     }
 
     if let Some(new_addr) = reelected {
-        info!(context, "Re-elected primary transport {new_addr:?}.");
+        info!(context, "Re-elected sending transport {new_addr:?}.");
         context.sql.uncache_raw_config("configured_addr").await;
         modified = true;
     }
@@ -765,7 +737,7 @@ pub(crate) fn maybe_update_sending_transport(
 }
 
 /// Adds transport entry to the `transports` table with empty configuration.
-pub(crate) async fn add_pseudo_transport(context: &Context, addr: &str) -> Result<()> {
+pub async fn add_pseudo_transport(context: &Context, addr: &str) -> Result<()> {
     context.sql
         .execute(
             "INSERT OR IGNORE INTO transports (addr, entered_param, configured_param) VALUES (?, ?, ?)",

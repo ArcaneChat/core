@@ -8,7 +8,6 @@ use crate::chat::{self, Chat, ChatId, ChatIdBlocked, get_chat_id_by_grpid, load_
 use crate::chat::{admin_group_base_id, admin_group_fingerprint};
 use crate::config::Config;
 use crate::constants::{Blocked, Chattype, NON_ALPHANUMERIC_WITHOUT_DOT};
-use crate::contact::mark_contact_id_as_verified;
 use crate::contact::{Contact, ContactId, Origin};
 use crate::context::Context;
 use crate::events::EventType;
@@ -34,15 +33,6 @@ mod qrinvite;
 pub(crate) use qrinvite::QrInvite;
 
 use crate::token::Namespace;
-
-/// Only new QR codes cause a verification on Alice's side.
-/// When a QR code is too old, it is assumed that there was no direct QR scan,
-/// and that the QR code was potentially published on a website,
-/// so, Alice doesn't mark Bob as verified.
-// TODO For backwards compatibility reasons, this is still using a rather large value.
-// Set this to a lower value (e.g. 10 minutes)
-// when Delta Chat v2.22.0 is sufficiently rolled out
-const VERIFICATION_TIMEOUT_SECONDS: i64 = 7 * 24 * 3600;
 
 const DISALLOWED_CHARACTERS: &AsciiSet = &NON_ALPHANUMERIC_WITHOUT_DOT.remove(b'_');
 
@@ -87,7 +77,7 @@ fn shorten_name(name: &str, length: usize) -> String {
 pub async fn get_securejoin_qr(context: &Context, chat: Option<ChatId>) -> Result<String> {
     /*=======================================================
     ====             Alice - the inviter side            ====
-    ====   Step 1 in "Setup verified contact" protocol   ====
+    ====      Step 1 in the Setup-Contact protocol       ====
     =======================================================*/
 
     key::ensure_secret_key_exists(context).await.ok();
@@ -124,15 +114,9 @@ pub async fn get_securejoin_qr(context: &Context, chat: Option<ChatId>) -> Resul
     // Invite number is used to request the inviter key.
     let invitenumber = token::lookup_or_new(context, Namespace::InviteNumber, grpid).await?;
 
-    // Auth token is used to verify the key-contact
-    // if the token is not old
-    // and add the contact to the group
+    // Auth token authenticates the joiner
+    // and adds the contact to the group
     // if there is an associated group ID.
-    //
-    // We always generate a new auth token
-    // because auth tokens "expire"
-    // and can only be used to join groups
-    // without verification afterwards.
     let auth = create_id();
     token::save(context, Namespace::Auth, grpid, &auth, time()).await?;
 
@@ -262,7 +246,7 @@ pub async fn join_securejoin_with_ux_info(
 async fn securejoin(context: &Context, qr: &str) -> Result<ChatId> {
     /*========================================================
     ====             Bob - the joiner's side             =====
-    ====   Step 2 in "Setup verified contact" protocol   =====
+    ====      Step 2 in the Setup-Contact protocol       =====
     ========================================================*/
 
     info!(context, "Requesting secure-join ...",);
@@ -310,8 +294,7 @@ async fn info_chat_id(context: &Context, contact_id: ContactId) -> Result<ChatId
     Ok(chat_id_blocked.id)
 }
 
-/// Checks fingerprint and marks the contact as verified
-/// if fingerprint matches.
+/// Checks whether the contact's fingerprint matches.
 async fn verify_sender_by_fingerprint(
     context: &Context,
     fingerprint: &Fingerprint,
@@ -320,11 +303,7 @@ async fn verify_sender_by_fingerprint(
     let Some(contact) = Contact::get_by_id_optional(context, contact_id).await? else {
         return Ok(false);
     };
-    let is_verified = contact.fingerprint().is_some_and(|fp| &fp == fingerprint);
-    if is_verified {
-        mark_contact_id_as_verified(context, contact_id, Some(ContactId::SELF)).await?;
-    }
-    Ok(is_verified)
+    Ok(contact.fingerprint().is_some_and(|fp| &fp == fingerprint))
 }
 
 /// What to do with a Secure-Join handshake message after it was handled.
@@ -428,7 +407,6 @@ pub(crate) fn get_secure_join_step(mime_message: &MimeMessage) -> Option<SecureJ
 ///
 /// When `handle_securejoin_handshake()` is called, the message is not yet filed in the
 /// database; this is done by `receive_imf()` later on as needed.
-#[expect(clippy::arithmetic_side_effects)]
 pub(crate) async fn handle_securejoin_handshake(
     context: &Context,
     mime_message: &mut MimeMessage,
@@ -464,7 +442,7 @@ pub(crate) async fn handle_securejoin_handshake(
         let mut self_found = false;
         let self_fingerprint = load_self_public_key(context).await?.dc_fingerprint();
         for key in mime_message.gossiped_keys.values() {
-            if key.public_key.dc_fingerprint() == self_fingerprint {
+            if key.dc_fingerprint() == self_fingerprint {
                 self_found = true;
                 break;
             }
@@ -481,7 +459,7 @@ pub(crate) async fn handle_securejoin_handshake(
         SecureJoinStep::Request { ref invitenumber } => {
             /*=======================================================
             ====             Alice - the inviter side            ====
-            ====   Step 3 in "Setup verified contact" protocol   ====
+            ====      Step 3 in the Setup-Contact protocol       ====
             =======================================================*/
 
             // this message may be unencrypted (Bob, the joiner and the sender, might not have Alice's key yet)
@@ -522,7 +500,7 @@ pub(crate) async fn handle_securejoin_handshake(
         SecureJoinStep::AuthRequired => {
             /*========================================================
             ====             Bob - the joiner's side             =====
-            ====   Step 4 in "Setup verified contact" protocol   =====
+            ====      Step 4 in the Setup-Contact protocol       =====
             ========================================================*/
             bob::handle_auth_required_or_pubkey(context, mime_message).await
         }
@@ -561,21 +539,23 @@ pub(crate) async fn handle_securejoin_handshake(
             }
 
             let rfc724_mid = create_outgoing_rfc724_mid();
-            let addr = ContactAddress::new(&mime_message.from.addr)?;
+            let addr = mime_message.from.addr.clone();
             let attach_self_pubkey = true;
             let self_fp = self_fingerprint(context).await?;
             let shared_secret = format!("securejoin/{self_fp}/{auth}");
-            let rendered_message = mimefactory::render_symm_encrypted_securejoin_message(
+            let recipients = vec![addr];
+            let queued_message = mimefactory::symm_encrypted_securejoin_message(
                 context,
                 "vc-pubkey",
                 &rfc724_mid,
                 attach_self_pubkey,
                 auth,
                 &shared_secret,
+                recipients,
             )
             .await?;
 
-            insert_into_smtp(context, &rfc724_mid, &addr, rendered_message).await?;
+            insert_into_smtp(context, &rfc724_mid, &queued_message).await?;
             context.scheduler.interrupt_smtp().await;
 
             Ok(HandshakeMessage::Done)
@@ -590,8 +570,8 @@ pub(crate) async fn handle_securejoin_handshake(
         SecureJoinStep::RequestWithAuth => {
             /*==========================================================
             ====              Alice - the inviter side              ====
-            ====   Steps 5+6 in "Setup verified contact" protocol   ====
-            ====  Step 6 in "Out-of-band verified groups" protocol  ====
+            ====      Steps 5+6 in the Setup-Contact protocol       ====
+            ====         Step 6 in the Join-Group protocol          ====
             ==========================================================*/
 
             // verify that Secure-Join-Fingerprint:-header matches the fingerprint of Bob
@@ -618,15 +598,14 @@ pub(crate) async fn handle_securejoin_handshake(
                 );
                 return Ok(HandshakeMessage::Ignore);
             };
-            let Some((grpid, timestamp)) = context
+            let Some(grpid) = context
                 .sql
                 .query_row_optional(
-                    "SELECT foreign_key, timestamp FROM tokens WHERE namespc=? AND token=?",
+                    "SELECT foreign_key FROM tokens WHERE namespc=? AND token=?",
                     (Namespace::Auth, auth),
                     |row| {
                         let foreign_key: String = row.get(0)?;
-                        let timestamp: i64 = row.get(1)?;
-                        Ok((foreign_key, timestamp))
+                        Ok(foreign_key)
                     },
                 )
                 .await?
@@ -659,12 +638,8 @@ pub(crate) async fn handle_securejoin_handshake(
                 );
                 return Ok(HandshakeMessage::Ignore);
             }
-            info!(context, "Fingerprint verified via Auth code.",);
+            info!(context, "Auth code and fingerprint match.",);
 
-            // Mark the contact as verified if auth code is less than VERIFICATION_TIMEOUT_SECONDS seconds old.
-            if time() < timestamp + VERIFICATION_TIMEOUT_SECONDS {
-                mark_contact_id_as_verified(context, contact_id, Some(ContactId::SELF)).await?;
-            }
             if sender_contact.blocked {
                 warn!(context, "Ignoring {step} message: {contact_id} is blocked.");
                 return Ok(HandshakeMessage::Ignore);
@@ -711,7 +686,7 @@ pub(crate) async fn handle_securejoin_handshake(
                 Ok(HandshakeMessage::Done)
             } else {
                 let chat_id = info_chat_id(context, contact_id).await?;
-                // Setup verified contact.
+                // Setup contact.
                 send_alice_handshake_msg(context, contact_id, "vc-contact-confirm")
                     .await
                     .context("failed sending vc-contact-confirm message")?;
@@ -722,7 +697,7 @@ pub(crate) async fn handle_securejoin_handshake(
         }
         /*=======================================================
         ====             Bob - the joiner's side             ====
-        ====   Step 7 in "Setup verified contact" protocol   ====
+        ====      Step 7 in the Setup-Contact protocol       ====
         =======================================================*/
         SecureJoinStep::ContactConfirm => {
             context.emit_event(EventType::SecurejoinJoinerProgress {
@@ -772,16 +747,14 @@ pub(crate) async fn handle_securejoin_handshake(
 /// we can make some conclusions of it.
 ///
 /// If we see self-sent {vc,vg}-request-with-auth,
-/// we know that we are Bob (joiner-observer)
-/// that just marked peer (Alice) as verified
+/// we know that we are Bob (joiner-observer),
 /// either after receiving {vc,vg}-auth-required
 /// or immediately after scanning the QR-code
 /// if the key was already known.
 ///
 /// If we see self-sent vc-contact-confirm or vg-member-added message,
 /// we know that we are Alice (inviter-observer)
-/// that just marked peer (Bob) as verified
-/// in response to correct vc-request-with-auth message.
+/// responding to a correct vc-request-with-auth message.
 pub(crate) async fn observe_securejoin_on_other_device(
     context: &Context,
     mime_message: &MimeMessage,
@@ -829,13 +802,12 @@ pub(crate) async fn observe_securejoin_on_other_device(
         return Ok(HandshakeMessage::Ignore);
     };
 
-    if key.public_key.dc_fingerprint() != contact_fingerprint {
+    if key.dc_fingerprint() != contact_fingerprint {
         // Fingerprint does not match, ignore.
         warn!(context, "Fingerprint does not match.");
         return Ok(HandshakeMessage::Ignore);
     }
 
-    mark_contact_id_as_verified(context, contact_id, Some(ContactId::SELF)).await?;
     if contact.blocked && step != SecureJoinStep::MemberAdded {
         // Contact might be blocked after another device had issued the message. Still, to avoid
         // membership inconsistency on devices, don't ignore "vg-member-added".

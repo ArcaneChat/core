@@ -72,8 +72,7 @@ CREATE TABLE contacts (
     -- empty string for "address-contacts".
     fingerprint TEXT NOT NULL DEFAULT '',
 
-    -- ID of the contact that has "introduced" us to this contact
-    -- by sharing the key with a verified attribute or in a "verified" chat.
+    -- Unused. Was the ID of the contact that introduced this contact's key.
     verifier INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX contacts_index1 ON contacts (name COLLATE NOCASE);
@@ -131,9 +130,7 @@ CREATE TABLE chats (
     -- 0 means the timer is disabled.
     ephemeral_timer INTEGER,
 
-    -- Deprecated, but still used to send Chat-Verified headers
-    -- for existing protected chats.
-    -- All new chats are created as "not protected".
+    -- Unused. Was 1 for protected chats.
     protected INTEGER DEFAULT 0,
 
     gossiped_timestamp INTEGER DEFAULT 0, -- deprecated 2025-04-08, replaced with gossip_timestamp table
@@ -400,14 +397,51 @@ CREATE TABLE bobstate (
     chat_id INTEGER NOT NULL
 );
 
-CREATE TABLE smtp (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  rfc724_mid TEXT NOT NULL,          -- Message-ID
-  mime TEXT NOT NULL,                -- SMTP payload
-  msg_id INTEGER NOT NULL,           -- ID of the message in `msgs` table
-  recipients TEXT NOT NULL,          -- List of recipients separated by space
-  retries INTEGER NOT NULL DEFAULT 0 -- Number of failed attempts to send the message
-);
+CREATE TABLE smtp2 (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    display_name TEXT NOT NULL, -- Display name to put into the From field.
+    rfc724_mid TEXT NOT NULL, -- Message-ID
+
+    -- Unencrypted payload with some headers.
+    mime BLOB NOT NULL,
+
+    -- True if Autocrypt header should be added before sending.
+    should_attach_pubkey INTEGER NOT NULL,
+
+    -- True if OpenPGP-encrypted message may use compression.
+    should_compress INTEGER NOT NULL,
+
+    -- True if encrypted message should be signed.
+    should_sign INTEGER NOT NULL,
+
+    -- ID of the message in `msgs` table
+    msg_id INTEGER NOT NULL,
+
+    -- Space-separated recipient addresses.
+    recipients TEXT NOT NULL,
+
+    -- Space-separated addresses the message was sent to.
+    sent_to TEXT NOT NULL DEFAULT '',
+
+    -- If true, copy should be sent to self in addition to the recipient list.
+    --
+    -- For encrypted messages copy is sent to all addresses.
+    -- For unencrypted messages, copy is sent to the From address only.
+    bcc_self INTEGER NOT NULL,
+
+    -- True if the message is encrypted.
+    -- If true, at most one of the shared_secret or encryption_fingerprints should be non-empty.
+    -- If false, both must be empty.
+    is_encrypted INTEGER NOT NULL,
+
+    -- Shared secret if the message is to be encrypted symmetrically.
+    shared_secret TEXT NOT NULL DEFAULT '',
+
+    -- Space-separated fingerprints of the keys the message should be encrypted to.
+    encryption_fingerprints TEXT NOT NULL DEFAULT '',
+
+    retries INTEGER NOT NULL DEFAULT 0 -- Number of failed attempts to send the message
+) STRICT;
 
 CREATE TABLE smtp_mdns (
     msg_id INTEGER NOT NULL, -- id of the message in msgs table which requested MDN (DEPRECATED 2024-06-21)
@@ -693,13 +727,13 @@ CREATE TABLE stats_securejoin_uipaths(
 ) STRICT;
 CREATE TABLE stats_securejoin_invites(
     already_existed INTEGER NOT NULL,
-    already_verified INTEGER NOT NULL,
+    already_verified INTEGER NOT NULL, -- unused, always 0
     type TEXT NOT NULL
 ) STRICT;
 CREATE TABLE stats_msgs(
     chattype INTEGER PRIMARY KEY,
-    verified INTEGER NOT NULL DEFAULT 0,
-    unverified_encrypted INTEGER NOT NULL DEFAULT 0,
+    verified INTEGER NOT NULL DEFAULT 0, -- unused, always 0
+    unverified_encrypted INTEGER NOT NULL DEFAULT 0, -- counts all encrypted messages
     unencrypted INTEGER NOT NULL DEFAULT 0,
     only_to_self INTEGER NOT NULL DEFAULT 0,
     last_counted_msg_id INTEGER NOT NULL DEFAULT 0
@@ -780,4 +814,14 @@ CREATE TABLE old_keypairs (
 CREATE TABLE sending_domains(
     domain TEXT PRIMARY KEY,
     dkim_works INTEGER DEFAULT 0
+);
+
+-- Replaced with smtp2.
+CREATE TABLE smtp (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  rfc724_mid TEXT NOT NULL,          -- Message-ID
+  mime TEXT NOT NULL,                -- SMTP payload
+  msg_id INTEGER NOT NULL,           -- ID of the message in `msgs` table
+  recipients TEXT NOT NULL,          -- List of recipients separated by space
+  retries INTEGER NOT NULL DEFAULT 0 -- Number of failed attempts to send the message
 );

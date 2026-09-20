@@ -278,9 +278,26 @@ impl CommandApi {
 
     /// Performs a background fetch for all accounts in parallel with a timeout.
     ///
-    /// The `AccountsBackgroundFetchDone` event is emitted at the end even in case of timeout.
+    /// For an account with IO stopped, the scheduler is paused
+    /// and every transport is fetched concurrently on a dedicated connection.
+    /// The account is done as soon as one transport received messages, the others stop.
+    /// Only one batch of messages is fetched per transport this way,
+    /// so a larger backlog is left to the next call or to started IO.
+    ///
+    /// For an account with IO running, IMAP IDLE is interrupted on every transport
+    /// and the account is done once every transport is.
+    ///
+    /// The call never waits for outgoing messages and never triggers sending them itself.
+    /// Received messages may still queue replies, securejoin handshakes for example,
+    /// which go out only while IO is running.
+    /// Use `is_sending_finished()` to tell whether the outgoing queue is empty.
+    ///
+    /// The `AccountsBackgroundFetchDone` event is emitted at the end even in case of timeout,
+    /// and immediately if another background fetch is already running.
     /// Process all events until you get this one and you can safely return to the background
-    /// without forgetting to create notifications caused by timing race conditions.
+    /// without forgetting to create a generic notification if no message was fetched.
+    /// The event carries no data identifying the call it belongs to,
+    /// so it marks your own call only if no concurrent background fetch is happening.
     async fn background_fetch(&self, timeout_in_seconds: f64) -> Result<()> {
         let future = {
             let lock = self.accounts.read().await;
@@ -291,6 +308,11 @@ impl CommandApi {
         Ok(())
     }
 
+    /// Stops an ongoing `background_fetch()` call, making it return early
+    /// without waiting for the remaining transports or for the timeout.
+    ///
+    /// The `AccountsBackgroundFetchDone` event is emitted as usual.
+    /// Does nothing if no background fetch is running.
     async fn stop_background_fetch(&self) -> Result<()> {
         self.accounts.read().await.stop_background_fetch();
         Ok(())
@@ -825,6 +847,8 @@ impl CommandApi {
 
     /// Get QR code text that will offer a [SecureJoin](https://securejoin.delta.chat/) invitation.
     ///
+    /// To reset invitations, pass the link to `set_config_from_qr()`.
+    ///
     /// If `chat_id` is a group chat ID, SecureJoin QR code for the group is returned.
     /// If `chat_id` is unset, setup contact QR code is returned.
     async fn get_chat_securejoin_qr_code(
@@ -838,20 +862,19 @@ impl CommandApi {
         Ok(qr)
     }
 
-    /// Get QR code (text and SVG) that will offer a Setup-Contact or Verified-Group invitation.
+    /// Get QR code (text and SVG) that will offer a SecureJoin invitation.
     /// The QR code is compatible to the OPENPGP4FPR format
     /// so that a basic fingerprint comparison also works e.g. with OpenKeychain.
     ///
     /// The scanning device will pass the scanned content to `checkQr()` then;
     /// if `checkQr()` returns `askVerifyContact` or `askVerifyGroup`
-    /// an out-of-band-verification can be joined using `secure_join()`
+    /// the securejoin protocol can be started using `secure_join()`
     ///
     /// @deprecated as of 2026-03; use create_qr_svg(get_chat_securejoin_qr_code()) instead.
     ///
     /// chat_id: If set to a group-chat-id,
-    ///     the Verified-Group-Invite protocol is offered in the QR code;
-    ///     works for protected groups as well as for normal groups.
-    ///     If not set, the Setup-Contact protocol is offered in the QR code.
+    ///     the SecureJoin QR code for the group is returned.
+    ///     If not set, the setup contact QR code is returned.
     ///     See https://securejoin.delta.chat/ for details about both protocols.
     ///
     /// return format: `[code, svg]`
@@ -867,7 +890,7 @@ impl CommandApi {
         Ok((qr, svg))
     }
 
-    /// Continue a Setup-Contact or Verified-Group-Invite protocol
+    /// Continue the SecureJoin protocol
     /// started on another device with `get_chat_securejoin_qr_code_svg()`.
     /// This function is typically called when `check_qr()` returns
     /// type=AskVerifyContact or type=AskVerifyGroup.
@@ -949,8 +972,6 @@ impl CommandApi {
     ///
     /// If the group is already _promoted_ (any message was sent to the group),
     /// all group members are informed by a special status message that is sent automatically by this function.
-    ///
-    /// If the group has group protection enabled, only verified contacts can be added to the group.
     ///
     /// Sends out #DC_EVENT_CHAT_MODIFIED and #DC_EVENT_MSGS_CHANGED if a status message was sent.
     async fn add_contact_to_chat(
@@ -1786,7 +1807,7 @@ impl CommandApi {
 
     /// Get encryption info for a contact.
     /// Get a multi-line encryption info, containing your fingerprint and the
-    /// fingerprint of the contact, used e.g. to compare the fingerprints for a simple out-of-band verification.
+    /// fingerprint of the contact, used e.g. to compare the fingerprints out-of-band.
     async fn get_contact_encryption_info(
         &self,
         account_id: u32,
@@ -2048,6 +2069,14 @@ impl CommandApi {
     /// or just that the network conditions might have changed
     async fn maybe_network(&self) -> Result<()> {
         self.accounts.read().await.maybe_network().await;
+        Ok(())
+    }
+
+    /// Waits until all transports are idle or failed and no background work is left.
+    /// Never returns unless I/O is started. Must ONLY be used by tests.
+    async fn wait_for_all_work_done(&self, account_id: u32) -> Result<()> {
+        let ctx = self.get_context(account_id).await?;
+        ctx.wait_for_all_work_done().await;
         Ok(())
     }
 
@@ -2787,6 +2816,15 @@ impl CommandApi {
                 .await?
                 .map(JsonrpcAppSource::from_core_type),
         )
+    }
+
+    /// Returns true if all accounts have empty outgoing message queue.
+    ///
+    /// This API is intended to be used by UIs
+    /// to request that operating system does not put the application in background
+    /// while there are still outgoing messages that are not sent out.
+    async fn is_sending_finished(&self) -> Result<bool> {
+        self.accounts.read().await.is_sending_finished().await
     }
 }
 

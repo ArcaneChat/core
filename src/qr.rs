@@ -46,7 +46,7 @@ pub(crate) const DCBACKUP_VERSION: i32 = 5;
 /// Scanned QR code.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Qr {
-    /// Ask the user whether to verify the contact.
+    /// Ask the user whether to start chatting with the contact.
     ///
     /// If the user agrees, pass this QR code to [`crate::securejoin::join_securejoin`].
     AskVerifyContact {
@@ -126,7 +126,7 @@ pub enum Qr {
         is_v3: bool,
     },
 
-    /// Contact fingerprint is verified.
+    /// Contact fingerprint matches.
     ///
     /// Ask the user if they want to start chatting.
     FprOk {
@@ -850,7 +850,8 @@ pub(crate) async fn login_param_from_account_qr(
         .context("Invalid DCACCOUNT scheme")?;
 
     if !payload.starts_with(HTTPS_SCHEME) {
-        let param = login_param_from_host(payload);
+        let mark_as_autorelay = false;
+        let param = login_param_from_host(payload, mark_as_autorelay);
         return Ok(param);
     }
 

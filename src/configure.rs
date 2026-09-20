@@ -490,17 +490,6 @@ pub(crate) async fn configure(
 
         progress!(ctx, 900);
 
-        let is_configured = ctx.is_configured().await?;
-        if !ctx.get_config_bool(Config::FixIsChatmail).await? {
-            if imap_session.is_chatmail() {
-                ctx.sql.set_raw_config("is_chatmail", Some("1")).await?;
-            } else if !is_configured {
-                // Reset the setting that may have been set
-                // during failed configuration.
-                ctx.sql.set_raw_config("is_chatmail", Some("0")).await?;
-            }
-        }
-
         // Drop the imap connection explicitly
         // to make sure that it's not forgotten in a future refactoring
         drop(imap_session);
@@ -681,7 +670,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_early_configure_failure_is_reported() -> Result<()> {
         let t = TestContext::new().await;
-        let mut param = login_param_from_host("example.org");
+        let mark_as_autorelay = false;
+        let mut param = login_param_from_host("example.org", mark_as_autorelay);
 
         // An ongoing process, e.g. a backup import,
         // makes configuration fail without ever contacting a relay.
@@ -726,7 +716,7 @@ mod tests {
         let mut tcm = TestContextManager::new();
         let t = &tcm.unconfigured().await;
 
-        // Setting ConfiguredAddr on an unconfigured account creates a pseudo transport
+        add_pseudo_transport(t, "primary@example.org").await?;
         t.set_config(Config::ConfiguredAddr, Some("primary@example.org"))
             .await?;
         assert_eq!(t.count_transports().await?, 1);

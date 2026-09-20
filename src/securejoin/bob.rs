@@ -106,7 +106,6 @@ pub(super) async fn start_protocol(context: &Context, invite: QrInvite) -> Resul
             // If QR code is a group invite
             // and we are already in the chat,
             // nothing needs to be done.
-            // Even if Alice is not verified, we don't send anything.
             context.emit_event(EventType::SecurejoinJoinerProgress {
                 contact_id: invite.contact_id(),
                 progress: JoinerProgress::Succeeded.into_u16(),
@@ -270,7 +269,7 @@ pub(super) async fn handle_auth_required_or_pubkey(
             continue;
         }
 
-        info!(context, "Fingerprint verified.",);
+        info!(context, "Fingerprint matches.",);
         let chat_id = private_chat_id(context, &invite).await?;
         delete_securejoin_wait_msg(context, chat_id)
             .await
@@ -325,22 +324,23 @@ pub(crate) async fn send_handshake_message(
     if invite.is_v3() && matches!(step, BobHandshakeMsg::Request) {
         // Send a minimal symmetrically-encrypted vc-request-pubkey message
         let rfc724_mid = create_outgoing_rfc724_mid();
-        let recipients = invite.addrs().join(" ");
+        let recipients = invite.addrs();
         let alice_fp = invite.fingerprint().hex();
         let auth = invite.authcode();
         let shared_secret = format!("securejoin/{alice_fp}/{auth}");
         let attach_self_pubkey = false;
-        let rendered_message = mimefactory::render_symm_encrypted_securejoin_message(
+        let queued_msg = mimefactory::symm_encrypted_securejoin_message(
             context,
             "vc-request-pubkey",
             &rfc724_mid,
             attach_self_pubkey,
             auth,
             &shared_secret,
+            recipients.to_vec(),
         )
         .await?;
+        insert_into_smtp(context, &rfc724_mid, &queued_msg).await?;
 
-        insert_into_smtp(context, &rfc724_mid, &recipients, rendered_message).await?;
         context.scheduler.interrupt_smtp().await;
     } else {
         let mut msg = Message {
@@ -448,8 +448,8 @@ async fn private_chat_id(context: &Context, invite: &QrInvite) -> Result<ChatId>
 ///
 /// This is the chat in which you want to notify the user as well.
 ///
-/// When joining a group this is the [`ChatId`] of the group chat, when verifying a
-/// contact this is the [`ChatId`] of the single chat.
+/// When joining a group this is the [`ChatId`] of the group chat,
+/// when setting up a contact this is the [`ChatId`] of the single chat.
 /// The group chat will be created if it does not yet exist.
 async fn joining_chat_id(
     context: &Context,
@@ -495,7 +495,7 @@ async fn joining_chat_id(
 pub(crate) enum JoinerProgress {
     /// vg-vc-request-with-auth sent.
     ///
-    /// Typically shows as "alice@addr verified, introducing myself."
+    /// Typically shows as "introducing myself."
     RequestWithAuthSent,
     /// Completed securejoin.
     Succeeded,

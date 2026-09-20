@@ -19,6 +19,7 @@ use async_imap::types::{Fetch, Flag, UnsolicitedResponse};
 use futures::{FutureExt as _, TryStreamExt};
 use futures_lite::FutureExt;
 use ratelimit::Ratelimit;
+use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::chat::{self, add_device_msg};
@@ -104,6 +105,10 @@ pub(crate) struct Imap {
 
     /// IMAP UID resync request receiver.
     pub(crate) resync_request_receiver: async_channel::Receiver<()>,
+
+    /// The background fetch is cancelled once messages are fetched from one of the transports,
+    /// so that the other transports fetch nothing.
+    pub(crate) background_fetch_stop_token: Option<CancellationToken>,
 }
 
 #[derive(Debug, Default)]
@@ -124,6 +129,8 @@ pub(crate) struct ServerMetadata {
     /// True if we think the relay supports push notifications.
     /// This gates wether we attempt to write an encrypted device token
     /// to per-transport IMAP metadata key `/private/devicetoken`.
+    ///
+    /// Any `/shared/vendor/deltachat/` entry identifies a chatmail relay.
     pub supports_push: bool,
 
     /// ICE servers for WebRTC calls.
@@ -237,19 +244,8 @@ impl Imap {
             ratelimit: Ratelimit::new(Duration::new(120, 0), 2.0),
             resync_request_sender,
             resync_request_receiver,
+            background_fetch_stop_token: None,
         })
-    }
-
-    /// Creates new disconnected IMAP client using configured parameters.
-    pub async fn new_configured(
-        context: &Context,
-        idle_interrupt_receiver: Receiver<()>,
-    ) -> Result<Self> {
-        let (transport_id, param) = ConfiguredLoginParam::load(context)
-            .await?
-            .context("Not configured")?;
-        let imap = Self::new(context, transport_id, param, idle_interrupt_receiver).await?;
-        Ok(imap)
     }
 
     /// Returns transport ID of the IMAP client.
@@ -428,12 +424,14 @@ impl Imap {
     ///
     /// Prefetches headers and downloads new message from the folder, moves messages away from the
     /// folder and deletes messages in the folder.
+    ///
+    /// Returns true if at least one message was fetched.
     pub async fn fetch_move_delete(
         &mut self,
         context: &Context,
         session: &mut Session,
         watch_folder: &str,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         ensure_and_debug_assert!(!watch_folder.is_empty(), "Watched folder cannot be empty");
         if !context.sql.is_open().await {
             // probably shutdown
@@ -454,7 +452,7 @@ impl Imap {
 
         // Mark expired messages for deletion. Note that `delete_expired_imap_messages` is
         // not well optimized and should not be called before fetching.
-        delete_expired_imap_messages(context, session.transport_id(), session.is_chatmail())
+        delete_expired_imap_messages(context, session.transport_id())
             .await
             .context("delete_expired_imap_messages")?;
 
@@ -463,7 +461,7 @@ impl Imap {
             .await
             .context("move_delete_messages")?;
 
-        Ok(())
+        Ok(msgs_fetched)
     }
 
     /// Fetches new messages.
@@ -532,6 +530,19 @@ impl Imap {
             .context("prefetch")?;
         let read_cnt = msgs.len();
         let _fetch_msgs_lock_guard = context.fetch_msgs_mutex.lock().await;
+        if let Some(stop_token) = &self.background_fetch_stop_token {
+            if stop_token.is_cancelled() {
+                // This also stops the transport that cancelled the token,
+                // so one background fetch receives at most `uids_to_prefetch` messages.
+                return Ok((0, false));
+            }
+            if read_cnt > 0 {
+                // Cancel the background fetch on the other transports,
+                // so that `background_fetch_any()` can return as soon as messages are received
+                // and the UI can show a notification.
+                stop_token.cancel();
+            }
+        }
 
         let mut uids_fetch: Vec<u32> = Vec::new();
         let mut available_post_msgs: Vec<String> = Vec::new();
@@ -1375,6 +1386,8 @@ impl Session {
                 _ => {}
             }
         }
+        let supports_push =
+            max_smtp_rcpt_to.is_some() || iroh_relay.is_some() || ice_servers.is_some();
         let ice_servers = if let Some(ice_servers) = ice_servers {
             ice_servers
         } else {
@@ -1390,7 +1403,7 @@ impl Session {
                 admin,
                 iroh_relay,
                 max_smtp_rcpt_to,
-                supports_push: max_smtp_rcpt_to.is_some() || self.capabilities.has_xdeltapush,
+                supports_push,
                 ice_servers,
                 ice_servers_expiration_timestamp,
                 app_versions,

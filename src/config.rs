@@ -18,8 +18,8 @@ use crate::events::EventType;
 use crate::log::LogExt;
 use crate::mimefactory::RECOMMENDED_FILE_SIZE;
 use crate::sync::{self, Sync::*, SyncData};
-use crate::tools::{get_abs_path, time};
-use crate::transport::{add_pseudo_transport, send_sync_transports, transport_addrs};
+use crate::tools::get_abs_path;
+use crate::transport::transport_addrs;
 use crate::{constants, stats};
 
 /// The available configuration keys.
@@ -42,10 +42,12 @@ use crate::{constants, stats};
 #[strum(serialize_all = "snake_case")]
 pub enum Config {
     /// Deprecated(2026-04).
-    /// Use ConfiguredAddr, [`crate::login_param::EnteredLoginParam`],
-    /// or add_transport{from_qr}()/list_transports() instead.
     ///
-    /// Email address, used in the `From:` field.
+    /// Email address used by the deprecated configure() procedure.
+    ///
+    /// Use add_transport{from_qr}() to configure new transports,
+    /// Use list_transports() to learn about configured transports,
+    /// including their addresses.
     Addr,
 
     /// Deprecated(2026-04).
@@ -195,9 +197,9 @@ pub enum Config {
     #[strum(props(default = "0"))]
     DeleteDeviceAfter,
 
-    /// The primary email address, used for sending and background fetch.
+    /// Deprecated(2026-09).
     ///
-    /// Device-local, other devices keep their own primary transport.
+    /// Use ConfiguredLoginParam and list_transports() instead.
     ConfiguredAddr,
 
     /// Deprecated(2026-04).
@@ -304,18 +306,6 @@ pub enum Config {
     ///
     /// True if account is configured.
     Configured,
-
-    /// Deprecated, we are trying to get rid of this global setting.
-    /// It is possible to configure a profile with both chatmail relays
-    /// and classical email servers.
-    ///
-    /// Most usages in UIs can be replaced by `force_encryption`.
-    ///
-    /// True if account is a chatmail account.
-    IsChatmail,
-
-    /// True if `IsChatmail` mustn't be autoconfigured. For tests.
-    FixIsChatmail,
 
     /// True if account is muted.
     IsMuted,
@@ -499,11 +489,6 @@ impl Config {
                 | Self::ForceEncryption,
         )
     }
-
-    /// Whether the config option needs an IO scheduler restart to take effect.
-    pub(crate) fn needs_io_restart(&self) -> bool {
-        matches!(self, Config::ConfiguredAddr)
-    }
 }
 
 impl Context {
@@ -549,7 +534,6 @@ impl Context {
         // Default values
         let val = match key {
             Config::ConfiguredInboxFolder => Some("INBOX".to_string()),
-            Config::Addr => self.get_config_opt(Config::ConfiguredAddr).await?,
             _ => key.get_str("default").map(|s| s.to_string()),
         };
         Ok(val)
@@ -683,10 +667,6 @@ impl Context {
     pub async fn set_config(&self, key: Config, value: Option<&str>) -> Result<()> {
         Self::check_config(key, value)?;
 
-        let _pause = match key.needs_io_restart() {
-            true => self.scheduler.pause(self).await?,
-            _ => Default::default(),
-        };
         if key == Config::StatsSending {
             let old_value = self.get_config(key).await?;
             let old_value = bool_from_config(old_value.as_deref());
@@ -766,63 +746,28 @@ impl Context {
                     bail!("Cannot unset configured_addr");
                 };
 
-                if !self.is_configured().await? {
-                    info!(
-                        self,
-                        "Creating a pseudo configured account which will not be able to send or receive messages. Only meant for tests!"
-                    );
-                    add_pseudo_transport(self, addr).await?;
-                    self.sql
-                        .set_raw_config(Config::ConfiguredAddr.as_ref(), Some(addr))
-                        .await?;
-                } else {
-                    self.sql
-                        .transaction(|transaction| {
-                            if transaction.query_row(
-                                "SELECT COUNT(*) FROM transports WHERE addr=?",
-                                (addr,),
-                                |row| {
-                                    let res: i64 = row.get(0)?;
-                                    Ok(res)
-                                },
-                            )? == 0
-                            {
-                                bail!("Address does not belong to any transport.");
-                            }
-                            transaction.execute(
-                                "UPDATE config SET value=? WHERE keyname='configured_addr'",
-                                (addr,),
-                            )?;
+                self.sql
+                    .transaction(|transaction| {
+                        if transaction.query_row(
+                            "SELECT COUNT(*) FROM transports WHERE addr=?",
+                            (addr,),
+                            |row| {
+                                let res: i64 = row.get(0)?;
+                                Ok(res)
+                            },
+                        )? == 0
+                        {
+                            bail!("Address does not belong to any transport.");
+                        }
+                        transaction.execute(
+                            "INSERT OR REPLACE INTO config (keyname, value) VALUES ('configured_addr', ?)",
+                            (addr,),
+                        )?;
 
-                            // The timestamp must strictly increase because
-                            // other devices ignore the row update otherwise,
-                            // and contacts only adopt the re-signed key
-                            // if its signature timestamp increases.
-                            transaction
-                                .execute(
-                                    "UPDATE transports
-                                     SET add_timestamp=MAX(?, add_timestamp+1)
-                                     WHERE addr=?",
-                                    (time(), addr),
-                                )
-                                .context(
-                                    "Failed to update add_timestamp for the new primary transport",
-                                )?;
-
-                            // Clean up SMTP queue.
-                            //
-                            // The messages in the queue have a different
-                            // From address so we cannot send them over
-                            // the new SMTP transport.
-                            transaction.execute("DELETE FROM smtp", ())?;
-
-                            Ok(())
-                        })
-                        .await?;
-                    // Invalidate the cache so the sync message cannot read a stale primary address.
-                    self.sql.uncache_raw_config("configured_addr").await;
-                    send_sync_transports(self).await?;
-                }
+                        Ok(())
+                    })
+                    .await?;
+                self.sql.uncache_raw_config("configured_addr").await;
             }
             _ => {
                 self.sql.set_raw_config(key.as_ref(), value).await?;
@@ -917,8 +862,7 @@ impl Context {
             .any(|a| addr_cmp(addr, a)))
     }
 
-    /// Sets `primary_new` as the new primary self address and saves the old
-    /// primary address (if exists) as a secondary address.
+    /// Sets `primary_new` as the address used for sending.
     ///
     /// This should only be used by test code and during configure.
     #[cfg(test)] // AEAP is disabled, but there are still tests for it
@@ -940,7 +884,7 @@ impl Context {
             .await
     }
 
-    /// Returns the primary self address.
+    /// Returns the address of the transport used for sending.
     /// Returns an error if no self addr is configured.
     pub async fn get_primary_self_addr(&self) -> Result<String> {
         self.get_config(Config::ConfiguredAddr)

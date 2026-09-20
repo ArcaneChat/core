@@ -9,7 +9,7 @@ use async_channel::{self as channel, Receiver, Sender};
 use futures::future::try_join_all;
 use futures_lite::FutureExt;
 use tokio::sync::{RwLock, oneshot};
-use tokio::task;
+use tokio::task::{self, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -215,10 +215,17 @@ impl SchedulerState {
 
     /// Indicate that the network likely has come back.
     pub(crate) async fn maybe_network(&self) {
+        self.interrupt_inbox_idle().await;
+        self.interrupt_smtp().await;
+    }
+
+    /// Interrupts IDLE on all transports so that they fetch,
+    /// and marks them as having work to do.
+    pub(crate) async fn interrupt_inbox_idle(&self) {
         let inner = self.inner.read().await;
         let inboxes = match *inner {
             InnerSchedulerState::Started(ref scheduler) => {
-                scheduler.maybe_network();
+                scheduler.interrupt_inbox();
                 scheduler
                     .inboxes
                     .iter()
@@ -282,6 +289,60 @@ impl SchedulerState {
             scheduler.interrupt_recently_seen(contact_id, timestamp);
         }
     }
+
+    /// Fetches from all transports at once, each on a dedicated connection,
+    /// with I/O paused so that the scheduler does not connect as well.
+    ///
+    /// Returns as soon as one transport fetched messages:
+    /// the others then fetch nothing more and are dropped,
+    /// so that a caller woken up by a push notification
+    /// does not wait for a transport that may never answer.
+    pub(crate) async fn background_fetch_any(&self, context: &Context) -> Result<()> {
+        let _pause_guard = self.pause(context).await?;
+
+        let stop_token = CancellationToken::new();
+        let mut set = JoinSet::new();
+        for (transport_id, param) in ConfiguredLoginParam::load_all(context).await? {
+            let context = context.clone();
+            let stop_token = stop_token.clone();
+            set.spawn(async move {
+                match background_fetch_from_transport(&context, transport_id, param, stop_token)
+                    .await
+                {
+                    Ok(fetched) => fetched,
+                    Err(err) => {
+                        warn!(context, "Transport {transport_id}: fetch failed: {err:#}.");
+                        false
+                    }
+                }
+            });
+        }
+
+        while let Some(fetched) = set.join_next().await {
+            if let Ok(true) = fetched {
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
+async fn background_fetch_from_transport(
+    context: &Context,
+    transport_id: u32,
+    param: ConfiguredLoginParam,
+    stop_token: CancellationToken,
+) -> Result<bool> {
+    // A single fetch has nothing to interrupt.
+    let (_, idle_interrupt_receiver) = channel::bounded(1);
+    let mut connection = Imap::new(context, transport_id, param, idle_interrupt_receiver).await?;
+    connection.background_fetch_stop_token = Some(stop_token);
+    let mut session = connection.prepare(context).await?;
+
+    let folder = connection.folder.clone();
+    connection
+        .fetch_move_delete(context, &mut session, &folder)
+        .await
 }
 
 #[derive(Debug, Default)]
@@ -460,7 +521,6 @@ async fn inbox_fetch_idle(ctx: &Context, imap: &mut Imap, mut session: Session) 
     };
 
     maybe_broadcast_reactions(ctx).await.log_err(ctx).ok();
-    maybe_send_stats(ctx).await.log_err(ctx).ok();
 
     session
         .update_metadata(ctx)
@@ -472,6 +532,8 @@ async fn inbox_fetch_idle(ctx: &Context, imap: &mut Imap, mut session: Session) 
             "Transport {transport_id}: Failed to register push token: {err:#}."
         );
     }
+
+    maybe_send_stats(ctx).await.log_err(ctx).ok();
 
     let session = fetch_idle(ctx, imap, session).await?;
     Ok(session)
@@ -743,13 +805,6 @@ impl Scheduler {
 
     fn boxes(&self) -> impl Iterator<Item = &SchedBox> {
         self.inboxes.iter()
-    }
-
-    fn maybe_network(&self) {
-        for b in self.boxes() {
-            b.conn_state.interrupt();
-        }
-        self.interrupt_smtp();
     }
 
     fn maybe_network_lost(&self) {

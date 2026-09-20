@@ -30,17 +30,17 @@ use crate::chat::{
 use crate::chatlist::Chatlist;
 use crate::config::Config;
 use crate::constants::{Blocked, Chattype, DC_GCL_NO_SPECIALS};
-use crate::contact::{
-    Contact, ContactId, Modifier, Origin, import_vcard, make_vcard, mark_contact_id_as_verified,
-};
+use crate::contact::{Contact, ContactId, Modifier, Origin, import_vcard, make_vcard};
 use crate::context::Context;
 use crate::events::{Event, EventEmitter, EventType, Events};
 use crate::key::{self, DcKey, self_fingerprint};
 use crate::message::{Message, MessageState, MsgId};
+use crate::mimefactory;
 use crate::mimeparser::{MimeMessage, SystemMessage};
 use crate::pgp::SeipdVersion;
 use crate::receive_imf::{ReceivedMsg, receive_imf};
 use crate::securejoin::{get_securejoin_qr, join_securejoin};
+use crate::smtp;
 use crate::smtp::msg_has_pending_smtp_job;
 use crate::stock_str::StockStrings;
 use crate::tools::time;
@@ -557,6 +557,9 @@ impl TestContext {
     /// The context will be configured but the key will not be pre-generated so if a key is
     /// used the fingerprint will be different every time.
     pub async fn configure_addr(&self, addr: &str) {
+        add_pseudo_transport(&self.ctx, addr)
+            .await
+            .expect("Failed to add pseudo transport");
         self.ctx
             .set_config(Config::ConfiguredAddr, Some(addr))
             .await
@@ -602,28 +605,51 @@ impl TestContext {
 
     pub async fn pop_sent_msg_ext(&self, rev_order: bool) -> Option<SentMessage<'_>> {
         let mut query = "
-SELECT id, msg_id, mime, recipients
-FROM smtp
+SELECT id, msg_id
+FROM smtp2
 ORDER BY id"
             .to_string();
         if rev_order {
             query += " DESC";
         }
-        let (rowid, msg_id, payload, recipients) = self
+        let (rowid, msg_id) = self
             .ctx
             .sql
             .query_row_optional(&query, (), |row| {
                 let rowid: i64 = row.get(0)?;
                 let msg_id: MsgId = row.get(1)?;
-                let mime: String = row.get(2)?;
-                let recipients: String = row.get(3)?;
-                Ok((rowid, msg_id, mime, recipients))
+                Ok((rowid, msg_id))
             })
             .await
             .expect("query_row_optional failed")?;
+        let query_only = true;
+        let mut queued_mail = self
+            .ctx
+            .sql
+            .transaction_ext(query_only, |transaction| {
+                smtp::queue::load_queued_mail(transaction, rowid)
+            })
+            .await
+            .expect("Failed to load queued mail");
+        if queued_mail.bcc_self {
+            let from = self
+                .get_primary_self_addr()
+                .await
+                .expect("Cannot get From address");
+            smtp::add_self_recipients(
+                &self.ctx,
+                &mut queued_mail.recipients,
+                queued_mail.encryption.is_encrypted(),
+                from,
+            )
+            .await
+            .expect("Failed to add self recipients");
+        }
+        let recipients = queued_mail.recipients.join(" ");
+        debug_assert!(!recipients.starts_with(" "));
         self.ctx
             .sql
-            .execute("DELETE FROM smtp WHERE id=?;", (rowid,))
+            .execute("DELETE FROM smtp2 WHERE id=?;", (rowid,))
             .await
             .expect("failed to remove job");
         if !msg_has_pending_smtp_job(self, msg_id)
@@ -642,6 +668,11 @@ ORDER BY id"
                 .await
                 .expect("Failed to update timestamp_sent");
         }
+
+        let rendered_mail = mimefactory::render_queued_mail_with_context(queued_mail, self)
+            .await
+            .expect("Failed to render queued mail");
+        let payload = rendered_mail.message;
 
         let payload_headers = payload.split("\r\n\r\n").next().unwrap().lines();
         let payload_header_names: Vec<_> = payload_headers
@@ -681,33 +712,61 @@ ORDER BY id"
     }
 
     pub async fn get_smtp_rows_for_msg<'a>(&'a self, msg_id: MsgId) -> Vec<SentMessage<'a>> {
-        let sent_msgs = self
+        let mut sent_msgs = Vec::new();
+
+        for rowid in self
             .ctx
             .sql
-            .query_map_vec(
-                "SELECT id, msg_id, mime, recipients FROM smtp WHERE msg_id=?",
-                (msg_id,),
-                |row| {
-                    let _id: MsgId = row.get(0)?;
-                    let msg_id: MsgId = row.get(1)?;
-                    let mime: String = row.get(2)?;
-                    let recipients: String = row.get(3)?;
-                    Ok((msg_id, mime, recipients))
-                },
-            )
+            .query_map_vec("SELECT id FROM smtp2 WHERE msg_id=?", (msg_id,), |row| {
+                let rowid: i64 = row.get(0)?;
+                Ok(rowid)
+            })
             .await
             .unwrap()
-            .into_iter()
-            .map(|(msg_id, mime, recipients)| SentMessage {
-                payload: mime,
+        {
+            let query_only = true;
+            let mut queued_mail = self
+                .ctx
+                .sql
+                .transaction_ext(query_only, |transaction| {
+                    smtp::queue::load_queued_mail(transaction, rowid)
+                })
+                .await
+                .expect("Failed to load queued mail");
+            if queued_mail.bcc_self {
+                let from = self
+                    .get_primary_self_addr()
+                    .await
+                    .expect("Cannot get self address");
+                smtp::add_self_recipients(
+                    &self.ctx,
+                    &mut queued_mail.recipients,
+                    queued_mail.encryption.is_encrypted(),
+                    from,
+                )
+                .await
+                .expect("Failed to add self recipients");
+            }
+            let recipients = queued_mail.recipients.join(" ");
+
+            let rendered_mail = mimefactory::render_queued_mail_with_context(queued_mail, self)
+                .await
+                .expect("Failed to render queued mail");
+            let payload = rendered_mail.message;
+
+            debug_assert!(!recipients.starts_with(" "));
+            let sent_message = SentMessage {
+                payload,
                 sender_msg_id: msg_id,
                 sender_context: &self.ctx,
                 recipients,
-            })
-            .collect();
+            };
+            sent_msgs.push(sent_message)
+        }
+
         self.ctx
             .sql
-            .execute("DELETE FROM smtp WHERE msg_id=?", (msg_id,))
+            .execute("DELETE FROM smtp2 WHERE msg_id=?", (msg_id,))
             .await
             .expect("Delete smtp jobs");
         if msg_id
@@ -892,27 +951,6 @@ ORDER BY id"
                 .await
                 .expect("add_or_lookup");
         contact_id
-    }
-
-    /// Returns a single [`Chat`] with another account address-contact.
-    /// Panics if it doesn't exist.
-    /// May return a blocked chat.
-    ///
-    /// This first creates a contact using the configured details on the other account, then
-    /// gets the single chat with this contact.
-    pub async fn get_email_chat(&self, other: &TestContext) -> Chat {
-        let contact = self.add_or_lookup_address_contact(other).await;
-
-        let chat_id = ChatIdBlocked::lookup_by_contact(&self.ctx, contact.id)
-            .await
-            .unwrap()
-            .map(|chat_id_blocked| chat_id_blocked.id)
-            .expect(
-                "There is no chat with this contact. \
-                Hint: Use create_email_chat() instead of get_email_chat() if this is expected.",
-            );
-
-        Chat::load_from_db(&self.ctx, chat_id).await.unwrap()
     }
 
     /// Returns a single [`Chat`] with another account key-contact.
@@ -1159,18 +1197,6 @@ ORDER BY id"
         chat_id
     }
 
-    /// Set the legacy `protected` column in the chats table to 1,
-    /// because for now, only these chats that were once protected can be used
-    /// to gossip verifications.
-    // TODO remove the next statement
-    // when we send the _verified header for all verified contacts
-    pub(crate) async fn set_chat_protected(self: &TestContext, chat_id: chat::ChatId) {
-        self.sql
-            .execute("UPDATE chats SET protected=1 WHERE id=?", (chat_id,))
-            .await
-            .unwrap();
-    }
-
     /// Allow reception of unencrypted messages.
     pub async fn allow_unencrypted(&self) -> Result<()> {
         self.set_config_bool(Config::ForceEncryption, false).await?;
@@ -1215,7 +1241,6 @@ pub async fn encrypt_raw_message(
         addr: context.get_primary_self_addr().await?,
         public_key: public_key.clone(),
         prefer_encrypt: EncryptPreference::Mutual,
-        verified: false,
     };
 
     let mut encryption_keyring = vec![public_key.clone()];
@@ -1712,14 +1737,6 @@ pub(crate) async fn get_chat_msg(
         panic!("Wrong item type");
     };
     Message::load_from_db(&t.ctx, msg_id).await.unwrap()
-}
-
-/// Saves the other account's public key as verified
-pub(crate) async fn mark_as_verified(this: &TestContext, other: &TestContext) {
-    let contact_id = this.add_or_lookup_contact_id(other).await;
-    mark_contact_id_as_verified(this, contact_id, Some(ContactId::SELF))
-        .await
-        .unwrap();
 }
 
 /// Pops a sync message from alice0 and receives it on alice1. Should be used after an action on

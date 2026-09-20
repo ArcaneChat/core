@@ -306,9 +306,10 @@ async fn test_mdn_create_encrypted() -> Result<()> {
     message::markseen_msgs(&bob, vec![rcvd.id]).await?;
     let mimefactory =
         MimeFactory::from_mdn(&bob, rcvd.from_id, rcvd.rfc724_mid.clone(), vec![]).await?;
-    let rendered_msg = mimefactory.render(&bob).await?;
+    assert!(!mimefactory.will_be_encrypted());
+    let bob_addr = bob.get_primary_self_addr().await?;
+    let rendered_msg = mimefactory.render(&bob, &bob_addr).await?;
 
-    assert!(!rendered_msg.is_encrypted);
     assert!(!rendered_msg.message.contains("Bob Examplenet"));
     assert!(!rendered_msg.message.contains("Alice Exampleorg"));
     let bob_alice_contact = bob.add_or_lookup_contact(&alice).await;
@@ -319,9 +320,10 @@ async fn test_mdn_create_encrypted() -> Result<()> {
     message::markseen_msgs(&bob, vec![rcvd.id]).await?;
 
     let mimefactory = MimeFactory::from_mdn(&bob, rcvd.from_id, rcvd.rfc724_mid, vec![]).await?;
-    let rendered_msg = mimefactory.render(&bob).await?;
+    assert!(mimefactory.will_be_encrypted());
+    let bob_addr = bob.get_primary_self_addr().await?;
+    let rendered_msg = mimefactory.render(&bob, &bob_addr).await?;
 
-    assert!(rendered_msg.is_encrypted);
     assert!(!rendered_msg.message.contains("Bob Examplenet"));
     assert!(!rendered_msg.message.contains("Alice Exampleorg"));
 
@@ -363,7 +365,8 @@ async fn test_mdn_autocrypt_throttle() -> Result<()> {
         rcvd: &Message,
     ) -> Result<bool> {
         let mf = MimeFactory::from_mdn(bob, rcvd.from_id, rcvd.rfc724_mid.clone(), vec![]).await?;
-        let rendered_msg = mf.render(bob).await?;
+        let addr = bob.get_primary_self_addr().await?;
+        let rendered_msg = mf.render(bob, &addr).await?;
         let mime = MimeMessage::from_bytes(alice, rendered_msg.message.as_bytes()).await?;
         Ok(mime.autocrypt_fingerprint.is_some())
     }
@@ -644,7 +647,8 @@ async fn test_render_reply() {
     let recipients = mimefactory.recipients();
     assert_eq!(recipients, vec!["charlie@example.net"]);
 
-    let rendered_msg = mimefactory.render(t).await.unwrap();
+    let addr = t.get_primary_self_addr().await.unwrap();
+    let rendered_msg = mimefactory.render(t, &addr).await.unwrap();
 
     let mail = mailparse::parse_mail(rendered_msg.message.as_bytes()).unwrap();
     assert_eq!(
@@ -709,9 +713,9 @@ async fn test_remove_member_bcc() -> Result<()> {
     let charlie = &tcm.charlie().await;
     alice.allow_unencrypted().await?;
 
-    let alice_addr = alice.get_config(Config::Addr).await?.unwrap();
-    let bob_addr = bob.get_config(Config::Addr).await?.unwrap();
-    let charlie_addr = charlie.get_config(Config::Addr).await?.unwrap();
+    let alice_addr = alice.get_config(Config::ConfiguredAddr).await?.unwrap();
+    let bob_addr = bob.get_config(Config::ConfiguredAddr).await?.unwrap();
+    let charlie_addr = charlie.get_config(Config::ConfiguredAddr).await?.unwrap();
 
     let bob_id = alice.add_or_lookup_address_contact_id(bob).await;
     let charlie_id = alice.add_or_lookup_address_contact_id(charlie).await;
@@ -874,7 +878,7 @@ async fn test_new_member_is_first_recipient() -> Result<()> {
     assert!(
         sent_msg
             .recipients
-            .starts_with(&charlie.get_config(Config::Addr).await?.unwrap())
+            .starts_with(&charlie.get_config(Config::ConfiguredAddr).await?.unwrap())
     );
 
     remove_contact_from_chat(alice, group, bob_id).await?;
@@ -885,7 +889,7 @@ async fn test_new_member_is_first_recipient() -> Result<()> {
     assert!(
         sent_msg
             .recipients
-            .starts_with(&bob.get_config(Config::Addr).await?.unwrap())
+            .starts_with(&bob.get_config(Config::ConfiguredAddr).await?.unwrap())
     );
     Ok(())
 }

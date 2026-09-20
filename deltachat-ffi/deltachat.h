@@ -453,18 +453,9 @@ char*           dc_get_blobdir               (const dc_context_t* context);
  *                    always auto-downloaded.
  *                    0 = no limit (default).
  *                    Changes affect future messages only.
- * - `protect_autocrypt` = Enable Header Protection for Autocrypt header.
- *                    This is an experimental option not compatible to other MUAs
- *                    and older Delta Chat versions.
- *                    1 = enable.
- *                    0 = disable (default).
  * - `gossip_period` = How often to gossip Autocrypt keys in chats with multiple recipients, in
  *                    seconds. 2 days by default.
  *                    This is not supposed to be changed by UIs and only used for testing.
- * - `is_chatmail`  = (deprecated) 1 if the the server is a chatmail server, 0 otherwise.
- *                    This is deprecated, UIs should not behave differently
- *                    for chatmail relays and classical email servers.
- *                    Most usages in UIs can be replaced by `force_encryption`.
  * - `is_muted`     = Whether a context is muted by the user.
  *                    Muted contexts should not sound, vibrate or show notifications.
  *                    In contrast to `dc_set_chat_mute_duration()`,
@@ -526,9 +517,10 @@ int             dc_set_config                (dc_context_t* context, const char*
  *
  * - `sys.version` = get the version string e.g. as `1.2.3` or as `1.2.3special4`.
  * - `sys.msgsize_max_recommended` = maximal recommended attachment size in bytes.
- *                    All possible overheads are already subtracted and this value can be used e.g. for direct comparison
- *                    with the size of a file the user wants to attach. If an attachment is larger than this value,
- *                    an error (no warning as it should be shown to the user) is logged but the attachment is sent anyway.
+ *                    All possible overheads are already subtracted and this value can be used
+ *                    e.g. for direct comparison with the size of a file the user wants to attach.
+ *                    If an attachment is larger than this value, the message is sent anyway,
+ *                    but email servers are likely to reject the message when receiving it or before trying to send.
  * - `sys.config_keys` = get a space-separated list of all config-keys available.
  *                    The config-keys are the keys that can be passed to the parameter `key` of this function.
  *
@@ -694,6 +686,21 @@ char*           dc_get_connectivity_html     (dc_context_t* context);
  * ~~~
  */
 void            dc_configure                 (dc_context_t* context);
+
+
+/**
+ * Add fake transport that cannot be used to connect.
+ *
+ * Used for offline tests only.
+ *
+ * To add a transport, use JSON-RPC calls `add_or_update_transport`
+ * and `add_transport_from_qr` instead.
+ *
+ * @memberof dc_context_t
+ * @param context The context object.
+ * @param addr The email address of the new transport.
+ */
+void            dc_add_pseudo_transport      (dc_context_t* context, const char *addr);
 
 
 /**
@@ -1777,8 +1784,6 @@ int             dc_is_contact_in_chat        (dc_context_t* context, uint32_t ch
  * If the group is already _promoted_ (any message was sent to the group),
  * all group members are informed by a special status message that is sent automatically by this function.
  *
- * If the group has group protection enabled, only verified contacts can be added to the group.
- *
  * Sends out #DC_EVENT_CHAT_MODIFIED and #DC_EVENT_MSGS_CHANGED if a status message was sent.
  *
  * @memberof dc_context_t
@@ -2277,7 +2282,7 @@ void            dc_block_contact             (dc_context_t* context, uint32_t co
 /**
  * Get encryption info for a contact.
  * Get a multi-line encryption info, containing your fingerprint and the
- * fingerprint of the contact, used e.g. to compare the fingerprints for a simple out-of-band verification.
+ * fingerprint of the contact, used e.g. to compare the fingerprints out-of-band.
  *
  * @memberof dc_context_t
  * @param context The context object.
@@ -2444,7 +2449,7 @@ char*           dc_imex_has_backup           (dc_context_t* context, const char*
 void            dc_stop_ongoing_process      (dc_context_t* context);
 
 
-// out-of-band verification
+// securejoin
 
 #define         DC_QR_ASK_VERIFYCONTACT      200 // id=contact
 #define         DC_QR_ASK_VERIFYGROUP        202 // text1=groupname
@@ -2479,7 +2484,7 @@ void            dc_stop_ongoing_process      (dc_context_t* context);
  * The QR code state is returned in dc_lot_t::state as:
  *
  * - DC_QR_ASK_VERIFYCONTACT with dc_lot_t::id=Contact ID:
- *   ask whether to verify the contact;
+ *   ask whether to start chatting with the contact;
  *   if so, start the protocol with dc_join_securejoin().
  *
  * - DC_QR_ASK_VERIFYGROUP or DC_QR_ASK_VERIFYBROADCAST
@@ -2488,7 +2493,7 @@ void            dc_stop_ongoing_process      (dc_context_t* context);
  *   if so, start the protocol with dc_join_securejoin().
  *
  * - DC_QR_FPR_OK with dc_lot_t::id=Contact ID:
- *   contact fingerprint verified,
+ *   contact fingerprint matches,
  *   ask the user if they want to start chatting;
  *   if so, call dc_create_chat_by_contact_id().
  *
@@ -2564,23 +2569,24 @@ dc_lot_t*       dc_check_qr                  (dc_context_t* context, const char*
 
 
 /**
- * Get QR code text that will offer an Setup-Contact or Verified-Group invitation.
+ * Get QR code text that will offer a SecureJoin invitation.
  *
  * The scanning device will pass the scanned content to dc_check_qr() then;
  * if dc_check_qr() returns
  * DC_QR_ASK_VERIFYCONTACT, DC_QR_ASK_VERIFYGROUP or DC_QR_ASK_VERIFYBROADCAST
- * an out-of-band-verification can be joined using dc_join_securejoin()
+ * the SecureJoin protocol can be started using dc_join_securejoin()
  *
  * The returned text will also work as a normal https:-link,
  * so that the QR code is useful also without Delta Chat being installed
  * or can be passed to contacts through other channels.
  *
+ * To reset invitations, pass the link to dc_set_config_from_qr().
+ *
  * @memberof dc_context_t
  * @param context The context object.
  * @param chat_id If set to a group-chat-id,
- *     the Verified-Group-Invite protocol is offered in the QR code;
- *     works for protected groups as well as for normal groups.
- *     If set to 0, the Setup-Contact protocol is offered in the QR code.
+ *     the SecureJoin QR code for the group is returned.
+ *     If set to 0, the setup contact QR code is returned.
  *     See https://securejoin.delta.chat/
  *     for details about both protocols.
  * @return The text that should go to the QR code,
@@ -2606,7 +2612,7 @@ char*           dc_get_securejoin_qr         (dc_context_t* context, uint32_t ch
 char*           dc_get_securejoin_qr_svg         (dc_context_t* context, uint32_t chat_id);
 
 /**
- * Continue a Setup-Contact or Verified-Group-Invite protocol
+ * Continue the SecureJoin protocol
  * started on another device with dc_get_securejoin_qr().
  * This function is typically called when dc_check_qr() returns
  * lot.state=DC_QR_ASK_VERIFYCONTACT, lot.state=DC_QR_ASK_VERIFYGROUP or lot.state=DC_QR_ASK_VERIFYBROADCAST
@@ -3187,19 +3193,33 @@ void           dc_accounts_maybe_network_lost    (dc_accounts_t* accounts);
 
 /**
  * Perform a background fetch for all accounts in parallel with a timeout.
- * Pauses the scheduler, fetches messages from imap and then resumes the scheduler.
  *
- * dc_accounts_background_fetch() was created for the iOS Background fetch.
+ * For an account with IO stopped, the scheduler is paused
+ * and every transport is fetched concurrently on a dedicated connection.
+ * The account is done as soon as one transport received messages, the others stop.
+ * Only one batch of messages is fetched per transport this way,
+ * so a larger backlog is left to the next call or to started IO.
  *
- * The `DC_EVENT_ACCOUNTS_BACKGROUND_FETCH_DONE` event is emitted at the end
- * even in case of timeout, unless the function fails and returns 0.
+ * For an account with IO running, IMAP IDLE is interrupted on every transport
+ * and the account is done once every transport is.
+ *
+ * The call never waits for outgoing messages and never triggers sending them itself.
+ * Received messages may still queue replies, securejoin handshakes for example,
+ * which go out only while IO is running.
+ *
+ * The `DC_EVENT_ACCOUNTS_BACKGROUND_FETCH_DONE` event is emitted at the end,
+ * also on timeout, when another background fetch is already running
+ * and when the call is ignored because the timeout is too small,
+ * so it is safe to wait for the event whenever `accounts` is not NULL.
  * Process all events until you get this one and you can safely return to the background
- * without forgetting to create notifications caused by timing race conditions.
+ * without forgetting to create a generic notification if no message was fetched.
+ * The event carries no data identifying the call it belongs to,
+ * so it marks your own call only if no concurrent background fetch is happening.
  *
  * @memberof dc_accounts_t
  * @param accounts The account manager as created by dc_accounts_new().
  * @param timeout The timeout in seconds
- * @return Return 1 if DC_EVENT_ACCOUNTS_BACKGROUND_FETCH_DONE was emitted and 0 otherwise.
+ * @return Return 0 if the call was ignored because `accounts` is NULL or the timeout is too small, 1 otherwise.
  */
 int            dc_accounts_background_fetch    (dc_accounts_t* accounts, uint64_t timeout);
 
@@ -3569,7 +3589,6 @@ dc_lot_t*        dc_chatlist_get_summary2    (dc_context_t* context, uint32_t ch
  * last-message-state: @ref DC_STATE constant
  * last-message-date:
  * avatar-path: path-to-blobfile
- * is_verified: yes/no
  * @return a UTF8-encoded JSON string containing all requested info. Must be freed using dc_str_unref(). NULL is never returned.
  */
 char*            dc_chat_get_info_json       (dc_context_t* context, size_t chat_id);
@@ -4909,7 +4928,6 @@ char*           dc_msg_get_poi_location       (dc_msg_t* msg);
  * By default, these names are equal,
  * but functions working with contact names
  * (e.g. dc_contact_get_name(), dc_contact_get_display_name(),
- * dc_contact_get_name_n_addr(),
  * dc_create_contact() or dc_add_address_book())
  * only affect the given-name.
  */
@@ -4959,7 +4977,7 @@ char*           dc_contact_get_addr          (const dc_contact_t* contact);
  * The function does not return the contact name as received from the network.
  *
  * This name is typically used in a form where the user can edit the name of a contact.
- * To get a fine name to display in lists etc., use dc_contact_get_display_name() or dc_contact_get_name_n_addr().
+ * To get a fine name to display in lists etc., use dc_contact_get_display_name().
  *
  * @memberof dc_contact_t
  * @param contact The contact object.
@@ -5012,23 +5030,6 @@ char*           dc_contact_get_display_name  (const dc_contact_t* contact);
 // dc_contact_get_first_name is removed,
 // the following define is to make upgrading more smoothly.
 #define         dc_contact_get_first_name    dc_contact_get_display_name
-
-
-/**
- * Get a summary of name and address.
- *
- * The returned string is either "Name (email@domain.com)" or just
- * "email@domain.com" if the name is unset.
- *
- * The summary is typically used when asking the user something about the contact.
- * The attached e-mail address makes the question unique, e.g. "Chat with Alan Miller (am@uniquedomain.com)?"
- *
- * @memberof dc_contact_t
- * @param contact The contact object.
- * @return A summary string, must be released using dc_str_unref().
- *     Never returns NULL.
- */
-char*           dc_contact_get_name_n_addr   (const dc_contact_t* contact);
 
 
 /**
@@ -5111,19 +5112,6 @@ int             dc_contact_is_blocked        (const dc_contact_t* contact);
 
 
 /**
- * Check if the contact
- * can be added to protected chats.
- *
- * See dc_contact_get_verifier_id() for a guidance how to display these information.
- *
- * @memberof dc_contact_t
- * @param contact The contact object.
- * @return 0: contact is not verified.
- *    2: SELF and contact have verified their fingerprints in both directions.
- */
-int             dc_contact_is_verified       (dc_contact_t* contact);
-
-/**
  * Returns whether contact is a bot.
  *
  * @memberof dc_contact_t
@@ -5145,36 +5133,6 @@ int             dc_contact_is_bot            (dc_contact_t* contact);
  * @return 1 if the contact is a key-contact, 0 if it is an address-contact.
  */
 int             dc_contact_is_key_contact    (dc_contact_t* contact);
-
-
-/**
- * Return the contact ID that verified a contact.
- *
- * As verifier may be unknown,
- * use dc_contact_is_verified() to check if a contact can be added to a protected chat.
- *
- * UI should display the information in the contact's profile as follows:
- *
- * - If dc_contact_get_verifier_id() != 0,
- *   display text "Introduced by ..."
- *   with the name of the contact
- *   formatted by dc_contact_get_name().
- *   Prefix the text by a green checkmark.
- *
- * - If dc_contact_get_verifier_id() == 0 and dc_contact_is_verified() != 0,
- *   display "Introduced" prefixed by a green checkmark.
- *
- * - if dc_contact_get_verifier_id() == 0 and dc_contact_is_verified() == 0,
- *   display nothing
- *
- * @memberof dc_contact_t
- * @param contact The contact object.
- * @return 
- *    The contact ID of the verifier. If it is DC_CONTACT_ID_SELF,
- *    we verified the contact ourself. If it is 0, we don't have verifier information or 
- *    the contact is not verified.
- */
-uint32_t       dc_contact_get_verifier_id      (dc_contact_t* contact);
 
 
 /**
@@ -6207,7 +6165,7 @@ void dc_event_unref(dc_event_t* event);
 
 
 /**
- * Contact(s) created, renamed, verified, blocked or deleted.
+ * Contact(s) created, renamed, blocked or deleted.
  *
  * @param data1 (int) contact_id of the changed contact or 0 on batch-changes or deletion.
  * @param data2 0
@@ -6279,8 +6237,7 @@ void dc_event_unref(dc_event_t* event);
  *
  * @param data1 (int) The ID of the inviting contact.
  * @param data2 (int) The progress as:
- *     400=vg-/vc-request-with-auth sent, typically shown as "alice@addr verified, introducing myself."
- *     (Bob has verified alice and waits until Alice does the same for him)
+ *     400=vg-/vc-request-with-auth sent, typically shown as "introducing myself."
  *     1000=vg-member-added/vc-contact-confirm received
  */
 #define DC_EVENT_SECUREJOIN_JOINER_PROGRESS       2061
@@ -6363,11 +6320,18 @@ void dc_event_unref(dc_event_t* event);
 #define DC_EVENT_WEBXDC_REALTIME_ADVERTISEMENT    2151
 
 /**
- * Tells that the Background fetch was completed (or timed out).
+ * Tells that a call to dc_accounts_background_fetch() is done:
+ * the fetch completed, timed out, was stopped or was not started.
  *
- * This event acts as a marker, when you reach this event you can be sure
- * that all events emitted during the background fetch were processed.
- * 
+ * For the call that started the fetch, this event acts as a marker:
+ * when you reach it, all events emitted during the fetch were processed.
+ * A call made while another background fetch is running gets the event immediately,
+ * and the running fetch keeps emitting events until its own marker.
+ *
+ * The event carries no data identifying the call it belongs to,
+ * so it marks your own call only if no concurrent background fetch is happening.
+ * Your own call has finished when dc_accounts_background_fetch() returns.
+ *
  * This event is only emitted by the account manager
  */
 
@@ -6663,12 +6627,6 @@ void dc_event_unref(dc_event_t* event);
 /// Used to build the string returned by dc_get_contact_encrinfo().
 #define DC_STR_FINGERPRINTS               30
 
-/// "%1$s verified"
-///
-/// Used in status messages.
-/// - %1$s will be replaced by the name of the verified contact
-#define DC_STR_CONTACT_VERIFIED           35
-
 /// "Archived chats"
 ///
 /// Used as the name for the corresponding chatlist entry.
@@ -6847,7 +6805,7 @@ void dc_event_unref(dc_event_t* event);
 ///
 /// Added as an info-message directly after scanning a QR code for joining a group.
 /// May be followed by the info-messages
-/// #DC_STR_SECURE_JOIN_REPLIES, #DC_STR_CONTACT_VERIFIED and #DC_STR_MSGADDMEMBER.
+/// #DC_STR_SECURE_JOIN_REPLIES and #DC_STR_MSGADDMEMBER.
 ///
 /// `%1$s` and `%2$s` will be replaced by name of the inviter.
 #define DC_STR_SECURE_JOIN_STARTED        117
@@ -6856,15 +6814,13 @@ void dc_event_unref(dc_event_t* event);
 ///
 /// Info-message on scanning a QR code for joining a group.
 /// Added after #DC_STR_SECURE_JOIN_STARTED.
-/// If the handshake allows to skip a step and go for #DC_STR_CONTACT_VERIFIED directly,
-/// this info-message is skipped.
 ///
 /// `%1$s` will be replaced by the name of the inviter.
 #define DC_STR_SECURE_JOIN_REPLIES        118
 
 /// "Scan to chat with %1$s"
 ///
-/// Subtitle for verification qrcode svg image generated by the core.
+/// Subtitle for the invite qrcode svg image generated by the core.
 ///
 /// `%1$s` will be replaced by name of the inviter.
 #define DC_STR_SETUP_CONTACT_QR_DESC      119

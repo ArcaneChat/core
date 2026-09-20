@@ -31,6 +31,7 @@ use deltachat::key::preconfigure_keypair;
 use deltachat::message::MsgId;
 use deltachat::qr_code_generator::{create_qr_svg, generate_backup_qr, get_securejoin_qr_svg};
 use deltachat::stock_str::StockMessage;
+use deltachat::transport::add_pseudo_transport;
 use deltachat::webxdc::StatusUpdateSerial;
 use deltachat::*;
 use deltachat::{accounts::Accounts, log::LogExt};
@@ -412,6 +413,21 @@ pub unsafe extern "C" fn dc_configure(context: *mut dc_context_t) {
 
     let ctx = unsafe { &*context };
     spawn_configure(ctx.clone());
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dc_add_pseudo_transport(
+    context: *mut dc_context_t,
+    addr: *const libc::c_char,
+) {
+    if context.is_null() {
+        eprintln!("ignoring careless call to dc_add_pseudo_transport()");
+        return;
+    }
+
+    let ctx = unsafe { &*context };
+    let addr = to_string_lossy(addr);
+    block_on(add_pseudo_transport(ctx, &addr)).log_err(ctx).ok();
 }
 
 #[unsafe(no_mangle)]
@@ -2397,7 +2413,7 @@ pub unsafe extern "C" fn dc_get_securejoin_qr_svg(
     chat_id: u32,
 ) -> *mut libc::c_char {
     if context.is_null() {
-        eprintln!("ignoring careless call to generate_verification_qr()");
+        eprintln!("ignoring careless call to dc_get_securejoin_qr_svg()");
         return "".strdup();
     }
     let ctx = unsafe { &*context };
@@ -3974,18 +3990,6 @@ pub unsafe extern "C" fn dc_contact_get_display_name(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn dc_contact_get_name_n_addr(
-    contact: *mut dc_contact_t,
-) -> *mut libc::c_char {
-    if contact.is_null() {
-        eprintln!("ignoring careless call to dc_contact_get_name_n_addr()");
-        return "".strdup();
-    }
-    let ffi_contact = unsafe { &*contact };
-    ffi_contact.contact.get_name_n_addr().strdup()
-}
-
-#[unsafe(no_mangle)]
 pub unsafe extern "C" fn dc_contact_get_profile_image(
     contact: *mut dc_contact_t,
 ) -> *mut libc::c_char {
@@ -4060,27 +4064,6 @@ pub unsafe extern "C" fn dc_contact_is_blocked(contact: *mut dc_contact_t) -> li
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn dc_contact_is_verified(contact: *mut dc_contact_t) -> libc::c_int {
-    if contact.is_null() {
-        eprintln!("ignoring careless call to dc_contact_is_verified()");
-        return 0;
-    }
-    let ffi_contact = unsafe { &*contact };
-
-    if block_on(ffi_contact.contact.is_verified(&ffi_contact.context))
-        .context("is_verified failed")
-        .log_err(&ffi_contact.context)
-        .unwrap_or_default()
-    {
-        // Return value is essentially a boolean,
-        // but we return 2 for true for backwards compatibility.
-        2
-    } else {
-        0
-    }
-}
-
-#[unsafe(no_mangle)]
 pub unsafe extern "C" fn dc_contact_is_bot(contact: *mut dc_contact_t) -> libc::c_int {
     if contact.is_null() {
         eprintln!("ignoring careless call to dc_contact_is_bot()");
@@ -4098,22 +4081,6 @@ pub unsafe extern "C" fn dc_contact_is_key_contact(contact: *mut dc_contact_t) -
     unsafe { (*contact).contact.is_key_contact() as libc::c_int }
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn dc_contact_get_verifier_id(contact: *mut dc_contact_t) -> u32 {
-    if contact.is_null() {
-        eprintln!("ignoring careless call to dc_contact_get_verifier_id()");
-        return 0;
-    }
-    let ffi_contact = unsafe { &*contact };
-    let verifier_contact_id = block_on(ffi_contact.contact.get_verifier_id(&ffi_contact.context))
-        .context("failed to get verifier")
-        .log_err(&ffi_contact.context)
-        .unwrap_or_default()
-        .unwrap_or_default()
-        .unwrap_or_default();
-
-    verifier_contact_id.to_u32()
-}
 // dc_lot_t
 
 pub type dc_lot_t = lot::Lot;
@@ -4760,12 +4727,17 @@ pub unsafe extern "C" fn dc_accounts_background_fetch(
     accounts: *const dc_accounts_t,
     timeout_in_seconds: u64,
 ) -> libc::c_int {
-    if accounts.is_null() || timeout_in_seconds <= 2 {
+    if accounts.is_null() {
         eprintln!("ignoring careless call to dc_accounts_background_fetch()");
         return 0;
     }
 
     let accounts = unsafe { &*accounts };
+    if timeout_in_seconds <= 2 {
+        eprintln!("ignoring careless call to dc_accounts_background_fetch(): timeout too small");
+        block_on(accounts.read()).emit_event(EventType::AccountsBackgroundFetchDone);
+        return 0;
+    }
     let background_fetch_future = {
         let lock = block_on(accounts.read());
         lock.background_fetch(Duration::from_secs(timeout_in_seconds))

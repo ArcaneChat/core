@@ -15,11 +15,11 @@ use crate::headerdef::HeaderDefMap as _;
 use crate::imap::prefetch_should_download;
 use crate::imex::{ImexMode, imex};
 use crate::key;
+use crate::mimefactory;
 use crate::securejoin::get_securejoin_qr;
+use crate::smtp;
 use crate::test_utils;
-use crate::test_utils::{
-    TestContext, TestContextManager, alice_keypair, get_chat_msg, mark_as_verified,
-};
+use crate::test_utils::{TestContext, TestContextManager, alice_keypair, get_chat_msg};
 use crate::tools::{SystemTime, time};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2733,7 +2733,8 @@ async fn test_read_receipts_dont_create_chats() -> Result<()> {
         vec![],
     )
     .await?;
-    let rendered_mdn = mdn_mimefactory.render(&bob).await?;
+    let bob_addr = bob.get_primary_self_addr().await?;
+    let rendered_mdn = mdn_mimefactory.render(&bob, &bob_addr).await?;
     let mdn_body = rendered_mdn.message;
 
     // Alice receives the read receipt.
@@ -2768,7 +2769,8 @@ async fn test_read_receipts_dont_unmark_bots() -> Result<()> {
         vec![],
     )
     .await?;
-    let rendered_mdn = mdn_mimefactory.render(bob).await?;
+    let bob_addr = bob.get_primary_self_addr().await?;
+    let rendered_mdn = mdn_mimefactory.render(bob, &bob_addr).await?;
     let mdn_body = rendered_mdn.message;
 
     // Alice receives the read receipt.
@@ -3164,13 +3166,11 @@ async fn test_auto_accept_group_for_bots() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_auto_accept_protected_group_for_bots() -> Result<()> {
+async fn test_auto_accept_encrypted_group_for_bots() -> Result<()> {
     let mut tcm = TestContextManager::new();
     let alice = &tcm.alice().await;
     let bob = &tcm.bob().await;
     bob.set_config(Config::Bot, Some("1")).await.unwrap();
-    mark_as_verified(alice, bob).await;
-    mark_as_verified(bob, alice).await;
     let group_id = alice.create_group_with_members("Group", &[bob]).await;
     let sent = alice.send_text(group_id, "Hello!").await;
     let msg = bob.recv_msg(&sent).await;
@@ -3180,21 +3180,13 @@ async fn test_auto_accept_protected_group_for_bots() -> Result<()> {
 }
 
 /// Regression test for a bug where receive_imf() failed
-/// if the sender of a verification-gossiping message
+/// if the sender of a gossiping message
 /// also put itself into the To header.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_verification_gossip() -> Result<()> {
+async fn test_gossip_sender_in_to_header() -> Result<()> {
     let mut tcm = TestContextManager::new();
-    let alice = &tcm.alice().await;
     let bob = &tcm.bob().await;
-    let fiona = &tcm.fiona().await;
 
-    mark_as_verified(alice, bob).await;
-    mark_as_verified(bob, alice).await;
-
-    // This is message sent by Alice with verified encryption
-    // that gossips Fiona's verification,
-    // and for some reason, Alice also put herself into the To: header.
     let imf_raw =
         include_bytes!("../../test-data/message/verification-gossip-also-sent-to-from.eml");
 
@@ -3202,12 +3194,6 @@ async fn test_verification_gossip() -> Result<()> {
     let msg = receive_imf(bob, imf_raw, false).await?.unwrap();
     let msg = Message::load_from_db(bob, msg.msg_ids[0]).await?;
     assert_eq!(msg.text, "Hello!");
-    assert!(
-        bob.add_or_lookup_contact(fiona)
-            .await
-            .is_verified(bob)
-            .await?
-    );
 
     Ok(())
 }
@@ -3863,7 +3849,7 @@ async fn test_unsigned_chat_group_hdr() -> Result<()> {
     let mut tcm = TestContextManager::new();
     let alice = &tcm.alice().await;
     let bob = &tcm.bob().await;
-    let bob_addr = bob.get_config(Config::Addr).await?.unwrap();
+    let bob_addr = bob.get_config(Config::ConfiguredAddr).await?.unwrap();
     let bob_id = alice.add_or_lookup_contact_id(bob).await;
     let alice_chat_id = create_group(alice, "foos").await?;
     add_contact_to_chat(alice, alice_chat_id, bob_id).await?;
@@ -4551,7 +4537,7 @@ async fn test_outgoing_msg_forgery() -> Result<()> {
     let mut tcm = TestContextManager::new();
     let export_dir = tempfile::tempdir().unwrap();
     let alice = &tcm.alice().await;
-    let alice_addr = &alice.get_config(Config::Addr).await?.unwrap();
+    let alice_addr = &alice.get_config(Config::ConfiguredAddr).await?.unwrap();
     imex(alice, ImexMode::ExportSelfKeys, export_dir.path(), None).await?;
     // We need Bob only to encrypt the forged message to Alice's key, actually Bob doesn't
     // participate in the scenario.
@@ -4626,11 +4612,10 @@ async fn test_pre_msg_group_consistency() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_protected_group_add_remove_member_missing_key() -> Result<()> {
+async fn test_group_add_remove_member_missing_key() -> Result<()> {
     let mut tcm = TestContextManager::new();
     let alice = &tcm.alice().await;
     let bob = &tcm.bob().await;
-    mark_as_verified(alice, bob).await;
     let group_id = create_group(alice, "Group").await?;
     let alice_bob_id = alice.add_or_lookup_contact(bob).await.id;
     add_contact_to_chat(alice, group_id, alice_bob_id).await?;
@@ -4638,7 +4623,6 @@ async fn test_protected_group_add_remove_member_missing_key() -> Result<()> {
     alice.sql.execute("DELETE FROM public_keys", ()).await?;
 
     let fiona = &tcm.fiona().await;
-    mark_as_verified(alice, fiona).await;
     let alice_fiona_id = alice.add_or_lookup_contact(fiona).await.id;
     add_contact_to_chat(alice, group_id, alice_fiona_id).await?;
 
@@ -5131,7 +5115,7 @@ async fn test_rename_chat_after_creating_invite() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_unverified_member_msg() -> Result<()> {
+async fn test_member_msg_downloaded() -> Result<()> {
     let mut tcm = TestContextManager::new();
     let alice = &tcm.alice().await;
     let bob = &tcm.bob().await;
@@ -5146,94 +5130,9 @@ async fn test_unverified_member_msg() -> Result<()> {
     let fiona_chat_id = fiona.get_last_msg().await.chat_id;
     let fiona_sent_msg = fiona.send_text(fiona_chat_id, "Hi").await;
 
-    // The message is by non-verified member,
-    // but the checks have been removed
-    // and the message should be downloaded as usual.
     let bob_msg = bob.recv_msg(&fiona_sent_msg).await;
     assert_eq!(bob_msg.download_state, DownloadState::Done);
     assert_eq!(bob_msg.text, "Hi");
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_dont_reverify_by_self_on_outgoing_msg() -> Result<()> {
-    let mut tcm = TestContextManager::new();
-    let a0 = &tcm.alice().await;
-    let a1 = &tcm.alice().await;
-    let bob = &tcm.bob().await;
-    let fiona = &tcm.fiona().await;
-
-    let bob_chat_id = chat::create_group(bob, "Group").await?;
-    bob.set_chat_protected(bob_chat_id).await;
-    let qr = get_securejoin_qr(bob, Some(bob_chat_id)).await?;
-    tcm.exec_securejoin_qr(fiona, bob, &qr).await;
-    tcm.exec_securejoin_qr(a0, bob, &qr).await;
-    tcm.exec_securejoin_qr(a1, bob, &qr).await;
-
-    // Shift time by one week to trigger gossip.
-    SystemTime::shift(Duration::from_secs(7 * 24 * 3600));
-
-    let a0_chat_id = a0.get_last_msg().await.chat_id;
-    let a0_sent_msg = a0.send_text(a0_chat_id, "Hi").await;
-    a1.recv_msg(&a0_sent_msg).await;
-    let a1_bob_id = a1.add_or_lookup_contact_id(bob).await;
-    let a1_fiona = a1.add_or_lookup_contact(fiona).await;
-    assert_eq!(
-        a1_fiona.get_verifier_id(a1).await?.unwrap().unwrap(),
-        a1_bob_id
-    );
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_dont_verify_by_verified_by_unknown() -> Result<()> {
-    let mut tcm = TestContextManager::new();
-    let a0 = &tcm.alice().await;
-    let a1 = &tcm.alice().await;
-    let bob = &tcm.bob().await;
-    let fiona = &tcm.fiona().await;
-
-    let bob_chat_id = chat::create_group(bob, "Group").await?;
-    bob.set_chat_protected(bob_chat_id).await;
-    let qr = get_securejoin_qr(bob, Some(bob_chat_id)).await?;
-    tcm.exec_securejoin_qr(a0, bob, &qr).await;
-
-    let qr = get_securejoin_qr(bob, None).await?;
-    tcm.exec_securejoin_qr(fiona, bob, &qr).await;
-
-    // Bob verifies Fiona for Alice#0.
-    let bob_fiona_id = bob.add_or_lookup_contact_id(fiona).await;
-    add_contact_to_chat(bob, bob_chat_id, bob_fiona_id).await?;
-    let sent_msg = bob.pop_sent_msg().await;
-    a0.recv_msg(&sent_msg).await;
-    fiona.recv_msg(&sent_msg).await;
-    let a0_bob = a0.add_or_lookup_contact(bob).await;
-    let a0_fiona = a0.add_or_lookup_contact(fiona).await;
-    assert_eq!(a0_fiona.get_verifier_id(a0).await?, Some(Some(a0_bob.id)));
-
-    let chat_id = a0.create_group_with_members("group", &[fiona]).await;
-    a0.set_chat_protected(chat_id).await;
-    a1.recv_msg(&a0.send_text(chat_id, "Hi").await).await;
-    let a1_fiona = a1.add_or_lookup_contact(fiona).await;
-    assert_eq!(a1_fiona.get_verifier_id(a1).await?, Some(None));
-
-    let some_time_to_regossip = Duration::from_secs(20 * 24 * 3600);
-    SystemTime::shift(some_time_to_regossip);
-    let fiona_chat_id = fiona.get_last_msg().await.chat_id;
-    fiona.set_chat_protected(fiona_chat_id).await;
-    a1.recv_msg(&fiona.send_text(fiona_chat_id, "Hi").await)
-        .await;
-    let a1_bob = a1.add_or_lookup_contact(bob).await;
-    // There was a bug that Bob is verified by Fiona on Alice's other device.
-    assert_eq!(a1_bob.get_verifier_id(a1).await?, Some(None));
-
-    SystemTime::shift(some_time_to_regossip);
-    tcm.execute_securejoin(a1, fiona).await;
-    a1.recv_msg(&fiona.send_text(fiona_chat_id, "Hi").await)
-        .await;
-    // But now Bob's verifier id must be updated because Fiona is verified by a known verifier
-    // (moreover, directly), so Alice has reverse verification chains on her devices.
-    assert_eq!(a1_bob.get_verifier_id(a1).await?, Some(Some(a1_fiona.id)));
     Ok(())
 }
 
@@ -5735,7 +5634,7 @@ async fn test_bcc_not_a_group() -> Result<()> {
 async fn test_lookup_key_contact_by_address_self() -> Result<()> {
     let mut tcm = TestContextManager::new();
     let t = &tcm.alice().await;
-    let addr = &t.get_config(Config::Addr).await?.unwrap();
+    let addr = &t.get_config(Config::ConfiguredAddr).await?.unwrap();
     assert_eq!(
         lookup_key_contact_by_address(t, addr, None).await?,
         Some(ContactId::SELF)
@@ -5788,7 +5687,7 @@ async fn test_outgoing_determined_by_signature() -> Result<()> {
     alice_dev2.configure_addr(different_from).await;
     key::store_self_keypair(alice_dev2, &alice_keypair()).await?;
     assert_ne!(
-        alice.get_config(Config::Addr).await?.unwrap(),
+        alice.get_config(Config::ConfiguredAddr).await?.unwrap(),
         different_from
     );
 
@@ -5847,15 +5746,32 @@ async fn test_mark_message_as_delivered_only_after_sent_out_fully() -> Result<()
 /// This simulates the case that a message is successfully sent out,
 /// but the 'OK' answer from the server doesn't arrive,
 /// so that the SMTP row stays in the database.
-pub(crate) async fn first_row_in_smtp_queue(alice: &TestContext) -> (MsgId, String) {
-    alice
+pub(crate) async fn first_row_in_smtp_queue(context: &TestContext) -> (MsgId, String) {
+    let (rowid, msg_id) = context
         .sql
-        .query_row_optional("SELECT msg_id, mime FROM smtp ORDER BY id", (), |row| {
-            let msg_id: MsgId = row.get(0)?;
-            let mime: String = row.get(1)?;
-            Ok((msg_id, mime))
-        })
+        .query_row_optional(
+            "SELECT id, msg_id FROM smtp2 ORDER BY id LIMIT 1",
+            (),
+            |row| {
+                let rowid: i64 = row.get(0)?;
+                let msg_id: MsgId = row.get(1)?;
+                Ok((rowid, msg_id))
+            },
+        )
         .await
         .expect("query_row_optional failed")
-        .expect("No SMTP row found")
+        .expect("No SMTP row found");
+    let query_only = true;
+    let queued_mail = context
+        .sql
+        .transaction_ext(query_only, |transaction| {
+            smtp::queue::load_queued_mail(transaction, rowid)
+        })
+        .await
+        .unwrap();
+    let rendered_mail = mimefactory::render_queued_mail_with_context(queued_mail, context)
+        .await
+        .unwrap();
+
+    (msg_id, rendered_mail.message)
 }

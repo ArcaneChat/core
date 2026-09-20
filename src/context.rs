@@ -16,11 +16,11 @@ use tokio::sync::{Mutex, Notify, RwLock};
 
 use crate::chat::{ChatId, get_chat_cnt};
 use crate::config::Config;
-use crate::constants::{self, DC_BACKGROUND_FETCH_QUOTA_CHECK_RATELIMIT, DC_VERSION_STR};
+use crate::constants::{self, DC_VERSION_STR};
 use crate::contact::{Contact, ContactId};
 use crate::debug_logging::DebugLogging;
 use crate::events::{Event, EventEmitter, EventType, Events};
-use crate::imap::{Imap, ServerMetadata};
+use crate::imap::ServerMetadata;
 use crate::log::warn;
 use crate::logged_debug_assert;
 use crate::message::{self, MessageState, MsgId};
@@ -568,20 +568,9 @@ impl Context {
         self.scheduler.maybe_network().await;
     }
 
-    /// Deprecated, we are trying to get rid of this global setting.
-    /// It is possible to configure a profile with both chatmail relays
-    /// and classical email servers.
-    ///
-    /// Returns true if an account is on a chatmail server.
-    pub async fn is_chatmail(&self) -> Result<bool> {
-        self.get_config_bool(Config::IsChatmail).await
-    }
-
-    /// Returns maximum number of recipients a single email can be sent to.
-    pub(crate) async fn get_max_smtp_rcpt_to(&self) -> Result<u32> {
-        let Some((transport_id, param)) = ConfiguredLoginParam::load(self).await? else {
-            bail!("Not configured");
-        };
+    /// Returns maximum number of recipients a single email can be sent to
+    /// over the transport `transport_id`, which sends from `addr`.
+    pub(crate) async fn get_max_smtp_rcpt_to(&self, transport_id: u32, addr: &str) -> Result<u32> {
         let metadata_limit = self
             .metadata
             .read()
@@ -591,19 +580,21 @@ impl Context {
         if let Some(limit) = metadata_limit {
             return Ok(limit);
         }
-        if let Some(limit) =
-            crate::provider::legacy_settings_for_addr(&param.addr)?.max_smtp_rcpt_to
-        {
+        if let Some(limit) = crate::provider::legacy_settings_for_addr(addr)?.max_smtp_rcpt_to {
             return Ok(limit);
         }
         Ok(constants::DEFAULT_MAX_SMTP_RCPT_TO)
     }
 
-    /// Does a single round of fetching from IMAP and returns.
+    /// Does a single round of fetching messages from all transports and returns.
     ///
-    /// Can be used even if I/O is currently stopped.
-    /// If I/O is currently stopped, starts a new IMAP connection
-    /// and fetches from Inbox and DeltaChat folders.
+    /// If IO is stopped, pauses the scheduler and fetches over a dedicated connection
+    /// per transport, returning as soon as one of them fetched messages.
+    /// If IO is running, interrupts IMAP IDLE on all transports
+    /// and waits until they are done fetching.
+    ///
+    /// Does not wait for outgoing messages to be sent out,
+    /// use [`crate::accounts::Accounts::is_sending_finished`] for that.
     pub async fn background_fetch(&self) -> Result<()> {
         if !(self.is_configured().await?) {
             return Ok(());
@@ -614,46 +605,20 @@ impl Context {
             return Ok(());
         }
 
-        let address = self.get_primary_self_addr().await?;
         let time_start = tools::Time::now();
-        info!(self, "background_fetch started fetching {address}.");
+        info!(self, "background_fetch started.");
 
         if self.scheduler.is_running().await {
-            self.scheduler.maybe_network().await;
-            self.wait_for_all_work_done().await;
+            self.scheduler.interrupt_inbox_idle().await;
+            let include_smtp = false;
+            self.wait_for_work_done(include_smtp).await;
         } else {
-            // Pause the scheduler to ensure another connection does not start
-            // while we are fetching on a dedicated connection.
-            let _pause_guard = self.scheduler.pause(self).await?;
-
-            // Start a new dedicated connection.
-            let mut connection = Imap::new_configured(self, channel::bounded(1).1).await?;
-            let mut session = connection.prepare(self).await?;
-
-            // Fetch IMAP folders.
-            let folder = connection.folder.clone();
-            connection
-                .fetch_move_delete(self, &mut session, &folder)
-                .await?;
-
-            // Update quota (to send warning if full) - but only check it once in a while.
-            // note: For now this only checks quota of primary transport,
-            // because background check only checks primary transport at the moment
-            if self
-                .quota_needs_update(
-                    session.transport_id(),
-                    DC_BACKGROUND_FETCH_QUOTA_CHECK_RATELIMIT,
-                )
-                .await
-                && let Err(err) = self.update_recent_quota(&mut session, &folder).await
-            {
-                warn!(self, "Failed to update quota: {err:#}.");
-            }
+            self.scheduler.background_fetch_any(self).await?;
         }
 
         info!(
             self,
-            "background_fetch done for {address} took {:?}.",
+            "background_fetch done, took {:?}.",
             time_elapsed(&time_start),
         );
 
@@ -912,13 +877,6 @@ impl Context {
             res.insert("imap_server_id", format!("{server_id:?}"));
         }
 
-        res.insert("is_chatmail", self.is_chatmail().await?.to_string());
-        res.insert(
-            "fix_is_chatmail",
-            self.get_config_bool(Config::FixIsChatmail)
-                .await?
-                .to_string(),
-        );
         res.insert(
             "is_muted",
             self.get_config_bool(Config::IsMuted).await?.to_string(),

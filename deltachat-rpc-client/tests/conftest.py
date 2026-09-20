@@ -22,8 +22,10 @@ ALL = "1:*"
 class DirectImap:
     """Internal Python-level IMAP handling."""
 
-    def __init__(self, account: Account) -> None:
+    def __init__(self, account: Account, addr=None, password=None) -> None:
         self.account = account
+        self.addr = addr or account.get_config("addr")
+        self.password = password or account.get_config("mail_pw")
         self.logid = account.get_config("displayname") or id(account)
         self._idling = False
         self.connect()
@@ -33,9 +35,9 @@ class DirectImap:
         host = self.account.get_config("configured_mail_server")
         port = 993
 
-        user = self.account.get_config("addr")
+        user = self.addr
         host = user.rsplit("@")[-1]
-        pw = self.account.get_config("mail_pw")
+        pw = self.password
 
         ssl_context = ssl.create_default_context()
         if host.startswith("_"):
@@ -169,7 +171,7 @@ class DirectImap:
         self.conn.append(bytes(msg, encoding="ascii"), folder)
 
     def get_uid_by_message_id(self, message_id) -> str:
-        msgs = [msg.uid for msg in self.conn.fetch(AND(header=Header("MESSAGE-ID", message_id)))]
+        msgs = [msg.uid for msg in self.conn.fetch(AND(header=Header("MESSAGE-ID", message_id)), mark_seen=False)]
         if len(msgs) == 0:
             raise Exception("Did not find message " + message_id + ", maybe you forgot to select the correct folder?")
         return msgs[0]
@@ -178,9 +180,6 @@ class DirectImap:
 class IdleManager:
     def __init__(self, direct_imap) -> None:
         self.direct_imap = direct_imap
-        # fetch latest messages before starting idle so that it only
-        # returns messages that arrive anew
-        self.direct_imap.conn.fetch("1:*")
         self.direct_imap.conn.idle.start()
 
     def check(self, timeout=None) -> list[bytes]:

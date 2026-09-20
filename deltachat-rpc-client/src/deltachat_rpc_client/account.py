@@ -150,9 +150,10 @@ class Account:
         return transports
 
     def bring_online(self):
-        """Start I/O and wait until IMAP becomes IDLE."""
+        """Start I/O, wait until all transports became IDLE and drop the events seen so far."""
         self.start_io()
-        self.wait_for_event(EventType.IMAP_INBOX_IDLE)
+        self._rpc.wait_for_all_work_done(self.id)
+        self.clear_all_events()
 
     def create_contact(self, obj: Union[int, str, Contact, "Account"], name: Optional[str] = None) -> Contact:
         """Create a new Contact or return an existing one.
@@ -271,7 +272,7 @@ class Account:
         return Contact(self, SpecialContactId.SELF)
 
     @property
-    def device_contact(self) -> Chat:
+    def device_contact(self) -> Contact:
         """Account's device contact."""
         return Contact(self, SpecialContactId.DEVICE)
 
@@ -359,7 +360,7 @@ class Account:
         return Chat(self, chat_id)
 
     def secure_join(self, qrdata: str) -> Chat:
-        """Continue a Setup-Contact or Verified-Group-Invite protocol started on another device.
+        """Continue the SecureJoin protocol started on another device.
 
         The function returns immediately and the handshake runs in background, sending
         and receiving several messages.

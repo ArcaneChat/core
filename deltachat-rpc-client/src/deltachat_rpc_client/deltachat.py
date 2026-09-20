@@ -48,6 +48,13 @@ class DeltaChat:
         """Stop ongoing background fetch."""
         self.rpc.stop_background_fetch()
 
+    def wait_for_event(self, event_type=None) -> AttrDict:
+        """Wait until the next account manager event and return it."""
+        while True:
+            next_event = AttrDict(self.rpc.wait_for_event(0))
+            if event_type is None or next_event.kind == event_type:
+                return next_event
+
     def maybe_network(self) -> None:
         """Indicate that the network conditions might have changed."""
         self.rpc.maybe_network()
@@ -67,3 +74,7 @@ class DeltaChat:
     def stop_sending_locations(self) -> None:
         """Stop sending locations to all chats."""
         return self.rpc.stop_sending_locations()
+
+    def is_sending_finished(self) -> bool:
+        """Return true if sending queues of all accounts are empty."""
+        return self.rpc.is_sending_finished()

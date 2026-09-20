@@ -421,7 +421,6 @@ def test_dont_move_sync_msgs(acf, direct_imap):
     addr, password = acf.get_credentials()
     ac1 = acf.get_unconfigured_account()
     ac1.set_config("bcc_self", "1")
-    ac1.set_config("fix_is_chatmail", "1")
     ac1.add_or_update_transport({"addr": addr, "password": password})
     ac1.start_io()
     ac1_direct_imap = direct_imap(ac1)
@@ -1354,6 +1353,22 @@ def test_background_fetch(acf, dc):
             break
 
 
+def test_background_fetch_does_not_wait_for_sending(dc, acf):
+    alice, bob = acf.get_online_accounts(2)
+    alice_chat_bob = alice.create_chat(bob)
+
+    alice.stop_io()
+    text = "x" * 200_000
+    for _ in range(50):
+        alice_chat_bob.send_text(text)
+    assert not dc.is_sending_finished()
+
+    alice.start_io()
+    dc.background_fetch(50)
+    dc.wait_for_event(EventType.ACCOUNTS_BACKGROUND_FETCH_DONE)
+    assert not dc.is_sending_finished()
+
+
 def test_message_exists(acf):
     ac1, ac2 = acf.get_online_accounts(2)
     chat = ac1.create_chat(ac2)
@@ -1435,3 +1450,35 @@ def test_large_message(acf, rpcdata) -> None:
     assert msg.id == msgs_changed_event.msg_id
     snapshot = msg.get_snapshot()
     assert snapshot.text == "Hello World, this message is bigger than 5 bytes"
+
+
+def test_is_sending_finished(dc, acf) -> None:
+    alice, bob = acf.get_online_accounts(2)
+
+    alice_chat_bob = alice.create_chat(bob)
+    bob_chat_alice = bob.create_chat(alice)
+
+    assert dc.is_sending_finished()
+
+    alice_chat_bob.send_text("Hello!")
+    alice.wait_for_event(EventType.SMTP_MESSAGE_SENT)
+
+    assert dc.is_sending_finished()
+
+    alice.stop_io()
+    bob.stop_io()
+
+    bob_chat_alice.send_text("Hello back!")
+    alice_chat_bob.send_text("Hello again!")
+
+    assert not dc.is_sending_finished()
+
+    alice.start_io()
+    alice.wait_for_event(EventType.SMTP_MESSAGE_SENT)
+
+    assert not dc.is_sending_finished()
+
+    bob.start_io()
+    bob.wait_for_event(EventType.SMTP_MESSAGE_SENT)
+
+    assert dc.is_sending_finished()
