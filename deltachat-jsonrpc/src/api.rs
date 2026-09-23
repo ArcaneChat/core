@@ -546,6 +546,18 @@ impl CommandApi {
         ctx.add_transport_from_qr(&qr).await
     }
 
+    /// Adds an initial transport on the chatmail relay that answers fastest
+    /// and lets the profile add further ones in the background.
+    ///
+    /// A `DCACCOUNT:` or `DCLOGIN:` `qr` code adds a single transport
+    /// while securejoin codes add the inviter's relays to the candidates.
+    ///
+    /// Does nothing if the profile already has a transport.
+    async fn init_transports(&self, account_id: u32, qr: Option<String>) -> Result<()> {
+        let ctx = self.get_context(account_id).await?;
+        ctx.init_transports(qr.as_deref()).await
+    }
+
     /// Returns the list of all email accounts that are used as a transport in the current profile.
     /// Use [Self::add_or_update_transport()] to add or change a transport
     /// and [Self::delete_transport()] to remove a transport.

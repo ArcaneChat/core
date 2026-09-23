@@ -31,7 +31,7 @@ use crate::login_param::EnteredCertificateChecks;
 pub use crate::login_param::EnteredLoginParam;
 use crate::net::proxy::ProxyConfig;
 use crate::provider::{self, Protocol, Socket};
-use crate::qr::{login_param_from_account_qr, login_param_from_login_qr};
+use crate::qr::{Qr, check_qr, login_param_from_account_qr, login_param_from_login_qr};
 use crate::smtp::Smtp;
 use crate::sync::Sync::Nosync;
 use crate::tools::time;
@@ -40,27 +40,30 @@ use crate::transport::{
     ConnectionCandidate, delete_transport_row, maybe_update_sending_transport,
     purge_transport_caches, send_sync_transports, transport_addrs,
 };
-use crate::{EventType, stock_str};
+use crate::{EventType, autorelay, stock_str};
 
 /// Maximum number of relays.
 ///
 /// See <https://github.com/chatmail/core/issues/7608>.
 pub(crate) const MAX_RELAYS: usize = 5;
 
-macro_rules! progress {
-    ($context:tt, $progress:expr, $comment:expr) => {
-        assert!(
-            $progress <= 1000,
-            "value in range 0..1000 expected with: 0=error, 1..999=progress, 1000=success"
-        );
-        $context.emit_event($crate::events::EventType::ConfigureProgress {
-            progress: $progress,
-            comment: $comment,
-        });
-    };
-    ($context:tt, $progress:expr) => {
-        progress!($context, $progress, None);
-    };
+tokio::task_local! {
+    pub(crate) static SILENT_PROGRESS: ();
+}
+
+#[track_caller]
+fn emit_progress(ctx: &Context, progress: u16) {
+    assert!(
+        progress <= 1000,
+        "value in range 0..1000 expected with: 0=error, 1..999=progress, 1000=success"
+    );
+    if SILENT_PROGRESS.try_with(|_| ()).is_ok() {
+        return;
+    }
+    ctx.emit_event(EventType::ConfigureProgress {
+        progress,
+        comment: None,
+    });
 }
 
 impl Context {
@@ -124,14 +127,17 @@ impl Context {
     pub(crate) async fn add_transport_inner(&self, param: &mut EnteredLoginParam) -> Result<()> {
         match self.add_transport_unreported(param).await {
             Ok(()) => {
-                progress!(self, 1000);
+                emit_progress(self, 1000);
                 Ok(())
             }
             Err(err) => {
                 // We are using Anyhow's .context() and to show the
                 // inner error, too, we need the {:#}:
                 let error_msg = stock_str::configuration_failed(self, &format!("{err:#}"));
-                progress!(self, 0, Some(error_msg.clone()));
+                self.emit_event(EventType::ConfigureProgress {
+                    progress: 0,
+                    comment: Some(error_msg.clone()),
+                });
                 bail!(error_msg);
             }
         }
@@ -186,6 +192,62 @@ impl Context {
             }
             return result;
         }
+        self.start_io().await;
+        Ok(())
+    }
+
+    /// Adds an initial transport on the chatmail relay that answers fastest
+    /// and lets the profile add further ones in the background.
+    ///
+    /// A `DCACCOUNT:` or `DCLOGIN:` `qr` code adds a single transport
+    /// while securejoin codes add the inviter's relays to the candidates.
+    ///
+    /// Does nothing if the profile already has a transport.
+    pub async fn init_transports(&self, qr: Option<&str>) -> Result<()> {
+        if self.is_configured().await? {
+            return Ok(());
+        }
+        if let Some(qr) = qr {
+            match check_qr(self, qr).await? {
+                Qr::Account { .. } | Qr::Login { .. } => {
+                    return self.add_transport_from_qr(qr).await;
+                }
+                Qr::AskVerifyContact { addrs, .. }
+                | Qr::AskVerifyGroup { addrs, .. }
+                | Qr::AskJoinBroadcast { addrs, .. } => {
+                    autorelay::add_relay_candidates(self, &addrs).await?
+                }
+                _ => bail!("QR code does not contain a relay"),
+            }
+        }
+
+        let cancel_channel = self.alloc_ongoing().await?;
+        let skip_network = false;
+        let res = autorelay::add_transport_from_candidates(self, skip_network)
+            .race(cancel_channel.recv().map(|_| Err(format_err!("Canceled"))))
+            .await;
+        self.free_ongoing().await;
+
+        let configured = self.is_configured().await?;
+        match res {
+            Ok(()) => {}
+            Err(err) if configured => {
+                warn!(
+                    self,
+                    "Onboarding interrupted after adding a transport: {err:#}."
+                );
+            }
+            Err(err) => {
+                let error_msg = stock_str::configuration_failed(self, &format!("{err:#}"));
+                self.emit_event(EventType::ConfigureProgress {
+                    progress: 0,
+                    comment: Some(error_msg.clone()),
+                });
+                bail!(error_msg);
+            }
+        }
+        self.set_config_bool(Config::Autorelay, true).await?;
+        emit_progress(self, 1000);
         self.start_io().await;
         Ok(())
     }
@@ -321,7 +383,7 @@ async fn get_configured_param(
     let parsed = EmailAddress::new(&param.addr).context("Bad email-address")?;
     let param_domain = parsed.domain;
 
-    progress!(ctx, 200);
+    emit_progress(ctx, 200);
 
     let param_autoconfig = if param.imap.server.is_empty()
         && param.imap.port == 0
@@ -343,7 +405,7 @@ async fn get_configured_param(
         None
     };
 
-    progress!(ctx, 500);
+    emit_progress(ctx, 500);
 
     let mut servers = param_autoconfig.unwrap_or_default();
     if !servers
@@ -437,13 +499,13 @@ pub(crate) async fn configure(
     param: &EnteredLoginParam,
     skip_network: bool,
 ) -> Result<()> {
-    progress!(ctx, 1);
+    emit_progress(ctx, 1);
 
     let configured_param = get_configured_param(ctx, param, skip_network).await?;
     let proxy_config = ProxyConfig::load(ctx).await?;
     let strict_tls = configured_param.strict_tls(proxy_config.is_some())?;
 
-    progress!(ctx, 550);
+    emit_progress(ctx, 550);
 
     if !skip_network {
         // Spawn SMTP configuration task
@@ -469,7 +531,7 @@ pub(crate) async fn configure(
             Ok::<(), anyhow::Error>(())
         });
 
-        progress!(ctx, 600);
+        emit_progress(ctx, 600);
 
         // Configure IMAP
 
@@ -483,12 +545,12 @@ pub(crate) async fn configure(
             }
         };
 
-        progress!(ctx, 850);
+        emit_progress(ctx, 850);
 
         // Wait for SMTP configuration
         smtp_config_task.await??;
 
-        progress!(ctx, 900);
+        emit_progress(ctx, 900);
 
         // Drop the imap connection explicitly
         // to make sure that it's not forgotten in a future refactoring
@@ -496,7 +558,7 @@ pub(crate) async fn configure(
         drop(imap);
     }
 
-    progress!(ctx, 910);
+    emit_progress(ctx, 910);
 
     configured_param
         .clone()
@@ -507,11 +569,11 @@ pub(crate) async fn configure(
     ctx.set_config_internal(Config::ConfiguredTimestamp, Some(&time().to_string()))
         .await?;
 
-    progress!(ctx, 920);
+    emit_progress(ctx, 920);
 
     ctx.scheduler.interrupt_inbox().await;
 
-    progress!(ctx, 940);
+    emit_progress(ctx, 940);
     ctx.update_device_chats()
         .await
         .context("Failed to update device chats")?;
@@ -555,7 +617,7 @@ async fn get_autoconfig(
     {
         return Some(res);
     }
-    progress!(ctx, 300);
+    emit_progress(ctx, 300);
 
     // `?emailaddress=` query string is excluded on purpose.
     // It is not part of the URL according to <https://datatracker.ietf.org/doc/draft-ietf-mailmaint-autoconfig/06/>.
@@ -570,7 +632,7 @@ async fn get_autoconfig(
     {
         return Some(res);
     }
-    progress!(ctx, 310);
+    emit_progress(ctx, 310);
 
     // Outlook uses always SSL but different domains (this comment describes the next two steps)
     if let Ok(res) = outlk_autodiscover(
@@ -582,7 +644,7 @@ async fn get_autoconfig(
     {
         return Some(res);
     }
-    progress!(ctx, 320);
+    emit_progress(ctx, 320);
 
     if let Ok(res) = outlk_autodiscover(
         ctx,
@@ -593,7 +655,7 @@ async fn get_autoconfig(
     {
         return Some(res);
     }
-    progress!(ctx, 330);
+    emit_progress(ctx, 330);
 
     // always SSL for Thunderbird's database
     if let Ok(res) = moz_autoconfigure(
@@ -686,6 +748,28 @@ mod tests {
             event,
             EventType::ConfigureProgress { progress: 0, .. }
         ));
+
+        Ok(())
+    }
+
+    /// Tests that init_transports() fails on a bad code
+    /// and does nothing on a profile that already has a transport.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_init_transports() -> Result<()> {
+        let mut tcm = TestContextManager::new();
+        let t = &tcm.unconfigured().await;
+        assert!(t.init_transports(Some("not a qr code")).await.is_err());
+        assert!(!t.is_configured().await?);
+
+        let alice = &tcm.alice().await;
+        let invite = "openpgp4fpr:79252762C34C5096AF57958F4FC3D21A81B0F0A7#a=cli%40invite.example&i=TbnwJ6lSvD5&s=0ejvbdFSQxB";
+        alice.init_transports(Some(invite)).await?;
+        let candidates = alice
+            .sql
+            .count("SELECT COUNT(*) FROM relay_candidates", ())
+            .await?;
+        assert_eq!(candidates, 0);
+        assert_eq!(alice.count_transports().await?, 1);
 
         Ok(())
     }

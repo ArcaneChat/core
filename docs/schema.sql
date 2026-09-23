@@ -630,9 +630,12 @@ CREATE TABLE broadcast_secrets(
 
 
 -- Candidate chatmail relays for automatic relay management.
+-- Holds the hosts a QR code contributed and the default relays already tried;
+-- the default list itself lives in `autorelay.rs` and is not stored here.
 CREATE TABLE relay_candidates(
     host TEXT PRIMARY KEY NOT NULL,
-    last_tried INTEGER NOT NULL DEFAULT 0 -- Timestamp of the last connection attempt.
+    -- Timestamp of the last connection attempt, 0 if the host was never tried.
+    last_tried INTEGER NOT NULL DEFAULT 0
 ) STRICT;
 
 CREATE TABLE transports (
@@ -680,7 +683,11 @@ CREATE TABLE imap (
     transport_id INTEGER NOT NULL, -- ID of the transport in the `transports` table.
     rfc724_mid TEXT NOT NULL, -- Message-ID header
     folder TEXT NOT NULL, -- IMAP folder
-    target TEXT NOT NULL, -- Destination folder. Empty string means that the message shall be deleted.
+
+    -- Destination folder. Empty string means that the message shall be deleted.
+    -- Since we don't move messages between IMAP folders anymore,
+    -- this is always either empty or equal to `folder`.
+    target TEXT NOT NULL,
     uid INTEGER NOT NULL, -- UID
     uidvalidity INTEGER NOT NULL,
     UNIQUE (transport_id, folder, uid, uidvalidity)

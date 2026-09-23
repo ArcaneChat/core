@@ -726,6 +726,7 @@ async fn test_resend_after_ndn() -> Result<()> {
     Ok(())
 }
 
+// an NDN in a group does not make the whole message as failed
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_parse_ndn_group_msg() -> Result<()> {
     let t = TestContext::new().await;
@@ -758,16 +759,13 @@ async fn test_parse_ndn_group_msg() -> Result<()> {
 
     let msg = Message::load_from_db(&t, msg_id).await?;
 
-    assert_eq!(msg.state, MessageState::OutFailed);
+    assert_eq!(msg.state, MessageState::OutDelivered);
 
     let msgs = chat::get_chat_msgs(&t, msg.chat_id).await?;
     assert!(matches!(
         *msgs.last().unwrap(),
         ChatItem::Message { msg_id } if msg_id == msg.id
     ));
-
-    t.assert_warn("Delivery Status Notification (Failure)")
-        .await;
 
     Ok(())
 }
@@ -2725,20 +2723,7 @@ async fn test_read_receipts_dont_create_chats() -> Result<()> {
     let chats = Chatlist::try_load(&alice, 0, None, None).await?;
     assert_eq!(chats.len(), 0);
 
-    // Bob sends a read receipt.
-    let mdn_mimefactory = crate::mimefactory::MimeFactory::from_mdn(
-        &bob,
-        received_msg.from_id,
-        received_msg.rfc724_mid,
-        vec![],
-    )
-    .await?;
-    let bob_addr = bob.get_primary_self_addr().await?;
-    let rendered_mdn = mdn_mimefactory.render(&bob, &bob_addr).await?;
-    let mdn_body = rendered_mdn.message;
-
-    // Alice receives the read receipt.
-    receive_imf(&alice, mdn_body.as_bytes(), false).await?;
+    alice.recv_mdn(&bob, &received_msg).await?;
 
     // Chat should not pop up in the chatlist.
     let chats = Chatlist::try_load(&alice, 0, None, None).await?;
@@ -2761,20 +2746,7 @@ async fn test_read_receipts_dont_unmark_bots() -> Result<()> {
         .await;
     let received_msg = bob.get_last_msg().await;
 
-    // Bob sends a read receipt.
-    let mdn_mimefactory = crate::mimefactory::MimeFactory::from_mdn(
-        bob,
-        received_msg.from_id,
-        received_msg.rfc724_mid,
-        vec![],
-    )
-    .await?;
-    let bob_addr = bob.get_primary_self_addr().await?;
-    let rendered_mdn = mdn_mimefactory.render(bob, &bob_addr).await?;
-    let mdn_body = rendered_mdn.message;
-
-    // Alice receives the read receipt.
-    receive_imf(alice, mdn_body.as_bytes(), false).await?;
+    alice.recv_mdn(bob, &received_msg).await?;
     let msg = alice.get_last_msg_in(alice_chat.id).await;
     assert_eq!(msg.state, MessageState::OutMdnRcvd);
     let ab_contact = alice.add_or_lookup_contact(bob).await;
@@ -3362,6 +3334,35 @@ async fn test_blocked_contact_creates_group() -> Result<()> {
     // In order not to lose context, Bob's message should also be shown in the group
     let msgs = chat::get_chat_msgs(&alice, rcvd.chat_id).await?;
     assert_eq!(msgs.len(), 3);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_blocked_contact_sends_reaction() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+
+    let bob_msg_id = tcm.send_recv_accept(alice, bob, "Hi!").await.id;
+
+    let chat = alice.get_chat(bob).await;
+    chat.id.block(alice).await?;
+
+    crate::reaction::send_reaction(bob, bob_msg_id, "👍").await?;
+    let sent = bob.pop_sent_msg().await;
+    alice.recv_msg_hidden(&sent).await;
+    alice.emit_event(EventType::Test);
+
+    while let Some(ev) = alice.evtracker.recv().await {
+        match ev.typ {
+            EventType::IncomingReaction { .. } => {
+                panic!("Alice is not supposed to receive a notification, since she blocked Bob")
+            }
+            EventType::Test => break,
+            _ => {}
+        }
+    }
 
     Ok(())
 }

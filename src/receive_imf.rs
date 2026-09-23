@@ -2116,7 +2116,8 @@ async fn add_parts(
         let hidden = part.is_reaction;
         if part.is_reaction {
             let reaction_str = simplify::remove_footers(part.msg.as_str());
-            let is_incoming_fresh = mime_parser.incoming && !seen;
+            let is_incoming_fresh =
+                mime_parser.incoming && !seen && chat_id_blocked == Blocked::Not;
             set_msg_reaction(
                 context,
                 mime_in_reply_to,
@@ -3772,10 +3773,9 @@ async fn apply_out_broadcast_changes(
         if from_id == ContactId::SELF {
             let added_id = lookup_key_contact_by_fingerprint(context, added_fpr).await?;
             if let Some(added_id) = added_id {
-                if chat::is_contact_in_chat(context, chat.id, added_id).await? {
-                    info!(context, "No-op broadcast addition (TRASH)");
-                    better_msg.get_or_insert("".to_string());
-                } else {
+                info!(context, "Broadcast addition (TRASH)");
+                better_msg.get_or_insert("".to_string());
+                if !chat::is_contact_in_chat(context, chat.id, added_id).await? {
                     chat::add_to_chat_contacts_table(
                         context,
                         mime_parser.timestamp_sent,
@@ -3783,11 +3783,6 @@ async fn apply_out_broadcast_changes(
                         &[added_id],
                     )
                     .await?;
-                    let msg =
-                        stock_str::msg_add_member_local(context, added_id, ContactId::UNDEFINED)
-                            .await;
-                    better_msg.get_or_insert(msg);
-                    added_removed_id = Some(added_id);
                     send_event_chat_modified = true;
                 }
             } else {

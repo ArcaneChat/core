@@ -10,6 +10,8 @@ use deltachat::context::Context;
 use serde::{Deserialize, Serialize};
 use typescript_type_def::TypeDef;
 
+use crate::api::types::contact::ContactFreshness;
+
 use super::color_int_to_hex_string;
 
 #[derive(Serialize, TypeDef, schemars::JsonSchema)]
@@ -70,7 +72,7 @@ pub struct FullChat {
     is_muted: bool,
     ephemeral_timer: u32,
     can_send: bool,
-    was_seen_recently: bool,
+    freshness: ContactFreshness,
     mailing_list_address: Option<String>,
 
    /// Contact ID of the group admin for admin-controlled groups, or `null` for regular groups.
@@ -96,16 +98,17 @@ impl FullChat {
 
         let can_send = chat.can_send(context).await?;
 
-        let was_seen_recently = if chat.get_type() == Chattype::Single {
+        let freshness = if chat.get_type() == Chattype::Single {
             match contact_ids.first() {
                 Some(contact) => Contact::get_by_id(context, *contact)
                     .await
-                    .context("failed to load contact for was_seen_recently")?
-                    .was_seen_recently(),
-                None => false,
+                    .context("failed to load contact for get_freshness")?
+                    .get_freshness()
+                    .into(),
+                None => ContactFreshness::Normal,
             }
         } else {
-            false
+            ContactFreshness::Normal
         };
 
         let mailing_list_address = chat.get_mailinglist_addr().map(|s| s.to_string());
@@ -134,7 +137,7 @@ impl FullChat {
             is_muted: chat.is_muted(),
             ephemeral_timer,
             can_send,
-            was_seen_recently,
+            freshness,
             mailing_list_address,
             group_admin_id,
         })
@@ -146,7 +149,7 @@ impl FullChat {
 /// - fresh_message_counter
 /// - ephemeral_timer
 /// - self_in_group
-/// - was_seen_recently
+/// - freshness
 /// - can_send
 ///
 /// used when you only need the basic metadata of a chat like type, name, profile picture

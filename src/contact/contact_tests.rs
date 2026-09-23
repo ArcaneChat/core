@@ -1048,7 +1048,7 @@ async fn test_last_seen() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_was_seen_recently() -> Result<()> {
+async fn test_contact_freshness() -> Result<()> {
     let _n = TimeShiftFalsePositiveNote;
 
     let mut tcm = TestContextManager::new();
@@ -1061,15 +1061,57 @@ async fn test_was_seen_recently() -> Result<()> {
     let chat = bob.create_chat(&alice).await;
     let contacts = chat::get_chat_contacts(&bob, chat.id).await?;
     let contact = Contact::get_by_id(&bob, *contacts.first().unwrap()).await?;
-    assert!(!contact.was_seen_recently());
+    assert_eq!(contact.get_freshness(), Freshness::Old);
 
     bob.recv_msg(&sent_msg).await;
     let contact = Contact::get_by_id(&bob, *contacts.first().unwrap()).await?;
 
-    assert!(contact.was_seen_recently());
+    assert_eq!(contact.get_freshness(), Freshness::RecentlySeen);
 
     let self_contact = Contact::get_by_id(&bob, ContactId::SELF).await?;
-    assert!(!self_contact.was_seen_recently());
+    assert_eq!(self_contact.get_freshness(), Freshness::Normal);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_contact_freshness_blocked() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = tcm.alice().await;
+    let bob = tcm.bob().await;
+
+    // Alice sends message to Bob. Bob receives message, contact's freshness is "recently seen"
+    let msg = tcm.send_recv(&alice, &bob, "moin").await;
+
+    let contact = Contact::get_by_id(&bob, msg.from_id).await?;
+    assert_eq!(contact.get_freshness(), Freshness::RecentlySeen);
+
+    // Bob blocks Alice, contact's freshness is "normal" now
+    Contact::block(&bob, msg.from_id).await?;
+    let contact = Contact::get_by_id(&bob, msg.from_id).await?;
+    assert!(contact.is_blocked());
+    assert_eq!(contact.get_freshness(), Freshness::Normal);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_contact_freshness_address_contact() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = tcm.alice().await;
+    alice.allow_unencrypted().await?;
+    let bob = tcm.bob().await;
+    bob.allow_unencrypted().await?;
+
+    // Alice sends a message to Bob
+    let alice_chat = alice.create_email_chat(&bob).await;
+    let sent_msg = alice.send_text(alice_chat.id, "moin").await;
+
+    // Bob receives message, contact's freshness is "normal", even though the messages was just received
+    let msg = bob.recv_msg(&sent_msg).await;
+    let contact = Contact::get_by_id(&bob, msg.from_id).await?;
+    assert!(!contact.is_key_contact());
+    assert_eq!(contact.get_freshness(), Freshness::Normal);
 
     Ok(())
 }
@@ -1087,11 +1129,11 @@ async fn test_was_seen_recently_event() -> Result<()> {
         let chat = alice.create_chat(&bob).await;
         let sent_msg = alice.send_text(chat.id, "moin").await;
         let contact = Contact::get_by_id(&bob, *contacts.first().unwrap()).await?;
-        assert!(!contact.was_seen_recently());
+        assert_ne!(contact.get_freshness(), Freshness::RecentlySeen);
         bob.evtracker.clear_events();
         bob.recv_msg(&sent_msg).await;
         let contact = Contact::get_by_id(&bob, *contacts.first().unwrap()).await?;
-        assert!(contact.was_seen_recently());
+        assert_eq!(contact.get_freshness(), Freshness::RecentlySeen);
         bob.evtracker
             .get_matching(|evt| matches!(evt, EventType::ContactsChanged { .. }))
             .await;
@@ -1099,12 +1141,12 @@ async fn test_was_seen_recently_event() -> Result<()> {
             .interrupt(contact.id, contact.last_seen)
             .await;
 
-        // Wait for `was_seen_recently()` to turn off.
+        // Wait for "seen recently" to turn off.
         bob.evtracker.clear_events();
         SystemTime::shift(Duration::from_secs(SEEN_RECENTLY_SECONDS as u64 * 2));
         recently_seen_loop.interrupt(ContactId::UNDEFINED, 0).await;
         let contact = Contact::get_by_id(&bob, *contacts.first().unwrap()).await?;
-        assert!(!contact.was_seen_recently());
+        assert_eq!(contact.get_freshness(), Freshness::Normal);
         bob.evtracker
             .get_matching(|evt| matches!(evt, EventType::ContactsChanged { .. }))
             .await;
