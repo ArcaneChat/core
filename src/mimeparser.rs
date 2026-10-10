@@ -295,11 +295,7 @@ impl MimeMessage {
             &mut wants_mdn,
             &mail,
         );
-        headers_removed.extend(
-            headers
-                .extract_if(|k, _v| is_hidden(k))
-                .map(|(k, _v)| k.to_string()),
-        );
+        headers_removed.extend(headers.extract_if(|k, _v| is_hidden(k)).map(|(k, _v)| k));
 
         // Parse hidden headers.
         let mimetype = mail.ctype.mimetype.parse::<Mime>()?;
@@ -935,9 +931,10 @@ impl MimeMessage {
         // See if an MDN is requested from the other side
         if self.decryption_error.is_none()
             && (!self.parts.is_empty() || matches!(&self.pre_message, PreMessageMode::Pre { .. }))
-            && self.wants_mdn
-            && self.incoming
-            && let Some(part) = self.parts.last_mut()
+                && self.wants_mdn
+                && self.was_encrypted() // Do not send MDNs for unencrypted messages.
+                && self.incoming
+                && let Some(part) = self.parts.last_mut()
         {
             part.param.set_int(Param::WantsMdn, 1);
         }
@@ -951,7 +948,7 @@ impl MimeMessage {
                 typ: Viewtype::Text,
                 ..Default::default()
             };
-            if self.wants_mdn && self.incoming {
+            if self.wants_mdn && self.was_encrypted() && self.incoming {
                 part.param.set_int(Param::WantsMdn, 1);
             }
             if let Some(ref subject) = self.get_subject()
@@ -1751,7 +1748,7 @@ impl MimeMessage {
         headers_removed.extend(
             headers
                 .extract_if(|k, _v| has_header_protection || is_protected(k))
-                .map(|(k, _v)| k.to_string()),
+                .map(|(k, _v)| k),
         );
 
         if has_header_protection {

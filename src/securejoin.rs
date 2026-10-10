@@ -34,14 +34,14 @@ pub(crate) use qrinvite::QrInvite;
 
 use crate::token::Namespace;
 
-const DISALLOWED_CHARACTERS: &AsciiSet = &NON_ALPHANUMERIC_WITHOUT_DOT.remove(b'_');
+const DISALLOWED_CHARACTERS: &AsciiSet = &NON_ALPHANUMERIC_WITHOUT_DOT.remove(b'_').remove(b'@');
 
 fn inviter_progress(
     context: &Context,
     contact_id: ContactId,
     chat_id: ChatId,
     chat_type: Chattype,
-) -> Result<()> {
+) {
     // No other values are used.
     let progress = 1000;
     context.emit_event(EventType::SecurejoinInviterProgress {
@@ -50,8 +50,6 @@ fn inviter_progress(
         chat_type,
         progress,
     });
-
-    Ok(())
 }
 
 /// Shorten name to max. `length` characters.
@@ -122,21 +120,18 @@ pub async fn get_securejoin_qr(context: &Context, chat: Option<ChatId>) -> Resul
 
     let fingerprint = self_fingerprint(context).await?;
 
-    let self_addr = context.get_primary_self_addr().await?;
-    let self_addr_urlencoded = utf8_percent_encode(&self_addr, DISALLOWED_CHARACTERS).to_string();
+    let self_addrs = context.get_self_addrs().await?;
+    let mut encoded_addrs = self_addrs
+        .iter()
+        .map(|addr| utf8_percent_encode(addr, DISALLOWED_CHARACTERS).to_string());
+    let self_addr_urlencoded = encoded_addrs.next().context("No self addr configured")?;
+    let encoded_extra_relays: Vec<String> = encoded_addrs.collect();
 
-    let r_param = context
-        .get_self_addrs()
-        .await?
-        .into_iter()
-        .filter(|addr| *addr != self_addr)
-        .reduce(|acc, addr| {
-            format!(
-                "{acc},{}",
-                utf8_percent_encode(&addr, DISALLOWED_CHARACTERS)
-            )
-        })
-        .map_or(String::default(), |addrs| format!("&r={addrs}"));
+    let r_param = if encoded_extra_relays.is_empty() {
+        "".to_string()
+    } else {
+        format!("&r={}", encoded_extra_relays.join(","))
+    };
 
     let self_name = context
         .get_config(Config::Displayname)
@@ -680,7 +675,7 @@ pub(crate) async fn handle_securejoin_handshake(
                     context.emit_event(EventType::ContactsChanged(Some(contact_id)));
                 }
 
-                inviter_progress(context, contact_id, joining_chat_id, chat.typ)?;
+                inviter_progress(context, contact_id, joining_chat_id, chat.typ);
                 // IMAP-delete the message to avoid handling it by another device and adding the
                 // member twice. Another device will know the member's key from Autocrypt-Gossip.
                 Ok(HandshakeMessage::Done)
@@ -691,7 +686,7 @@ pub(crate) async fn handle_securejoin_handshake(
                     .await
                     .context("failed sending vc-contact-confirm message")?;
 
-                inviter_progress(context, contact_id, chat_id, Chattype::Single)?;
+                inviter_progress(context, contact_id, chat_id, Chattype::Single);
                 Ok(HandshakeMessage::Ignore) // "Done" would delete the message and break multi-device (the key from Autocrypt-header is needed)
             }
         }
@@ -838,7 +833,7 @@ pub(crate) async fn observe_securejoin_on_other_device(
         // and tests which don't care about the chat ID,
         // so we pass invalid chat ID here.
         let chat_id = ChatId::new(0);
-        inviter_progress(context, contact_id, chat_id, chat_type)?;
+        inviter_progress(context, contact_id, chat_id, chat_type);
     }
 
     if matches!(step, SecureJoinStep::MemberAdded) {

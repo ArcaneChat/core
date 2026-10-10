@@ -2,13 +2,13 @@
 
 mod dclogin_scheme;
 use std::collections::BTreeMap;
-use std::sync::LazyLock;
 
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
 pub use dclogin_scheme::LoginOptions;
 pub(crate) use dclogin_scheme::login_param_from_login_qr;
 use deltachat_contact_tools::{ContactAddress, addr_normalize, may_be_valid_addr};
 use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, percent_encode};
+use regex::regex;
 use serde::Deserialize;
 
 use crate::autorelay::login_param_from_host;
@@ -776,7 +776,7 @@ fn decode_tg_socks_proxy(_context: &Context, qr: &str) -> Result<Qr> {
 fn decode_shadowsocks_proxy(qr: &str) -> Result<Qr> {
     let server_config = shadowsocks::config::ServerConfig::from_url(qr)?;
     let addr = server_config.addr();
-    let host = addr.host().to_string();
+    let host = addr.host();
     let port = addr.port();
     Ok(Qr::Proxy {
         url: qr.to_string(),
@@ -1083,16 +1083,11 @@ async fn decode_matmsg(context: &Context, qr: &str) -> Result<Qr> {
     Qr::from_address(context, name, &addr, None).await
 }
 
-static VCARD_NAME_RE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"(?m)^N:([^;]*);([^;\n]*)").unwrap());
-static VCARD_EMAIL_RE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"(?m)^EMAIL([^:\n]*):([^;\n]*)").unwrap());
-
 /// Extract address for the vcard scheme.
 ///
 /// Scheme: `VCARD:BEGIN\nN:last name;first name;...;\nEMAIL;<type>:addr...;`
 async fn decode_vcard(context: &Context, qr: &str) -> Result<Qr> {
-    let name = VCARD_NAME_RE
+    let name = regex!(r"(?m)^N:([^;]*);([^;\n]*)")
         .captures(qr)
         .and_then(|caps| {
             let last_name = caps.get(1)?.as_str().trim();
@@ -1102,7 +1097,10 @@ async fn decode_vcard(context: &Context, qr: &str) -> Result<Qr> {
         })
         .unwrap_or_default();
 
-    let addr = if let Some(cap) = VCARD_EMAIL_RE.captures(qr).and_then(|caps| caps.get(2)) {
+    let addr = if let Some(cap) = regex!(r"(?m)^EMAIL([^:\n]*):([^;\n]*)")
+        .captures(qr)
+        .and_then(|caps| caps.get(2))
+    {
         normalize_address(cap.as_str().trim())?
     } else {
         bail!("Bad e-mail address");
@@ -1136,7 +1134,7 @@ fn normalize_address(addr: &str) -> Result<String> {
 
     ensure!(may_be_valid_addr(&new_addr), "Bad e-mail address");
 
-    Ok(new_addr.to_string())
+    Ok(new_addr)
 }
 
 #[cfg(test)]

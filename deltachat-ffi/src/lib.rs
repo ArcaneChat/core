@@ -12,7 +12,6 @@
 extern crate human_panic;
 
 use std::collections::BTreeMap;
-use std::convert::TryFrom;
 use std::fmt::Write;
 use std::future::Future;
 use std::mem::ManuallyDrop;
@@ -47,7 +46,6 @@ mod dc_array;
 mod lot;
 
 mod string;
-use deltachat::chatlist::Chatlist;
 
 use self::string::*;
 
@@ -514,6 +512,7 @@ pub unsafe extern "C" fn dc_event_get_id(event: *mut dc_event_t) -> libc::c_int 
         EventType::ChatModified(_) => 2020,
         EventType::ChatEphemeralTimerModified { .. } => 2021,
         EventType::ChatDeleted { .. } => 2023,
+        EventType::PinnedMessagesChanged { .. } => 2024,
         EventType::ContactsChanged(_) => 2030,
         EventType::LocationChanged(_) => 2035,
         EventType::ConfigureProgress { .. } => 2041,
@@ -587,7 +586,8 @@ pub unsafe extern "C" fn dc_event_get_data1_int(event: *mut dc_event_t) -> libc:
         | EventType::MsgReadCountChanged { chat_id, .. }
         | EventType::ChatModified(chat_id)
         | EventType::ChatEphemeralTimerModified { chat_id, .. }
-        | EventType::ChatDeleted { chat_id } => chat_id.to_u32() as libc::c_int,
+        | EventType::ChatDeleted { chat_id }
+        | EventType::PinnedMessagesChanged { chat_id } => chat_id.to_u32() as libc::c_int,
         EventType::ContactsChanged(id) | EventType::LocationChanged(id) => {
             let id = id.unwrap_or_default();
             id.to_u32() as libc::c_int
@@ -661,7 +661,8 @@ pub unsafe extern "C" fn dc_event_get_data2_int(event: *mut dc_event_t) -> libc:
         | EventType::OutgoingCallAccepted { .. }
         | EventType::CallEnded { .. }
         | EventType::EventChannelOverflow { .. }
-        | EventType::TransportsModified => 0,
+        | EventType::TransportsModified
+        | EventType::PinnedMessagesChanged { .. } => 0,
         EventType::MsgsChanged { msg_id, .. }
         | EventType::ReactionsChanged { msg_id, .. }
         | EventType::IncomingReaction { msg_id, .. }
@@ -762,7 +763,8 @@ pub unsafe extern "C" fn dc_event_get_data2_str(event: *mut dc_event_t) -> *mut 
         | EventType::AccountsItemChanged
         | EventType::IncomingCallAccepted { .. }
         | EventType::WebxdcRealtimeAdvertisementReceived { .. }
-        | EventType::TransportsModified => ptr::null_mut(),
+        | EventType::TransportsModified
+        | EventType::PinnedMessagesChanged { .. } => ptr::null_mut(),
         EventType::IncomingCall {
             place_call_info, ..
         } => place_call_info.strdup(),
@@ -2840,34 +2842,6 @@ pub unsafe extern "C" fn dc_chatlist_get_summary(
     Box::into_raw(Box::new(summary.into()))
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn dc_chatlist_get_summary2(
-    context: *mut dc_context_t,
-    chat_id: u32,
-    msg_id: u32,
-) -> *mut dc_lot_t {
-    if context.is_null() {
-        eprintln!("ignoring careless call to dc_chatlist_get_summary2()");
-        return ptr::null_mut();
-    }
-    let ctx = unsafe { &*context };
-    let msg_id = if msg_id == 0 {
-        None
-    } else {
-        Some(MsgId::new(msg_id))
-    };
-    let summary = block_on(Chatlist::get_summary2(
-        ctx,
-        ChatId::new(chat_id),
-        msg_id,
-        None,
-    ))
-    .context("get_summary2 failed")
-    .log_err(ctx)
-    .unwrap_or_default();
-    Box::into_raw(Box::new(summary.into()))
-}
-
 // dc_chat_t
 
 /// FFI struct for [dc_chat_t]
@@ -3508,6 +3482,7 @@ pub unsafe extern "C" fn dc_msg_get_summary(
     Box::into_raw(Box::new(summary.into()))
 }
 
+// deprecated, use dc_msg_get_summary_text instead
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dc_msg_get_summarytext(
     msg: *mut dc_msg_t,
@@ -3519,14 +3494,37 @@ pub unsafe extern "C" fn dc_msg_get_summarytext(
     }
     let ffi_msg = unsafe { &mut *msg };
 
-    let summary = block_on(ffi_msg.message.get_summary(&ffi_msg.context, None))
-        .context("dc_msg_get_summarytext failed")
-        .log_err(&ffi_msg.context)
-        .unwrap_or_default();
-    match usize::try_from(approx_characters) {
-        Ok(chars) => summary.truncated_text(chars).strdup(),
-        Err(_) => summary.text.strdup(),
+    let add_forwarded = true;
+    let add_type_emoji = true;
+    block_on(ffi_msg.message.get_summary_text_ext(
+        &ffi_msg.context,
+        add_forwarded,
+        add_type_emoji,
+        usize::try_from(approx_characters).unwrap_or_default(),
+    ))
+    .strdup()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dc_msg_get_summary_text(
+    msg: *mut dc_msg_t,
+    add_forwarded: libc::c_int,
+    add_type_emoji: libc::c_int,
+    approx_chars: libc::c_int,
+) -> *mut libc::c_char {
+    if msg.is_null() {
+        eprintln!("ignoring careless call to dc_msg_get_summary_text()");
+        return "".strdup();
     }
+    let ffi_msg = unsafe { &mut *msg };
+
+    block_on(ffi_msg.message.get_summary_text_ext(
+        &ffi_msg.context,
+        add_forwarded != 0,
+        add_type_emoji != 0,
+        usize::try_from(approx_chars).unwrap_or(0),
+    ))
+    .strdup()
 }
 
 #[unsafe(no_mangle)]

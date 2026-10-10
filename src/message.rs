@@ -581,7 +581,7 @@ impl Message {
 
         if let Some(msg) = &mut msg {
             msg.additional_text =
-                Self::get_additional_text(context, msg.download_state, &msg.param)?;
+                Self::get_additional_text(context, msg.download_state, &msg.param);
         }
 
         Ok(msg)
@@ -619,7 +619,7 @@ impl Message {
         context: &Context,
         download_state: DownloadState,
         param: &Params,
-    ) -> Result<String> {
+    ) -> String {
         if download_state != DownloadState::Done {
             let file_size = param
                 .get(Param::PostMessageFileBytes)
@@ -636,14 +636,14 @@ impl Message {
                 .unwrap_or("?".to_owned());
 
             return match viewtype {
-                Viewtype::File => Ok(format!(" [{file_name} – {file_size}]")),
+                Viewtype::File => format!(" [{file_name} – {file_size}]"),
                 _ => {
                     let translated_viewtype = viewtype.to_locale_string(context);
-                    Ok(format!(" [{translated_viewtype} – {file_size}]"))
+                    format!(" [{translated_viewtype} – {file_size}]")
                 }
             };
         }
-        Ok(String::new())
+        String::new()
     }
 
     /// Returns the MIME type of an attached file if it exists.
@@ -1653,10 +1653,14 @@ pub(crate) async fn delete_msgs_locally_done(
     context: &Context,
     msg_ids: &[MsgId],
     modified_chat_ids: BTreeSet<ChatId>,
+    pinned_messages_changed_chat_ids: BTreeSet<ChatId>,
 ) -> Result<()> {
     for modified_chat_id in modified_chat_ids {
         context.emit_msgs_changed_without_msg_id(modified_chat_id);
         chatlist_events::emit_chatlist_item_changed(context, modified_chat_id);
+    }
+    for chat_id in pinned_messages_changed_chat_ids {
+        context.emit_event(EventType::PinnedMessagesChanged { chat_id });
     }
     if !msg_ids.is_empty() {
         context.emit_msgs_changed_without_ids();
@@ -1683,6 +1687,7 @@ pub async fn delete_msgs_ext(
     delete_for_all: bool,
 ) -> Result<()> {
     let mut modified_chat_ids = BTreeSet::new();
+    let mut pinned_messages_changed_chat_ids = BTreeSet::new();
     let mut deleted_rfc724_mid = Vec::new();
     let mut res = Ok(());
 
@@ -1700,6 +1705,9 @@ pub async fn delete_msgs_ext(
         );
 
         modified_chat_ids.insert(msg.chat_id);
+        if msg.is_pinned() {
+            pinned_messages_changed_chat_ids.insert(msg.chat_id);
+        }
         deleted_rfc724_mid.push(msg.rfc724_mid.clone());
 
         let update_db = |trans: &mut rusqlite::Transaction| {
@@ -1757,7 +1765,13 @@ pub async fn delete_msgs_ext(
         let msg = Message::load_from_db(context, msg_id).await?;
         delete_msg_locally(context, &msg).await?;
     }
-    delete_msgs_locally_done(context, msg_ids, modified_chat_ids).await?;
+    delete_msgs_locally_done(
+        context,
+        msg_ids,
+        modified_chat_ids,
+        pinned_messages_changed_chat_ids,
+    )
+    .await?;
 
     // Interrupt Inbox loop to start message deletion, run housekeeping and call send_sync_msg().
     context.scheduler.interrupt_inbox().await;
@@ -2017,14 +2031,19 @@ pub(crate) async fn set_msg_failed(
 
 /// Inserts a tombstone into `msgs` table
 /// to prevent downloading the same message in the future.
+/// With `on_server`, copies seen on IMAP later are deleted on the server.
 ///
 /// Returns tombstone database row ID.
-pub(crate) async fn insert_tombstone(context: &Context, rfc724_mid: &str) -> Result<MsgId> {
+pub(crate) async fn insert_tombstone(
+    context: &Context,
+    rfc724_mid: &str,
+    on_server: bool,
+) -> Result<MsgId> {
     let row_id = context
         .sql
         .insert(
-            "INSERT INTO msgs(rfc724_mid, chat_id) VALUES (?,?)",
-            (rfc724_mid, ChatId::TRASH),
+            "INSERT INTO msgs(rfc724_mid, chat_id, deleted) VALUES (?,?,?)",
+            (rfc724_mid, ChatId::TRASH, on_server),
         )
         .await?;
     let msg_id = MsgId::new(u32::try_from(row_id)?);

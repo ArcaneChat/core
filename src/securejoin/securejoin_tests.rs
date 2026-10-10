@@ -6,6 +6,7 @@ use crate::chat::{CantSendReason, ChatId, add_contact_to_chat, remove_contact_fr
 use crate::chatlist::Chatlist;
 use crate::constants::Chattype;
 use crate::key::self_fingerprint;
+use crate::message::rfc724_mid_exists_ext;
 use crate::qr::Qr;
 use crate::receive_imf::receive_imf;
 use crate::stock_str::{self, messages_e2ee_info_msg};
@@ -13,6 +14,7 @@ use crate::test_utils::{
     AVATAR_64x64_BYTES, AVATAR_64x64_DEDUPLICATED, TestContext, TestContextManager,
     TimeShiftFalsePositiveNote, get_chat_msg, sync,
 };
+use crate::transport::add_pseudo_transport;
 
 #[derive(PartialEq)]
 enum SetupContactCase {
@@ -1142,6 +1144,43 @@ async fn test_get_securejoin_qr_name_is_last() -> Result<()> {
     Ok(())
 }
 
+/// Test that addresses in QR codes are percent-encoded.
+/// `@` should not be encoded unnecessarily,
+/// since this would just make the QR code longer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_get_securejoin_qr_encoding() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+
+    // `@` in email addresses must not be percent-encoded:
+    add_pseudo_transport(alice, "asdf@example.org").await?;
+    // But `%` does need percent-encoding:
+    add_pseudo_transport(alice, "jk%l@example.net").await?;
+
+    let qr = get_securejoin_qr(alice, None).await?;
+    assert!(
+        qr.contains("a=jk%25l@example.net"),
+        "{qr} doesn't contain 'a=jk%25l@example.net'"
+    );
+    assert!(
+        qr.contains("r=asdf@example.org,alice@example.org"),
+        "{qr} doesn't contain 'r=asdf@example.org,alice@example.org'"
+    );
+
+    let qr = check_qr(bob, &qr).await?;
+    let Qr::AskVerifyContact { mut addrs, .. } = qr else {
+        unreachable!()
+    };
+    addrs.sort();
+    assert_eq!(
+        addrs,
+        vec!["alice@example.org", "asdf@example.org", "jk%l@example.net",]
+    );
+
+    Ok(())
+}
+
 /// QR codes should not get arbitrary big because of long names.
 /// The truncation, however, should not let the url end with a `.`, which is a call for trouble in linkfiers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1523,5 +1562,31 @@ async fn test_deduplicate_member_added() -> Result<()> {
     // Second message is a no-op, so it is trashed.
     bob.recv_msg_trash(&sent2).await;
 
+    Ok(())
+}
+
+/// Tests that a handled join request is also marked as "deleted"
+/// in the database, so that if a copy of the request arrives via
+/// other relays in the future, then this copy will also be deleted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_join_request_deleted_on_all_relays() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+
+    let alice_chat_id = chat::create_group(alice, "Group").await?;
+    let qr = get_securejoin_qr(alice, Some(alice_chat_id)).await?;
+    bob.add_or_lookup_contact_id(alice).await;
+    join_securejoin(bob, &qr).await?;
+    let request = bob.pop_sent_msg().await;
+    alice.recv_msg_trash(&request).await;
+
+    let rfc724_mid = Message::load_from_db(bob, request.sender_msg_id)
+        .await?
+        .rfc724_mid;
+    let (_, deleted) = rfc724_mid_exists_ext(alice, &rfc724_mid, "deleted=1")
+        .await?
+        .unwrap();
+    assert!(deleted);
     Ok(())
 }

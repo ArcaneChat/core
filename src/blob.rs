@@ -164,9 +164,9 @@ impl<'a> BlobObject<'a> {
     /// you want to create a [BlobObject] for a filename read from the
     /// database.
     pub fn from_name(context: &'a Context, name: &str) -> Result<BlobObject<'a>> {
-        let name = match name.starts_with("$BLOBDIR/") {
-            true => name.splitn(2, '/').last().unwrap(),
-            false => name,
+        let name = match name.strip_prefix("$BLOBDIR/") {
+            Some(name) => name,
+            None => name,
         };
         if !BlobObject::is_acceptible_blob_name(name) {
             return Err(format_err!("not an acceptable blob name: {name}"));
@@ -289,6 +289,7 @@ impl<'a> BlobObject<'a> {
         name: Option<String>,
         viewtype: &mut Viewtype,
     ) -> Result<String> {
+        debug_assert!(matches!(viewtype, Viewtype::File | Viewtype::Image));
         let (max_wh, max_bytes) =
             match MediaQuality::from_i32(context.get_config_int(Config::MediaQuality).await?)
                 .unwrap_or_default()
@@ -326,6 +327,7 @@ impl<'a> BlobObject<'a> {
         max_bytes: usize,
         is_avatar: bool,
     ) -> Result<String> {
+        debug_assert!(matches!(viewtype, Viewtype::File | Viewtype::Image));
         // Add white background only to avatars to spare the CPU.
         let mut add_white_bg = is_avatar;
         let mut no_exif = false;
@@ -340,45 +342,38 @@ impl<'a> BlobObject<'a> {
             // It's strange that BufReader modifies a file position while it takes a non-mut
             // reference. Ok, just rewind it.
             file.rewind()?;
-            let imgreader = ImageReader::new(std::io::BufReader::new(&file)).with_guessed_format();
-            let imgreader = match imgreader {
-                Ok(ir) => ir,
-                _ => {
-                    file.rewind()?;
-                    ImageReader::with_format(
-                        std::io::BufReader::new(&file),
-                        ImageFormat::from_path(self.to_abs_path())?,
-                    )
-                }
-            };
+            let imgreader = ImageReader::new(std::io::BufReader::new(&file))
+                .with_guessed_format()
+                .context("Failed to guess image format due to I/O error")?;
             let fmt = imgreader.format().context("Unknown format")?;
             if *vt == Viewtype::File {
                 *vt = Viewtype::Image;
                 return Ok(name);
             }
-            let mut img = imgreader.decode().context("image decode failure")?;
+
+            let mut img = match fmt {
+                image::ImageFormat::WebP => {
+                    // `with_guessed_format()` restores file position,
+                    // so `buf_reader` is at the beginning of the file.
+                    let buf_reader = imgreader.into_inner();
+                    let webp_decoder = image::codecs::webp::WebPDecoder::new(buf_reader)
+                        .context("Failed to create WebP decoder")?;
+
+                    // If WebP has animation, do not try to recode it.
+                    // Recoding into JPEG will result in losing the animation.
+                    if !is_avatar && webp_decoder.has_animation() {
+                        return Ok(name);
+                    }
+                    DynamicImage::from_decoder(webp_decoder)?
+                }
+                _ => imgreader.decode().context("Failed to decode image")?,
+            };
             let orientation = exif
                 .as_ref()
                 .map(|exif| exif_orientation(exif, context))
                 .unwrap_or(Orientation::NoTransforms);
             let mut encoded = Vec::new();
 
-            if *vt == Viewtype::Sticker {
-                let x_max = img.width().saturating_sub(1);
-                let y_max = img.height().saturating_sub(1);
-                if !img.in_bounds(x_max, y_max)
-                    || !(img.get_pixel(0, 0).0[3] == 0
-                        || img.get_pixel(x_max, 0).0[3] == 0
-                        || img.get_pixel(0, y_max).0[3] == 0
-                        || img.get_pixel(x_max, y_max).0[3] == 0)
-                {
-                    *vt = Viewtype::Image;
-                } else {
-                    // Core doesn't auto-assign `Viewtype::Sticker` to messages and stickers coming
-                    // from UIs shouldn't contain sensitive Exif info.
-                    return Ok(name);
-                }
-            }
             img.apply_orientation(orientation);
 
             // max_wh is the maximum image width and height, i.e. the resolution-limit,

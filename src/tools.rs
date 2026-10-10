@@ -220,6 +220,7 @@ async fn maybe_warn_on_bad_time(context: &Context, now: i64, known_past_timestam
                 ),
                 Some(&mut msg),
                 true,
+                time(),
             )
             .await
             .ok();
@@ -534,32 +535,6 @@ where
 {
     fn is_none_or_empty(&self) -> bool {
         !matches!(self, Some(s) if !s.as_ref().is_empty())
-    }
-}
-
-pub(crate) trait ToOption<T> {
-    fn to_option(self) -> Option<T>;
-}
-impl<'a> ToOption<&'a str> for &'a String {
-    fn to_option(self) -> Option<&'a str> {
-        if self.is_empty() { None } else { Some(self) }
-    }
-}
-impl ToOption<String> for u16 {
-    fn to_option(self) -> Option<String> {
-        if self == 0 {
-            None
-        } else {
-            Some(self.to_string())
-        }
-    }
-}
-impl ToOption<String> for Option<i32> {
-    fn to_option(self) -> Option<String> {
-        match self {
-            None | Some(0) => None,
-            Some(v) => Some(v.to_string()),
-        }
     }
 }
 

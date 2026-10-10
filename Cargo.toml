@@ -1,6 +1,6 @@
 [package]
 name = "deltachat"
-version = "2.62.0"
+version = "2.63.0"
 edition = "2024"
 license = "MPL-2.0"
 rust-version = "1.89"
@@ -36,7 +36,6 @@ strip = true
 
 [dependencies]
 deltachat_derive = { path = "./deltachat_derive" }
-deltachat-time = { path = "./deltachat-time" }
 deltachat-contact-tools = { workspace = true }
 format-flowed = { path = "./format-flowed" }
 ratelimit = { path = "./deltachat-ratelimit" }
@@ -44,7 +43,7 @@ ratelimit = { path = "./deltachat-ratelimit" }
 anyhow = { workspace = true }
 async-broadcast = "0.7.2"
 async-channel = { workspace = true }
-async-imap = { version = "0.11.3", default-features = false, features = ["runtime-tokio", "compress"] }
+async-imap = { version = "0.12.0", default-features = false, features = ["runtime-tokio", "compress"] }
 async-native-tls = { version = "0.6", default-features = false, features = ["runtime-tokio"] }
 async-smtp = { version = "0.10.2", default-features = false, features = ["runtime-tokio"] }
 async_zip = { version = "0.0.18", default-features = false, features = ["deflate", "tokio-fs"] }
@@ -70,7 +69,7 @@ iroh-gossip = { version = "0.35", default-features = false, features = ["net"] }
 iroh = { version = "0.35", default-features = false }
 kamadak-exif = "0.6.1"
 libc = { workspace = true }
-mail-builder = { version = "0.5.0", default-features = false }
+mail-builder = { version = "1.0.0", default-features = false }
 mailparse = { workspace = true }
 mime = "0.3.17"
 num_cpus = "1.17"
@@ -78,7 +77,7 @@ num-derive = "0.4"
 num-traits = { workspace = true }
 parking_lot = "0.12.4"
 percent-encoding = "2.3"
-pgp = { version = "0.20.0", features = ["draft-pqc"], default-features = false }
+pgp = { version = "0.21.0", features = ["pqc"], default-features = false }
 pin-project = "1"
 qrcodegen = "1.7.0"
 quick-xml = { version = "0.41", features = ["escape-html"] }
@@ -87,7 +86,6 @@ rand = { workspace = true }
 regex = { workspace = true }
 rusqlite = { workspace = true, features = ["sqlcipher"] }
 sanitize-filename = { workspace = true }
-sdp = "0.17.1"
 serde_json = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 sha-1 = "0.10"
@@ -102,11 +100,10 @@ thiserror = { workspace = true }
 tokio-io-timeout = "1.2.1"
 tokio-rustls = { version = "0.26.2", default-features = false, features = ["tls12", "brotli"] }
 tokio-stream = { version = "0.1.17", features = ["fs"] }
-astral-tokio-tar = { version = "0.6.3", default-features = false }
+astral-tokio-tar = { version = "0.7.0", default-features = false }
 tokio-util = { workspace = true }
 tokio = { workspace = true, features = ["fs", "rt-multi-thread", "macros"] }
 toml = "0.9"
-tracing = "0.1.41"
 url = "2"
 uuid = { version = "1", features = ["serde", "v4"] }
 walkdir = "2.5.0"
@@ -115,6 +112,7 @@ webpki-roots = "0.26.8"
 [dev-dependencies]
 anyhow = { workspace = true, features = ["backtrace"] } # Enable `backtrace` feature in tests.
 criterion = { version = "0.8.1", features = ["async_tokio"] }
+deltachat-time = { path = "./deltachat-time" }
 futures-lite = { workspace = true }
 log = { workspace = true }
 nu-ansi-term = { workspace = true }
@@ -180,7 +178,7 @@ harness = false
 [workspace.dependencies]
 anyhow = "1"
 async-channel = "2.5.0"
-base64 = "0.22"
+base64 = { version = "0.23", default-features = false, features = ["std"] }
 chrono = { version = "0.4.44", default-features = false }
 deltachat-contact-tools = { path = "deltachat-contact-tools" }
 deltachat-jsonrpc = { path = "deltachat-jsonrpc", default-features = false }
@@ -189,7 +187,7 @@ futures = "0.3.32"
 futures-lite = "2.6.1"
 libc = "0.2"
 log = "0.4"
-mailparse = "0.16.1"
+mailparse = "0.17.0"
 nu-ansi-term = "0.50"
 num-traits = "0.2"
 rand = "0.9"

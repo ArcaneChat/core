@@ -1,6 +1,6 @@
 [package]
 name = "deltachat-repl"
-version = "2.62.0"
+version = "2.63.0"
 license = "MPL-2.0"
 edition = "2024"
 repository = "https://github.com/chatmail/core"
@@ -8,7 +8,7 @@ repository = "https://github.com/chatmail/core"
 [dependencies]
 anyhow = { workspace = true }
 deltachat = { workspace = true, features = ["internals"]}
-dirs = "6"
+dirs = "7"
 log = { workspace = true }
 nu-ansi-term = { workspace = true }
 qr2term = "0.3.3"

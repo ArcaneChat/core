@@ -22,7 +22,6 @@ use crate::log::{LogExt, warn};
 use crate::message::Message;
 use crate::message::{self, MsgId};
 use crate::mimefactory;
-use crate::mimefactory::MimeFactory;
 use crate::net::proxy::ProxyConfig;
 use crate::net::session::SessionBufStream;
 use crate::scheduler::connectivity::ConnectivityStore;
@@ -55,6 +54,39 @@ pub(crate) struct Smtp {
     pub(crate) last_send_error: Option<String>,
 }
 
+/// Returns transports with their IDs in the order in which they should be tried.
+async fn sorted_transports(context: &Context) -> Result<Vec<(u32, ConfiguredLoginParam)>> {
+    context
+        .sql
+        .query_map_vec(
+            "SELECT transports.id, configured_param FROM transports
+             LEFT JOIN smtp_success ON smtp_success.transport_id=transports.id
+             ORDER BY IFNULL(smtp_success.id, 0) DESC, transports.id ASC",
+            (),
+            |row| {
+                let id: u32 = row.get(0)?;
+                let json: String = row.get(1)?;
+                let param = ConfiguredLoginParam::from_json(&json)?;
+                Ok((id, param))
+            },
+        )
+        .await
+}
+
+/// Records successful use of SMTP transport so it is tried first next time we connect to SMTP.
+async fn record_success(context: &Context, transport_id: u32) -> Result<()> {
+    // INSERT OR REPLACE essentially replaces rowid of the row
+    // if the row exists already, so it becomes the highest rowid in the table.
+    context
+        .sql
+        .execute(
+            "INSERT OR REPLACE INTO smtp_success (transport_id) VALUES (?)",
+            (transport_id,),
+        )
+        .await?;
+    Ok(())
+}
+
 impl Smtp {
     /// Create a new Smtp instances.
     pub fn new() -> Self {
@@ -69,6 +101,8 @@ impl Smtp {
             // separate task to avoid waiting for reply or timeout.
             task::spawn(async move { transport.quit().await });
         }
+        self.transport_id = None;
+        self.from = None;
         self.last_success = None;
     }
 
@@ -100,13 +134,7 @@ impl Smtp {
 
         self.connectivity.set_connecting(context);
         let proxy_config = ProxyConfig::load(context).await?;
-        let transports = ConfiguredLoginParam::load_all(context).await?;
-
-        // Try to connect to the newest transport first. If sending is unreliable,
-        // user can configure a new transport and it will be the one used.
-        // Conversely, if user just added a new transport and sending got less reliable,
-        // user can restore old state by removing the just added transport.
-        for (transport_id, lp) in transports.into_iter().rev() {
+        for (transport_id, lp) in sorted_transports(context).await? {
             info!(context, "Trying to connect to transport {transport_id}.");
             match self
                 .connect(
@@ -326,6 +354,18 @@ pub(crate) async fn smtp_send(
         Ok(()) => SendResult::Success,
     };
 
+    if matches!(status, SendResult::Success) {
+        debug_assert!(smtp.transport_id.is_some());
+        if let Some(transport_id) = smtp.transport_id
+            && let Err(err) = record_success(context, transport_id).await
+        {
+            warn!(
+                context,
+                "Failed to record successful use of transport {transport_id} in smtp_success table: {err:#}."
+            );
+        }
+    }
+
     if let SendResult::Failure(err) = &status
         && let Some(msg_id) = msg_id
     {
@@ -356,7 +396,7 @@ pub(crate) async fn insert_into_smtp(
     queued_msg: &QueuedMail,
 ) -> Result<()> {
     let now = tools::time();
-    let msg_id = message::insert_tombstone(context, rfc724_mid).await?;
+    let msg_id = message::insert_tombstone(context, rfc724_mid, false).await?;
     context
         .sql
         .transaction(|transaction| queue::enqueue_mail(transaction, now, msg_id, queued_msg, None))
@@ -652,6 +692,24 @@ pub(crate) async fn send_smtp_messages(context: &Context, connection: &mut Smtp)
     Ok(())
 }
 
+async fn delete_mdns_by_rfc724_mid(
+    context: &Context,
+    rfc724_mid: &str,
+    additional_rfc724_mids: Vec<String>,
+) -> Result<()> {
+    context
+        .sql
+        .transaction(|transaction| {
+            let mut stmt = transaction.prepare("DELETE FROM smtp_mdns WHERE rfc724_mid = ?")?;
+            stmt.execute((rfc724_mid,))?;
+            for additional_rfc724_mid in additional_rfc724_mids {
+                stmt.execute((additional_rfc724_mid,))?;
+            }
+            Ok(())
+        })
+        .await
+}
+
 /// Tries to send MDN for message identified by `rfc724_mdn` to `contact_id`.
 ///
 /// Attempts to aggregate additional MDNs for `contact_id` into sent MDN.
@@ -687,28 +745,30 @@ async fn send_mdn_rfc724_mid(
         )
         .await?;
 
-    let mimefactory = MimeFactory::from_mdn(
+    let queued_mdn = mimefactory::mdn(
         context,
         contact_id,
-        rfc724_mid.to_string(),
+        rfc724_mid,
         additional_rfc724_mids.clone(),
     )
     .await?;
-    let encrypted = mimefactory.will_be_encrypted();
-    let mut recipients = if contact_id == ContactId::SELF {
-        Vec::new()
-    } else {
-        mimefactory.recipients()
-    };
+    let bcc_self = queued_mdn.bcc_self;
+
+    let encrypted = queued_mdn.encryption.is_encrypted();
+    let mut recipients = queued_mdn.recipients.clone();
+
+    let public_key = key::load_self_public_key(context).await?;
+    let secret_key = key::load_self_secret_key(context).await?;
     let from = smtp
         .from
         .as_ref()
         .context("No From address, not connected")?
         .to_string();
-    let rendered_msg = Box::pin(mimefactory.render(context, &from)).await?;
+    let rendered_msg =
+        mimefactory::render_queued_mail(queued_mdn, &public_key, &secret_key, from.clone())?;
     let body = rendered_msg.message;
 
-    if context.get_config_bool(Config::BccSelf).await? {
+    if bcc_self {
         add_self_recipients(context, &mut recipients, encrypted, from).await?;
     }
     let recipients: Vec<_> = recipients
@@ -720,24 +780,13 @@ async fn send_mdn_rfc724_mid(
                 .ok()
         })
         .collect();
-    message::insert_tombstone(context, &rendered_msg.rfc724_mid).await?;
+    message::insert_tombstone(context, &rendered_msg.rfc724_mid, false).await?;
     match smtp_send(context, &recipients, &body, smtp, None).await {
         SendResult::Success => {
             if !recipients.is_empty() {
                 info!(context, "Successfully sent MDN for {rfc724_mid}.");
             }
-            context
-                .sql
-                .transaction(|transaction| {
-                    let mut stmt =
-                        transaction.prepare("DELETE FROM smtp_mdns WHERE rfc724_mid = ?")?;
-                    stmt.execute((rfc724_mid,))?;
-                    for additional_rfc724_mid in additional_rfc724_mids {
-                        stmt.execute((additional_rfc724_mid,))?;
-                    }
-                    Ok(())
-                })
-                .await?;
+            delete_mdns_by_rfc724_mid(context, rfc724_mid, additional_rfc724_mids).await?;
             Ok(true)
         }
         SendResult::Retry => {
@@ -848,3 +897,6 @@ pub(crate) async fn add_self_recipients(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod smtp_tests;

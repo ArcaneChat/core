@@ -336,6 +336,17 @@ pub enum Config {
     /// Timestamp of the last time housekeeping was run
     LastHousekeeping,
 
+    /// ID of the device message added after backup transfer.
+    ///
+    /// If the message does not exist on the first housekeeping
+    /// after `READD_BACKUP_TRANSFER_MSG_DELAY`, it is re-added.
+    BackupTransferMsgId,
+
+    /// Timestamp of the device message added after backup transfer.
+    ///
+    /// Needed to check against `READD_BACKUP_TRANSFER_MSG_DELAY`.
+    BackupTransferTimestamp,
+
     /// Timestamp of the last time accumulated broadcast channel reactions were sent
     LastReactionsBroadcast,
 
@@ -809,7 +820,7 @@ impl Context {
 
     /// Set the given config to a boolean value.
     pub async fn set_config_bool(&self, key: Config, value: bool) -> Result<()> {
-        self.set_config(key, from_bool(value)).await?;
+        self.set_config(key, Some(from_bool(value))).await?;
         Ok(())
     }
 
@@ -830,8 +841,8 @@ impl Context {
 }
 
 /// Returns a value for use in `Context::set_config_*()` for the given `bool`.
-pub(crate) fn from_bool(val: bool) -> Option<&'static str> {
-    Some(if val { "1" } else { "0" })
+pub(crate) fn from_bool(val: bool) -> &'static str {
+    if val { "1" } else { "0" }
 }
 
 pub(crate) fn bool_from_config(config: Option<&str>) -> bool {

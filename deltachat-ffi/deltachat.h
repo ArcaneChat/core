@@ -3544,28 +3544,6 @@ dc_lot_t*        dc_chatlist_get_summary     (const dc_chatlist_t* chatlist, siz
 
 
 /**
- * Create a chatlist summary item when the chatlist object is already unref()'d.
- *
- * This function is similar to dc_chatlist_get_summary(), however,
- * it takes the chat ID and the message ID as returned by dc_chatlist_get_chat_id() and dc_chatlist_get_msg_id()
- * as arguments. The chatlist object itself is not needed directly.
- *
- * This maybe useful if you convert the complete object into a different representation
- * as done e.g. in the node-bindings.
- * If you have access to the chatlist object in some way, using this function is not recommended,
- * use dc_chatlist_get_summary() in this case instead.
- *
- * @memberof dc_context_t
- * @param context The context object.
- * @param chat_id The chat ID to get a summary for.
- * @param msg_id The message ID to get a summary for.
- * @return The summary as an dc_lot_t object, see dc_chatlist_get_summary() for details.
- *     Must be freed using dc_lot_unref(). NULL is never returned.
- */
-dc_lot_t*        dc_chatlist_get_summary2    (dc_context_t* context, uint32_t chat_id, uint32_t msg_id);
-
-
-/**
  * Get info summary for a chat, in JSON format.
  *
  * @deprecated 2026-08-13, use dedicated dc_chat_get_*() getters or jsonrpc
@@ -4313,6 +4291,7 @@ dc_lot_t*       dc_msg_get_summary            (const dc_msg_t* msg, const dc_cha
  * notifications.
  *
  * @memberof dc_msg_t
+ * @deprecated 2026-10-08, use dc_msg_get_summary_text(msg, 1, 1, approx_chars) instead
  * @param msg The message object.
  * @param approx_characters A rough length of the expected string.
  * @return A summary for the given messages.
@@ -4320,6 +4299,34 @@ dc_lot_t*       dc_msg_get_summary            (const dc_msg_t* msg, const dc_cha
  *     Returns an empty string on errors, never returns NULL.
  */
 char*           dc_msg_get_summarytext        (const dc_msg_t* msg, int approx_characters);
+
+
+/**
+ * Get a message summary.
+ * Used for notifications, pinned messages and for copying texts to clipboard.
+ *
+ * @memberof dc_msg_t
+ * @param msg The message object.
+ * @param add_forwarded 1=add a hint if a message was forwarded.
+ *     0=do not add the hint;
+ *     this is allowed only if the message is shown without a username, e.g. for pinned messages.
+ * @param add_type_emoji 1=add the type of the message as an emoji prefix.
+ *     0=do not add type emoji;
+ *     this is allowed only if the message type is visible otherwise,
+ *     close to where the emoji would be displayed otherwise
+ *     (eg. images in pinned messages preceding summary)
+ * @param approx_chars >0=convert linebreaks to spaces and truncate the line at about the given number of characters;
+ *     for single-line UI elements such as pinned messages or notifications;
+ *     additionally, UIs will most times clip the text to the available space.
+ *     0=leave linebreaks as is and return the full text, useful e.g. for copying to clipboard.
+ * @return A summary for the given message.
+ *     The returned string must be released using dc_str_unref().
+ *     Returns an empty string on errors, never returns NULL.
+ */
+char*           dc_msg_get_summary_text       (const dc_msg_t* msg, int add_forwarded, int add_type_emoji, int approx_chars);
+
+
+
 
 
 /**
@@ -6177,6 +6184,17 @@ void dc_event_unref(dc_event_t* event);
  * @param data2 (int) 0
  */
 #define DC_EVENT_CHAT_DELETED             2023
+
+
+/**
+ * The list of pinned messages for the chat has changed.
+ *
+ * Some message got pinned, or pinned message is unpinned or deleted.
+ *
+ * @param data1 (int) chat_id
+ * @param data2 (int) 0
+ */
+#define DC_EVENT_PINNED_MESSAGES_CHANGED 2024
 
 
 /**

@@ -5,7 +5,7 @@ use pgp::armor;
 use pgp::packet::{Packet, PacketParser};
 use pretty_assertions::assert_eq;
 use regex::regex;
-use std::io::BufReader;
+use std::io::{BufReader, Cursor};
 use std::str;
 use std::time::Duration;
 
@@ -22,7 +22,7 @@ use crate::key::{load_self_secret_key, secret_key_to_public_key};
 use crate::message;
 use crate::mimeparser::MimeMessage;
 use crate::receive_imf::receive_imf;
-use crate::test_utils;
+use crate::test_utils::{self, SentMessage};
 use crate::test_utils::{TestContext, TestContextManager, get_chat_msg};
 use crate::tools::SystemTime;
 
@@ -30,8 +30,7 @@ fn render_email_address(display_name: &str, addr: &str) -> String {
     let mut output = Vec::<u8>::new();
     new_address_with_name(display_name, addr.to_string())
         .unwrap_address()
-        .write_header(&mut output, 0)
-        .unwrap();
+        .write_header(&mut output, 0);
 
     String::from_utf8(output).unwrap()
 }
@@ -50,9 +49,7 @@ fn test_render_email_address() {
 
     let s = render_email_address(display_name, addr);
 
-    println!("{s}");
-
-    assert_eq!(s, "=?utf-8?B?w6Qgc3BhY2U=?= <x@y.org>");
+    assert_eq!(s, "=?utf-8?B?w6Qgc3BhY2U=?= <x@y.org>\r\n");
 }
 
 #[test]
@@ -70,14 +67,14 @@ fn test_render_email_address_noescape() {
     let s = render_email_address(display_name, addr);
 
     // Addresses should not be unnecessarily be encoded, see <https://github.com/deltachat/deltachat-core-rust/issues/1575>:
-    assert_eq!(s, r#""a space" <x@y.org>"#);
+    assert_eq!(s, "\"a space\" <x@y.org>\r\n");
 }
 
 #[test]
 fn test_render_email_address_duplicated_as_name() {
     let addr = "x@y.org";
     let s = render_email_address(addr, addr);
-    assert_eq!(s, "<x@y.org>");
+    assert_eq!(s, "<x@y.org>\r\n");
 }
 
 #[test]
@@ -102,8 +99,7 @@ fn render_header_text(text: &str) -> String {
     // Some non-zero length of the header name.
     let bytes_written = 20;
     mail_builder::headers::text::Text::new(text.to_string())
-        .write_header(&mut output, bytes_written)
-        .unwrap();
+        .write_header(&mut output, bytes_written);
 
     String::from_utf8(output).unwrap()
 }
@@ -281,8 +277,12 @@ async fn test_subject_mdn() {
     assert_eq!("Re: Hello, Bob", mf.subject_str(t).await.unwrap());
 }
 
+/// Tests that MDN for unencrypted message can be created without throwing an error.
+///
+/// We do not send unencrypted MDNs, but do not want SMTP loop to get stuck
+/// if we somehow request the creation of unencrypted MDN.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_mdn_create_encrypted() -> Result<()> {
+async fn test_mdn_create_unencrypted() -> Result<()> {
     let mut tcm = TestContextManager::new();
     let alice = tcm.alice().await;
     alice.allow_unencrypted().await?;
@@ -297,21 +297,43 @@ async fn test_mdn_create_encrypted() -> Result<()> {
         .await?;
     bob.set_config_bool(Config::MdnsEnabled, true).await?;
 
-    // MDN for unencrypted message is not encrypted.
+    // MDN for unencrypted message.
+    // Should not happen, but should also not throw an error.
     let mut msg = Message::new(Viewtype::Text);
     let chat_alice = alice.create_email_chat(&bob).await.id;
     let sent = alice.send_msg(chat_alice, &mut msg).await;
 
     let rcvd = bob.recv_msg(&sent).await;
     message::markseen_msgs(&bob, vec![rcvd.id]).await?;
-    let mimefactory =
-        MimeFactory::from_mdn(&bob, rcvd.from_id, rcvd.rfc724_mid.clone(), vec![]).await?;
-    assert!(!mimefactory.will_be_encrypted());
-    let bob_addr = bob.get_primary_self_addr().await?;
-    let rendered_msg = mimefactory.render(&bob, &bob_addr).await?;
+    let queued_mdn = mdn(&bob, rcvd.from_id, &rcvd.rfc724_mid, vec![]).await?;
 
-    assert!(!rendered_msg.message.contains("Bob Examplenet"));
-    assert!(!rendered_msg.message.contains("Alice Exampleorg"));
+    // Only sending MDN to self (if BCC-self is enabled) because address-contact recipient has no key.
+    assert!(queued_mdn.recipients.is_empty());
+
+    // MDNs are always encrypted, even if requested for unencrypted message.
+    assert!(queued_mdn.encryption.is_encrypted());
+
+    bob.assert_warn("has no key, sending to self").await;
+
+    Ok(())
+}
+
+/// Tests that MDNs sent in reply to encrypted messages are encrypted
+/// and MDNs for unencrypted messages are not created.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_mdn_create_encrypted() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = tcm.alice().await;
+    alice
+        .set_config(Config::Displayname, Some("Alice Exampleorg"))
+        .await?;
+    let bob = tcm.bob().await;
+    bob.set_config(Config::Displayname, Some("Bob Examplenet"))
+        .await?;
+    bob.set_config(Config::Selfstatus, Some("Bob Examplenet"))
+        .await?;
+    bob.set_config_bool(Config::MdnsEnabled, true).await?;
+
     let bob_alice_contact = bob.add_or_lookup_contact(&alice).await;
     assert_eq!(bob_alice_contact.get_authname(), "Alice Exampleorg");
 
@@ -319,10 +341,9 @@ async fn test_mdn_create_encrypted() -> Result<()> {
     let rcvd = tcm.send_recv(&alice, &bob, "Heyho").await;
     message::markseen_msgs(&bob, vec![rcvd.id]).await?;
 
-    let mimefactory = MimeFactory::from_mdn(&bob, rcvd.from_id, rcvd.rfc724_mid, vec![]).await?;
-    assert!(mimefactory.will_be_encrypted());
-    let bob_addr = bob.get_primary_self_addr().await?;
-    let rendered_msg = mimefactory.render(&bob, &bob_addr).await?;
+    let queued_mdn = mdn(&bob, rcvd.from_id, &rcvd.rfc724_mid, vec![]).await?;
+    assert!(queued_mdn.encryption.is_encrypted());
+    let rendered_msg = render_queued_mail_with_context(queued_mdn, &bob).await?;
 
     assert!(!rendered_msg.message.contains("Bob Examplenet"));
     assert!(!rendered_msg.message.contains("Alice Exampleorg"));
@@ -349,8 +370,8 @@ async fn test_mdn_sent_to_all_relays() -> Result<()> {
     )?;
     import_public_key(alice, &bob_public_key).await?;
 
-    let mimefactory = MimeFactory::from_mdn(alice, rcvd.from_id, rcvd.rfc724_mid, vec![]).await?;
-    let mut recipients = mimefactory.recipients();
+    let queued_mdn = mdn(alice, rcvd.from_id, &rcvd.rfc724_mid, vec![]).await?;
+    let mut recipients = queued_mdn.recipients;
     recipients.sort();
     assert_eq!(recipients, vec!["bob@example.net", "bob@relay2.example"]);
 
@@ -364,9 +385,8 @@ async fn test_mdn_autocrypt_throttle() -> Result<()> {
         alice: &TestContext,
         rcvd: &Message,
     ) -> Result<bool> {
-        let mf = MimeFactory::from_mdn(bob, rcvd.from_id, rcvd.rfc724_mid.clone(), vec![]).await?;
-        let addr = bob.get_primary_self_addr().await?;
-        let rendered_msg = mf.render(bob, &addr).await?;
+        let queued_mdn = mdn(bob, rcvd.from_id, &rcvd.rfc724_mid, vec![]).await?;
+        let rendered_msg = render_queued_mail_with_context(queued_mdn, bob).await?;
         let mime = MimeMessage::from_bytes(alice, rendered_msg.message.as_bytes()).await?;
         Ok(mime.autocrypt_fingerprint.is_some())
     }
@@ -647,8 +667,7 @@ async fn test_render_reply() {
     let recipients = mimefactory.recipients();
     assert_eq!(recipients, vec!["charlie@example.net"]);
 
-    let addr = t.get_primary_self_addr().await.unwrap();
-    let rendered_msg = mimefactory.render(t, &addr).await.unwrap();
+    let rendered_msg = mimefactory.render(t).await.unwrap();
 
     let mail = mailparse::parse_mail(rendered_msg.message.as_bytes()).unwrap();
     assert_eq!(
@@ -795,7 +814,7 @@ async fn test_protected_headers_directive() -> Result<()> {
     // Long messages are truncated and MimeMessage::decoded_data is set for them. We need
     // decoded_data to check presence of the necessary headers.
     msg.set_text("a".repeat(constants::DC_DESIRED_TEXT_LEN + 1));
-    msg.set_file_from_bytes(&bob, "foo.bar", "content".as_bytes(), None)?;
+    msg.set_file_from_bytes(&bob, "foo.bar", b"content", None)?;
     let sent = bob.send_msg(chat, &mut msg).await;
     assert!(msg.get_showpadlock());
     assert!(sent.payload.contains("\r\nSubject: [...]\r\n"));
@@ -932,7 +951,7 @@ async fn test_no_empty_to_header() -> Result<()> {
     assert!(
         // It would be equally fine if the payload contained `To: alice@example.org` or similar,
         // as long as it's a valid header
-        payload.contains("To: \"hidden-recipients\": ;"),
+        payload.contains("To: \"hidden-recipients\":;"),
         "Payload doesn't contain correct To: header: {payload}"
     );
 
@@ -1022,7 +1041,7 @@ END:VCARD";
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_render_outer_headers() -> Result<()> {
+async fn test_render_outer_headers_of_encrypted_msg() -> Result<()> {
     let mut tcm = TestContextManager::new();
     let alice = &tcm.alice().await;
     let bob = &tcm.bob().await;
@@ -1030,26 +1049,9 @@ async fn test_render_outer_headers() -> Result<()> {
     let chat_id = alice.create_chat_id(bob).await;
     let sent = alice.send_text(chat_id, "Hello!").await;
 
-    let (unencrypted, _encrypted) = sent
-        .payload()
-        .split_once("-----BEGIN PGP MESSAGE-----")
-        .unwrap();
+    let payload = normalized_payload(sent).await;
 
-    // Normalize the parts of the message that vary between runs
-    // (MIME boundary, Date, Message-ID)
-    let boundary = unencrypted
-        .split_once("boundary=\"")
-        .and_then(|(_, rest)| rest.split_once('"'))
-        .map(|(b, _)| b)
-        .unwrap_or_default();
-    let unencrypted = unencrypted.replace(boundary, "BOUNDARY");
-
-    let rfc724_mid = sent.load_from_db().await.rfc724_mid;
-    let unencrypted = unencrypted.replace(&rfc724_mid, "MESSAGE_ID@localhost");
-
-    let unencrypted = regex!(r"Date:[^\r\n]*")
-        .replace(&unencrypted, "Date: DATE")
-        .to_string();
+    let (unencrypted, _encrypted) = payload.split_once("-----BEGIN PGP MESSAGE-----").unwrap();
 
     let expected = r#"From: <alice@example.org>
 Date: DATE
@@ -1058,8 +1060,8 @@ MIME-Version: 1.0
 To: "hidden-recipients": ;
 Subject: [...]
 Chat-Version: 1.0
-Content-Type: multipart/encrypted; protocol="application/pgp-encrypted"; 
-	boundary="BOUNDARY"
+Content-Type: multipart/encrypted; protocol="application/pgp-encrypted";
+ boundary="BOUNDARY"
 
 
 --BOUNDARY
@@ -1084,4 +1086,141 @@ expected (debug print): {expected:?}"
     );
 
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_render_unencrypted_msg_basic() -> Result<()> {
+    let alice = &TestContext::new_alice().await;
+    alice.allow_unencrypted().await?;
+
+    let chat = alice
+        .create_chat_with_contact("Bob", "bob@example.net")
+        .await;
+    let sent = alice.send_text(chat.id, "Hello!").await;
+    let unencrypted = normalized_payload(sent).await;
+
+    let expected = r#"From: <alice@example.org>
+Message-ID: <MESSAGE_ID@localhost>
+MIME-Version: 1.0
+Autocrypt: addr=alice@example.org; prefer-encrypt=mutual;
+ keydata=mDMEXlh13RYJKwYBBAHaRw8BAQdAzfVIAleCXMJrq8VeLlEVof6ITCviMktKjmcBKAu4m5
+ DCtAQfFggAZgUCXlh13RYhBC5vossjtTLXKGNLWGSwj2Gp7ZRDAhsDAh4JBAsJCAcFFQgJCgsDFgIB
+ AycJAgIZASwUgAAAAAASABFyZWxheXNAY2hhdG1haWwuYXRhbGljZUBleGFtcGxlLm9yZwAAb1QA/0
+ HbvPN3/Vn02Gk1dcQMEcyGyETld9dSsRo8uwHAyW35AQCrFJjAQFLTud7XK61uYt9BC/QHipCfIGbq
+ X1FjMbTUC80TPGFsaWNlQGV4YW1wbGUub3JnPsKRBBMWCAA5BQJeWHXdFiEELm+iyyO1MtcoY0tYZL
+ CPYantlEMCGwMCHgkECwkIBwUVCAkKCwMWAgEDJwkCAhkBAAoJEGSwj2Gp7ZRD1m4A/iOifEzIOiP8
+ wW0O8I/sg69gQtG8Czn4MsVV6Ea1EyIqAP4uByHaUJdy8MSQPfv/Usr09KsidNgy2Jh37yg82fKUBr
+ g4BF5Ydd0SCisGAQQBl1UBBQEBB0AG7cjWy2SFAU8KnltlubVW67rFiyfp01JrRe6Xqy22HQMBCAeI
+ eAQYFggAIBYhBC5vossjtTLXKGNLWGSwj2Gp7ZRDBQJeWHXdAhsMAAoJEGSwj2Gp7ZRDLo8BAObE8G
+ nsGVwKzNqCvHeWgJsqhjS3C6gvSlV3tEm9XmF6AQDXucIyVfoBwoyMh2h6cSn/ATn5QJb35pgo+ivp
+ 3jsMAg==
+Content-Type: text/plain; charset="utf-8"
+Date: DATE
+To: <bob@example.net>
+Subject: Message from alice@example.org
+References: <MESSAGE_ID@localhost>
+Chat-Version: 1.0
+Content-Transfer-Encoding: 7bit
+
+Hello!"#
+        .replace("\n", "\r\n");
+    assert_eq!(
+        unencrypted, expected,
+        "---------------- Actual: ----------------
+{unencrypted}
+-----------------------------------------
+actual (debug print): {unencrypted:?}
+expected (debug print): {expected:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_render_unencrypted_msg_with_attachment() -> Result<()> {
+    let alice = &TestContext::new_alice().await;
+    alice.allow_unencrypted().await?;
+
+    let chat = alice
+        .create_chat_with_contact("Bob", "bob@example.net")
+        .await;
+    let mut msg = Message::new(Viewtype::File);
+    msg.set_text("Hello!".to_string());
+    msg.set_file_from_bytes(alice, "foo.bar", b"content", None)?;
+    let sent = alice.send_msg(chat.id, &mut msg).await;
+    let unencrypted = normalized_payload(sent).await;
+
+    let expected = r#"From: <alice@example.org>
+Message-ID: <MESSAGE_ID@localhost>
+MIME-Version: 1.0
+Autocrypt: addr=alice@example.org; prefer-encrypt=mutual;
+ keydata=mDMEXlh13RYJKwYBBAHaRw8BAQdAzfVIAleCXMJrq8VeLlEVof6ITCviMktKjmcBKAu4m5
+ DCtAQfFggAZgUCXlh13RYhBC5vossjtTLXKGNLWGSwj2Gp7ZRDAhsDAh4JBAsJCAcFFQgJCgsDFgIB
+ AycJAgIZASwUgAAAAAASABFyZWxheXNAY2hhdG1haWwuYXRhbGljZUBleGFtcGxlLm9yZwAAb1QA/0
+ HbvPN3/Vn02Gk1dcQMEcyGyETld9dSsRo8uwHAyW35AQCrFJjAQFLTud7XK61uYt9BC/QHipCfIGbq
+ X1FjMbTUC80TPGFsaWNlQGV4YW1wbGUub3JnPsKRBBMWCAA5BQJeWHXdFiEELm+iyyO1MtcoY0tYZL
+ CPYantlEMCGwMCHgkECwkIBwUVCAkKCwMWAgEDJwkCAhkBAAoJEGSwj2Gp7ZRD1m4A/iOifEzIOiP8
+ wW0O8I/sg69gQtG8Czn4MsVV6Ea1EyIqAP4uByHaUJdy8MSQPfv/Usr09KsidNgy2Jh37yg82fKUBr
+ g4BF5Ydd0SCisGAQQBl1UBBQEBB0AG7cjWy2SFAU8KnltlubVW67rFiyfp01JrRe6Xqy22HQMBCAeI
+ eAQYFggAIBYhBC5vossjtTLXKGNLWGSwj2Gp7ZRDBQJeWHXdAhsMAAoJEGSwj2Gp7ZRDLo8BAObE8G
+ nsGVwKzNqCvHeWgJsqhjS3C6gvSlV3tEm9XmF6AQDXucIyVfoBwoyMh2h6cSn/ATn5QJb35pgo+ivp
+ 3jsMAg==
+Content-Type: multipart/mixed;
+ boundary="BOUNDARY"
+Date: DATE
+To: <bob@example.net>
+Subject: Message from alice@example.org
+References: <MESSAGE_ID@localhost>
+Chat-Version: 1.0
+
+
+--BOUNDARY
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+
+Hello!
+--BOUNDARY
+Content-Type: application/octet-stream
+Content-Disposition: attachment; filename="foo.bar"
+Content-Transfer-Encoding: base64
+
+Y29udGVudA==
+
+--BOUNDARY--
+"#
+    .replace("\n", "\r\n");
+    assert_eq!(
+        unencrypted, expected,
+        "---------------- Actual: ----------------
+{unencrypted}
+-----------------------------------------
+actual (debug print): {unencrypted:?}
+expected (debug print): {expected:?}"
+    );
+
+    Ok(())
+}
+
+/// Normalize the parts of the message that vary between runs
+/// (MIME boundary, Date, Message-ID)
+async fn normalized_payload(sent: SentMessage<'_>) -> String {
+    let rfc724_mid = sent.load_from_db().await.rfc724_mid;
+
+    let mut payload = sent.payload;
+
+    if let Some(boundary) = payload
+        .split_once("boundary=\"")
+        .and_then(|(_, rest)| rest.split_once('"'))
+        .map(|(b, _)| b)
+    {
+        payload = payload.replace(boundary, "BOUNDARY");
+    }
+
+    payload = payload.replace(&rfc724_mid, "MESSAGE_ID@localhost");
+
+    payload = regex!(r"Date:[^\r\n]*")
+        .replace(&payload, "Date: DATE")
+        .to_string();
+
+    payload
 }

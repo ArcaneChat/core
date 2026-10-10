@@ -3,7 +3,6 @@
 use std::cmp;
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
-use std::io::Cursor;
 use std::marker::Sync;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -1938,8 +1937,7 @@ impl Chat {
         let new_mime_headers: Option<String> = new_mime_headers.map(|s| {
             let html_part = MimePart::new("text/html", s);
             let mut buffer = Vec::new();
-            let cursor = Cursor::new(&mut buffer);
-            html_part.write_part(cursor).ok();
+            html_part.write_part(&mut buffer);
             String::from_utf8_lossy(&buffer).to_string()
         });
         let new_mime_headers = new_mime_headers.or_else(|| match was_truncated {
@@ -2944,9 +2942,7 @@ async fn create_send_msg_jobs(context: &Context, msg: &mut Message) -> Result<Ve
         );
     }
 
-    if let Some(ref side_effects) = side_effects {
-        msg.subject.clone_from(&side_effects.subject);
-    }
+    msg.subject.clone_from(&side_effects.subject);
     if is_encrypted {
         msg.param.set_int(Param::GuaranteeE2ee, 1);
     } else {
@@ -2988,13 +2984,13 @@ async fn create_send_msg_jobs(context: &Context, msg: &mut Message) -> Result<Ve
                     now,
                     msg.id,
                     &queued_pre_msg,
-                    pre_side_effects.as_ref(),
+                    Some(&pre_side_effects),
                 )
                 .context("Failed to enqueue pre-message")?;
                 row_ids.push(row_id)
             }
             row_ids.push(
-                enqueue_mail(transaction, now, msg.id, &queued_msg, side_effects.as_ref())
+                enqueue_mail(transaction, now, msg.id, &queued_msg, Some(&side_effects))
                     .context("Failed to enqueue message")?,
             );
             Ok(row_ids)
@@ -3709,7 +3705,7 @@ pub(crate) async fn create_out_broadcast_ext(
         )?;
         ensure!(cnt == 0, "{cnt} chats exist with grpid {grpid}");
         let mut params: Params = Params::new();
-        params.update_timestamp(Param::GroupNameTimestamp, time())?;
+        params.update_timestamp(Param::GroupNameTimestamp, time());
 
         t.execute(
             "INSERT INTO chats
@@ -4906,12 +4902,14 @@ pub(crate) async fn get_chat_id_by_grpid(
 ///
 /// Optional `label` can be provided to ensure that message is added only once.
 /// If `important` is true, a notification will be sent.
+/// `timestamp_sent` is the time shown on the message; it does not affect ordering.
 #[expect(clippy::arithmetic_side_effects)]
 pub async fn add_device_msg_with_importance(
     context: &Context,
     label: Option<&str>,
     msg: Option<&mut Message>,
     important: bool,
+    timestamp_sent: i64,
 ) -> Result<MsgId> {
     ensure!(
         label.is_some() || msg.is_some(),
@@ -4931,11 +4929,10 @@ pub async fn add_device_msg_with_importance(
         chat_id = ChatId::get_for_contact(context, ContactId::DEVICE).await?;
 
         let rfc724_mid = create_outgoing_rfc724_mid();
-        let timestamp_sent = time();
 
         // makes sure, the added message is the last one,
         // even if the date is wrong (useful esp. when warning about bad dates)
-        msg.timestamp_sort = timestamp_sent;
+        msg.timestamp_sort = time();
         if let Some(last_msg_time) = chat_id.get_timestamp(context).await?
             && msg.timestamp_sort <= last_msg_time
         {
@@ -5003,7 +5000,7 @@ pub async fn add_device_msg(
     label: Option<&str>,
     msg: Option<&mut Message>,
 ) -> Result<MsgId> {
-    add_device_msg_with_importance(context, label, msg, false).await
+    add_device_msg_with_importance(context, label, msg, false, time()).await
 }
 
 /// Returns true if device message with a given label was ever added to the device chat.
@@ -5031,6 +5028,12 @@ pub(crate) async fn delete_and_reset_all_device_msgs(context: &Context) -> Resul
         .execute("DELETE FROM msgs WHERE from_id=?;", (ContactId::DEVICE,))
         .await?;
     context.sql.execute("DELETE FROM devmsglabels;", ()).await?;
+    context
+        .set_config_internal(Config::BackupTransferMsgId, None)
+        .await?;
+    context
+        .set_config_internal(Config::BackupTransferTimestamp, None)
+        .await?;
 
     // Insert labels for welcome messages to avoid them being re-added on reconfiguration.
     context

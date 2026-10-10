@@ -484,7 +484,7 @@ pub(crate) async fn receive_imf_inner(
     }
 
     let trash = || async {
-        let msg_ids = vec![insert_tombstone(context, rfc724_mid).await?];
+        let msg_ids = vec![insert_tombstone(context, rfc724_mid, false).await?];
         Ok(Some(ReceivedMsg {
             chat_id: ChatId::TRASH,
             state: MessageState::Undefined,
@@ -669,14 +669,15 @@ pub(crate) async fn receive_imf_inner(
 
         match res {
             securejoin::HandshakeMessage::Done | securejoin::HandshakeMessage::Ignore => {
-                let msg_id = insert_tombstone(context, rfc724_mid).await?;
+                let needs_delete_job = res == securejoin::HandshakeMessage::Done;
+                let msg_id = insert_tombstone(context, rfc724_mid, needs_delete_job).await?;
                 received_msg = Some(ReceivedMsg {
                     chat_id: ChatId::TRASH,
                     state: MessageState::InSeen,
                     hidden: false,
                     sort_timestamp: mime_parser.timestamp_sent,
                     msg_ids: vec![msg_id],
-                    needs_delete_job: res == securejoin::HandshakeMessage::Done,
+                    needs_delete_job,
                 });
             }
             securejoin::HandshakeMessage::Propagate => {
@@ -2320,7 +2321,7 @@ INSERT INTO msgs
         // This way, `LastSubject` actually refers to the most recent message _shown_ in the chat.
         if chat
             .param
-            .update_timestamp(Param::SubjectTimestamp, sort_timestamp)?
+            .update_timestamp(Param::SubjectTimestamp, sort_timestamp)
         {
             // write the last subject even if empty -
             // otherwise a reply may get an outdated subject.
@@ -2402,6 +2403,7 @@ async fn handle_edit_delete(
         }
 
         let mut modified_chat_ids = BTreeSet::new();
+        let mut pinned_messages_changed_chat_ids = BTreeSet::new();
         let mut msg_ids = Vec::new();
 
         let rfc724_mid_vec: Vec<&str> = rfc724_mid_list.split_whitespace().collect();
@@ -2410,7 +2412,7 @@ async fn handle_edit_delete(
             let Some(msg_id) = message::rfc724_mid_exists(context, rfc724_mid).await? else {
                 warn!(context, "Delete message: {rfc724_mid:?} not found.");
                 // Insert a tombstone so that the message will be ignored if it arrives later within a period specified in prune_tombstones().
-                insert_tombstone(context, rfc724_mid).await?;
+                insert_tombstone(context, rfc724_mid, false).await?;
                 continue;
             };
 
@@ -2426,8 +2428,17 @@ async fn handle_edit_delete(
             message::delete_msg_locally(context, &msg).await?;
             msg_ids.push(msg.id);
             modified_chat_ids.insert(msg.chat_id);
+            if msg.is_pinned() {
+                pinned_messages_changed_chat_ids.insert(msg.chat_id);
+            }
         }
-        message::delete_msgs_locally_done(context, &msg_ids, modified_chat_ids).await?;
+        message::delete_msgs_locally_done(
+            context,
+            &msg_ids,
+            modified_chat_ids,
+            pinned_messages_changed_chat_ids,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -3444,7 +3455,7 @@ async fn apply_chat_name_avatar_and_description_changes(
         && can_modify_group_state
         && chat
             .param
-            .update_timestamp(Param::AvatarTimestamp, mime_parser.timestamp_sent)?
+            .update_timestamp(Param::AvatarTimestamp, mime_parser.timestamp_sent)
     {
         info!(context, "Group-avatar change for {}.", chat.id);
         match avatar_action {

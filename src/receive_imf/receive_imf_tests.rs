@@ -416,7 +416,9 @@ async fn test_escaped_from() {
     );
     let msg = get_chat_msg(&t, chat_id, 0, 1).await;
     assert_eq!(msg.text, "hello");
-    assert_eq!(msg.param.get_int(Param::WantsMdn).unwrap(), 1);
+
+    // MDN request from unencrypted message is ignored.
+    assert!(msg.param.get_int(Param::WantsMdn).is_none());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2955,6 +2957,7 @@ async fn test_weird_and_duplicated_filenames() -> Result<()> {
         "a.tar.gz",
         "a.a..a.a.a.a.tar.gz",
         "a. tar.tar.gz",
+        "very long filename with emoji \u{1F600} very long file name with emoji \u{1FAE0} very long file name with emoji.tar.gz",
     ] {
         let attachment = alice.blobdir.join(filename_sent);
         let content = "File content of tar.gz archive".to_string();

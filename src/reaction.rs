@@ -165,7 +165,7 @@ async fn set_msg_id_reaction(
             .await?;
         if chat
             .param
-            .update_timestamp(Param::LastReactionTimestamp, timestamp)?
+            .update_timestamp(Param::LastReactionTimestamp, timestamp)
         {
             chat.param
                 .set_i64(Param::LastReactionMsgId, i64::from(msg_id.to_u32()));
@@ -1032,7 +1032,6 @@ Content-Disposition: reaction\n\
         assert_eq!(summary.timestamp, bob_msg1.get_timestamp()); // time refers to message, not to reaction
         assert_eq!(summary.state, MessageState::InFresh); // state refers to message, not to reaction
         assert!(summary.prefix.is_none());
-        assert!(summary.thumbnail_path.is_none());
         assert_summary(&alice, "BOB reacted 👍 to \"Party?\"").await;
 
         // Alice reacts to own message as well
