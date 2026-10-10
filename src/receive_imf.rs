@@ -2105,7 +2105,7 @@ async fn add_parts(
             BTreeSet::<ContactId>::from_iter(chat::get_chat_contacts(context, chat_id).await?);
         let is_from_in_chat =
             !chat_contacts.contains(&ContactId::SELF) || chat_contacts.contains(&from_id);
-        if is_from_in_chat {
+        if is_from_in_chat && is_group_admin_contact(context, &grpid, from_id).await? {
             let new_pinned_state = mime_parser.is_system_message == SystemMessage::MessagePinned;
             handle_pinned_state_from_wire(context, &msg_to_change, new_pinned_state).await?;
         }
