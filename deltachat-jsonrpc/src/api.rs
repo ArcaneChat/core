@@ -155,6 +155,18 @@ impl CommandApi {
 
 #[rpc(all_positional)]
 impl CommandApi {
+    /// Get the fingerprint of a given contact.
+    ///
+    /// Returns `None` if the contact does not have a fingerprint.
+    async fn get_contact_fingerprint(
+        &self,
+        account_id: u32,
+        contact_id: u32,
+    ) -> Result<Option<String>> {
+        let ctx = self.get_context(account_id).await?;
+        deltachat::contact::get_contact_fingerprint(&ctx, ContactId::new(contact_id)).await
+    }
+
     /// Test function.
     async fn sleep(&self, delay: f64) {
         tokio::time::sleep(std::time::Duration::from_secs_f64(delay)).await

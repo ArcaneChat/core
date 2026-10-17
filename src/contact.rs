@@ -339,6 +339,20 @@ pub async fn make_vcard(context: &Context, contacts: &[ContactId]) -> Result<Str
         .to_string())
 }
 
+/// Returns the fingerprint of the given contact as a hex string.
+///
+/// Returns `Ok(None)` if the contact does not have a fingerprint.
+pub async fn get_contact_fingerprint(context: &Context, contact_id: ContactId) -> Result<Option<String>> {
+    if contact_id == ContactId::SELF {
+        Ok(self_fingerprint_opt(context).await?.map(|s| s.to_string()))
+    } else {
+        Ok(Contact::get_by_id(context, contact_id)
+            .await?
+           .fingerprint()
+           .map(|f| f.hex()))
+    }
+}
+
 /// Imports public key into the public key store.
 ///
 /// They key may come from Autocrypt header,

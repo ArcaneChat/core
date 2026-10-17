@@ -4194,24 +4194,13 @@ async fn lookup_key_contact_by_address(
     Ok(contact_id)
 }
 
-async fn get_contact_fingerprint(context: &Context, contact_id: ContactId) -> Result<Option<String>> {
-    if contact_id == ContactId::SELF {
-        Ok(self_fingerprint_opt(context).await?.map(|s| s.to_string()))
-    } else {
-        Ok(Contact::get_by_id(context, contact_id)
-            .await?
-           .fingerprint()
-           .map(|f| f.hex()))
-    }
-}
-
 async fn is_group_admin_contact(
     context: &Context,
     grpid: &str,
     contact_id: ContactId,
 ) -> Result<bool> {
     if let Some(admin_fpr) = admin_group_fingerprint(grpid) {
-        let contact_fpr = get_contact_fingerprint(context, contact_id).await?;
+        let contact_fpr = contact::get_contact_fingerprint(context, contact_id).await?;
         Ok(contact_fpr.as_deref() == Some(admin_fpr))
     } else {
         Ok(true)
