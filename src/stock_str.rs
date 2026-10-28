@@ -91,7 +91,7 @@ pub enum StockMessage {
     SavedMessages = 69,
 
     #[strum(props(
-        fallback = "Messages in this chat are generated locally by your Delta Chat app. \
+        fallback = "Messages in this chat are generated locally by your ArcaneChat app. \
                     Its makers use it to inform about app updates and problems during usage."
     ))]
     DeviceMessagesHint = 70,
@@ -123,10 +123,10 @@ pub enum StockMessage {
     ))]
     BadTimeMsgBody = 85,
 
-    #[strum(props(fallback = "⚠️ Your Delta Chat version might be outdated.\n\n\
+    #[strum(props(fallback = "⚠️ Your ArcaneChat version might be outdated.\n\n\
                     This may cause problems because your chat partners use newer versions - \
                     and you are missing the latest features 😳\n\
-                    Please check https://get.delta.chat or your app store for updates."))]
+                    Please check https://arcanechat.me or your app store for updates."))]
     UpdateReminderMsgBody = 86,
 
     #[strum(props(
@@ -150,7 +150,7 @@ pub enum StockMessage {
 
     #[strum(props(
         fallback = "This message is used to synchronize data between your devices.\n\n\
-                    👉 If you see this message in Delta Chat, please update your Delta Chat apps on all devices."
+                    👉 If you see this message in ArcaneChat, please update your ArcaneChat apps on all devices."
     ))]
     SyncMsgBody = 102,
 
@@ -351,14 +351,14 @@ pub enum StockMessage {
     #[strum(props(fallback = "Establishing connection, please wait…"))]
     SecurejoinWait = 190,
 
-    #[strum(props(fallback = "❤️ Seems you're enjoying Delta Chat!
+    #[strum(props(fallback = "💜 Seems you're enjoying ArcaneChat!
 
-Please consider donating to help that Delta Chat stays free for everyone.
+Please consider donating to help that ArcaneChat stays free for everyone.
 
-While Delta Chat is free to use and open source, development costs money.
-Help keeping us to keep Delta Chat independent and make it more awesome in the future.
+While ArcaneChat is free to use and open source, development costs money.
+Help keeping us to keep ArcaneChat independent and make it more awesome in the future.
 
-https://delta.chat/donate"))]
+https://arcanechat.me/#contribute"))]
     DonationRequest = 193,
 
     #[strum(props(fallback = "Declined call"))]
