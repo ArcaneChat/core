@@ -2613,8 +2613,6 @@ char*           dc_get_securejoin_qr_svg         (dc_context_t* context, uint32_
  * During the handshake, info messages are added to the chat,
  * showing progress, success or errors.
  *
- * Subsequent calls of dc_join_securejoin() will abort previous, unfinished handshakes.
- *
  * See https://securejoin.delta.chat/ for details about both protocols.
  *
  * @memberof dc_context_t
@@ -4478,6 +4476,7 @@ int             dc_msg_is_info                (const dc_msg_t* msg);
  * - DC_INFO_CHAT_E2EE (50) - Info-message for "Chat is end-to-end-encrypted"
  * - DC_INFO_GROUP_DESCRIPTION_CHANGED (70) - Info-message "Description changed", UI should open the profile with the description
  * - DC_INFO_MESSAGE_PINNED (71) - Message pinned, UI should scroll to the pinned message returned by dc_msg_get_parent()
+ * - DC_INFO_MESSAGE_UNPINNED (72) - Message unpinned, UI should scroll to the pinned message returned by dc_msg_get_parent()
  *
  * For the messages that refer to a CONTACT,
  * dc_msg_get_info_contact_id() returns the contact ID.
@@ -4538,6 +4537,7 @@ uint32_t        dc_msg_get_info_contact_id    (const dc_msg_t* msg);
 #define         DC_INFO_CHAT_E2EE                 50
 #define         DC_INFO_GROUP_DESCRIPTION_CHANGED 70
 #define         DC_INFO_MESSAGE_PINNED            71
+#define         DC_INFO_MESSAGE_UNPINNED          72
 
 
 /**
@@ -7275,6 +7275,12 @@ void dc_event_unref(dc_event_t* event);
 
 /// @deprecated 2026-08-31
 #define DC_STR_PHASING_OUT 245
+
+/// "You unpinned a message."
+#define DC_STR_MESSAGE_UNPINNED_BY_YOU 246
+
+/// "Message unpinned by %1$s."
+#define DC_STR_MESSAGE_UNPINNED_BY_OTHER 247
 
 /**
  * @}

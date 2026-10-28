@@ -32,21 +32,26 @@ use crate::transport::{
     ConfiguredLoginParam, ConfiguredServerLoginParam, prioritize_server_login_params,
 };
 
+/// SMTP connection with information about it.
+#[derive(Debug)]
+struct Connection {
+    transport: SmtpTransport<Box<dyn SessionBufStream>>,
+
+    /// Email address that should be put into the From field when sending over this connection.
+    from: EmailAddress,
+
+    /// ID of the transport from which SMTP connection configuration comes from.
+    transport_id: u32,
+
+    /// Timestamp of last successful send/receive network interaction
+    /// (eg connect or send succeeded).
+    last_success: tools::Time,
+}
+
 #[derive(Default)]
 pub(crate) struct Smtp {
     /// SMTP connection.
-    transport: Option<SmtpTransport<Box<dyn SessionBufStream>>>,
-
-    /// Email address we are sending from.
-    from: Option<EmailAddress>,
-
-    /// Transport we are connected to.
-    transport_id: Option<u32>,
-
-    /// Timestamp of last successful send/receive network interaction
-    /// (eg connect or send succeeded). On initialization and disconnect
-    /// it is set to None.
-    last_success: Option<tools::Time>,
+    connection: Option<Connection>,
 
     pub(crate) connectivity: ConnectivityStore,
 
@@ -61,7 +66,10 @@ async fn sorted_transports(context: &Context) -> Result<Vec<(u32, ConfiguredLogi
         .query_map_vec(
             "SELECT transports.id, configured_param FROM transports
              LEFT JOIN smtp_success ON smtp_success.transport_id=transports.id
-             ORDER BY IFNULL(smtp_success.id, 0) DESC, transports.id ASC",
+             LEFT JOIN smtp_failure ON smtp_failure.transport_id=transports.id
+             ORDER BY IFNULL(smtp_success.id, 0) DESC,
+                      IFNULL(smtp_failure.id, 0) ASC,
+                      transports.id ASC",
             (),
             |row| {
                 let id: u32 = row.get(0)?;
@@ -79,10 +87,37 @@ async fn record_success(context: &Context, transport_id: u32) -> Result<()> {
     // if the row exists already, so it becomes the highest rowid in the table.
     context
         .sql
-        .execute(
-            "INSERT OR REPLACE INTO smtp_success (transport_id) VALUES (?)",
-            (transport_id,),
-        )
+        .transaction(|t| {
+            t.execute(
+                "INSERT OR REPLACE INTO smtp_success (transport_id) VALUES (?)",
+                (transport_id,),
+            )?;
+            t.execute(
+                "DELETE FROM smtp_failure WHERE transport_id = ?",
+                (transport_id,),
+            )?;
+            Ok(())
+        })
+        .await?;
+    Ok(())
+}
+
+/// Records a failure and removes last remembered success for
+/// SMTP transport so another transport is tried next time.
+async fn record_failure(context: &Context, transport_id: u32) -> Result<()> {
+    context
+        .sql
+        .transaction(|t| {
+            t.execute(
+                "INSERT OR REPLACE INTO smtp_failure (transport_id) VALUES (?)",
+                (transport_id,),
+            )?;
+            t.execute(
+                "DELETE FROM smtp_success WHERE transport_id = ?",
+                (transport_id,),
+            )?;
+            Ok(())
+        })
         .await?;
     Ok(())
 }
@@ -95,30 +130,25 @@ impl Smtp {
 
     /// Disconnect the SMTP transport and drop it entirely.
     pub fn disconnect(&mut self) {
-        if let Some(mut transport) = self.transport.take() {
+        if let Some(mut connection) = self.connection.take() {
             // Closing connection with a QUIT command may take some time, especially if it's a
             // stale connection and an attempt to send the command times out. Send a command in a
             // separate task to avoid waiting for reply or timeout.
-            task::spawn(async move { transport.quit().await });
+            task::spawn(async move { connection.transport.quit().await });
         }
-        self.transport_id = None;
-        self.from = None;
-        self.last_success = None;
     }
 
     /// Return true if smtp was connected but is not known to
     /// have been successfully used the last 60 seconds
     pub fn has_maybe_stale_connection(&self) -> bool {
-        if let Some(last_success) = self.last_success {
-            time_elapsed(&last_success).as_secs() > 60
-        } else {
-            false
-        }
+        self.connection
+            .as_ref()
+            .is_some_and(|connection| time_elapsed(&connection.last_success).as_secs() > 60)
     }
 
     /// Check whether we are connected.
     pub fn is_connected(&self) -> bool {
-        self.transport.is_some()
+        self.connection.is_some()
     }
 
     /// Connect using configured parameters.
@@ -143,14 +173,12 @@ impl Smtp {
                     &lp.smtp_password,
                     &proxy_config,
                     &lp.addr,
+                    transport_id,
                     lp.strict_tls(proxy_config.is_some())?,
                 )
                 .await
             {
-                Ok(()) => {
-                    self.transport_id = Some(transport_id);
-                    return Ok(());
-                }
+                Ok(()) => return Ok(()),
                 Err(err) => {
                     warn!(
                         context,
@@ -163,6 +191,7 @@ impl Smtp {
     }
 
     /// Connect using the provided login params.
+    #[expect(clippy::too_many_arguments)]
     pub async fn connect(
         &mut self,
         context: &Context,
@@ -170,6 +199,7 @@ impl Smtp {
         password: &str,
         proxy_config: &Option<ProxyConfig>,
         addr: &str,
+        transport_id: u32,
         strict_tls: bool,
     ) -> Result<()> {
         if self.is_connected() {
@@ -179,7 +209,6 @@ impl Smtp {
 
         let from = EmailAddress::new(addr.to_string())
             .with_context(|| format!("Invalid address {addr:?}"))?;
-        self.from = Some(from);
 
         let login_params =
             prioritize_server_login_params(&context.sql, login_params, "smtp").await?;
@@ -204,8 +233,12 @@ impl Smtp {
                 }
             };
 
-            self.transport = Some(transport);
-            self.last_success = Some(tools::Time::now());
+            self.connection = Some(Connection {
+                transport,
+                from,
+                transport_id,
+                last_success: tools::Time::now(),
+            });
 
             context.emit_event(EventType::SmtpConnected(format!(
                 "SMTP-LOGIN as {} ok",
@@ -230,7 +263,7 @@ pub(crate) enum SendResult {
 }
 
 /// Tries to send a message.
-pub(crate) async fn smtp_send(
+async fn smtp_send(
     context: &Context,
     recipients: &[async_smtp::EmailAddress],
     message: &str,
@@ -246,13 +279,36 @@ pub(crate) async fn smtp_send(
 
     smtp.connectivity.set_working(context);
 
-    let send_result = smtp.send(context, recipients, message.as_bytes()).await;
-    smtp.last_send_error = send_result.as_ref().err().map(|e| e.to_string());
+    let Some(ref mut connection) = smtp.connection else {
+        warn!(
+            context,
+            "Failed to send a message because SMTP client is not connected."
+        );
+        return SendResult::Retry;
+    };
+    let transport_id = connection.transport_id;
+
+    let send_result = connection
+        .send(context, recipients, message.as_bytes())
+        .await;
+    smtp.last_send_error = send_result.as_ref().err().map(|e| format!("{e:#}"));
 
     let status = match send_result {
-        Err(crate::smtp::send::Error::SmtpSend(err)) => {
+        Err(send::Error::SmtpSend(err)) => {
             // Remote error, retry later.
             info!(context, "SMTP failed to send: {:?}.", &err);
+
+            // Record failure on any error returned by the server, but not network errors.
+            if matches!(
+                err,
+                async_smtp::error::Error::Permanent(_) | async_smtp::error::Error::Transient(_)
+            ) && let Err(err) = record_failure(context, transport_id).await
+            {
+                warn!(
+                    context,
+                    "Failed to remove success for {transport_id}: {err:#}."
+                )
+            }
 
             let res = match err {
                 async_smtp::error::Error::Permanent(ref response) => {
@@ -327,44 +383,28 @@ pub(crate) async fn smtp_send(
                 }
             };
 
-            // this clears last_success info
             info!(context, "Failed to send message over SMTP, disconnecting.");
             smtp.disconnect();
 
             res
         }
-        Err(crate::smtp::send::Error::Envelope(err)) => {
-            // Local error, job is invalid, do not retry.
-            smtp.disconnect();
-            warn!(context, "SMTP job is invalid: {err:#}.");
-            SendResult::Failure(err)
-        }
-        Err(crate::smtp::send::Error::NoTransport) => {
-            // Should never happen.
-            // It does not even make sense to disconnect here.
-            error!(context, "SMTP job failed because SMTP has no transport.");
-            SendResult::Failure(format_err!("SMTP has not transport"))
-        }
-        Err(crate::smtp::send::Error::Other(err)) => {
+        Err(send::Error::Other(err)) => {
             // Local error, job is invalid, do not retry.
             smtp.disconnect();
             warn!(context, "Unable to load SMTP job: {err:#}.");
             SendResult::Failure(err)
         }
-        Ok(()) => SendResult::Success,
-    };
-
-    if matches!(status, SendResult::Success) {
-        debug_assert!(smtp.transport_id.is_some());
-        if let Some(transport_id) = smtp.transport_id
-            && let Err(err) = record_success(context, transport_id).await
-        {
-            warn!(
-                context,
-                "Failed to record successful use of transport {transport_id} in smtp_success table: {err:#}."
-            );
+        Ok(()) => {
+            record_success(context, transport_id)
+                .await
+                .with_context(|| {
+                    format!("Failed to record successful use of transport {transport_id}")
+                })
+                .log_err(context)
+                .ok();
+            SendResult::Success
         }
-    }
+    };
 
     if let SendResult::Failure(err) = &status
         && let Some(msg_id) = msg_id
@@ -390,28 +430,21 @@ pub(crate) async fn smtp_send(
 
 /// Inserts a tombstone for `rfc724_mid`
 /// and queues the message for SMTP sending.
-pub(crate) async fn insert_into_smtp(
-    context: &Context,
+pub(crate) fn insert_into_smtp(
+    tx: &mut rusqlite::Transaction<'_>,
     rfc724_mid: &str,
     queued_msg: &QueuedMail,
 ) -> Result<()> {
     let now = tools::time();
-    let msg_id = message::insert_tombstone(context, rfc724_mid, false).await?;
-    context
-        .sql
-        .transaction(|transaction| queue::enqueue_mail(transaction, now, msg_id, queued_msg, None))
-        .await?;
+    let msg_id = message::insert_tombstone(tx, rfc724_mid, false)?;
+    queue::enqueue_mail(tx, now, msg_id, queued_msg, None)?;
     Ok(())
 }
 
 /// Sends message identified by `smtp` table rowid over SMTP connection.
 ///
 /// Removes row if the message should not be retried, otherwise increments retry count.
-pub(crate) async fn send_msg_to_smtp(
-    context: &Context,
-    smtp: &mut Smtp,
-    rowid: i64,
-) -> anyhow::Result<()> {
+pub(crate) async fn send_msg_to_smtp(context: &Context, smtp: &mut Smtp, rowid: i64) -> Result<()> {
     if let Err(err) = smtp
         .connect_configured(context)
         .await
@@ -472,9 +505,10 @@ pub(crate) async fn send_msg_to_smtp(
     let mut recipients = queued_mail.recipients.clone();
     if queued_mail.bcc_self {
         let from_addr = smtp
-            .from
+            .connection
             .as_ref()
-            .context("No From address available, likely not connected")?
+            .context("Not connected")?
+            .from
             .to_string();
         add_self_recipients(
             context,
@@ -504,12 +538,17 @@ pub(crate) async fn send_msg_to_smtp(
     let public_key = key::load_self_public_key(context).await?;
     let secret_key = key::load_self_secret_key(context).await?;
     let from_addr = smtp
-        .from
+        .connection
         .as_ref()
-        .context("No From address available, likely not connected")?
+        .context("Not connected")?
+        .from
         .to_string();
 
-    let transport_id = smtp.transport_id.context("Not connected")?;
+    let transport_id = smtp
+        .connection
+        .as_ref()
+        .context("Not connected")?
+        .transport_id;
     let chunk_size = context
         .get_max_smtp_rcpt_to(transport_id, &from_addr)
         .await?
@@ -760,9 +799,10 @@ async fn send_mdn_rfc724_mid(
     let public_key = key::load_self_public_key(context).await?;
     let secret_key = key::load_self_secret_key(context).await?;
     let from = smtp
-        .from
+        .connection
         .as_ref()
-        .context("No From address, not connected")?
+        .context("Not connected")?
+        .from
         .to_string();
     let rendered_msg =
         mimefactory::render_queued_mail(queued_mdn, &public_key, &secret_key, from.clone())?;
@@ -780,7 +820,10 @@ async fn send_mdn_rfc724_mid(
                 .ok()
         })
         .collect();
-    message::insert_tombstone(context, &rendered_msg.rfc724_mid, false).await?;
+    context
+        .sql
+        .transaction(|tx| message::insert_tombstone(tx, &rendered_msg.rfc724_mid, false))
+        .await?;
     match smtp_send(context, &recipients, &body, smtp, None).await {
         SendResult::Success => {
             if !recipients.is_empty() {

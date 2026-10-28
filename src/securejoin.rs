@@ -34,7 +34,7 @@ pub(crate) use qrinvite::QrInvite;
 
 use crate::token::Namespace;
 
-const DISALLOWED_CHARACTERS: &AsciiSet = &NON_ALPHANUMERIC_WITHOUT_DOT.remove(b'_').remove(b'@');
+const DISALLOWED_CHARACTERS: &AsciiSet = &NON_ALPHANUMERIC_WITHOUT_DOT.remove(b'_');
 
 fn inviter_progress(
     context: &Context,
@@ -550,7 +550,10 @@ pub(crate) async fn handle_securejoin_handshake(
             )
             .await?;
 
-            insert_into_smtp(context, &rfc724_mid, &queued_message).await?;
+            context
+                .sql
+                .transaction(|tx| insert_into_smtp(tx, &rfc724_mid, &queued_message))
+                .await?;
             context.scheduler.interrupt_smtp().await;
 
             Ok(HandshakeMessage::Done)

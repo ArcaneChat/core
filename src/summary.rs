@@ -7,7 +7,7 @@ use std::str;
 use anyhow::Result;
 use num_traits::FromPrimitive;
 
-use crate::calls::{CallState, call_state};
+use crate::calls::CallState;
 use crate::chat::Chat;
 use crate::constants::Chattype;
 use crate::constants::DC_DESIRED_TEXT_LEN;
@@ -68,9 +68,11 @@ impl Summary {
         chat: &Chat,
         contact: Option<&Contact>,
     ) -> Result<Summary> {
-        if let Some((reaction_msg, reaction_contact_id, reaction)) = chat
-            .get_last_reaction_if_newer_than(context, msg.timestamp_sort)
-            .await?
+        let is_broadcast = matches!(chat.typ, Chattype::InBroadcast | Chattype::OutBroadcast);
+        if !is_broadcast
+            && let Some((reaction_msg, reaction_contact_id, reaction)) = chat
+                .get_last_reaction_if_newer_than(context, msg.timestamp_sort)
+                .await?
         {
             // there is a reaction newer than the latest message, show that.
             // sorting and therefore date is still the one of the last message,
@@ -237,11 +239,11 @@ impl Message {
                 append_text = true;
             }
             Viewtype::Call => {
-                let call_info = context.load_call_by_id(self.id).await.unwrap_or(None);
-                let has_video = call_info.is_some_and(|c| c.has_video_initially());
-                let call_state = call_state(context, self.id)
-                    .await
-                    .unwrap_or(CallState::Alerting);
+                let call_info = context.load_call_by_message(self.clone());
+                let has_video = call_info.as_ref().is_some_and(|c| c.has_video_initially());
+                let call_state = call_info
+                    .as_ref()
+                    .map_or(CallState::Alerting, |c| c.call_state());
                 emoji = Some(if has_video { "🎥" } else { "📞" });
                 type_name = Some(match call_state {
                     CallState::Alerting | CallState::Active | CallState::Completed { .. } => {

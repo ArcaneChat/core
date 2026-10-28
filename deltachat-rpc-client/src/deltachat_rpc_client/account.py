@@ -140,6 +140,11 @@ class Account:
         yield self._rpc.add_transport_from_qr.future(self.id, qr)
 
     @futuremethod
+    def add_pseudo_transport(self, addr: str):
+        """Add transport for offline tests without connection candidates."""
+        yield self._rpc.add_pseudo_transport.future(self.id, addr)
+
+    @futuremethod
     def init_transports(self, qr: Optional[str] = None):
         """Add an initial transport on the chatmail relay that answers fastest.
 
@@ -376,7 +381,6 @@ class Account:
 
         The function returns immediately and the handshake runs in background, sending
         and receiving several messages.
-        Subsequent calls of `secure_join()` will abort previous, unfinished handshakes.
         See https://securejoin.delta.chat/ for protocol details.
 
         :param qrdata: The text of the scanned QR code.

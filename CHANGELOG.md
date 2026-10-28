@@ -1,5 +1,71 @@
 # Changelog
 
+## [2.65.0] - 2026-10-22
+
+### Features / Changes
+
+- show info message for unpinning ([#8852](https://github.com/chatmail/core/pull/8852)).
+
+### Fixes
+
+- don't ignore `join_next()` errors in `background_fetch_any()`.
+
+### Documentation
+
+- remove outdated sentence saying QR scan aborts started securejoin processes.
+
+### Miscellaneous Tasks
+
+- update webpki-roots to 1.0.10.
+- update webpki-roots 0.26.8 to 0.26.11.
+- update rustls-webpki 0.103.15 to 0.103.16.
+- add deny.toml exception for RUSTSEC-2026-0382.
+- remove unused broadcast icon.
+
+### Refactor
+
+- make `message::insert_tombstone()` synchronous.
+- make `insert_into_smtp()` synchronous.
+- make `non_chat_headers()` synchronous.
+- create all keyupdates in a single transaction.
+
+## [2.64.0] - 2026-10-20
+
+### API-Changes
+
+- add jsonrpc for `get_summary_text`.
+
+### Features / Changes
+
+- take key flags and expiration into account when selecting the key.
+- switch to another SMTP transport when current one returns an error.
+- do not spam channel summaries with reactions ([#8829](https://github.com/chatmail/core/pull/8829)).
+- do not copy Chat-Version header into unprotected headers.
+
+### Fixes
+
+- Encode '@' with '%40' again in QR codes ([#8825](https://github.com/chatmail/core/pull/8825)).
+- abort scheduler tasks after shutdown timeout ([#8832](https://github.com/chatmail/core/pull/8832)).
+- do not apply channel reaction summaries as reactions.
+- imap: do not busy loop if there are no connection candidates and interrupt channel is closed.
+- races in `get_summary_text_ext`, improve perf.
+- avoid integer overflow when multiplying received image width by height.
+
+### CI
+
+- test with Python 3.15.
+
+### Miscellaneous Tasks
+
+- bump rustls from 0.23.45 to 0.23.46.
+
+### Refactor
+
+- remove Context argument from `secret_key_to_public_key()`.
+- smtp: introduce smtp::Connection structure.
+- move `call_state_ext` to `CallInfo`.
+- clean up remaining `clippy::arithmetic_side_effects` in `mimeparser`.
+
 ## [2.63.0] - 2026-10-09
 
 ### API-Changes
@@ -8983,3 +9049,5 @@ https://github.com/chatmail/core/pulls?q=is%3Apr+is%3Aclosed
 [2.61.0]: https://github.com/chatmail/core/compare/v2.60.0..v2.61.0
 [2.62.0]: https://github.com/chatmail/core/compare/v2.61.0..v2.62.0
 [2.63.0]: https://github.com/chatmail/core/compare/v2.62.0..v2.63.0
+[2.64.0]: https://github.com/chatmail/core/compare/v2.63.0..v2.64.0
+[2.65.0]: https://github.com/chatmail/core/compare/v2.64.0..v2.65.0
