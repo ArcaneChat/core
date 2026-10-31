@@ -62,6 +62,20 @@ const RFC724MID_UID: &str = "(UID BODY.PEEK[HEADER.FIELDS (\
                              )])";
 const BODY_FULL: &str = "(FLAGS BODY.PEEK[])";
 
+const PENDING_DELETIONS: &str = "
+    SELECT id, uid, target FROM imap
+    WHERE folder = ?
+    AND transport_id = ?
+    AND target != folder
+    ORDER BY target, uid";
+
+/// `CROSS JOIN` loops over the few `imap_markseen` rows, not over the transport's `imap` rows.
+const PENDING_SEEN_FLAGS: &str = "
+    SELECT imap.id, uid, folder FROM imap_markseen CROSS JOIN imap
+    WHERE imap.id = imap_markseen.id
+    AND imap.transport_id=?
+    AND target = folder";
+
 #[derive(Debug)]
 pub(crate) struct Imap {
     /// ID of the transport configuration in the `transports` table.
@@ -467,8 +481,7 @@ impl Imap {
             context.scheduler.interrupt_ephemeral_task().await;
         }
 
-        // Mark expired messages for deletion. Note that `delete_expired_imap_messages` is
-        // not well optimized and should not be called before fetching.
+        // Mark messages for deletion on the server.
         delete_expired_imap_messages(context, session.transport_id())
             .await
             .context("delete_expired_imap_messages")?;
@@ -868,20 +881,12 @@ impl Session {
         let transport_id = self.transport_id();
         let rows = context
             .sql
-            .query_map_vec(
-                "SELECT id, uid, target FROM imap
-                 WHERE folder = ?
-                 AND transport_id = ?
-                 AND target != folder
-                 ORDER BY target, uid",
-                (folder, transport_id),
-                |row| {
-                    let rowid: i64 = row.get(0)?;
-                    let uid: u32 = row.get(1)?;
-                    let target: String = row.get(2)?;
-                    Ok((rowid, uid, target))
-                },
-            )
+            .query_map_vec(PENDING_DELETIONS, (folder, transport_id), |row| {
+                let rowid: i64 = row.get(0)?;
+                let uid: u32 = row.get(1)?;
+                let target: String = row.get(2)?;
+                Ok((rowid, uid, target))
+            })
             .await?;
 
         for (target, rowid_set, uid_set) in UidGrouper::from(rows) {
@@ -930,19 +935,12 @@ impl Session {
         let transport_id = self.transport_id();
         let mut rows = context
             .sql
-            .query_map_vec(
-                "SELECT imap.id, uid, folder FROM imap, imap_markseen
-                 WHERE imap.id = imap_markseen.id
-                 AND imap.transport_id=?
-                 AND target = folder",
-                (transport_id,),
-                |row| {
-                    let rowid: i64 = row.get(0)?;
-                    let uid: u32 = row.get(1)?;
-                    let folder: String = row.get(2)?;
-                    Ok((rowid, uid, folder))
-                },
-            )
+            .query_map_vec(PENDING_SEEN_FLAGS, (transport_id,), |row| {
+                let rowid: i64 = row.get(0)?;
+                let uid: u32 = row.get(1)?;
+                let folder: String = row.get(2)?;
+                Ok((rowid, uid, folder))
+            })
             .await?;
 
         // Number of SQL results is expected to be low as
@@ -1593,16 +1591,21 @@ pub(crate) async fn prefetch_should_download(
 /// Schedule marking the message as Seen on IMAP by adding all known IMAP messages corresponding to
 /// the given Message-ID to `imap_markseen` table.
 pub(crate) async fn markseen_on_imap_table(context: &Context, message_id: &str) -> Result<()> {
-    context
-        .sql
-        .execute(
-            "INSERT OR IGNORE INTO imap_markseen (id)
-             SELECT id FROM imap WHERE rfc724_mid=?",
-            (message_id,),
-        )
+    let sql = &context.sql;
+    sql.transaction(|tx| insert_imap_markseen(tx, message_id))
         .await?;
     context.scheduler.interrupt_inbox().await;
 
+    Ok(())
+}
+
+/// Like [`markseen_on_imap_table`], but leaves interrupting the inbox loop to the caller.
+pub(crate) fn insert_imap_markseen(tx: &rusqlite::Transaction, message_id: &str) -> Result<()> {
+    tx.execute(
+        "INSERT OR IGNORE INTO imap_markseen (id)
+         SELECT id FROM imap WHERE rfc724_mid=?",
+        (message_id,),
+    )?;
     Ok(())
 }
 

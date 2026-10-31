@@ -291,63 +291,18 @@ pub(crate) async fn stock_ephemeral_timer_changed(
 }
 
 impl MsgId {
-    /// Returns ephemeral message timer value for the message.
-    pub(crate) async fn ephemeral_timer(self, context: &Context) -> Result<Timer> {
-        let res = match context
-            .sql
-            .query_get_value("SELECT ephemeral_timer FROM msgs WHERE id=?", (self,))
-            .await?
-        {
-            None => Timer::Disabled,
-            Some(duration) => Timer::from_u32(duration),
-        };
-        Ok(res)
-    }
-
     /// Starts ephemeral message timer for the message if it is not started yet.
-    pub(crate) async fn start_ephemeral_timer(self, context: &Context) -> Result<()> {
-        if let Timer::Enabled { duration } = self.ephemeral_timer(context).await? {
-            let ephemeral_timestamp = time().saturating_add(duration.get().into());
-
-            context
-                .sql
-                .execute(
-                    "UPDATE msgs SET ephemeral_timestamp = ? \
-                WHERE (ephemeral_timestamp == 0 OR ephemeral_timestamp > ?) \
-                AND id = ?",
-                    (ephemeral_timestamp, ephemeral_timestamp, self),
-                )
-                .await?;
-            context.scheduler.interrupt_ephemeral_task().await;
-        }
-        Ok(())
+    ///
+    /// Returns whether the timer was started.
+    pub(crate) fn start_ephemeral_timer(self, tx: &rusqlite::Transaction) -> Result<bool> {
+        let updated = tx.execute(
+            "UPDATE msgs SET ephemeral_timestamp = ?1 + ephemeral_timer
+             WHERE (ephemeral_timestamp == 0 OR ephemeral_timestamp > ?1 + ephemeral_timer)
+             AND ephemeral_timer > 0 AND id=?2",
+            (time(), self),
+        )?;
+        Ok(updated > 0)
     }
-}
-
-pub(crate) async fn start_ephemeral_timers_msgids(
-    context: &Context,
-    msg_ids: &[MsgId],
-) -> Result<()> {
-    let now = time();
-    let should_interrupt =
-    context
-        .sql
-        .transaction(move |transaction| {
-            let mut should_interrupt = false;
-            let mut stmt =
-                transaction.prepare(
-                    "UPDATE msgs SET ephemeral_timestamp = ?1 + ephemeral_timer
-                     WHERE (ephemeral_timestamp == 0 OR ephemeral_timestamp > ?1 + ephemeral_timer) AND ephemeral_timer > 0
-                     AND id=?2")?;
-            for msg_id in msg_ids {
-                should_interrupt |= stmt.execute((now, msg_id))? > 0;
-            }
-            Ok(should_interrupt)
-        }).await?;
-    if should_interrupt {
-        context.scheduler.interrupt_ephemeral_task().await;
-    }
-    Ok(())
 }
 
 /// Starts ephemeral timer for all messages in the chat.
@@ -391,7 +346,7 @@ async fn select_expired_messages(
 SELECT id, chat_id, type, pinned, location_id
 FROM msgs
 WHERE
-  ephemeral_timestamp != 0
+  ephemeral_timestamp > 0
   AND ephemeral_timestamp <= ?
   AND chat_id != ?
 "#,
@@ -572,6 +527,14 @@ async fn next_delete_device_after_timestamp(context: &Context) -> Result<Option<
     }
 }
 
+/// `> 0` rather than `!= 0`, so that SQLite uses `msgs_index8`.
+const NEXT_EPHEMERAL_TIMESTAMP: &str = "
+    SELECT min(ephemeral_timestamp)
+    FROM msgs
+    WHERE ephemeral_timestamp > 0
+      AND chat_id != ?
+    HAVING count(*) > 0";
+
 /// Calculates next timestamp when expiration of some message will happen.
 ///
 /// Expiration can happen either because user has set `delete_device_after` setting or because the
@@ -580,13 +543,7 @@ async fn next_expiration_timestamp(context: &Context) -> Option<i64> {
     let ephemeral_timestamp: Option<i64> = match context
         .sql
         .query_get_value(
-            r#"
-            SELECT min(ephemeral_timestamp)
-            FROM msgs
-            WHERE ephemeral_timestamp != 0
-              AND chat_id != ?
-            HAVING count(*) > 0
-            "#,
+            NEXT_EPHEMERAL_TIMESTAMP,
             (ChatId::TRASH,), // Trash contains already deleted messages, skip them
         )
         .await
@@ -673,6 +630,60 @@ pub(crate) async fn ephemeral_loop(context: &Context, interrupt_receiver: Receiv
     }
 }
 
+/// Driven by `imap`: with `bcc_self` off and `force_encryption` on core deletes downloaded
+/// messages from the server and their `imap` rows with them, leaving rows only for messages
+/// it does not download.
+const MARK_DOWNLOADED_FOR_DELETION: &str = "
+    UPDATE imap
+    SET target=''
+    WHERE transport_id=?1 AND target!=''
+    AND (EXISTS (
+            SELECT 1 FROM msgs
+            WHERE rfc724_mid=imap.rfc724_mid
+              AND id>9
+              AND ((ephemeral_timestamp!=0 AND ephemeral_timestamp<=?2) OR download_state=?3))
+        OR EXISTS (
+            SELECT 1 FROM msgs
+            WHERE pre_rfc724_mid=imap.rfc724_mid
+              AND pre_rfc724_mid!=''
+              AND id>9))";
+
+/// Driven by `imap` like [`MARK_DOWNLOADED_FOR_DELETION`]: with `bcc_self` and
+/// `force_encryption` off core deletes only encrypted and expired messages from the server,
+/// so the rows of other messages remain.
+const MARK_ENCRYPTED_FOR_DELETION: &str = "
+    UPDATE imap
+    SET target=''
+    WHERE transport_id=?1 AND target!=''
+    AND (EXISTS (
+            SELECT 1 FROM msgs
+            WHERE rfc724_mid=imap.rfc724_mid
+              AND id>9
+              AND ((ephemeral_timestamp!=0 AND ephemeral_timestamp<=?2) OR
+                   ((param GLOB '*\nc=1*' OR param GLOB 'c=1*') AND download_state=?3)))
+        OR EXISTS (
+            SELECT 1 FROM msgs
+            WHERE pre_rfc724_mid=imap.rfc724_mid
+              AND pre_rfc724_mid!=''
+              AND id>9
+              AND ((ephemeral_timestamp!=0 AND ephemeral_timestamp<=?2) OR
+                   (param GLOB '*\nc=1*' OR param GLOB 'c=1*'))))";
+
+/// Driven by `msgs_index8`: in multi-device mode core leaves downloaded messages on the server,
+/// so the `imap` table keeps a row for every message core has not deleted there.
+const MARK_EXPIRED_FOR_DELETION: &str = "
+    UPDATE imap
+    SET target=''
+    WHERE transport_id=?1 AND target!=''
+    AND rfc724_mid IN (
+        SELECT rfc724_mid FROM msgs
+        WHERE ephemeral_timestamp>0 AND ephemeral_timestamp<=?2 AND id>9
+        UNION
+        SELECT pre_rfc724_mid FROM msgs
+        WHERE pre_rfc724_mid!=''
+            AND ephemeral_timestamp>0 AND ephemeral_timestamp<=?2 AND id>9
+    )";
+
 /// Schedules expired IMAP messages for deletion on the server.
 ///
 /// Also see [`delete_expired_messages`],
@@ -696,18 +707,7 @@ pub(crate) async fn delete_expired_imap_messages(
         context
             .sql
             .execute(
-                "UPDATE imap
-                SET target=''
-                WHERE transport_id=?1
-                AND rfc724_mid IN (
-                    SELECT rfc724_mid FROM msgs
-                    WHERE ((ephemeral_timestamp!=0 AND ephemeral_timestamp<=?2) OR download_state=?3)
-                        AND id>9
-                    UNION
-                    SELECT pre_rfc724_mid FROM msgs
-                    WHERE pre_rfc724_mid!=''
-                        AND id>9
-                )",
+                MARK_DOWNLOADED_FOR_DELETION,
                 (transport_id, now, DownloadState::Done),
             )
             .await?;
@@ -717,20 +717,7 @@ pub(crate) async fn delete_expired_imap_messages(
         // Only delete expired ephemeral messages.
         context
             .sql
-            .execute(
-                "UPDATE imap
-                SET target=''
-                WHERE transport_id=?1
-                AND rfc724_mid IN (
-                    SELECT rfc724_mid FROM msgs
-                    WHERE ephemeral_timestamp!=0 AND ephemeral_timestamp<=?2 AND id>9
-                    UNION
-                    SELECT pre_rfc724_mid FROM msgs
-                    WHERE pre_rfc724_mid!=''
-                        AND ephemeral_timestamp!=0 AND ephemeral_timestamp<=?2 AND id>9
-                )",
-                (transport_id, now),
-            )
+            .execute(MARK_EXPIRED_FOR_DELETION, (transport_id, now))
             .await?;
     } else {
         // Single device, but unencrypted messages are allowed.
@@ -738,21 +725,7 @@ pub(crate) async fn delete_expired_imap_messages(
         context
             .sql
             .execute(
-                "UPDATE imap
-                 SET target=''
-                 WHERE transport_id=?1
-                 AND rfc724_mid IN (
-                    SELECT rfc724_mid FROM msgs
-                    WHERE id>9
-                      AND ((ephemeral_timestamp!=0 AND ephemeral_timestamp<=?2) OR
-                           ((param GLOB '*\nc=1*' OR param GLOB 'c=1*') AND download_state=?3))
-                    UNION
-                    SELECT pre_rfc724_mid FROM msgs
-                    WHERE pre_rfc724_mid!=''
-                      AND id>9
-                      AND ((ephemeral_timestamp!=0 AND ephemeral_timestamp<=?2) OR
-                           (param GLOB '*\nc=1*' OR param GLOB 'c=1*'))
-                )",
+                MARK_ENCRYPTED_FOR_DELETION,
                 (transport_id, now, DownloadState::Done),
             )
             .await?;

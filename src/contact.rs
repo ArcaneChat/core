@@ -386,7 +386,11 @@ pub(crate) async fn import_public_key(
         .await?
     {
         let old_public_key = SignedPublicKey::from_slice(&public_key_bytes)?;
-        merged_public_key = merge_openpgp_certificates(public_key.clone(), old_public_key)
+
+        // Order of merge_openpgp_certificates() arguments is important.
+        // Second argument is the new key, it is preferred in case of ties,
+        // i.e. same signature timestamps.
+        merged_public_key = merge_openpgp_certificates(old_public_key, public_key.clone())
             .context("Failed to merge public keys")?;
         &merged_public_key
     } else {
@@ -732,9 +736,9 @@ impl Contact {
                     .await?
                     .unwrap_or_default();
                 contact.addr = context
-                    .get_config(Config::ConfiguredAddr)
-                    .await?
-                    .unwrap_or_default();
+                    .get_primary_self_addr()
+                    .await
+                    .context("Cannot get address for self-contact")?;
                 if let Some(self_fp) = self_fingerprint_opt(context).await? {
                     contact.fingerprint = Some(self_fp.to_string());
                 }
@@ -1435,10 +1439,6 @@ WHERE addr=?
         );
 
         let contact = Contact::get_by_id(context, contact_id).await?;
-        let addr = context
-            .get_config(Config::ConfiguredAddr)
-            .await?
-            .unwrap_or_default();
 
         let Some(fingerprint_other) = contact.fingerprint() else {
             return Ok(stock_str::encr_none(context));
@@ -1458,37 +1458,15 @@ WHERE addr=?
             .await?
             .dc_fingerprint()
             .human_readable();
-        if addr < contact.addr {
-            cat_fingerprint(
-                &mut ret,
-                &stock_str::self_msg(context),
-                &addr,
-                &fingerprint_self,
-            );
-            cat_fingerprint(
-                &mut ret,
-                contact.get_display_name(),
-                &contact.addr,
-                &fingerprint_other,
-            );
+        if fingerprint_self < fingerprint_other {
+            cat_fingerprint(&mut ret, &stock_str::self_msg(context), &fingerprint_self);
+            cat_fingerprint(&mut ret, contact.get_display_name(), &fingerprint_other);
         } else {
-            cat_fingerprint(
-                &mut ret,
-                contact.get_display_name(),
-                &contact.addr,
-                &fingerprint_other,
-            );
-            cat_fingerprint(
-                &mut ret,
-                &stock_str::self_msg(context),
-                &addr,
-                &fingerprint_self,
-            );
+            cat_fingerprint(&mut ret, contact.get_display_name(), &fingerprint_other);
+            cat_fingerprint(&mut ret, &stock_str::self_msg(context), &fingerprint_self);
         }
 
-        if let Some(public_key) = contact.public_key(context).await?
-            && let Some(relay_addrs) = addresses_from_public_key(&public_key)
-        {
+        if let Some(relay_addrs) = contact.relay_addresses(context).await? {
             ret += "\n\nRelays:";
             for relay in &relay_addrs {
                 ret += "\n";
@@ -1613,6 +1591,17 @@ WHERE addr=?
             } else {
                 Ok(None)
             }
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Returns a list of relay addresses for the contact if it is distributed in the public key.
+    pub(crate) async fn relay_addresses(&self, context: &Context) -> Result<Option<Vec<String>>> {
+        if let Some(public_key) = self.public_key(context).await?
+            && let Some(relay_addrs) = addresses_from_public_key(&public_key)
+        {
+            Ok(Some(relay_addrs))
         } else {
             Ok(None)
         }
@@ -1982,8 +1971,8 @@ pub(crate) async fn update_last_seen(
     Ok(())
 }
 
-fn cat_fingerprint(ret: &mut String, name: &str, addr: &str, fingerprint: &str) {
-    *ret += &format!("\n\n{name} ({addr}):\n{fingerprint}");
+fn cat_fingerprint(ret: &mut String, name: &str, fingerprint: &str) {
+    *ret += &format!("\n\n{name}:\n{fingerprint}");
 }
 
 fn split_address_book(book: &str) -> Vec<(&str, &str)> {

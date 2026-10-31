@@ -10,6 +10,7 @@ use deltachat_derive::{FromSql, ToSql};
 use humansize::BINARY;
 use humansize::format_size;
 use num_traits::FromPrimitive;
+use rusqlite::{OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use tokio::{fs, io};
 
@@ -22,9 +23,9 @@ use crate::contact::{self, Contact, ContactId};
 use crate::context::Context;
 use crate::debug_logging::set_debug_logging_xdc;
 use crate::download::DownloadState;
-use crate::ephemeral::{Timer as EphemeralTimer, start_ephemeral_timers_msgids};
+use crate::ephemeral::Timer as EphemeralTimer;
 use crate::events::EventType;
-use crate::imap::markseen_on_imap_table;
+use crate::imap::insert_imap_markseen;
 use crate::location;
 use crate::location::get_poi_location;
 use crate::log::warn;
@@ -1791,87 +1792,69 @@ pub async fn markseen_msgs(context: &Context, msg_ids: Vec<MsgId>) -> Result<()>
         .set_config_internal(Config::LastMsgId, Some(&last_msg_id.to_u32().to_string()))
         .await?;
 
-    let mut msgs = Vec::with_capacity(msg_ids.len());
-    for &id in &msg_ids {
-        if let Some(msg) = context
-            .sql
-            .query_row_optional(
-                "SELECT
-                    m.chat_id AS chat_id,
-                    m.state AS state,
-                    m.ephemeral_timer AS ephemeral_timer,
-                    m.param AS param,
-                    m.from_id AS from_id,
-                    m.rfc724_mid AS rfc724_mid,
-                    m.hidden AS hidden,
-                    c.archived AS archived,
-                    c.blocked AS blocked
-                 FROM msgs m LEFT JOIN chats c ON c.id=m.chat_id
-                 WHERE m.id=? AND m.chat_id>9",
-                (id,),
-                |row| {
-                    let chat_id: ChatId = row.get("chat_id")?;
-                    let state: MessageState = row.get("state")?;
-                    let param: Params = row.get::<_, String>("param")?.parse().unwrap_or_default();
-                    let from_id: ContactId = row.get("from_id")?;
-                    let rfc724_mid: String = row.get("rfc724_mid")?;
-                    let hidden: bool = row.get("hidden")?;
-                    let visibility: ChatVisibility = row.get("archived")?;
-                    let blocked: Option<Blocked> = row.get("blocked")?;
-                    let ephemeral_timer: EphemeralTimer = row.get("ephemeral_timer")?;
-                    Ok((
-                        (
-                            id,
-                            chat_id,
-                            state,
-                            param,
-                            from_id,
-                            rfc724_mid,
-                            hidden,
-                            visibility,
-                            blocked.unwrap_or_default(),
-                        ),
-                        ephemeral_timer,
-                    ))
-                },
-            )
-            .await?
-        {
-            msgs.push(msg);
-        }
-    }
-
-    if msgs
-        .iter()
-        .any(|(_, ephemeral_timer)| *ephemeral_timer != EphemeralTimer::Disabled)
-    {
-        start_ephemeral_timers_msgids(context, &msg_ids)
-            .await
-            .context("failed to start ephemeral timers")?;
-    }
-
+    let should_send_mdns = context.should_send_mdns().await?;
+    let bcc_self = context.get_config_bool(Config::BccSelf).await?;
     let mut updated_chat_ids = BTreeSet::new();
     let mut archived_chats_maybe_noticed = false;
-    for (
-        (
-            id,
-            curr_chat_id,
-            curr_state,
-            curr_param,
-            curr_from_id,
-            curr_rfc724_mid,
-            curr_hidden,
-            curr_visibility,
-            curr_blocked,
-        ),
-        _curr_ephemeral_timer,
-    ) in msgs
-    {
-        if curr_state == MessageState::InFresh || curr_state == MessageState::InNoticed {
-            update_msg_state(context, id, MessageState::InSeen).await?;
+    let mut trigger_imap_interrupt = false;
+    let mut trigger_smtp_interrupt = false;
+    let mut trigger_ephemeral_interrupt = false;
+    let sql = &context.sql;
+    sql.transaction(|tx| {
+        for id in msg_ids {
+            let Some((
+                curr_chat_id,
+                curr_state,
+                curr_param,
+                curr_from_id,
+                curr_rfc724_mid,
+                curr_hidden,
+                curr_visibility,
+                curr_blocked,
+            )) = tx
+                .query_row(
+                    "SELECT
+                        m.chat_id AS chat_id,
+                        m.state AS state,
+                        m.param AS param,
+                        m.from_id AS from_id,
+                        m.rfc724_mid AS rfc724_mid,
+                        m.hidden AS hidden,
+                        c.archived AS archived,
+                        c.blocked AS blocked
+                     FROM msgs m LEFT JOIN chats c ON c.id=m.chat_id
+                     WHERE m.id=? AND m.chat_id>9",
+                    (id,),
+                    |row| {
+                        let chat_id: ChatId = row.get("chat_id")?;
+                        let state: MessageState = row.get("state")?;
+                        let param: Params =
+                            row.get::<_, String>("param")?.parse().unwrap_or_default();
+                        let from_id: ContactId = row.get("from_id")?;
+                        let rfc724_mid: String = row.get("rfc724_mid")?;
+                        let hidden: bool = row.get("hidden")?;
+                        let visibility: ChatVisibility = row.get("archived")?;
+                        let blocked: Option<Blocked> = row.get("blocked")?;
+                        let blocked = blocked.unwrap_or_default();
+                        Ok((
+                            chat_id, state, param, from_id, rfc724_mid, hidden, visibility,
+                            blocked,
+                        ))
+                    },
+                )
+                .optional()?
+            else {
+                continue;
+            };
+            trigger_ephemeral_interrupt |= id.start_ephemeral_timer(tx)?;
+            if !matches!(curr_state, MessageState::InFresh | MessageState::InNoticed) {
+                continue;
+            }
+            update_msg_state(tx, id, MessageState::InSeen)?;
             info!(context, "Seen message {}.", id);
 
-            markseen_on_imap_table(context, &curr_rfc724_mid).await?;
+            insert_imap_markseen(tx, &curr_rfc724_mid)?;
+            trigger_imap_interrupt = true;
 
             // Read receipts for system messages are never sent to contacts.
             // These messages have no place to display received read receipt
@@ -1888,21 +1871,18 @@ pub async fn markseen_msgs(context: &Context, msg_ids: Vec<MsgId>) -> Result<()>
                 && !curr_hidden
                 && wants_mdn
                 && curr_param.get_cmd() == SystemMessage::Unknown
-                && context.should_send_mdns().await?
+                && should_send_mdns
             {
                 // Clear WantsMdn to not handle a MDN twice
                 // if the state later is InFresh again as markfresh_chat() was called.
                 // BccSelf MDN messages in the next branch may be sent twice for syncing.
-                context
-                    .sql
-                    .execute(
-                        "UPDATE msgs SET param=? WHERE id=?",
-                        (curr_param.clone().remove(Param::WantsMdn).to_string(), id),
-                    )
-                    .await
-                    .context("failed to clear WantsMdn")?;
+                tx.execute(
+                    "UPDATE msgs SET param=? WHERE id=?",
+                    (curr_param.clone().remove(Param::WantsMdn).to_string(), id),
+                )
+                .context("failed to clear WantsMdn")?;
                 Some(curr_from_id)
-            } else if context.get_config_bool(Config::BccSelf).await? {
+            } else if bcc_self {
                 Some(ContactId::SELF)
             } else {
                 None
@@ -1913,24 +1893,32 @@ pub async fn markseen_msgs(context: &Context, msg_ids: Vec<MsgId>) -> Result<()>
                     "Queuing MDN to {to_id} for {id} from {curr_from_id}, wants_mdn={wants_mdn}, cmd={}.",
                     curr_param.get_cmd()
                 );
-                context
-                    .sql
-                    .execute(
-                        "INSERT INTO smtp_mdns (msg_id, from_id, rfc724_mid) VALUES(?, ?, ?)",
-                        (id, to_id, curr_rfc724_mid),
-                    )
-                    .await
-                    .context("failed to insert into smtp_mdns")?;
-                context.scheduler.interrupt_smtp().await;
+                tx.execute(
+                    "INSERT INTO smtp_mdns (msg_id, from_id, rfc724_mid) VALUES(?, ?, ?)",
+                    (id, to_id, curr_rfc724_mid),
+                )
+                .context("failed to insert into smtp_mdns")?;
+                trigger_smtp_interrupt = true;
             }
 
             if !curr_hidden {
                 updated_chat_ids.insert(curr_chat_id);
             }
+            archived_chats_maybe_noticed |= curr_state == MessageState::InFresh
+                && !curr_hidden
+                && curr_visibility == ChatVisibility::Archived;
         }
-        archived_chats_maybe_noticed |= curr_state == MessageState::InFresh
-            && !curr_hidden
-            && curr_visibility == ChatVisibility::Archived;
+        Ok(())
+    })
+    .await?;
+    if trigger_imap_interrupt {
+        context.scheduler.interrupt_inbox().await;
+    }
+    if trigger_smtp_interrupt {
+        context.scheduler.interrupt_smtp().await;
+    }
+    if trigger_ephemeral_interrupt {
+        context.scheduler.interrupt_ephemeral_task().await;
     }
 
     for updated_chat_id in updated_chat_ids {
@@ -1971,11 +1959,7 @@ pub async fn get_existing_msg_ids(context: &Context, ids: &[MsgId]) -> Result<Ve
     Ok(res)
 }
 
-pub(crate) async fn update_msg_state(
-    context: &Context,
-    msg_id: MsgId,
-    state: MessageState,
-) -> Result<()> {
+pub(crate) fn update_msg_state(tx: &Transaction, msg_id: MsgId, state: MessageState) -> Result<()> {
     ensure!(
         state != MessageState::OutMdnRcvd,
         "Update msgs_mdns table instead!"
@@ -1985,13 +1969,10 @@ pub(crate) async fn update_msg_state(
         true => ", error=''",
         false => "",
     };
-    context
-        .sql
-        .execute(
-            &format!("UPDATE msgs SET state=? {error_subst} WHERE id=?"),
-            (state, msg_id),
-        )
-        .await?;
+    tx.execute(
+        &format!("UPDATE msgs SET state=? {error_subst} WHERE id=?"),
+        (state, msg_id),
+    )?;
     Ok(())
 }
 

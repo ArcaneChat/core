@@ -2913,15 +2913,9 @@ async fn create_send_msg_jobs(context: &Context, msg: &mut Message) -> Result<Ve
     let (queued_msg, side_effects) = queued_msg_pair;
 
     if needs_encryption && !is_encrypted {
-        let addr = context.get_config(Config::ConfiguredAddr).await?;
-        let text = stock_str::unencrypted_email(
-            context,
-            addr.unwrap_or_default()
-                .split('@')
-                .nth(1)
-                .unwrap_or_default(),
-        )
-        .await;
+        let addr = context.get_primary_self_addr().await?;
+        let text =
+            stock_str::unencrypted_email(context, addr.split('@').nth(1).unwrap_or_default()).await;
         message::set_msg_failed(context, msg, &text).await?;
         add_info_msg_with_cmd(
             context,
@@ -4803,7 +4797,11 @@ pub(crate) async fn resend_msgs_ext(
                 // Broadcast owners shouldn't see spinners on messages being auto-re-sent to new
                 // subscribers (otherwise big channel owners will see spinners most of the time).
                 if to_fingerprint.is_none() {
-                    message::update_msg_state(context, msg.id, MessageState::OutPending).await?;
+                    let sql = &context.sql;
+                    sql.transaction(|tx| {
+                        message::update_msg_state(tx, msg.id, MessageState::OutPending)
+                    })
+                    .await?;
                 }
             }
             msg_state => bail!("Unexpected message state {msg_state}"),

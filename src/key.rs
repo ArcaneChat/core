@@ -124,6 +124,9 @@ pub trait DcKey: Serialize + Deserializable + Clone {
 }
 
 /// Converts secret key to public key.
+///
+/// `addr` is the address used in the User ID which is generated for compatibility.
+/// `relay_addrs` is the comma-separated list of relay addresses.
 pub(crate) fn secret_key_to_public_key(
     mut signed_secret_key: SignedSecretKey,
     timestamp: u32,
@@ -657,7 +660,6 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::config::Config;
     use crate::test_utils::{TestContext, TestContextManager, alice_keypair};
     use crate::tools::SystemTime;
     use crate::transport::add_pseudo_transport;
@@ -811,9 +813,6 @@ i8pcjGO+IZffvyZJVRWfVooBJmWWbPB1pueo3tx8w3+fcuzpxz+RLFKaPyqXO+dD
     async fn test_load_self_generate_public() {
         let t = TestContext::new().await;
         add_pseudo_transport(&t, "alice@example.org").await.unwrap();
-        t.set_config(Config::ConfiguredAddr, Some("alice@example.org"))
-            .await
-            .unwrap();
         let key = load_self_public_key(&t).await;
         assert!(key.is_ok());
     }
@@ -822,9 +821,6 @@ i8pcjGO+IZffvyZJVRWfVooBJmWWbPB1pueo3tx8w3+fcuzpxz+RLFKaPyqXO+dD
     async fn test_load_self_generate_secret() {
         let t = TestContext::new().await;
         add_pseudo_transport(&t, "alice@example.org").await.unwrap();
-        t.set_config(Config::ConfiguredAddr, Some("alice@example.org"))
-            .await
-            .unwrap();
         let key = load_self_secret_key(&t).await;
         assert!(key.is_ok());
     }
@@ -835,9 +831,6 @@ i8pcjGO+IZffvyZJVRWfVooBJmWWbPB1pueo3tx8w3+fcuzpxz+RLFKaPyqXO+dD
 
         let t = TestContext::new().await;
         add_pseudo_transport(&t, "alice@example.org").await.unwrap();
-        t.set_config(Config::ConfiguredAddr, Some("alice@example.org"))
-            .await
-            .unwrap();
         let thr0 = {
             let ctx = t.clone();
             thread::spawn(move || {
