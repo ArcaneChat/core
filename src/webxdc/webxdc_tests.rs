@@ -17,47 +17,6 @@ use crate::test_utils::{E2EE_INFO_MSGS, TestContext, TestContextManager};
 use crate::tools::{self, SystemTime};
 use crate::{message, sql};
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_is_webxdc_file() -> Result<()> {
-    let t = TestContext::new().await;
-    assert!(
-        !t.is_webxdc_file(
-            "bad-ext-no-zip.txt",
-            include_bytes!("../../test-data/message/issue_523.txt")
-        )
-        .await?
-    );
-    assert!(
-        !t.is_webxdc_file(
-            "bad-ext-good-zip.txt",
-            include_bytes!("../../test-data/webxdc/minimal.xdc")
-        )
-        .await?
-    );
-    assert!(
-        !t.is_webxdc_file(
-            "good-ext-no-zip.xdc",
-            include_bytes!("../../test-data/message/issue_523.txt")
-        )
-        .await?
-    );
-    assert!(
-        !t.is_webxdc_file(
-            "good-ext-no-index-html.xdc",
-            include_bytes!("../../test-data/webxdc/no-index-html.xdc")
-        )
-        .await?
-    );
-    assert!(
-        t.is_webxdc_file(
-            "good-ext-good-zip.xdc",
-            include_bytes!("../../test-data/webxdc/minimal.xdc")
-        )
-        .await?
-    );
-    Ok(())
-}
-
 fn create_webxdc_instance(t: &TestContext, name: &str, bytes: &[u8]) -> Result<Message> {
     let mut instance = Message::new(Viewtype::File);
     instance.set_file_from_bytes(t, name, bytes, None)?;
@@ -264,11 +223,11 @@ async fn test_receive_webxdc_instance() -> Result<()> {
     test_utils::receive_encrypted_imf(
         alice,
         bob,
-        include_bytes!("../../test-data/message/webxdc_good_extension.eml"),
+        include_bytes!("../../test-data/message/webxdc_bad_mime_type.eml"),
     )
     .await?;
     let instance = alice.get_last_msg().await;
-    assert_eq!(instance.viewtype, Viewtype::Webxdc);
+    assert_eq!(instance.viewtype, Viewtype::File);
     assert_eq!(instance.get_filename().unwrap(), "minimal.xdc");
 
     test_utils::receive_encrypted_imf(
@@ -1080,57 +1039,78 @@ async fn test_get_webxdc_blob() -> Result<()> {
     Ok(())
 }
 
-/// Tests that valid webxdc icon can be loaded.
+/// Tests that valid PNG webxdc icon can be loaded.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_get_webxdc_blob_icon() -> Result<()> {
+async fn test_get_webxdc_png_icon() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let chat_id = create_group(alice, "chat").await?;
+    let mut instance = create_webxdc_instance(
+        alice,
+        "with-png-icon.xdc",
+        include_bytes!("../../test-data/webxdc/with-png-icon.xdc"),
+    )?;
+    send_msg(alice, chat_id, &mut instance).await?;
+    let buf = instance.get_webxdc_blob(alice, "icon.png").await?;
+    assert_eq!(buf.len(), 103);
+    Ok(())
+}
+
+/// Tests that valid JPEG webxdc icon can be loaded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_get_webxdc_jpeg_icon() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let chat_id = create_group(alice, "chat").await?;
+    let mut instance = create_webxdc_instance(
+        alice,
+        "with-jpg-icon.xdc",
+        include_bytes!("../../test-data/webxdc/with-jpg-icon.xdc"),
+    )?;
+    send_msg(alice, chat_id, &mut instance).await?;
+    let buf = instance.get_webxdc_blob(alice, "icon.jpg").await?;
+    assert_eq!(buf.len(), 286);
+    Ok(())
+}
+
+/// Tests that placeholder icon is loaded if webxdc icon is invalid.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_get_webxdc_broken_png_icon() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let chat_id = create_group(alice, "chat").await?;
+    // Webxdc with icon.png than is in fact a text file.
+    let mut instance = create_webxdc_instance(
+        alice,
+        "with-broken-png-icon.xdc",
+        include_bytes!("../../test-data/webxdc/with-broken-png-icon.xdc"),
+    )?;
+    send_msg(alice, chat_id, &mut instance).await?;
+    let default_icon = instance.get_webxdc_blob(alice, "icon.png").await?;
+    assert_eq!(default_icon, webxdc_default_icon_vec());
+    alice.assert_warn("Unable to determine image format.").await;
+    Ok(())
+}
+
+/// Tests that if webxdc icon is too large, then a placeholder icon is returned.
+///
+/// This is to avoid the UI trying to render a very large icon and run out of memory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_get_webxdc_too_large_png_icon() -> Result<()> {
     let mut tcm = TestContextManager::new();
     let alice = &tcm.alice().await;
     let chat_id = create_group(alice, "chat").await?;
 
-    {
-        let mut instance = create_webxdc_instance(
-            alice,
-            "with-png-icon.xdc",
-            include_bytes!("../../test-data/webxdc/with-png-icon.xdc"),
-        )?;
-        send_msg(alice, chat_id, &mut instance).await?;
-        let buf = instance.get_webxdc_blob(alice, "icon.png").await?;
-        assert_eq!(buf.len(), 103);
-    }
-
-    {
-        let mut instance = create_webxdc_instance(
-            alice,
-            "with-jpg-icon.xdc",
-            include_bytes!("../../test-data/webxdc/with-jpg-icon.xdc"),
-        )?;
-        send_msg(alice, chat_id, &mut instance).await?;
-        let buf = instance.get_webxdc_blob(alice, "icon.jpg").await?;
-        assert_eq!(buf.len(), 286);
-    }
-
-    {
-        // Webxdc with icon.png than is in fact a text file.
-        let mut instance = create_webxdc_instance(
-            alice,
-            "with-broken-png-icon.xdc",
-            include_bytes!("../../test-data/webxdc/with-broken-png-icon.xdc"),
-        )?;
-        send_msg(alice, chat_id, &mut instance).await?;
-        assert!(instance.get_webxdc_blob(alice, "icon.png").await.is_err());
-    }
-
-    {
-        // Webxdc with icon.png than is a 9999x9999 PNG image.
-        let mut instance = create_webxdc_instance(
-            alice,
-            "with-too-large-png-icon.xdc",
-            include_bytes!("../../test-data/webxdc/with-too-large-png-icon.xdc"),
-        )?;
-        send_msg(alice, chat_id, &mut instance).await?;
-        assert!(instance.get_webxdc_blob(alice, "icon.png").await.is_err());
-    }
-
+    // Webxdc with icon.png than is a 9999x9999 PNG image.
+    let mut instance = create_webxdc_instance(
+        alice,
+        "with-too-large-png-icon.xdc",
+        include_bytes!("../../test-data/webxdc/with-too-large-png-icon.xdc"),
+    )?;
+    send_msg(alice, chat_id, &mut instance).await?;
+    let default_icon = instance.get_webxdc_blob(alice, "icon.png").await?;
+    assert_eq!(default_icon, webxdc_default_icon_vec());
+    alice.assert_warn("Icon is too large.").await;
     Ok(())
 }
 

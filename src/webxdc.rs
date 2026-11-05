@@ -63,6 +63,10 @@ const WEBXDC_DEFAULT_ICON: &str = "__webxdc__/default-icon.png";
 /// Text shown to classic e-mail users in the visible e-mail body.
 const BODY_DESCR: &str = "Webxdc Status Update";
 
+fn webxdc_default_icon_vec() -> Vec<u8> {
+    include_bytes!("../assets/icon-webxdc.png").to_vec()
+}
+
 /// Raw information read from manifest.toml
 #[derive(Debug, Deserialize, Default)]
 #[non_exhaustive]
@@ -244,28 +248,6 @@ fn find_zip_entry<'a>(
 const STATUS_UPDATE_SIZE_MAX: usize = 100 << 10;
 
 impl Context {
-    /// check if a file is an acceptable webxdc for sending or receiving.
-    pub(crate) async fn is_webxdc_file(&self, filename: &str, file: &[u8]) -> Result<bool> {
-        if !filename.ends_with(WEBXDC_SUFFIX) {
-            return Ok(false);
-        }
-
-        let archive = match async_zip::base::read::mem::ZipFileReader::new(file.to_vec()).await {
-            Ok(archive) => archive,
-            Err(_) => {
-                info!(self, "{} cannot be opened as zip-file", &filename);
-                return Ok(false);
-            }
-        };
-
-        if find_zip_entry(archive.file(), "index.html").is_none() {
-            info!(self, "{} misses index.html", &filename);
-            return Ok(false);
-        }
-
-        Ok(true)
-    }
-
     /// Ensure that a file is an acceptable webxdc for sending.
     pub(crate) async fn ensure_sendable_webxdc_file(&self, path: &Path) -> Result<()> {
         let filename = path.to_str().unwrap_or_default();
@@ -879,12 +861,12 @@ impl Message {
     /// `name` is the filename within the archive, e.g. `index.html`.
     ///
     /// If the file is `icon.png` or `icon.jpg`,
-    /// loading it may fail if dimensions are unexpectedly large.
+    /// it may return default icon if dimensions are unexpectedly large.
     pub async fn get_webxdc_blob(&self, context: &Context, name: &str) -> Result<Vec<u8>> {
         ensure!(self.viewtype == Viewtype::Webxdc, "No webxdc instance.");
 
         if name == WEBXDC_DEFAULT_ICON {
-            return Ok(include_bytes!("../assets/icon-webxdc.png").to_vec());
+            return Ok(webxdc_default_icon_vec());
         }
 
         // ignore first slash.
@@ -914,17 +896,31 @@ impl Message {
                 .with_guessed_format()
                 .context("Reading from Cursor must never fail")?;
             match image_reader.format() {
-                None => bail!("Unable to determine image format"),
+                None => {
+                    warn!(context, "Unable to determine image format.");
+                    return Ok(webxdc_default_icon_vec());
+                }
                 Some(ImageFormat::Png) | Some(ImageFormat::Jpeg) => {
                     // We accept PNG named icon.jpg and JPEG named icon.png
                     // to avoid incompatibilities, but no unexpected formats like GIF.
                 }
-                Some(format) => bail!("Unexpected icon format {format:?}"),
+                Some(format) => {
+                    warn!(context, "Unexpected icon format {format:?}.");
+                    return Ok(webxdc_default_icon_vec());
+                }
             }
-            let (width, height) = image_reader
-                .into_dimensions()
-                .context("Failed to determine icon dimensions")?;
-            ensure!(width <= 4096 && height <= 4096, "Icon is too large");
+            match image_reader.into_dimensions() {
+                Ok((width, height)) => {
+                    if width > 4096 || height > 4096 {
+                        warn!(context, "Icon is too large.");
+                        return Ok(webxdc_default_icon_vec());
+                    }
+                }
+                Err(err) => {
+                    warn!(context, "Failed to determine icon dimensions: {err:#}.");
+                    return Ok(webxdc_default_icon_vec());
+                }
+            }
         }
         Ok(blob)
     }
