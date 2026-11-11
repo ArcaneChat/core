@@ -12,14 +12,14 @@ use crate::chatlist::Chatlist;
 use crate::config::Config;
 use crate::ephemeral;
 use crate::securejoin::get_securejoin_qr;
-use crate::test_utils;
+use crate::test_utils::{self, TimeShiftFalsePositiveNote};
 use crate::test_utils::{E2EE_INFO_MSGS, TestContext, TestContextManager};
 use crate::tools::{self, SystemTime};
 use crate::{message, sql};
 
 fn create_webxdc_instance(t: &TestContext, name: &str, bytes: &[u8]) -> Result<Message> {
     let mut instance = Message::new(Viewtype::File);
-    instance.set_file_from_bytes(t, name, bytes, None)?;
+    instance.set_file_from_bytes(t, name, bytes, Some("application/octet-stream"))?;
     Ok(instance)
 }
 
@@ -227,7 +227,7 @@ async fn test_receive_webxdc_instance() -> Result<()> {
     )
     .await?;
     let instance = alice.get_last_msg().await;
-    assert_eq!(instance.viewtype, Viewtype::File);
+    assert_eq!(instance.viewtype, Viewtype::Webxdc);
     assert_eq!(instance.get_filename().unwrap(), "minimal.xdc");
 
     test_utils::receive_encrypted_imf(
@@ -256,6 +256,10 @@ async fn test_webxdc_contact_request() -> Result<()> {
     // Bob can start the webxdc from a contact request (get index.html)
     // but cannot send updates to contact requests
     let bob_instance = bob.get_last_msg().await;
+    assert_eq!(
+        bob_instance.get_filemime().unwrap(),
+        "application/webxdc+zip"
+    );
     let bob_chat = Chat::load_from_db(&bob, bob_instance.chat_id).await?;
     assert!(bob_chat.is_contact_request());
     assert!(
@@ -1745,43 +1749,6 @@ async fn test_webxdc_delete_event() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn change_logging_webxdc() -> Result<()> {
-    let alice = TestContext::new_alice().await;
-    let chat_id = ChatId::create_for_contact(&alice, ContactId::SELF).await?;
-
-    assert_eq!(
-        alice
-            .sql
-            .count("SELECT COUNT(*) FROM msgs_status_updates;", ())
-            .await?,
-        0
-    );
-
-    let mut instance = create_webxdc_instance(
-        &alice,
-        "debug_logging.xdc",
-        include_bytes!("../../test-data/webxdc/minimal.xdc"),
-    )?;
-    assert!(alice.debug_logging.read().unwrap().is_none());
-    send_msg(&alice, chat_id, &mut instance).await?;
-    assert!(alice.debug_logging.read().unwrap().is_some());
-
-    alice.emit_event(EventType::Info("hi".to_string()));
-    alice
-        .evtracker
-        .get_matching(|ev| matches!(*ev, EventType::WebxdcStatusUpdate { .. }))
-        .await;
-    assert!(
-        alice
-            .sql
-            .count("SELECT COUNT(*) FROM msgs_status_updates;", ())
-            .await?
-            > 0
-    );
-    Ok(())
-}
-
 /// Tests extensibility of WebXDC updates.
 ///
 /// If an update sent by WebXDC contains unknown properties,
@@ -1861,6 +1828,60 @@ async fn test_status_update_vs_delete_device_after() -> Result<()> {
     let bob_instance = Message::load_from_db(bob, bob_instance.id).await?;
     assert_eq!(bob_instance.chat_id.is_trash(), false);
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_status_update_vs_ephemeral_timer() -> Result<()> {
+    let _n = TimeShiftFalsePositiveNote;
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+
+    // Alice creates a chat with Bob and sets ephemeral messages to 60 minutes
+    let alice_chat = alice.create_chat(bob).await;
+    alice_chat
+        .id
+        .set_ephemeral_timer(
+            alice,
+            ephemeral::Timer::Enabled {
+                duration: 3600.try_into()?,
+            },
+        )
+        .await?;
+    bob.recv_msg(&alice.pop_sent_msg().await).await;
+
+    // Alice sends an app
+    let alice_instance = send_webxdc_instance(alice, alice_chat.id).await?;
+    let bob_instance = bob.recv_msg(&alice.pop_sent_msg().await).await;
+    bob_instance.chat_id.accept(bob).await?;
+    message::markseen_msgs(bob, vec![bob_instance.id]).await?;
+
+    // 30 minutes later, Alice sends a status update
+    SystemTime::shift(Duration::from_secs(1800));
+    alice
+        .send_webxdc_status_update(alice_instance.id, r#"{"payload":1}"#)
+        .await?;
+    alice.flush_status_updates().await?;
+    bob.recv_msg_trash(&alice.pop_sent_msg().await).await;
+    bob.send_webxdc_status_update(bob_instance.id, r#"{"payload":2}"#)
+        .await?;
+
+    // further 45 minutes later, both apps are deleted, although the last status update is only 45 minutes old:
+    // status updates do not extend the ephemeral timer
+    SystemTime::shift(Duration::from_secs(2700));
+    ephemeral::delete_expired_messages(bob, tools::time()).await?;
+    ephemeral::delete_expired_messages(alice, tools::time()).await?;
+    assert!(
+        Message::load_from_db_optional(bob, bob_instance.id)
+            .await?
+            .is_none()
+    );
+    assert!(
+        Message::load_from_db_optional(alice, alice_instance.id)
+            .await?
+            .is_none()
+    );
     Ok(())
 }
 

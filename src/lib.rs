@@ -7,6 +7,7 @@
     clippy::correctness,
     missing_debug_implementations,
     missing_docs,
+    closure_returning_async_block,
     clippy::all,
     clippy::wildcard_imports,
     clippy::needless_borrow,
@@ -113,7 +114,6 @@ pub use stats::SecurejoinSource;
 pub use stats::SecurejoinUiPath;
 pub mod summary;
 
-mod debug_logging;
 pub mod receive_imf;
 pub mod tools;
 

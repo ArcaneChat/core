@@ -18,7 +18,6 @@ use crate::chat::{ChatId, get_chat_cnt};
 use crate::config::Config;
 use crate::constants::{self, DC_VERSION_STR};
 use crate::contact::{Contact, ContactId};
-use crate::debug_logging::DebugLogging;
 use crate::events::{Event, EventEmitter, EventType, Events};
 use crate::imap::ServerMetadata;
 use crate::log::warn;
@@ -293,12 +292,6 @@ pub struct InnerContext {
     /// which happened 2025-05, and can be removed a few releases later.
     pub(crate) migration_error: parking_lot::RwLock<Option<String>>,
 
-    /// If debug logging is enabled, this contains all necessary information
-    ///
-    /// Standard RwLock instead of [`tokio::sync::RwLock`] is used
-    /// because the lock is used from synchronous [`Context::emit_event`].
-    pub(crate) debug_logging: std::sync::RwLock<Option<DebugLogging>>,
-
     /// Push subscriber to store device token.
     pub(crate) push_subscriber: PushSubscriber,
 
@@ -501,7 +494,6 @@ impl Context {
             creation_time: tools::Time::now(),
             last_error: parking_lot::RwLock::new("".to_string()),
             migration_error: parking_lot::RwLock::new(None),
-            debug_logging: std::sync::RwLock::new(None),
             push_subscriber,
             tls_session_store: TlsSessionStore::new(),
             spki_hash_store: SpkiHashStore::new(),
@@ -645,12 +637,6 @@ impl Context {
 
     /// Emits a single event.
     pub fn emit_event(&self, event: EventType) {
-        {
-            let lock = self.debug_logging.read().expect("RwLock is poisoned");
-            if let Some(debug_logging) = &*lock {
-                debug_logging.log_event(event.clone());
-            }
-        }
         self.events.emit(Event {
             id: self.id,
             typ: event,
@@ -943,10 +929,6 @@ impl Context {
                 .to_string(),
         );
         res.insert(
-            "debug_logging",
-            self.get_config_int(Config::DebugLogging).await?.to_string(),
-        );
-        res.insert(
             "last_msg_id",
             self.get_config_int(Config::LastMsgId).await?.to_string(),
         );
@@ -1022,6 +1004,12 @@ impl Context {
             self.get_config_bool(Config::AutorelayFinished)
                 .await?
                 .to_string(),
+        );
+        res.insert(
+            "test_relay_set",
+            self.get_config(Config::TestRelaySet)
+                .await?
+                .unwrap_or_else(|| "<unset>".to_string()),
         );
         res.insert(
             "keyupdate_debounce",
@@ -1155,12 +1143,6 @@ ORDER BY m.timestamp DESC,m.id DESC",
     ///
     /// If `chat_id` is provided this searches only for messages in this chat, if `chat_id`
     /// is `None` this searches messages from all chats.
-    ///
-    /// NB: Wrt the search in long messages which are shown truncated with the "Show Full Message…"
-    /// button, we only look at the first several kilobytes. Let's not fix this -- one can send a
-    /// dictionary in the message that matches any reasonable search request, but the user won't see
-    /// the match because they should tap on "Show Full Message…" for that. Probably such messages
-    /// would only clutter search results.
     pub async fn search_msgs(&self, chat_id: Option<ChatId>, query: &str) -> Result<Vec<MsgId>> {
         let real_query = query.trim().to_lowercase();
         if real_query.is_empty() {

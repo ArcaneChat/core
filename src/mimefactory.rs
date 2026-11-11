@@ -1877,7 +1877,7 @@ impl MimeFactory {
 
         let mut parts = Vec::new();
 
-        if msg.has_html() {
+        if msg.mime_modified {
             let html = if let Some(html) = msg.param.get(Param::SendHtml) {
                 Some(html.to_string())
             } else if let Some(orig_msg_id) = msg.param.get_int(Param::Forwarded)
@@ -2101,11 +2101,11 @@ async fn build_body_file(context: &Context, msg: &Message) -> Result<MimePart<'s
         .param
         .get_file_blob(context)?
         .context("msg has no file")?;
-    let mimetype = msg
-        .param
-        .get(Param::MimeType)
-        .unwrap_or("application/octet-stream")
-        .to_string();
+    let mime = match msg.viewtype {
+        Viewtype::Webxdc => Some("application/webxdc+zip"),
+        _ => msg.param.get(Param::MimeType),
+    };
+    let mimetype = mime.unwrap_or("application/octet-stream").to_string();
     let body = fs::read(blob.to_abs_path()).await?;
 
     // create mime part, for Content-Disposition, see RFC 2183.

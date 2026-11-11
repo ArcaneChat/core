@@ -251,6 +251,10 @@ CREATE TABLE msgs (
 
     timestamp INTEGER DEFAULT 0, -- Timestamp of the message used for sorting.
     timestamp_sent INTEGER DEFAULT 0, -- Timestamp of the message as sent in the Date header.
+
+    -- Receive time of a message as a unix timestamp in seconds.
+    -- For webxdc apps, incoming or outgoing, this is the time of the last status update, if any.
+    -- 0 if there is none, e.g. for most outgoing messages that are not webxdc.
     timestamp_rcvd INTEGER DEFAULT 0,
 
     -- True if the message should not be displayed.
@@ -732,10 +736,10 @@ CREATE TABLE imap_markseen (
 
 CREATE TABLE imap_sync (
     transport_id INTEGER NOT NULL, -- ID of the transport in the `transports` table.
-    folder TEXT NOT NULL,
-    uidvalidity INTEGER NOT NULL DEFAULT 0,
-    uid_next INTEGER NOT NULL DEFAULT 0,
-    modseq INTEGER NOT NULL DEFAULT 0,
+    folder TEXT NOT NULL, -- IMAP folder name, normally "INBOX"
+    uidvalidity INTEGER NOT NULL DEFAULT 0, -- Last seen UID validity
+    uid_next INTEGER NOT NULL DEFAULT 0, -- Next expected UID
+    modseq INTEGER NOT NULL DEFAULT 0, -- Deprecated since 2.54.0
     UNIQUE (transport_id, folder)
 ) STRICT;
 CREATE INDEX imap_sync_index ON imap_sync(transport_id, folder);

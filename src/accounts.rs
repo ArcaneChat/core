@@ -5,7 +5,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context as _, Result, bail, ensure};
+use anyhow::{Context as _, Result, ensure};
 use async_channel::{self, Receiver, Sender};
 use futures::FutureExt as _;
 use futures::future;
@@ -550,30 +550,25 @@ impl Accounts {
     ///
     /// Returns true if location should still be streamed.
     pub async fn set_location(&self, latitude: f64, longitude: f64, accuracy: f64) -> Result<bool> {
-        let continue_streaming = future::try_join_all(self.accounts.iter().map(
-            |(account_id, account)| async move {
+        let continue_streaming =
+            future::try_join_all(self.accounts.iter().map(async |(account_id, account)| {
                 location::set(account, latitude, longitude, accuracy)
                     .await
                     .with_context(|| format!("Failed to set location for account {account_id}"))
-            },
-        ))
-        .await?
-        .into_iter()
-        .any(|continue_streaming| continue_streaming);
+            }))
+            .await?
+            .into_iter()
+            .any(|continue_streaming| continue_streaming);
         Ok(continue_streaming)
     }
 
     /// Stops sending locations to all chats.
     pub async fn stop_sending_locations(&self) -> Result<()> {
-        future::try_join_all(
-            self.accounts
-                .iter()
-                .map(|(account_id, account)| async move {
-                    location::stop_sending(account).await.with_context(|| {
-                        format!("Failed to stop sending locations for account {account_id}")
-                    })
-                }),
-        )
+        future::try_join_all(self.accounts.iter().map(async |(account_id, account)| {
+            location::stop_sending(account).await.with_context(|| {
+                format!("Failed to stop sending locations for account {account_id}")
+            })
+        }))
         .await?;
         Ok(())
     }
@@ -665,7 +660,7 @@ impl Config {
             Ok(())
         });
         if locked_rx.await.is_err() {
-            bail!(
+            anyhow::bail!(
                 "Delta Chat is already running. To use Delta Chat, you must first close the existing Delta Chat process, or restart your device. (accounts.lock file is already locked)"
             );
         };

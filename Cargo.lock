@@ -1334,7 +1334,7 @@ dependencies = [
 
 [[package]]
 name = "deltachat"
-version = "2.67.0"
+version = "2.69.0"
 dependencies = [
  "anyhow",
  "astral-tokio-tar",
@@ -1440,7 +1440,7 @@ dependencies = [
 
 [[package]]
 name = "deltachat-jsonrpc"
-version = "2.67.0"
+version = "2.69.0"
 dependencies = [
  "anyhow",
  "async-channel 2.5.0",
@@ -1461,14 +1461,14 @@ dependencies = [
 
 [[package]]
 name = "deltachat-jsonrpc-bindings"
-version = "2.67.0"
+version = "2.69.0"
 dependencies = [
  "deltachat-jsonrpc",
 ]
 
 [[package]]
 name = "deltachat-repl"
-version = "2.67.0"
+version = "2.69.0"
 dependencies = [
  "anyhow",
  "deltachat",
@@ -1484,7 +1484,7 @@ dependencies = [
 
 [[package]]
 name = "deltachat-rpc-server"
-version = "2.67.0"
+version = "2.69.0"
 dependencies = [
  "anyhow",
  "deltachat",
@@ -1514,7 +1514,7 @@ dependencies = [
 
 [[package]]
 name = "deltachat_ffi"
-version = "2.67.0"
+version = "2.69.0"
 dependencies = [
  "anyhow",
  "deltachat",
@@ -1871,6 +1871,16 @@ name = "embedded-io"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
+
+[[package]]
+name = "encodify"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e95d6e27686e1d6991a3077f4dbec9d33d18903466d234165ad86cd08c3ebc79"
+dependencies = [
+ "memchr",
+ "simdutf8",
+]
 
 [[package]]
 name = "encoding_rs"
@@ -3329,9 +3339,9 @@ dependencies = [
 
 [[package]]
 name = "libc"
-version = "0.2.191"
+version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
+checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "libm"
@@ -3451,9 +3461,12 @@ checksum = "9106e1d747ffd48e6be5bb2d97fa706ed25b144fbee4d5c02eae110cd8d6badd"
 
 [[package]]
 name = "mail-builder"
-version = "1.0.0"
+version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ccbc27cb02a58a311a404769a22f5abf63fe3173b290d80be7c534f9c7023151"
+checksum = "a8bca634885db8e836b80700a73661de20ffd93cb5787729afc31575545e2aed"
+dependencies = [
+ "encodify",
+]
 
 [[package]]
 name = "mailparse"

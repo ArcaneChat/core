@@ -357,6 +357,10 @@ pub enum Config {
     /// Whether automatic relay management successfully added the desired number of relays
     AutorelayFinished,
 
+    /// For tests only: space-separated relay hosts used for initial onboarding.
+    /// If set, it will replace the internal default relay list.
+    TestRelaySet,
+
     /// Sorted, space-separated relay list for which no keyupdate is due.
     KeyupdateBaseline,
 
@@ -397,11 +401,6 @@ pub enum Config {
     /// In tests, this is usually disabled.
     #[strum(props(default = "1"))]
     SyncMsgs,
-
-    /// Let the core save all events to the database.
-    /// This value is used internally to remember the MsgId of the logging xdc
-    #[strum(props(default = "0"))]
-    DebugLogging,
 
     /// Last message processed by the bot.
     LastMsgId,
