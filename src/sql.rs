@@ -196,7 +196,7 @@ impl Sql {
             // so there is no event emitter yet.
             // So, try to report the error in other ways:
             eprintln!("Running migrations failed: {e:#}");
-            context.set_migration_error(&format!("Updating Delta Chat failed. Please send this message to the Delta Chat developers, either at delta@merlinux.eu or at https://support.delta.chat.\n\n{e:#}"));
+            context.set_migration_error(&format!("Updating ArcaneChat failed. Please send this message to the ArcaneChat developers, either at contact@arcanechat.me or at https://arcanechat.me/#contact\n\n{e:#}"));
             // We can't simply close the db for two reasons:
             // a. backup export would fail
             // b. The UI would think that the account is unconfigured (because `is_configured()` fails)

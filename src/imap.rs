@@ -1134,7 +1134,7 @@ impl Session {
                         let text = format!(
                             // No trailing '.' to avoid from the Android UI treating it as a part of
                             // URL.
-                            "❌ Failed to receive a message: {err:#}. Core version v{DC_VERSION_STR}. Please report this bug to delta@merlinux.eu or https://support.delta.chat/",
+                            "❌ Failed to receive a message: {err:#}. Core version v{DC_VERSION_STR}. Please report this bug to contact@arcanechat.me or https://arcanechat.me/#contact",
                         );
                         let mut msg = Message::new_text(text);
                         add_device_msg(context, None, Some(&mut msg)).await?;
